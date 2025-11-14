@@ -1,2 +1,2 @@
-# Numax
+# numax
 The beginning of a new runtime model ...
