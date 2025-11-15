@@ -1,0 +1,9 @@
+[package]
+name = "nx-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nx-core = { path = "../nx-core" }

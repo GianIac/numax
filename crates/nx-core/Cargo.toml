@@ -1,0 +1,8 @@
+[package]
+name = "nx-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+wasmtime = "38.0.4"

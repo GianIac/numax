@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/nx-core",
+  "crates/nx-cli",
+  "crates/nx-store",
+  "crates/nx-sync",
+  "crates/nx-net",
+  "crates/nx-sdk",
+  "examples/hello_wasm",
+]
