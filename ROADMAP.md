@@ -3,7 +3,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 0 — Bootstrap del Runtime: 
+## FASE 0 — Bootstrap del Runtime: DONE 
 **Obiettivo:** eseguire un modulo WASM. Punto.
 
 - Runtime minimale (`nx-core`)
