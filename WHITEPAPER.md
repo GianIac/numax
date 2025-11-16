@@ -307,9 +307,9 @@ Numax Sync è responsabile della replica dello stato tra nodi.
 Esempi di comandi:
 
 ```
-Numax run module.wasm
-Numax inspect module.wasm
-Numax peers
+nx run module.wasm
+nx inspect module.wasm
+nx peers
 ```
 
 ---
