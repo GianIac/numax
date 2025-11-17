@@ -9,7 +9,7 @@ pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<()> {
             let memory = match caller.get_export("memory") {
                 Some(wasmtime::Extern::Memory(mem)) => mem,
                 _ => {
-                    eprintln!("[nx-core] host_log: no memory export");
+                    eprintln!("[nx-core] host_log: no `memory` export on guest");
                     return;
                 }
             };

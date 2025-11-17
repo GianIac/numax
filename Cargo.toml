@@ -7,5 +7,6 @@ members = [
   "crates/nx-sync",
   "crates/nx-net",
   "crates/nx-sdk",
+  "examples/hello_wasi", 
   "examples/hello_wasm",
 ]
