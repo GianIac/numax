@@ -7,12 +7,14 @@
 
 ## 1. Executive Summary
 
-### 1.1 Problema
+### 1.1 The Problem
 
-Lo sviluppo di applicazioni distribuite moderne è diventato eccessivamente complesso e per far girare logica relativamente semplice si ricorre a:
+L'idea di numax nasce da una riflessione fatta riguardo lo sviluppo di applicazioni distribuite, che risulta essere spesso eccessivamente complesse anche per quanto riguarda logiche semplici.
+
+Spesso si ricorre a:
 
 - container e orchestratori,
-- database esterni per ogni tipo di stato,
+- db esterni,
 - sistemi di sincronizzazione ad hoc,
 - differenze significative tra ambienti (browser, server, edge, IoT),
 - catene di dipendenze, permessi, versioni, configurazioni.
@@ -24,12 +26,12 @@ Il risultato è spesso un ecosistema:
 - costoso da mantenere,
 - poco portabile tra ambienti diversi.
 
-### 1.2 Soluzione proposta: Numax
+### 1.2 Numax
 
 Numax è un runtime portabile progettato per eseguire applicazioni distribuite in modo semplice, sicuro e coerente su qualsiasi ambiente. 
-Integra tre componenti fondamentali:
+La sua architettura è semplice ed è composta da 3 blocchi:
 
-1. **Esecuzione di moduli WebAssembly (WASM)**
+1. **WebAssembly (WASM)**
    Il runtime esegue moduli WASM in sandbox isolata, con un set controllato di host API.
    Questo garantisce portabilità tra piattaforme, avvii rapidi e sicurezza memory-safe.
 
@@ -37,25 +39,25 @@ Integra tre componenti fondamentali:
    Ogni istanza del runtime include un datastore locale persistente e sempre disponibile.
    Lo stato vive vicino al calcolo, riducendo latenza, dipendenze esterne e permettendo il funzionamento offline.
 
-3. **Sincronizzazione distribuita dello stato basata su CRDT + gossip**
-   Il runtime replica automaticamente lo stato tra nodi tramite CRDT, evitando conflitti senza lock o transazioni distribuite.
+3. **Sincronizzazione distribuita dello stato**
+   Il runtime replica automaticamente lo stato tra nodi tramite CRDT (Conflict-free replicated data type) e gossip.
    Il protocollo gossip gestisce propagazione, resilienza e comunicazione tra nodi anche con rete intermittente.
 
-## 1.3 Concetti Chiave
+## 1.3 Il cuore tecnologico
 
-I concetti chiave che lo rendono utile sono:
+I concetti chiave di numax sono:
 
 - **Semplicità architetturale come principio guida**
-  Il runtime integra solo ciò che è davvero necessario (compute, stato locale, sincronizzazione).
-  Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e capire.
+  Il runtime integra solo ciò che è davvero necessario come compute, stato locale o sincronizzazione.
+  Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e sopratutto capire.
 
 - **Stato e codice nello stesso ambiente**
-  In Numax il datastore locale è parte integrante del runtime.
+  Il datastore locale è parte integrante del runtime.
   Il calcolo non è separato dallo stato tramite un database remoto: vive nello stesso luogo, con benefici in termini di latenza, coerenza e resilienza offline.
 
 - **WASM come unità di calcolo portabile**
   Il modulo WASM è l’unico artefatto necessario per distribuire logica applicativa.
-  Lo stesso modulo può essere eseguito su server, edge, browser, mobile e IoT senza modifiche, evitando codebase multiple o branching condizionale.
+  Lo stesso modulo può essere eseguito su un po' ovunque senza modifiche, evitando codebase multiple o branching condizionale.
 
 - **CRDT invece di lock o transazioni distribuite**
   La sincronizzazione dello stato non richiede coordinamento centralizzato:
@@ -65,28 +67,21 @@ I concetti chiave che lo rendono utile sono:
   Ogni nodo mantiene una copia locale dello stato e continua a funzionare autonomamente.
   Quando torna online, il runtime esegue la riconciliazione tramite CRDT, senza conflitti e senza codice applicativo aggiuntivo.
 
-In sintesi: Numax rende possibile costruire applicazioni distribuite senza dipendere da una infrastruttura complessa, mantenendo al tempo stesso portabilità, resilienza e coerenza dei dati.
-
-
-### 1.4 Obiettivo
+In sintesi: l'obbiettivo è costruire applicazioni distribuite senza dipendere da una infrastruttura complessa, mantenendo al tempo stesso portabilità, resilienza e coerenza dei dati.
 
 Numax non elimina la complessità del dominio distribuito: la gestisce in modo sistematico, incorporandola nel runtime.
 
-L’obiettivo è ridurre drasticamente la complessità auto-imposta fornendo:
-
-* un runtime portabile unificato basato su WebAssembly,
-* uno store locale integrato vicino al calcolo,
-* sincronizzazione basata su CRDT che gestisce automaticamente la concorrenza.
+L’obiettivo è ridurre drasticamente la complessità auto-imposta fornendo: un runtime portabile unificato basato su WebAssembly, uno store locale integrato vicino al calcolo e una sincronizzazione basata che gestisce automaticamente la concorrenza.
 
 In questo modo, lo sviluppatore mantiene il controllo sulla complessità necessaria del proprio dominio, senza dover pagare il costo dell’infrastruttura distribuita tradizionale.
 
 ---
 
-## 2. Contesto e Problema
+## 2. Contesto
 
 ### 2.1 L’ecosistema attuale
 
-Negli ultimi anni, lo sviluppo di sistemi distribuiti ha fatto emergere un pattern ricorrente:
+Negli ultimi anni, lo sviluppo di sistemi distribuiti presenta dei patterns ricorrenti:
 
 - microservizi containerizzati,
 - orchestrazione centralizzata,
@@ -94,7 +89,7 @@ Negli ultimi anni, lo sviluppo di sistemi distribuiti ha fatto emergere un patte
 - sistemi di messaggistica/eventi,
 - strumenti di osservabilità e gestione sempre più complessi.
 
-Questa architettura funziona, ma ha un costo: **la complessità operativa diventa una dipendenza strutturale**.
+Questa architettura funziona, ma ha un costo: **la complessità operativa può diventare una dipendenza strutturale**.
 
 ## 2.2 Sintomi della complessità
 
