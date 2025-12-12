@@ -342,40 +342,9 @@ Questa configurazione definisce:
 
 ## 7. Casi d'Uso
 
-### 7.1 Applicazioni offline-first
+### // TODO
 
-Scenario: applicazioni che devono funzionare anche senza connettività continua.
-Numax offre:
-* datastore locale per lo stato,
-* sincronizzazione eventuale via CRDT + gossip,
-* stessa logica che può girare nel browser, su mobile e su edge.
-
-### 7.2 Edge Functions
-
-Scenario: esecuzione di funzioni vicino all’utente, con latenze ridotte.
-Numax fornisce:
-* moduli WASM dal cold start molto rapido,
-* stato persistente vicino al calcolo,
-* un modello di deployment semplificato (WASM + config).
-
-### 7.3 IoT e dispositivi a risorse limitate
-
-Scenario: dispositivi embedded con risorse limitate e connettività intermittente.
-Numax contribuisce con:
-* runtime leggero e sicuro,
-* datastore locale integrato,
-* sincronizzazione eventuale quando il dispositivo è online.
-
-### 7.4 Microservizi minimali
-
-Scenario: servizi piccoli, indipendenti, che non richiedono l’intero stack container + orchestratore.
-
-Numax permette:
-* di eseguire logica applicativa senza container,
-* di gestire stato e sync dentro il runtime,
-* di ridurre dipendenze infrastrutturali.
-
-> TODO: aggiungere esempi concreti (es. carrello e-commerce, note condivise, IoT sensor hub, ecc.).
+> TODO: aggiungere esempi concreti (es. applicazione scsritta usando numax).
 
 ---
 
@@ -383,53 +352,15 @@ Numax permette:
 
 Questa sezione chiarisce la posizione di Numax all'interno dell’ecosistema moderno, confrontandolo con le principali categorie di piattaforme utilizzate oggi per eseguire applicazioni distribuite.
 
-### 8.1 Container e Kubernetes
-
-Kubernetes offre un ecosistema maturo, strumenti diffusi e un alto livello di automazione nella gestione dei cluster.
-Tuttavia opera a un livello molto diverso da Numax.
-
-Differenze principali:
-
-- Numax non è un orchestratore ma un runtime leggero
-- molte applicazioni che non richiedono container o orchestrazione complessa possono funzionare interamente dentro Numax
-- l'obiettivo non è gestire cluster ma ridurre la complessità operativa
-
-Kubernetes rimane ideale per workload complessi e altamente scalabili; Numax mira a casi d'uso più semplici e distribuiti, dove la leggerezza è un vantaggio.
-
-### 8.2 Serverless tradizionale
-
-Le piattaforme serverless astraggono l’infrastruttura e forniscono scalabilità automatica, ma introducono vincoli forti:
-
-- il calcolo è spesso stateless
-- lo stato è delegato a servizi esterni
-- forte dipendenza dal vendor
-
-Numax adotta un modello diverso:
-
-- portabile e self-hosted
-- stato locale integrato e sincronizzazione nativa
-- nessun lock-in con un provider specifico
-
-Dove il serverless separa calcolo e dati, Numax li riporta nello stesso luogo.
-
-### 8.3 Altri runtime WASM ed edge platforms
-
-Esistono runtime WASM focalizzati su edge computing (es. Wasmtime, WasmEdge, Cloudflare Workers, Fastly Compute) e ciascuno ottimizza un aspetto diverso: performance, sandboxing, deploy veloce.
-
-La differenza sostanziale rispetto a Numax:
-
-- questi runtime eseguono solo calcolo
-- non includono uno store locale persistente
-- non offrono sincronizzazione distribuita dello stato
-- non forniscono un modello dati basato su CRDT
+### // TODO
 
 Numax combina compute, stato e sync in un singolo runtime, fornendo un ambiente più alto livello per applicazioni distribuite.
 
-### 8.4 Quindi dove si colloca Numax?
+### 8.X Quindi dove si colloca Numax?
 
 Numax si posiziona in uno spazio specifico che oggi è quasi vuoto:
 
-**runtime portabile con stato locale integrato e sincronizzazione nativa.**
+**runtime portabile con stato locale integrato e sincronizzazione nativa.** (magari lo scrivi meglio)
 
 Riducendo la complessità dell’infrastruttura senza rinunciare a distribuzione, portabilità e sicurezza.
 
@@ -446,8 +377,7 @@ Numax è pensato per semplificare lo sviluppo di applicazioni distribuite, ma la
 - Non sostituisce orchestratori complessi. 
   Non è progettato per gestire cluster estesi o deployment ad alta scalabilità.
 
-- Non è ottimizzato per workload pesanti o CPU-bound. 
-  Il focus è su applicazioni leggere, offline-first e distribuite.
+- Non è ottimizzato (per ora) per workload pesanti o CPU-bound. 
 
 - I modelli dati devono essere compatibili con i CRDT. 
   Pattern basati su lock o transazioni forti non si adattano direttamente.
