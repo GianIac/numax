@@ -79,35 +79,7 @@ In questo modo, lo sviluppatore mantiene il controllo sulla complessità necessa
 
 ## 2. Contesto
 
-### 2.1 L’ecosistema attuale
-
-Negli ultimi anni, lo sviluppo di sistemi distribuiti presenta dei patterns ricorrenti:
-
-- microservizi containerizzati,
-- orchestrazione centralizzata,
-- database esterni condivisi,
-- sistemi di messaggistica/eventi,
-- strumenti di osservabilità e gestione sempre più complessi.
-
-Questa architettura funziona, ma ha un costo: **la complessità operativa può diventare una dipendenza strutturale**.
-
-## 2.2 Sintomi della complessità
-
-La complessità dell’ecosistema attuale emerge come una serie di frizioni durante sviluppo, deploy e manutenzione.
-Spesso il sistema è difficile da comprendere nella sua interezza: la logica applicativa si disperde tra livelli di configurazione con YAML, Helm chart, operator custom che influenzano il comportamento ma sono onerosi da mantenere.
-
-Questa frammentazione rallenta l’ingresso di nuovi sviluppatori: prima di scrivere codice è necessario capire infrastruttura, permessi e convenzioni operative. La complessità vive più nel contesto che nell’applicazione stessa.
-
-Replicare ambienti coerenti (dev, staging, produzione) diventa difficile: differenze minime in servizi, configurazioni o variabili generano comportamenti divergenti difficili da diagnosticare.
-
-A questo si aggiunge un **coupling nascosto** verso componenti infrastrutturali come database remoti, sistemi di messaggistica, ingress, sidecar che vincola le applicazioni alla topologia del cloud più di quanto appaia.
-
-Infine, molte architetture moderne sono pensate per il cloud centrale e risultano poco portabili su edge, browser, mobile o IoT. Il codice deve adattarsi all’ambiente, moltiplicando i percorsi di esecuzione e ampliando la superficie d’errore.
-
-Nel complesso, questi sintomi mostrano un modello potente ma spesso più complesso del necessario per molti casi d’uso.
-
-
-### 2.3 Complessità Necessaria vs Complessità Auto-Imposta
+### 2.1 Complessità Necessaria vs Complessità Auto-Imposta
 
 Per fare chiarezza, la progettazione di sistemi distribuiti comporta una parte di complessità che è intrinseca al dominio e non può essere eliminata. Tuttavia, l’ecosistema tecnologico moderno introduce spesso un livello aggiuntivo di complessità che non deriva dal problema, ma dagli strumenti utilizzati per affrontarlo.
 Questa sezione chiarisce questa distinzione.
@@ -133,7 +105,7 @@ Questa sezione chiarisce questa distinzione.
 
 > Questa complessità è spesso evitabile: nasce dalla stratificazione di tecnologie general-purpose applicate anche in scenari in cui non sono strettamente necessarie.
 
-### 2.4 Opportunità
+### 2.2 Opportunità
 
 L’emergere di WebAssembly e di modelli di sincronizzazione come i CRDT apre la possibilità di ripensare la base su cui costruiamo sistemi distribuiti:
 
