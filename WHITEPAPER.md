@@ -1,4 +1,4 @@
-# Numax Runtime — Whitepaper Tecnico (Versione 0.1 ITA)
+# Numax Runtime - Whitepaper Tecnico (Versione 0.1 ITA)
 
 > **Nota V0.1.0  
 > Questo documento è una base di partenza. Alcune sezioni contengono `TODO:` per indicare parti da approfondire in iterazioni successive.
