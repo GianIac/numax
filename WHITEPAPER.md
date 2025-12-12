@@ -97,10 +97,10 @@ Questa sezione chiarisce questa distinzione.
 **Complessità Auto-Imposta:**
 
 È la complessità aggiunta dagli strumenti moderni e dal toolchain, non dal problema:
-* orchestratori complessi anche per applicazioni piccole
+* orchestratori complessi spesso anche per applicazioni piccole
 * dipendenze multiple tra servizi e infrastrutture esterne
 * configurazioni distribuite in molti file (YAML, operator custom, chart)
-* stato delegato a DB remoti anche quando sarebbe più efficiente mantenerlo localmente
+* stato delegato spesso a DB remoti anche quando sarebbe più efficiente mantenerlo localmente
 * tool differenziati per ambiente (dev, browser, edge, IoT)
 
 > Questa complessità è spesso evitabile: nasce dalla stratificazione di tecnologie general-purpose applicate anche in scenari in cui non sono strettamente necessarie.
