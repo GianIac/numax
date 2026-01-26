@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use crate::StoreError;
@@ -8,6 +9,19 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+
+        // if exists, deve essere una dir
+        if path.exists() && !path.is_dir() {
+            return Err(StoreError::NotADirectory(path.display().to_string()));
+        }
+
+        // if NOT exists, crea (inclusi parent)
+        if !path.exists() {
+            fs::create_dir_all(path)?;
+        }
+
+        // Apri sled dentro quella dir
         let db = sled::open(path)?;
         Ok(Self { db })
     }

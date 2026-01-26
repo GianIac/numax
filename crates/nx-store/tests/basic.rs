@@ -28,3 +28,27 @@ fn scan_prefix_works() {
     assert!(keys.contains(&b"cart:2".to_vec()));
     assert!(!keys.contains(&b"user:1".to_vec()));
 }
+
+#[test]
+fn open_creates_dir_if_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("nx-store-data-does-not-exist-yet");
+
+    assert!(!db_dir.exists());
+    let _store = Store::open(&db_dir).unwrap();
+    assert!(db_dir.exists());
+    assert!(db_dir.is_dir());
+}
+
+#[test]
+fn open_errors_if_path_is_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file_path = tmp.path().join("not_a_dir");
+    std::fs::write(&file_path, b"x").unwrap();
+
+    let res = Store::open(&file_path);
+    assert!(res.is_err());
+
+    let msg = res.err().unwrap().to_string();
+    assert!(msg.contains("not a directory"));
+}
