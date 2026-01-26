@@ -1210,6 +1210,7 @@ name = "nx-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nx-store",
  "wasmtime",
  "wasmtime-wasi",
 ]

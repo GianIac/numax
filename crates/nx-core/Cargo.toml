@@ -7,3 +7,4 @@ edition = "2021"
 anyhow = "1"
 wasmtime = "41.0.0"
 wasmtime-wasi = "41.0.0"
+nx-store = { path = "../nx-store" }
