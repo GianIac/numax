@@ -13,6 +13,14 @@ fn roundtrip_get_set_delete() {
 }
 
 #[test]
+fn get_returns_none_when_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+
+    assert_eq!(store.get(b"missing").unwrap(), None);
+}
+
+#[test]
 fn scan_prefix_works() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
