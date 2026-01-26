@@ -20,7 +20,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 1 — Runtime solido (ma ancora minimale)
+## FASE 1 — Upgrade Runtime (ancora minimale): DONE
 **Obiettivo:** passare da “demo” a “runtime vero ma semplice”.
 
 - Introduzione di `RuntimeConfig`

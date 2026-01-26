@@ -1,4 +1,4 @@
-# Numax Runtime — Whitepaper Tecnico (Versione 0.1 ITA)
+# Numax Runtime - Whitepaper Tecnico (Versione 0.1 ITA)
 
 > **Nota V0.1.0  
 > Questo documento è una base di partenza. Alcune sezioni contengono `TODO:` per indicare parti da approfondire in iterazioni successive.
@@ -7,12 +7,14 @@
 
 ## 1. Executive Summary
 
-### 1.1 Problema
+### 1.1 The Problem
 
-Lo sviluppo di applicazioni distribuite moderne è diventato eccessivamente complesso e per far girare logica relativamente semplice si ricorre a:
+L'idea di numax nasce da una riflessione fatta riguardo lo sviluppo di applicazioni distribuite, che risulta essere spesso eccessivamente complesse anche per quanto riguarda logiche semplici.
+
+Spesso si ricorre a:
 
 - container e orchestratori,
-- database esterni per ogni tipo di stato,
+- db esterni,
 - sistemi di sincronizzazione ad hoc,
 - differenze significative tra ambienti (browser, server, edge, IoT),
 - catene di dipendenze, permessi, versioni, configurazioni.
@@ -24,12 +26,12 @@ Il risultato è spesso un ecosistema:
 - costoso da mantenere,
 - poco portabile tra ambienti diversi.
 
-### 1.2 Soluzione proposta: Numax
+### 1.2 Numax
 
 Numax è un runtime portabile progettato per eseguire applicazioni distribuite in modo semplice, sicuro e coerente su qualsiasi ambiente. 
-Integra tre componenti fondamentali:
+La sua architettura è semplice ed è composta da 3 blocchi:
 
-1. **Esecuzione di moduli WebAssembly (WASM)**
+1. **WebAssembly (WASM)**
    Il runtime esegue moduli WASM in sandbox isolata, con un set controllato di host API.
    Questo garantisce portabilità tra piattaforme, avvii rapidi e sicurezza memory-safe.
 
@@ -37,25 +39,25 @@ Integra tre componenti fondamentali:
    Ogni istanza del runtime include un datastore locale persistente e sempre disponibile.
    Lo stato vive vicino al calcolo, riducendo latenza, dipendenze esterne e permettendo il funzionamento offline.
 
-3. **Sincronizzazione distribuita dello stato basata su CRDT + gossip**
-   Il runtime replica automaticamente lo stato tra nodi tramite CRDT, evitando conflitti senza lock o transazioni distribuite.
+3. **Sincronizzazione distribuita dello stato**
+   Il runtime replica automaticamente lo stato tra nodi tramite CRDT (Conflict-free replicated data type) e gossip.
    Il protocollo gossip gestisce propagazione, resilienza e comunicazione tra nodi anche con rete intermittente.
 
-## 1.3 Concetti Chiave
+## 1.3 Il cuore tecnologico
 
-I concetti chiave che lo rendono utile sono:
+I concetti chiave di numax sono:
 
 - **Semplicità architetturale come principio guida**
-  Il runtime integra solo ciò che è davvero necessario (compute, stato locale, sincronizzazione).
-  Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e capire.
+  Il runtime integra solo ciò che è davvero necessario come compute, stato locale o sincronizzazione.
+  Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e sopratutto capire.
 
 - **Stato e codice nello stesso ambiente**
-  In Numax il datastore locale è parte integrante del runtime.
+  Il datastore locale è parte integrante del runtime.
   Il calcolo non è separato dallo stato tramite un database remoto: vive nello stesso luogo, con benefici in termini di latenza, coerenza e resilienza offline.
 
 - **WASM come unità di calcolo portabile**
   Il modulo WASM è l’unico artefatto necessario per distribuire logica applicativa.
-  Lo stesso modulo può essere eseguito su server, edge, browser, mobile e IoT senza modifiche, evitando codebase multiple o branching condizionale.
+  Lo stesso modulo può essere eseguito su un po' ovunque senza modifiche, evitando codebase multiple o branching condizionale.
 
 - **CRDT invece di lock o transazioni distribuite**
   La sincronizzazione dello stato non richiede coordinamento centralizzato:
@@ -65,54 +67,19 @@ I concetti chiave che lo rendono utile sono:
   Ogni nodo mantiene una copia locale dello stato e continua a funzionare autonomamente.
   Quando torna online, il runtime esegue la riconciliazione tramite CRDT, senza conflitti e senza codice applicativo aggiuntivo.
 
-In sintesi: Numax rende possibile costruire applicazioni distribuite senza dipendere da una infrastruttura complessa, mantenendo al tempo stesso portabilità, resilienza e coerenza dei dati.
-
-
-### 1.4 Obiettivo
+In sintesi: l'obbiettivo è costruire applicazioni distribuite senza dipendere da una infrastruttura complessa, mantenendo al tempo stesso portabilità, resilienza e coerenza dei dati.
 
 Numax non elimina la complessità del dominio distribuito: la gestisce in modo sistematico, incorporandola nel runtime.
 
-L’obiettivo è ridurre drasticamente la complessità auto-imposta fornendo:
-
-* un runtime portabile unificato basato su WebAssembly,
-* uno store locale integrato vicino al calcolo,
-* sincronizzazione basata su CRDT che gestisce automaticamente la concorrenza.
+L’obiettivo è ridurre drasticamente la complessità auto-imposta fornendo: un runtime portabile unificato basato su WebAssembly, uno store locale integrato vicino al calcolo e una sincronizzazione basata che gestisce automaticamente la concorrenza.
 
 In questo modo, lo sviluppatore mantiene il controllo sulla complessità necessaria del proprio dominio, senza dover pagare il costo dell’infrastruttura distribuita tradizionale.
 
 ---
 
-## 2. Contesto e Problema
+## 2. Contesto
 
-### 2.1 L’ecosistema attuale
-
-Negli ultimi anni, lo sviluppo di sistemi distribuiti ha fatto emergere un pattern ricorrente:
-
-- microservizi containerizzati,
-- orchestrazione centralizzata,
-- database esterni condivisi,
-- sistemi di messaggistica/eventi,
-- strumenti di osservabilità e gestione sempre più complessi.
-
-Questa architettura funziona, ma ha un costo: **la complessità operativa diventa una dipendenza strutturale**.
-
-## 2.2 Sintomi della complessità
-
-La complessità dell’ecosistema attuale emerge come una serie di frizioni durante sviluppo, deploy e manutenzione.
-Spesso il sistema è difficile da comprendere nella sua interezza: la logica applicativa si disperde tra livelli di configurazione con YAML, Helm chart, operator custom che influenzano il comportamento ma sono onerosi da mantenere.
-
-Questa frammentazione rallenta l’ingresso di nuovi sviluppatori: prima di scrivere codice è necessario capire infrastruttura, permessi e convenzioni operative. La complessità vive più nel contesto che nell’applicazione stessa.
-
-Replicare ambienti coerenti (dev, staging, produzione) diventa difficile: differenze minime in servizi, configurazioni o variabili generano comportamenti divergenti difficili da diagnosticare.
-
-A questo si aggiunge un **coupling nascosto** verso componenti infrastrutturali come database remoti, sistemi di messaggistica, ingress, sidecar che vincola le applicazioni alla topologia del cloud più di quanto appaia.
-
-Infine, molte architetture moderne sono pensate per il cloud centrale e risultano poco portabili su edge, browser, mobile o IoT. Il codice deve adattarsi all’ambiente, moltiplicando i percorsi di esecuzione e ampliando la superficie d’errore.
-
-Nel complesso, questi sintomi mostrano un modello potente ma spesso più complesso del necessario per molti casi d’uso.
-
-
-### 2.3 Complessità Necessaria vs Complessità Auto-Imposta
+### 2.1 Complessità Necessaria vs Complessità Auto-Imposta
 
 Per fare chiarezza, la progettazione di sistemi distribuiti comporta una parte di complessità che è intrinseca al dominio e non può essere eliminata. Tuttavia, l’ecosistema tecnologico moderno introduce spesso un livello aggiuntivo di complessità che non deriva dal problema, ma dagli strumenti utilizzati per affrontarlo.
 Questa sezione chiarisce questa distinzione.
@@ -130,15 +97,15 @@ Questa sezione chiarisce questa distinzione.
 **Complessità Auto-Imposta:**
 
 È la complessità aggiunta dagli strumenti moderni e dal toolchain, non dal problema:
-* orchestratori complessi anche per applicazioni piccole
+* orchestratori complessi spesso anche per applicazioni piccole
 * dipendenze multiple tra servizi e infrastrutture esterne
 * configurazioni distribuite in molti file (YAML, operator custom, chart)
-* stato delegato a DB remoti anche quando sarebbe più efficiente mantenerlo localmente
+* stato delegato spesso a DB remoti anche quando sarebbe più efficiente mantenerlo localmente
 * tool differenziati per ambiente (dev, browser, edge, IoT)
 
 > Questa complessità è spesso evitabile: nasce dalla stratificazione di tecnologie general-purpose applicate anche in scenari in cui non sono strettamente necessarie.
 
-### 2.4 Opportunità
+### 2.2 Opportunità
 
 L’emergere di WebAssembly e di modelli di sincronizzazione come i CRDT apre la possibilità di ripensare la base su cui costruiamo sistemi distribuiti:
 
@@ -375,40 +342,9 @@ Questa configurazione definisce:
 
 ## 7. Casi d'Uso
 
-### 7.1 Applicazioni offline-first
+### // TODO
 
-Scenario: applicazioni che devono funzionare anche senza connettività continua.
-Numax offre:
-* datastore locale per lo stato,
-* sincronizzazione eventuale via CRDT + gossip,
-* stessa logica che può girare nel browser, su mobile e su edge.
-
-### 7.2 Edge Functions
-
-Scenario: esecuzione di funzioni vicino all’utente, con latenze ridotte.
-Numax fornisce:
-* moduli WASM dal cold start molto rapido,
-* stato persistente vicino al calcolo,
-* un modello di deployment semplificato (WASM + config).
-
-### 7.3 IoT e dispositivi a risorse limitate
-
-Scenario: dispositivi embedded con risorse limitate e connettività intermittente.
-Numax contribuisce con:
-* runtime leggero e sicuro,
-* datastore locale integrato,
-* sincronizzazione eventuale quando il dispositivo è online.
-
-### 7.4 Microservizi minimali
-
-Scenario: servizi piccoli, indipendenti, che non richiedono l’intero stack container + orchestratore.
-
-Numax permette:
-* di eseguire logica applicativa senza container,
-* di gestire stato e sync dentro il runtime,
-* di ridurre dipendenze infrastrutturali.
-
-> TODO: aggiungere esempi concreti (es. carrello e-commerce, note condivise, IoT sensor hub, ecc.).
+> TODO: aggiungere esempi concreti (es. applicazione scsritta usando numax).
 
 ---
 
@@ -416,53 +352,15 @@ Numax permette:
 
 Questa sezione chiarisce la posizione di Numax all'interno dell’ecosistema moderno, confrontandolo con le principali categorie di piattaforme utilizzate oggi per eseguire applicazioni distribuite.
 
-### 8.1 Container e Kubernetes
-
-Kubernetes offre un ecosistema maturo, strumenti diffusi e un alto livello di automazione nella gestione dei cluster.
-Tuttavia opera a un livello molto diverso da Numax.
-
-Differenze principali:
-
-- Numax non è un orchestratore ma un runtime leggero
-- molte applicazioni che non richiedono container o orchestrazione complessa possono funzionare interamente dentro Numax
-- l'obiettivo non è gestire cluster ma ridurre la complessità operativa
-
-Kubernetes rimane ideale per workload complessi e altamente scalabili; Numax mira a casi d'uso più semplici e distribuiti, dove la leggerezza è un vantaggio.
-
-### 8.2 Serverless tradizionale
-
-Le piattaforme serverless astraggono l’infrastruttura e forniscono scalabilità automatica, ma introducono vincoli forti:
-
-- il calcolo è spesso stateless
-- lo stato è delegato a servizi esterni
-- forte dipendenza dal vendor
-
-Numax adotta un modello diverso:
-
-- portabile e self-hosted
-- stato locale integrato e sincronizzazione nativa
-- nessun lock-in con un provider specifico
-
-Dove il serverless separa calcolo e dati, Numax li riporta nello stesso luogo.
-
-### 8.3 Altri runtime WASM ed edge platforms
-
-Esistono runtime WASM focalizzati su edge computing (es. Wasmtime, WasmEdge, Cloudflare Workers, Fastly Compute) e ciascuno ottimizza un aspetto diverso: performance, sandboxing, deploy veloce.
-
-La differenza sostanziale rispetto a Numax:
-
-- questi runtime eseguono solo calcolo
-- non includono uno store locale persistente
-- non offrono sincronizzazione distribuita dello stato
-- non forniscono un modello dati basato su CRDT
+### // TODO
 
 Numax combina compute, stato e sync in un singolo runtime, fornendo un ambiente più alto livello per applicazioni distribuite.
 
-### 8.4 Quindi dove si colloca Numax?
+### 8.X Quindi dove si colloca Numax?
 
 Numax si posiziona in uno spazio specifico che oggi è quasi vuoto:
 
-**runtime portabile con stato locale integrato e sincronizzazione nativa.**
+**runtime portabile con stato locale integrato e sincronizzazione nativa.** (magari lo scrivi meglio)
 
 Riducendo la complessità dell’infrastruttura senza rinunciare a distribuzione, portabilità e sicurezza.
 
@@ -479,8 +377,7 @@ Numax è pensato per semplificare lo sviluppo di applicazioni distribuite, ma la
 - Non sostituisce orchestratori complessi. 
   Non è progettato per gestire cluster estesi o deployment ad alta scalabilità.
 
-- Non è ottimizzato per workload pesanti o CPU-bound. 
-  Il focus è su applicazioni leggere, offline-first e distribuite.
+- Non è ottimizzato (per ora) per workload pesanti o CPU-bound. 
 
 - I modelli dati devono essere compatibili con i CRDT. 
   Pattern basati su lock o transazioni forti non si adattano direttamente.
