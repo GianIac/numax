@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-wasmtime = "38.0.4"
-wasmtime-wasi = "38.0.4"
+wasmtime = "41.0.0"
+wasmtime-wasi = "41.0.0"
