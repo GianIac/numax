@@ -32,6 +32,7 @@ fn read_bytes(
 }
 
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
+    
     // nx.db_get(key_ptr, key_len, out_ptr, out_cap) -> i32
     // Returns:
     //   >=0  bytes copied into out_ptr
@@ -139,5 +140,37 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
+    // nx.db_delete(key_ptr, key_len) -> i32
+    // Returns:
+    //   0    ok (idempotent)
+    //  -3    internal/guest memory error
+    linker.func_wrap(
+        "nx",
+        "db_delete",
+        |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> i32 {
+            let memory = match get_memory(&mut caller) {
+                Some(m) => m,
+                None => {
+                    eprintln!("[nx-core] db_delete: no `memory` export on guest");
+                    return ERR_INTERNAL;
+                }
+            };
+
+            let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[nx-core] db_delete: failed to read key: {e}");
+                    return ERR_INTERNAL;
+                }
+            };
+
+            if let Err(e) = caller.data().store.delete(&key) {
+                eprintln!("[nx-core] db_delete: store error: {e}");
+                return ERR_INTERNAL;
+            }
+
+            0
+        },
+    )?;
     Ok(())
 }

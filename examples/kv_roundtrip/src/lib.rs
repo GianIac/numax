@@ -1,13 +1,11 @@
 #[link(wasm_import_module = "nx")]
 extern "C" {
-    // log
     fn host_log(ptr: i32, len: i32);
 
-    // db
     fn db_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
     fn db_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+    fn db_delete(key_ptr: i32, key_len: i32) -> i32;
 }
-
 
 fn log_str(s: &str) {
     unsafe { host_log(s.as_ptr() as i32, s.len() as i32) }
@@ -81,6 +79,37 @@ pub extern "C" fn run() {
         Err(_) => {
             log_str("kv_roundtrip: db_get ok, value is not utf8");
         }
+    }
+
+    // 3) db_delete("hello")
+    let del_rc = unsafe { db_delete(key.as_ptr() as i32, key.len() as i32) };
+    if del_rc != 0 {
+        log_str("kv_roundtrip: db_delete failed");
+        return;
+    }
+    log_str("kv_roundtrip: db_delete ok");
+
+    // 4) db_get dopo delete -> deve tornare -1 (not found)
+    let mut out_buf2 = vec![0u8; 64];
+    let n2 = unsafe {
+        db_get(
+            key.as_ptr() as i32,
+            key.len() as i32,
+            out_buf2.as_mut_ptr() as i32,
+            out_buf2.len() as i32,
+        )
+    };
+
+    if n2 == -1 {
+        log_str("kv_roundtrip: db_get after delete -> not found (ok)");
+    } else if n2 == -2 {
+        log_str("kv_roundtrip: db_get after delete -> buffer too small (-2) (unexpected)");
+    } else if n2 == -3 {
+        log_str("kv_roundtrip: db_get after delete -> internal error (-3)");
+    } else if n2 >= 0 {
+        log_str("kv_roundtrip: db_get after delete -> unexpected value (should be not found)");
+    } else {
+        log_str("kv_roundtrip: db_get after delete -> unknown negative error");
     }
 
     log_str("kv_roundtrip: done");
