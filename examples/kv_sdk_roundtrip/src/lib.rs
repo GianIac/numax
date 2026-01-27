@@ -1,0 +1,18 @@
+use nx_sdk::{db, nx_log};
+
+#[no_mangle]
+pub extern "C" fn run() {
+    nx_log!("kv_sdk_roundtrip: start");
+
+    db::set("hello", b"world").unwrap();
+
+    let v = db::get("hello").unwrap().unwrap();
+    nx_log!("kv_sdk_roundtrip: got {}", core::str::from_utf8(&v).unwrap());
+
+    db::delete("hello").unwrap();
+    let after = db::get("hello").unwrap();
+    nx_log!("kv_sdk_roundtrip: after delete = {}", after.is_none());
+
+    nx_log!("kv_sdk_roundtrip: done");
+}
+
