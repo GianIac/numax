@@ -13,5 +13,5 @@ fn log_str(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn run() {
-    log_str("Hello Word from WASM by NumaX !!");
+    log_str("Hello from WASM by NumaX !!");
 }
