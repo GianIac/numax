@@ -1,8 +1,7 @@
 use crate::ffi;
 
-/// Log semplice (safe wrapper).
 pub fn log(s: &str) {
-    unsafe { ffi::host_log(s.as_ptr() as i32, s.len() as i32) }
+    unsafe { ffi::nx_host_log(s.as_ptr() as i32, s.len() as i32) }
 }
 
 /// Macro comoda

@@ -10,4 +10,3 @@ pub use error::{NxError, Result};
 pub use crate::log::log;
 
 mod ffi;
-

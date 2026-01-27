@@ -1,32 +1,253 @@
 use anyhow::Result;
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 
+const ERR_NOT_FOUND: i32 = -1;
+const ERR_BUF_TOO_SMALL: i32 = -2;
+const ERR_INTERNAL: i32 = -3;
+
+// Guardrail: evita allocazioni patologiche/DoS dal guest.
+const MAX_KEY_LEN: i32 = 8 * 1024;      // 8 KiB
+const MAX_VALUE_LEN: i32 = 1024 * 1024; // 1 MiB
+const MAX_OUT_CAP: i32 = 1024 * 1024;   // 1 MiB
+
+/// Get guest linear memory export (`memory`).
+fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
+    match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(mem)) => Some(mem),
+        _ => None,
+    }
+}
+
+/// Read `len` bytes from guest memory at `ptr`.
+fn read_bytes(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        anyhow::bail!("negative ptr/len");
+    }
+
+    // Nota: questo cap è generico (1 MiB). I cap specifici (key/value) li applichiamo
+    // nei call-site con check dedicati.
+    if len > MAX_VALUE_LEN {
+        anyhow::bail!("requested length too large: {len} > {MAX_VALUE_LEN}");
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    memory.read(caller, ptr as usize, &mut buf)?;
+    Ok(buf)
+}
+
+// --- #24: implementazioni condivise (1 sola logica, 2 nomi export) ---
+
+fn db_get_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] db_get: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_ptr < 0 || out_cap < 0 {
+        eprintln!("[nx-core] db_get: negative out ptr/cap");
+        return ERR_INTERNAL;
+    }
+
+    if key_len < 0 || key_len > MAX_KEY_LEN {
+        eprintln!(
+            "[nx-core] db_get: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] db_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[nx-core] db_get: failed to read key: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let value = match caller.data().store.get(&key) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[nx-core] db_get: store error: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let Some(value) = value else {
+        return ERR_NOT_FOUND;
+    };
+
+    if value.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &value) {
+        eprintln!("[nx-core] db_get: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    value.len() as i32
+}
+
+fn db_set_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    val_ptr: i32,
+    val_len: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] db_set: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    // (altrimenti key_len poteva arrivare a 1 MiB perché read_bytes ha solo MAX_VALUE_LEN).
+    if key_len < 0 || key_len > MAX_KEY_LEN {
+        eprintln!(
+            "[nx-core] db_set: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+        );
+        return ERR_INTERNAL;
+    }
+    if val_len < 0 || val_len > MAX_VALUE_LEN {
+        eprintln!(
+            "[nx-core] db_set: invalid value length: {val_len} (max {MAX_VALUE_LEN})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[nx-core] db_set: failed to read key: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let val = match read_bytes(&mut caller, &memory, val_ptr, val_len) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[nx-core] db_set: failed to read value: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if let Err(e) = caller.data().store.set(&key, &val) {
+        eprintln!("[nx-core] db_set: store error: {e}");
+        return ERR_INTERNAL;
+    }
+
+    0
+}
+
+fn db_delete_impl(mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] db_delete: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if key_len < 0 || key_len > MAX_KEY_LEN {
+        eprintln!(
+            "[nx-core] db_delete: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[nx-core] db_delete: failed to read key: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if let Err(e) = caller.data().store.delete(&key) {
+        eprintln!("[nx-core] db_delete: store error: {e}");
+        return ERR_INTERNAL;
+    }
+
+    0
+}
+
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
+    // --- NEW names (preferred) ---
+
+    // nx.nx_host_db_get(key_ptr, key_len, out_ptr, out_cap) -> i32
     linker.func_wrap(
         "nx",
-        "host_log",
-        move |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
-                _ => {
-                    eprintln!("[nx-core] host_log: no `memory` export on guest");
-                    return;
-                }
-            };
+        "nx_host_db_get",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32| -> i32 {
+            db_get_impl(caller, key_ptr, key_len, out_ptr, out_cap)
+        },
+    )?;
 
-            let mut buf = vec![0u8; len as usize];
-            if let Err(e) = memory.read(&caller, ptr as usize, &mut buf) {
-                eprintln!("[nx-core] host_log: memory read error: {e}");
-                return;
-            }
+    // nx.nx_host_db_set(key_ptr, key_len, val_ptr, val_len) -> i32
+    linker.func_wrap(
+        "nx",
+        "nx_host_db_set",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i32 {
+            db_set_impl(caller, key_ptr, key_len, val_ptr, val_len)
+        },
+    )?;
 
-            if let Ok(s) = String::from_utf8(buf) {
-                println!("[guest] {s}");
-            } else {
-                println!("[guest] <non-utf8-bytes>");
-            }
+    // nx.nx_host_db_delete(key_ptr, key_len) -> i32
+    linker.func_wrap(
+        "nx",
+        "nx_host_db_delete",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> i32 {
+            db_delete_impl(caller, key_ptr, key_len)
+        },
+    )?;
+
+    // --- OLD aliases (compat) ---
+
+    linker.func_wrap(
+        "nx",
+        "db_get",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32| -> i32 {
+            db_get_impl(caller, key_ptr, key_len, out_ptr, out_cap)
+        },
+    )?;
+
+    linker.func_wrap(
+        "nx",
+        "db_set",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i32 {
+            db_set_impl(caller, key_ptr, key_len, val_ptr, val_len)
+        },
+    )?;
+
+    linker.func_wrap(
+        "nx",
+        "db_delete",
+        |caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> i32 {
+            db_delete_impl(caller, key_ptr, key_len)
         },
     )?;
 
