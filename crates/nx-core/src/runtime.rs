@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::{WasiCtx, p1};
+use wasmtime_wasi::{p1, WasiCtx};
 use std::path::PathBuf;
 use nx_store::Store as NxStore;
 use crate::host_api;
@@ -41,6 +41,7 @@ pub struct Runtime {
     engine: Engine,
     linker: Linker<HostState>,
     config: RuntimeConfig,
+    store: NxStore, // <-- FIX: store inizializzato una volta sola e clonato per HostState
 }
 
 impl Runtime {
@@ -67,25 +68,29 @@ impl Runtime {
             })?;
         }
 
+        // apri il datastore UNA SOLA VOLTA qui
+        let store = NxStore::open(&config.datastore_path)
+            .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
+
         Ok(Self {
             engine,
             linker,
             config,
+            store,
         })
     }
 
     pub fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
-        // 0. Apri datastore locale (host-side)
-        let store_db = nx_store::Store::open(&self.config.datastore_path)
-            .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
-    
+        // Usa clone del singleton.
+        let store_db = self.store.clone();
+
         // 1. Costruisce lo stato host per questo run
         let host_state = if self.config.enable_wasi {
             let wasi = WasiCtx::builder()
                 .inherit_stdio()
                 .inherit_args()
                 .build_p1();
-    
+
             HostState {
                 wasi: Some(wasi),
                 store: store_db,
@@ -96,13 +101,13 @@ impl Runtime {
                 store: store_db,
             }
         };
-    
+
         let mut store = Store::new(&self.engine, host_state);
-    
+
         // 2. Compilazione / validazione modulo
         let module = Module::new(&self.engine, wasm_bytes)
             .map_err(|_e| anyhow!("Invalid module (failed to compile/validate)"))?;
-    
+
         // 3. Istanziazione (linking import/host)
         let instance = self
             .linker
@@ -110,17 +115,17 @@ impl Runtime {
             .map_err(|_e| {
                 anyhow!("Link error while instantiating module (missing import or incompatible types)")
             })?;
-    
+
         // 4. Entrypoint: prima `run`, poi `_start`
         let run = instance
             .get_typed_func::<(), ()>(&mut store, "run")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
             .map_err(|_e| anyhow!("No entrypoint found (expected `run` or `_start`)"))?;
-    
+
         // 5. Esecuzione
         run.call(&mut store, ())
             .map_err(|_e| anyhow!("Error while executing module"))?;
-    
+
         Ok(())
-    }    
+    }
 }

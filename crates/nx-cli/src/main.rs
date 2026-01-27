@@ -13,6 +13,10 @@ enum Cli {
     Run {
         /// Path to the .wasm module
         module: PathBuf,
+
+        /// Datastore directory path (default: ./nx-data)
+        #[arg(long, value_name = "PATH")]
+        datastore_path: Option<PathBuf>,
     },
 }
 
@@ -27,13 +31,18 @@ fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Run { module } => {
+        Cli::Run {
+            module,
+            datastore_path,
+        } => {
             let bytes = fs::read(&module)?;
 
-            // Per ora usiamo la config di default:
-            // - WASI abilitato
-            // - nessun limite di memoria/fuel
-            let rt = Runtime::new(RuntimeConfig::default())?;
+            let mut cfg = RuntimeConfig::default();
+            if let Some(p) = datastore_path {
+                cfg.datastore_path = p;
+            }
+
+            let rt = Runtime::new(cfg)?;
             rt.run_module(&bytes)?;
         }
     }
