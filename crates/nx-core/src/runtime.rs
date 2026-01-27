@@ -53,6 +53,8 @@ impl Runtime {
 
         // host_log (namespace "nx", func "host_log")
         host_api::log::add_to_linker(&mut linker)?;
+        // host_db (namespace "nx", func "db_get", "db_set" etc.)
+        host_api::db::add_to_linker(&mut linker)?;
 
         // WASI base (preview1 / p1)
         if config.enable_wasi {
