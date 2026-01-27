@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::StoreError;
 
+#[derive(Clone)]
 pub struct Store {
     db: sled::Db,
 }
