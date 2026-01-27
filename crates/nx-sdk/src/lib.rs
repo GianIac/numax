@@ -6,6 +6,8 @@ pub mod db;
 pub mod error;
 pub mod log;
 
+pub use error::NxError;
+pub use crate::log::log;
+
 mod ffi;
 
-pub use error::NxError;
