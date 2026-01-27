@@ -7,6 +7,11 @@ const ERR_NOT_FOUND: i32 = -1;
 const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
 
+// Guardrail: evita allocazioni patologiche/DoS dal guest.
+const MAX_KEY_LEN: i32 = 8 * 1024;      // 8 KiB
+const MAX_VALUE_LEN: i32 = 1024 * 1024; // 1 MiB
+const MAX_OUT_CAP: i32 = 1024 * 1024;   // 1 MiB
+
 /// Get guest linear memory export (`memory`).
 fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     match caller.get_export("memory") {
@@ -26,13 +31,18 @@ fn read_bytes(
         anyhow::bail!("negative ptr/len");
     }
 
+    // Nota: questo cap è generico (1 MiB). I cap specifici (key/value) li applichiamo
+    // nei call-site con check dedicati.
+    if len > MAX_VALUE_LEN {
+        anyhow::bail!("requested length too large: {len} > {MAX_VALUE_LEN}");
+    }
+
     let mut buf = vec![0u8; len as usize];
     memory.read(caller, ptr as usize, &mut buf)?;
     Ok(buf)
 }
 
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
-    
     // nx.db_get(key_ptr, key_len, out_ptr, out_cap) -> i32
     // Returns:
     //   >=0  bytes copied into out_ptr
@@ -58,6 +68,20 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
 
             if out_ptr < 0 || out_cap < 0 {
                 eprintln!("[nx-core] db_get: negative out ptr/cap");
+                return ERR_INTERNAL;
+            }
+
+            if key_len < 0 || key_len > MAX_KEY_LEN {
+                eprintln!(
+                    "[nx-core] db_get: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+                );
+                return ERR_INTERNAL;
+            }
+
+            if out_cap > MAX_OUT_CAP {
+                eprintln!(
+                    "[nx-core] db_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+                );
                 return ERR_INTERNAL;
             }
 
@@ -115,6 +139,20 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                 }
             };
 
+            // (altrimenti key_len poteva arrivare a 1 MiB perché read_bytes ha solo MAX_VALUE_LEN).
+            if key_len < 0 || key_len > MAX_KEY_LEN {
+                eprintln!(
+                    "[nx-core] db_set: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+                );
+                return ERR_INTERNAL;
+            }
+            if val_len < 0 || val_len > MAX_VALUE_LEN {
+                eprintln!(
+                    "[nx-core] db_set: invalid value length: {val_len} (max {MAX_VALUE_LEN})"
+                );
+                return ERR_INTERNAL;
+            }
+
             let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
                 Ok(k) => k,
                 Err(e) => {
@@ -156,6 +194,13 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                 }
             };
 
+            if key_len < 0 || key_len > MAX_KEY_LEN {
+                eprintln!(
+                    "[nx-core] db_delete: invalid key length: {key_len} (max {MAX_KEY_LEN})"
+                );
+                return ERR_INTERNAL;
+            }
+
             let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
                 Ok(k) => k,
                 Err(e) => {
@@ -172,5 +217,6 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
             0
         },
     )?;
+
     Ok(())
 }

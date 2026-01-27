@@ -1,11 +1,13 @@
 use anyhow::Result;
 use wasmtime::{Caller, Linker};
 
-pub fn add_to_linker<T: 'static>(linker: &mut Linker<T>) -> Result<()> {
+use crate::runtime::HostState;
+
+pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         "nx",
         "host_log",
-        move |mut caller: Caller<'_, T>, ptr: i32, len: i32| {
+        move |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
             let memory = match caller.get_export("memory") {
                 Some(wasmtime::Extern::Memory(mem)) => mem,
                 _ => {
