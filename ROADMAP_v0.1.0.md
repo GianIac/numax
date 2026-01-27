@@ -34,7 +34,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 2 — Store Locale Integrato
+## FASE 2 — Store Locale Integrato: DONE
 **Obiettivo:** lo stato torna vicino al calcolo.  
 Senza store, Numax non è Numax.
 
@@ -74,7 +74,6 @@ Scrivere un modulo Numax = importare `nx-sdk` e andare.
 
 ## FASE 4 — Sync Distribuito (Prototipo)
 **Obiettivo:** iniziare a far parlare due nodi.  
-Non “magico”. Non completo. Solo il minimo per dimostrare il concetto.
 
 - `nx-sync`
   - primo CRDT:
