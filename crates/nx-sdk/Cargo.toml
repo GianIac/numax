@@ -5,3 +5,7 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+std = []

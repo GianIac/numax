@@ -7,6 +7,7 @@ members = [
   "crates/nx-sync",
   "crates/nx-net",
   "crates/nx-sdk",
+  "examples/hello_sdk"
 ]
 
 exclude = ["examples/*"]

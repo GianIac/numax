@@ -20,11 +20,11 @@ fn map_rc_unit(rc: i32) -> Result<()> {
 /// set(key, value) -> Result<(), NxError>
 pub fn set(key: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
-        ffi::nx_host_db_set(
-            key.as_ptr() as i32,
-            key.len() as i32,
-            value.as_ptr() as i32,
-            value.len() as i32,
+        ffi::db_set(
+            key.as_ptr() as u32,
+            key.len() as u32,
+            value.as_ptr() as u32,
+            value.len() as u32,
         )
     };
     map_rc_unit(rc)
@@ -32,7 +32,7 @@ pub fn set(key: &str, value: &[u8]) -> Result<()> {
 
 /// delete(key) -> Result<(), NxError>
 pub fn delete(key: &str) -> Result<()> {
-    let rc = unsafe { ffi::nx_host_db_delete(key.as_ptr() as i32, key.len() as i32) };
+    let rc = unsafe { ffi::db_delete(key.as_ptr() as u32, key.len() as u32) };
     map_rc_unit(rc)
 }
 
@@ -47,11 +47,11 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
         let mut out = vec![0u8; cap];
 
         let n = unsafe {
-            ffi::nx_host_db_get(
-                key.as_ptr() as i32,
-                key.len() as i32,
-                out.as_mut_ptr() as i32,
-                out.len() as i32,
+            ffi::db_get(
+                key.as_ptr() as u32,
+                key.len() as u32,
+                out.as_mut_ptr() as u32,
+                out.len() as u32,
             )
         };
 

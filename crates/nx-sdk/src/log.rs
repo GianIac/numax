@@ -1,7 +1,9 @@
 use crate::ffi;
 
 pub fn log(s: &str) {
-    unsafe { ffi::nx_host_log(s.as_ptr() as i32, s.len() as i32) }
+    unsafe { 
+        ffi::host_log(s.as_ptr() as u32, s.len() as u32);
+    }
 }
 
 /// Macro comoda

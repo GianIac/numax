@@ -1,19 +1,20 @@
 use anyhow::{anyhow, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{p1, WasiCtx};
-use std::path::PathBuf;
+
 use nx_store::Store as NxStore;
+
 use crate::host_api;
 
 /// Configurazione del runtime.
-/// Crescerà con store path, permessi, ecc. nelle fasi successive.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Abilita o meno il supporto WASI (stdout, args, ecc.).
     pub enable_wasi: bool,
 
     /// Limite massimo di memoria per modulo (non ancora applicato).
-    /// Lo teniamo già in config per coerenza con la roadmap.
     pub max_memory_bytes: Option<u64>,
 
     /// The path to the datastore.
@@ -31,24 +32,24 @@ impl Default for RuntimeConfig {
 }
 
 /// Stato host associato allo Store.
-/// In Fase 1 contiene solo WASI, ma potrà crescere (store, sync, ecc.).
 pub struct HostState {
     pub wasi: Option<p1::WasiP1Ctx>,
-    pub store: NxStore,
+    pub store: Arc<NxStore>,
 }
 
 pub struct Runtime {
     engine: Engine,
     linker: Linker<HostState>,
     config: RuntimeConfig,
-    store: NxStore, // <-- FIX: store inizializzato una volta sola e clonato per HostState
+    store: Arc<NxStore>,
 }
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
-        // In futuro qui possiamo usare wasmtime::Config
-        // per applicare limiti di memoria, ecc.
-        let engine = Engine::default();
+        // Engine con config (utile per debug/backtrace; limiti memory opzionali in futuro)
+        let mut wasm_cfg = wasmtime::Config::new();
+        wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+        let engine = Engine::new(&wasm_cfg)?;
 
         let mut linker: Linker<HostState> = Linker::new(&engine);
 
@@ -59,7 +60,6 @@ impl Runtime {
 
         // WASI base (preview1 / p1)
         if config.enable_wasi {
-            // Mappa HostState -> &mut WasiP1Ctx per le funzioni WASI.
             wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
                 state
                     .wasi
@@ -71,6 +71,7 @@ impl Runtime {
         // apri il datastore UNA SOLA VOLTA qui
         let store = NxStore::open(&config.datastore_path)
             .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
+        let store = Arc::new(store);
 
         Ok(Self {
             engine,
@@ -81,8 +82,8 @@ impl Runtime {
     }
 
     pub fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
-        // Usa clone del singleton.
-        let store_db = self.store.clone();
+        // handle condiviso al DB
+        let store_db = Arc::clone(&self.store);
 
         // 1. Costruisce lo stato host per questo run
         let host_state = if self.config.enable_wasi {
@@ -106,25 +107,23 @@ impl Runtime {
 
         // 2. Compilazione / validazione modulo
         let module = Module::new(&self.engine, wasm_bytes)
-            .map_err(|_e| anyhow!("Invalid module (failed to compile/validate)"))?;
+            .map_err(|e| anyhow!("Invalid module (compile/validate): {e}"))?;
 
         // 3. Istanziazione (linking import/host)
         let instance = self
             .linker
             .instantiate(&mut store, &module)
-            .map_err(|_e| {
-                anyhow!("Link error while instantiating module (missing import or incompatible types)")
-            })?;
+            .map_err(|e| anyhow!("Link error while instantiating module: {e}"))?;
 
         // 4. Entrypoint: prima `run`, poi `_start`
         let run = instance
             .get_typed_func::<(), ()>(&mut store, "run")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
-            .map_err(|_e| anyhow!("No entrypoint found (expected `run` or `_start`)"))?;
+            .map_err(|e| anyhow!("No entrypoint found (expected `run` or `_start`): {e}"))?;
 
         // 5. Esecuzione
         run.call(&mut store, ())
-            .map_err(|_e| anyhow!("Error while executing module"))?;
+            .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 
         Ok(())
     }
