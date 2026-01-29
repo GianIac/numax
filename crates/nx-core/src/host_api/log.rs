@@ -3,8 +3,16 @@ use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 
-const ERR_INTERNAL: i32 = -3;
+/// Legacy ABI: kept for backwards compatibility with already-compiled guest modules.
+/// NOTE: do not change the signature or semantics of this function.
+/// Signature (WASM): (ptr: u32, len: u32) -> ()
+///
+/// New code should prefer `host_log_v2`.
 const MAX_MSG_LEN: u32 = 8 * 1024; // 8 KiB
+
+/// v2 return codes (only for host_log_v2)
+const OK: i32 = 0;
+const ERR_INTERNAL: i32 = -3;
 
 fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     match caller.get_export("memory") {
@@ -27,17 +35,58 @@ fn read_bytes(
     Ok(buf)
 }
 
-/// nx.host_log(msg_ptr, msg_len) -> i32
-/// Returns: 0 ok, -3 internal error
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
+    // -------------------------------------------------------------------------
+    // LEGACY API (do not break):
+    // nx::host_log(ptr,len) -> ()
+    //
+    // Best-effort logging. Never traps intentionally. Does not return an error
+    // code because older guests expect `()`.
+    // -------------------------------------------------------------------------
     linker.func_wrap(
         "nx",
         "host_log",
+        |mut caller: Caller<'_, HostState>, msg_ptr: u32, msg_len: u32| {
+            let memory = match get_memory(&mut caller) {
+                Some(m) => m,
+                None => {
+                    eprintln!("[nx-core] host_log(legacy): no `memory` export on guest");
+                    return;
+                }
+            };
+
+            let msg = match read_bytes(&mut caller, &memory, msg_ptr, msg_len) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(e) => {
+                    eprintln!("[nx-core] host_log(legacy): failed to read msg: {e}");
+                    return;
+                }
+            };
+
+            eprintln!("[guest] {msg}");
+        },
+    )?;
+
+    // -------------------------------------------------------------------------
+    // V2 API (preferred):
+    // nx::host_log_v2(ptr,len) -> i32
+    //
+    // Returns:
+    //   0  => ok
+    //  -3  => internal error (no memory export / invalid read)
+    //
+    // Rationale:
+    // - allows guests to detect failures
+    // - enables future extensions (levels, structured logs, etc.)
+    // -------------------------------------------------------------------------
+    linker.func_wrap(
+        "nx",
+        "host_log_v2",
         |mut caller: Caller<'_, HostState>, msg_ptr: u32, msg_len: u32| -> i32 {
             let memory = match get_memory(&mut caller) {
                 Some(m) => m,
                 None => {
-                    eprintln!("[nx-core] host_log: no `memory` export on guest");
+                    eprintln!("[nx-core] host_log_v2: no `memory` export on guest");
                     return ERR_INTERNAL;
                 }
             };
@@ -45,13 +94,13 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
             let msg = match read_bytes(&mut caller, &memory, msg_ptr, msg_len) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                 Err(e) => {
-                    eprintln!("[nx-core] host_log: failed to read msg: {e}");
+                    eprintln!("[nx-core] host_log_v2: failed to read msg: {e}");
                     return ERR_INTERNAL;
                 }
             };
 
             eprintln!("[guest] {msg}");
-            0
+            OK
         },
     )?;
 
