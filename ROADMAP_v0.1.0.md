@@ -95,7 +95,7 @@ Due Numax separati, stesso modulo, stesso stato alla fine.
 ## FASE 5 — Ripulitura, Documenti, Tooling
 **Obiettivo:** mettere ordine prima di costruire altro.
 
-- `docs/`
+- `docs:`
   - WHITEPAPER aggiornato
   - ARCHITECTURE (runtime, store, sync)
   - HOST_API (specifica minima)
