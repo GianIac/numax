@@ -72,7 +72,7 @@ Scrivere un modulo Numax = importare `nx-sdk` e andare.
 
 ---
 
-## FASE 4 — Sync Distribuito (Prototipo)
+## FASE 4 — Sync Distribuito 
 **Obiettivo:** iniziare a far parlare due nodi.  
 
 - `nx-sync`
