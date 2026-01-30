@@ -57,7 +57,7 @@ Ogni modulo WASM ha un piccolo DB persistente, zero dipendenze esterne.
 
 ---
 
-## FASE 3 — SDK + DX
+## FASE 3 — SDK + DX: DONE
 **Obiettivo:** chi sviluppa moduli non deve toccare `extern "C"`.
 
 - `nx-sdk` pubblicabile (ancora sperimentale)
