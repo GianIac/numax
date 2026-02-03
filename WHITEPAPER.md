@@ -294,7 +294,7 @@ L'idea è che un’applicazione è composta da uno o più moduli WASM che:
 
 ### 6.2 API Host esposte ai moduli
 
-TODO: Descrizione 
+TODO: Descrizione allienata al codice attuale
 
 **Datastore:**
 * db_get(key)
@@ -316,7 +316,7 @@ TODO: Descrizione
 TODO: definire meglio la semantica delle callback e eventuali limiti (timeout, dimensioni payload, ecc.).
 
 ### 6.3 Configurazione e Deploy
-TO DO: aggiungere più info
+TO DO: aggiungere più info + esmepio reale 
 Il deploy consiste nell’invio di un file .wasm e una configurazione minimale.
 Esempio:
 
