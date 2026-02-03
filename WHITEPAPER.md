@@ -188,7 +188,7 @@ Numax è progettato per girare su:
 
 - server (x86_64),
 - edge nodes,
-- browser (tramite WASM nel WASM),
+- browser (tramite WASM),
 - mobile (tramite integrazione nativa),
 - IoT (ARM / RISC-V).
 
