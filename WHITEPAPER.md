@@ -189,6 +189,13 @@ Numax è progettato per girare su:
 
 > TODO: in futuro verranno elencati target specifici previsti per la prima versione (es. Linux server, Raspberry Pi, ecc.).
 
+### 4.3 Modello di esecuzione e dati (overview)
+- **Compute**: un nodo Numax esegue moduli **WASM** in sandbox, esponendo un set limitato di Host API.
+- **State**: ogni nodo mantiene uno **store key/value locale** persistente.
+- **Sync**: una parte dello stato può essere **replicata** tra nodi tramite **CRDT + gossip**.
+- **Consistency**: il sistema mira a **convergenza eventuale** (eventual consistency): in assenza di nuove scritture e con connettività sufficiente, tutti i nodi convergono allo stesso stato.
+- **Rete fallibile**: disconnessioni e rientri sono condizioni normali; Numax include meccanismi per recuperare delta mancanti.
+
 ---
 
 ## 5. Architettura del Sistema
@@ -278,6 +285,59 @@ nx run module.wasm
 nx inspect module.wasm
 nx peers
 ```
+### 5.5 Topologia: epidemic gossip!
+
+Numax Net non assume una topologia ad anello (es. `n1→n2→n3→…`) perché sarebbe fragile: la caduta di un nodo può spezzare la catena.
+
+Ma utilizza un modello **peer-to-peer a gossip** in cui:
+- ogni nodo mantiene connessioni attive verso un **sottoinsieme** di peer (fanout **K**);
+- gli aggiornamenti (delta CRDT) vengono propagati in modo “epidemico”: un nodo invia l’update ai suoi peer, i peer lo inoltrano ad altri peer, fino a coprire la rete;
+- ogni update ha un **identificatore** (es. `op_id`) e/o una versione logica, così i nodi possono **deduplicare** e prevenire loop.
+
+Questo approccio scala meglio del full-mesh (tutti connessi con tutti) e rimane resiliente anche in presenza di disconnessioni temporanee.
+
+### 5.6 Resilienza: nodo down, rete intermittente, rientro
+
+La rete è considerata fallibile per natura: nodi possono spegnersi, perdere connettività o rientrare.
+
+Quando un peer diventa irraggiungibile:
+- il nodo applica timeout e retry con **backoff**;
+- marca il peer come **down** e lo rimuove dal set attivo;
+- seleziona un nuovo peer dal discovery per mantenere il fanout **K** (evitando che la mesh si “assottigli”).
+
+Quando un nodo rientra:
+- ristabilisce connessioni sicure (TLS/mTLS o equivalente);
+- esegue un meccanismo di **anti-entropy** (pull periodico) per recuperare gli update mancanti;
+- converge allo stesso stato grazie alle proprietà dei CRDT (commutativit��/merge-safe).
+
+### 5.7 Sicurezza del canale (anti‑MITM) e identità dei nodi
+
+Numax assume una rete ostile: il trasporto può essere osservato, alterato o reindirizzato (attacchi MITM, DNS/route hijack, Wi‑Fi malevolo).  
+Per questo, **tutte le comunicazioni tra nodi avvengono su canali cifrati e autenticati**.
+
+- **Confidenzialità**: terzi non possono leggere il traffico.
+- **Integrità**: terzi non possono modificare i messaggi senza essere rilevati.
+- **Autenticazione**: un nodo parla solo con peer che dimostrano la propria identità crittografica.
+- **Forward Secrecy**: la compromissione futura di una chiave non decifra traffico passato.
+
+Numax Net stabilisce connessioni usando **TLS 1.3 in modalità mutual authentication (mTLS)** (o protocollo equivalente basato su key exchange autenticato). (non ho ancora preso una decisone definitiva ... sto studiando)
+La protezione contro MITM non deriva dalla sola cifratura, ma dal fatto che **il peer deve presentare una credenziale valida** (certificato o chiave pubblica attesa) durante l’handshake.
+
+In altre parole:
+- se un attaccante si inserisce “in mezzo” ma **non possiede una credenziale valida**, l’handshake fallisce;
+- se il trasporto viene manomesso, i messaggi non verificano e la sessione viene terminata.
+
+Ogni nodo possiede una coppia di chiavi (private/public). L’identità del nodo (**NodeID**) è derivata dalla sua chiave pubblica (es. hash).  
+La verifica dell’identità può seguire due modelli:
+
+1. **Rete permissioned (consigliato per cluster/edge gestiti)**  
+   I nodi sono ammessi tramite una CA/registry: i certificati sono emessi e revocati da un’autorità o da un meccanismo di governance.
+
+2. **Rete permissionless (sperimentale)**  
+   L’identità è la chiave pubblica; le policy di trust (allowlist, reputazione, stake/slashing) determinano con chi parlare.
+
+Se un nodo viene compromesso e l’attaccante ottiene la sua chiave privata, il traffico può risultare “valido” dal punto di vista TLS.  
+Per questo Numax prevede un meccanismo di **revoca/quarantena** (denylist/CRL/registry) e rotazione chiavi: un NodeID compromesso può essere escluso rapidamente dalla rete.
 
 ---
 
