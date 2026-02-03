@@ -196,6 +196,22 @@ Numax è progettato per girare su:
 - **Consistency**: il sistema mira a **convergenza eventuale** (eventual consistency): in assenza di nuove scritture e con connettività sufficiente, tutti i nodi convergono allo stesso stato.
 - **Rete fallibile**: disconnessioni e rientri sono condizioni normali; Numax include meccanismi per recuperare delta mancanti.
 
+### 4.4 Security model & threat model
+**Assunzioni:**
+- La rete è potenzialmente **ostile** (osservazione, MITM, packet injection, route hijack).
+- I nodi possono essere **offline** o intermittenti oppure alcuni peer possono essere **malevoli** o non affidabili.
+
+**Obiettivi di sicurezza:**
+- Isolamento del compute (sandbox WASM).
+- Confidenzialità/integrità delle comunicazioni tra nodi.
+- Autenticazione dei peer (evitare MITM).
+- (valutare) Policy di membership (permissioned vs open).
+
+**Fuori scope e idee future:**
+- Bug logici nel modulo applicativo.
+- Data poisoning se si accettano peer non trusted senza policy.
+- Compromissione host-level (se un nodo perde la chiave privata, serve revoca/rotazione).
+
 ---
 
 ## 5. Architettura del Sistema
@@ -225,6 +241,11 @@ Di seguito una panoramica ad alto livello dei tre componenti principali di Numax
 - nessun accesso implicito al filesystem,
 - avvio rapido (< 5 ms),
 - sicurezza memory-safe.
+
+** (Add-on) Limiti di esecuzione e capability model: **
+- **Memoria**: ogni modulo opera entro un limite massimo (configurabile).
+- **CPU/timeouts**: chiamate host e/o run del modulo possono essere interrotti per evitare runaway.
+- **Capabilities**: nessun accesso implicito a filesystem/rete; il modulo usa solo Host API con policy esplicite. (da valutare)
 
 > TODO: dettagliare le host functions principali esposte (DB, sync, rete).
 
