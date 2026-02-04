@@ -105,6 +105,21 @@ Far convergere una parte dello stato in modo automatico (CRDT + scambio di delta
 Due Numax separati, stesso modulo, stesso stato alla fine (convergenza dimostrata).
 
 ---
+FASE 5 — Ripulitura, Documenti, Tooling
+
+Obiettivo: mettere ordine prima di costruire altro.
+
+  - docs
+  - WHITEPAPER aggiornato
+  - ARCHITECTURE (runtime, store, sync)
+  - HOST_API (specifica)
+  - CI
+  - test
+
+Goal finale:
+Progetto coerente, comprensibile, compilabile ovunque.
+
+---
 
 ## NOTE FINALI
 - Ogni Fase deve produrre almeno **un esempio** eseguibile “end-to-end”.  
