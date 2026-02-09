@@ -105,9 +105,9 @@ Far convergere una parte dello stato in modo automatico (CRDT + scambio di delta
 Due Numax separati, stesso modulo, stesso stato alla fine (convergenza dimostrata).
 
 ---
-FASE 5 — Ripulitura, Documenti, Tooling
+## FASE 5 - Ripulitura, Documenti, Tooling
 
-Obiettivo: mettere ordine prima di costruire altro.
+**Obiettivo:** mettere ordine prima di costruire altro.
 
 Documentation:
   - WHITEPAPER aggiornato
