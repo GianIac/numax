@@ -113,8 +113,7 @@ Documentation:
   - WHITEPAPER aggiornato
   - ARCHITECTURE (runtime, store, sync)
   - HOST_API (specifica)
-  - CI
-  - test
+CI and all tests.
 
 Goal finale:
 Progetto coerente, comprensibile, compilabile ovunque.
