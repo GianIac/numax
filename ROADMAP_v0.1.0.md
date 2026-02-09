@@ -109,7 +109,7 @@ FASE 5 — Ripulitura, Documenti, Tooling
 
 Obiettivo: mettere ordine prima di costruire altro.
 
-  - docs
+Docuemntation:
   - WHITEPAPER aggiornato
   - ARCHITECTURE (runtime, store, sync)
   - HOST_API (specifica)
