@@ -3,7 +3,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 0 — Bootstrap del Runtime: DONE 
+## FASE 0 - Bootstrap del Runtime: DONE 
 **Obiettivo:** eseguire un modulo WASM. Punto.
 
 - Runtime minimale (`nx-core`)
@@ -20,7 +20,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 1 — Upgrade Runtime (ancora minimale): DONE
+## FASE 1 - Upgrade Runtime (ancora minimale): DONE
 **Obiettivo:** passare da “demo” a “runtime vero ma semplice”.
 
 - Introduzione di `RuntimeConfig`
@@ -34,7 +34,7 @@ Versione iniziale. Soggetta a cambiamenti rapidi. Come il codice.
 
 ---
 
-## FASE 2 — Store Locale Integrato: DONE
+## FASE 2 - Store Locale Integrato: DONE
 **Obiettivo:** lo stato torna vicino al calcolo.  
 Senza store, Numax non è Numax.
 
@@ -57,7 +57,7 @@ Ogni modulo WASM ha un piccolo DB persistente, zero dipendenze esterne.
 
 ---
 
-## FASE 3 — SDK + DX
+## FASE 3 - SDK + DX: DONE
 **Obiettivo:** chi sviluppa moduli non deve toccare `extern "C"`.
 
 - `nx-sdk` pubblicabile (ancora sperimentale)
@@ -72,39 +72,50 @@ Scrivere un modulo Numax = importare `nx-sdk` e andare.
 
 ---
 
-## FASE 4 — Sync Distribuito (Prototipo)
+## FASE 4 - Sync Distribuito
 **Obiettivo:** iniziare a far parlare due nodi.  
+Far convergere una parte dello stato in modo automatico (CRDT + scambio di delta).
 
 - `nx-sync`
-  - primo CRDT:
-    - `GCounter` **oppure** `LWW-Register`
-  - serializzazione operazioni
+  - primo CRDT (sceglierne **uno** e farlo bene):
+    - `GCounter` *(consigliato v0.1.0)* **oppure**
+    - `LWW-Register` *(timestamp + tie-break)*
+  - operazioni (delta) + merge/apply
+  - deduplica/idempotenza tramite `op_id`
+  - serializzazione ops (es. JSON/bincode/msgpack — scegli 1)
+
 - `nx-net`
-  - canale peer-to-peer semplice (TCP/QUIC)
-  - scambio periodico di delta
+  - canale peer-to-peer semplice *(Prototype)*:
+    - TCP (ok) / QUIC (opzionale)
+  - protocollo minimale:
+    - `HELLO(node_id, version)`
+    - `PUSH_OPS([...])`
+    - `PULL_SINCE(cursor)` / anti-entropy
+  - loop periodico push/pull per recuperare delta mancanti
+
 - Integrazione con runtime
-  - un prefisso di chiavi può essere replicato
-- Esempio:
-  - `sync_counter`: due processi convergono allo stesso valore
+  - **prefissi replicati** configurabili (minimo 1), es:
+    - `counter:`
+  - se il guest scrive su un prefisso replicato:
+    - il runtime genera una `Op` CRDT
+    - la invia ai peer
+    - applica le `Op` ricevute sullo store locale
 
 **Goal finale:**  
-Due Numax separati, stesso modulo, stesso stato alla fine.
+Due Numax separati, stesso modulo, stesso stato alla fine (convergenza dimostrata).
 
 ---
+## FASE 5 - Ripulitura, Documenti, Tooling
 
-## FASE 5 — Ripulitura, Documenti, Tooling
 **Obiettivo:** mettere ordine prima di costruire altro.
 
-- `docs/`
+Documentation:
   - WHITEPAPER aggiornato
   - ARCHITECTURE (runtime, store, sync)
-  - HOST_API (specifica minima)
-- CI:
-  - `cargo fmt --check`
-  - `cargo clippy -D warnings`
-  - test basilari
+  - HOST_API (specifica)
+CI and all tests.
 
-**Goal finale:**  
+Goal finale:
 Progetto coerente, comprensibile, compilabile ovunque.
 
 ---

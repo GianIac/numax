@@ -2,6 +2,11 @@
 
 > **Nota V0.1.0  
 > Questo documento è una base di partenza. Alcune sezioni contengono `TODO:` per indicare parti da approfondire in iterazioni successive.
+>
+> **Label di stato (coerenza col codice):**
+> - **(Implemented)**: presente nel codice attuale (Fasi 0–3 completate)
+> - **(Prototype)**: presente in forma iniziale / crate scaffolding / comportamento parziale
+> - **(Planned)**: previsto da roadmap, non ancora stabile/implementato
 
 ---
 
@@ -31,15 +36,15 @@ Il risultato è spesso un ecosistema:
 Numax è un runtime portabile progettato per eseguire applicazioni distribuite in modo semplice, sicuro e coerente su qualsiasi ambiente. 
 La sua architettura è semplice ed è composta da 3 blocchi:
 
-1. **WebAssembly (WASM)**
+1. **WebAssembly (WASM)** *(Implemented)*
    Il runtime esegue moduli WASM in sandbox isolata, con un set controllato di host API.
    Questo garantisce portabilità tra piattaforme, avvii rapidi e sicurezza memory-safe.
 
-2. **Datastore key/value locale embedded**
+2. **Datastore key/value locale embedded** *(Implemented)*
    Ogni istanza del runtime include un datastore locale persistente e sempre disponibile.
    Lo stato vive vicino al calcolo, riducendo latenza, dipendenze esterne e permettendo il funzionamento offline.
 
-3. **Sincronizzazione distribuita dello stato**
+3. **Sincronizzazione distribuita dello stato** *(Planned - Roadmap Fase 4)*
    Il runtime replica automaticamente lo stato tra nodi tramite CRDT (Conflict-free replicated data type) e gossip.
    Il protocollo gossip gestisce propagazione, resilienza e comunicazione tra nodi anche con rete intermittente.
 
@@ -126,9 +131,9 @@ Questo paragrafo definisce cosa Numax è e cosa non è.
 
 Numax integra solo tre componenti fondamentali:
 
-1. esecuzione di moduli WASM in sandbox
-2. datastore locale sempre disponibile
-3. sincronizzazione distribuita dello stato
+1. esecuzione di moduli WASM in sandbox *(Implemented)*
+2. datastore locale sempre disponibile *(Implemented)*
+3. sincronizzazione distribuita dello stato *(Planned  Roadmap Fase 4)*
 
 Qualsiasi altra funzionalità appartiene ai livelli superiori o a tool esterni
 Il runtime rimane intenzionalmente minimo.
@@ -150,7 +155,7 @@ Questo approccio riduce configurazioni specifiche per ambiente, dipendenze da pi
 Il runtime assume che lo stato debba:
 
 - essere locale per garantire velocità e resilienza
-- essere replicabile per garantire distribuzione
+- essere replicabile per garantire distribuzione *(Planned  Fase 4)*
 
 Per questo il datastore è integrato nel runtime e non dipende da componenti esterni.
 
@@ -173,9 +178,9 @@ Il runtime gestisce disconnessioni, latenze e rientri come condizioni normali, n
 
 Numax è composto da tre moduli core:
 
-1. **Numax Core** - runtime WASM + sandboxing + host API.
-2. **Numax Store** - datastore key/value locale.
-3. **Numax Sync** - replica dello stato tramite CRDT + protocollo gossip.
+1. **Numax Core** *(Implemented)* - runtime WASM + sandboxing + host API.
+2. **Numax Store** *(Implemented)* - datastore key/value locale.
+3. **Numax Sync** *(Planned / Prototype  Fase 4)* - replica dello stato tramite CRDT + protocollo gossip.
 
 ### 4.2 Ambienti supportati
 
@@ -183,11 +188,34 @@ Numax è progettato per girare su:
 
 - server (x86_64),
 - edge nodes,
-- browser (tramite WASM nel WASM),
+- browser (tramite WASM),
 - mobile (tramite integrazione nativa),
 - IoT (ARM / RISC-V).
 
 > TODO: in futuro verranno elencati target specifici previsti per la prima versione (es. Linux server, Raspberry Pi, ecc.).
+
+### 4.3 Modello di esecuzione e dati (overview)
+- **Compute**: un nodo Numax esegue moduli **WASM** in sandbox, esponendo un set limitato di Host API. *(Implemented)*
+- **State**: ogni nodo mantiene uno **store key/value locale** persistente. *(Implemented)*
+- **Sync**: una parte dello stato può essere **replicata** tra nodi tramite **CRDT + gossip**. *(Planned  Fase 4)*
+- **Consistency**: il sistema mira a **convergenza eventuale** (eventual consistency): in assenza di nuove scritture e con connettività sufficiente, tutti i nodi convergono allo stesso stato. *(Planned  proprietà target della Fase 4)*
+- **Rete fallibile**: disconnessioni e rientri sono condizioni normali; Numax include meccanismi per recuperare delta mancanti. *(Planned  Fase 4)*
+
+### 4.4 Security model & threat model
+**Assunzioni:**
+- La rete è potenzialmente **ostile** (osservazione, MITM, packet injection, route hijack). *(Planned  Fase 4, networking)*
+- I nodi possono essere **offline** o intermittenti oppure alcuni peer possono essere **malevoli** o non affidabili. *(Planned - Fase 4)*
+
+**Obiettivi di sicurezza:**
+- Isolamento del compute (sandbox WASM). *(Implemented)*
+- Confidenzialità/integrità delle comunicazioni tra nodi. *(Planned - Fase 4)*
+- Autenticazione dei peer (evitare MITM). *(Planned - Fase 4)*
+- (valutare) Policy di membership (permissioned vs open). *(Planned)*
+
+**Fuori scope e idee future:**
+- Bug logici nel modulo applicativo.
+- Data poisoning se si accettano peer non trusted senza policy.
+- Compromissione host-level (se un nodo perde la chiave privata, serve revoca/rotazione).
 
 ---
 
@@ -197,7 +225,7 @@ Di seguito una panoramica ad alto livello dei tre componenti principali di Numax
 
 // TODO: add img 
 
-### 5.1 Numax Core - Runtime WASM
+### 5.1 Numax Core - Runtime WASM *(Implemented)*
 
 **Responsabilità principali:**
 
@@ -219,18 +247,27 @@ Di seguito una panoramica ad alto livello dei tre componenti principali di Numax
 - avvio rapido (< 5 ms),
 - sicurezza memory-safe.
 
-> TODO: dettagliare le host functions principali esposte (DB, sync, rete).
+**(Add-on) Limiti di esecuzione e capability model: (Implemented in parte / TODO(allineamento))**
+- **Memoria**: ogni modulo opera entro un limite massimo (configurabile). *(Implemented: limiti/guardrail sono presenti; dettagli config: TODO(allineamento))*
+- **CPU/timeouts**: chiamate host e/o run del modulo possono essere interrotti per evitare runaway. *(TODO(allineamento))*
+- **Capabilities**: nessun accesso implicito a filesystem/rete; il modulo usa solo Host API con policy esplicite. (da valutare)
 
-### 5.2 Numax Store - Datastore Locale
+> TODO: dettagliare le host functions principali esposte (DB, sync, rete).  
+> **Allineamento al codice (Implemented):**
+> - Namespace import guest: `"nx"`
+> - DB: `db_get`, `db_set`, `db_delete`
+> - LOG: `host_log` (legacy) e `host_log_v2` (preferita; ritorna error code)
+
+### 5.2 Numax Store - Datastore Locale *(Implemented)*
 
 Numax Store fornisce un key/value store persistente locale per ogni istanza di runtime.
 
 **API tipiche (lato modulo WASM):**
 
-- `db_get(key)`
-- `db_set(key, value)`
-- `db_delete(key)`
-- `db_scan(prefix)`
+- `db_get(key)` *(Implemented)*
+- `db_set(key, value)` *(Implemented)*
+- `db_delete(key)` *(Implemented)*
+- `db_scan(prefix)` *(Planned / TODO)*
 
 **Proprietà:**
 
@@ -244,7 +281,7 @@ Implementazione possibile:
 - motore embedded in Rust (ex. `sled`),
 - o LSM-tree custom.
 
-### 5.3 Numax Sync - Replica Distribuita
+### 5.3 Numax Sync - Replica Distribuita *(Planned - Fase 4)*
 
 Numax Sync è responsabile della replica dello stato tra nodi.
 
@@ -263,13 +300,13 @@ Numax Sync è responsabile della replica dello stato tra nodi.
 
 > TODO: specificare il tipo di CRDT utilizzati (es. OR-Set, LWW-Register, Map, ecc.).
 
-### 5.4 Numax Net (rete) e Numax CLI
+### 5.4 Numax Net (rete) e Numax CLI *(CLI: Implemented / Net: Planned-Prototype)*
 
-- **Numax Net**: gestisce networking, TLS, discovery peer-to-peer, gossip.
-- **Numax CLI**: fornisce comandi per:
+- **Numax Net** *(Planned / Prototype)*: gestisce networking, TLS, discovery peer-to-peer, gossip.
+- **Numax CLI** *(Implemented)*: fornisce comandi per:
   - esecuzione moduli,
   - introspezione,
-  - gestione peer.
+  - gestione peer. *(Planned: peers quando ci sarà nx-net)*
 
 Esempi di comandi:
 
@@ -278,45 +315,100 @@ nx run module.wasm
 nx inspect module.wasm
 nx peers
 ```
+### 5.5 Topologia: epidemic gossip! *(Planned - Fase 4)*
+
+Numax Net non assume una topologia ad anello (es. `n1→n2→n3→…`) perché sarebbe fragile: la caduta di un nodo può spezzare la catena.
+
+Ma utilizza un modello **peer-to-peer a gossip** in cui:
+- ogni nodo mantiene connessioni attive verso un **sottoinsieme** di peer (fanout **K**);
+- gli aggiornamenti (delta CRDT) vengono propagati in modo “epidemico”: un nodo invia l’update ai suoi peer, i peer lo inoltrano ad altri peer, fino a coprire la rete;
+- ogni update ha un **identificatore** (es. `op_id`) e/o una versione logica, così i nodi possono **deduplicare** e prevenire loop.
+
+Questo approccio scala meglio del full-mesh (tutti connessi con tutti) e rimane resiliente anche in presenza di disconnessioni temporanee.
+
+### 5.6 Resilienza: nodo down, rete intermittente, rientro *(Planned - Fase 4)*
+
+La rete è considerata fallibile per natura: nodi possono spegnersi, perdere connettività o rientrare.
+
+Quando un peer diventa irraggiungibile:
+- il nodo applica timeout e retry con **backoff**;
+- marca il peer come **down** e lo rimuove dal set attivo;
+- seleziona un nuovo peer dal discovery per mantenere il fanout **K** (evitando che la mesh si “assottigli”).
+
+Quando un nodo rientra:
+- ristabilisce connessioni sicure (TLS/mTLS o equivalente);
+- esegue un meccanismo di **anti-entropy** (pull periodico) per recuperare gli update mancanti;
+- converge allo stesso stato grazie alle proprietà dei CRDT (commutatività/merge-safe).
+
+### 5.7 Sicurezza del canale (anti‑MITM) e identità dei nodi *(Planned - Fase 4)*
+
+Numax assume una rete ostile: il trasporto può essere osservato, alterato o reindirizzato (attacchi MITM, DNS/route hijack, Wi‑Fi malevolo).  
+Per questo, **tutte le comunicazioni tra nodi avvengono su canali cifrati e autenticati**.
+
+- **Confidenzialità**: terzi non possono leggere il traffico.
+- **Integrità**: terzi non possono modificare i messaggi senza essere rilevati.
+- **Autenticazione**: un nodo parla solo con peer che dimostrano la propria identità crittografica.
+- **Forward Secrecy**: la compromissione futura di una chiave non decifra traffico passato.
+
+Numax Net stabilisce connessioni usando **TLS 1.3 in modalità mutual authentication (mTLS)** (o protocollo equivalente basato su key exchange autenticato). (non ho ancora preso una decisone definitiva ... sto studiando)
+La protezione contro MITM non deriva dalla sola cifratura, ma dal fatto che **il peer deve presentare una credenziale valida** (certificato o chiave pubblica attesa) durante l’handshake.
+
+In altre parole:
+- se un attaccante si inserisce “in mezzo” ma **non possiede una credenziale valida**, l’handshake fallisce;
+- se il trasporto viene manomesso, i messaggi non verificano e la sessione viene terminata.
+
+Ogni nodo possiede una coppia di chiavi (private/public). L’identità del nodo (**NodeID**) è derivata dalla sua chiave pubblica (es. hash).  
+La verifica dell’identità può seguire due modelli:
+
+1. **Rete permissioned (consigliato per cluster/edge gestiti)**  
+   I nodi sono ammessi tramite una CA/registry: i certificati sono emessi e revocati da un’autorità o da un meccanismo di governance.
+
+2. **Rete permissionless (sperimentale)**  
+   L’identità è la chiave pubblica; le policy di trust (allowlist, reputazione, stake/slashing) determinano con chi parlare.
+
+Se un nodo viene compromesso e l’attaccante ottiene la sua chiave privata, il traffico può risultare “valido” dal punto di vista TLS.  
+Per questo Numax prevede un meccanismo di **revoca/quarantena** (denylist/CRL/registry) e rotazione chiavi: un NodeID compromesso può essere escluso rapidamente dalla rete.
 
 ---
 
 ## 6. Modello di Programmazione
 
-### 6.1 Moduli WASM come unità di calcolo
+### 6.1 Moduli WASM come unità di calcolo *(Implemented)*
 
 L'idea è che un’applicazione è composta da uno o più moduli WASM che:
 
 * eseguono logica applicativa,
 * leggono/scrivono sul datastore locale,
-* pubblicano e ricevono aggiornamenti via Sync,
-* effettuano chiamate HTTP se necessario.
+* pubblicano e ricevono aggiornamenti via Sync, *(Planned - Fase 4)*
+* effettuano chiamate HTTP se necessario. *(Planned / fuori scope v0.1.0)*
 
-### 6.2 API Host esposte ai moduli
+### 6.2 API Host esposte ai moduli *(Implemented/Planned)*
 
-TODO: Descrizione 
+TODO: Descrizione allienata al codice attuale
 
-**Datastore:**
-* db_get(key)
-* db_set(key, value)
-* db_delete(key)
-* db_scan(prefix)
+**Datastore:** *(Implemented in parte)*
+* db_get(key) *(Implemented - ritorna len o error code: -1 not found, -2 buffer too small, -3 internal)*
+* db_set(key, value) *(Implemented - ritorna 0 o internal error)*
+* db_delete(key) *(Implemented - ritorna 0 o internal error)*
+* db_scan(prefix) *(Planned / TODO(allineamento): verificare implementazione e firma)*
 
-**Sync:**
+**Sync:** *(Planned - Fase 4)*
 * sync_on_update(prefix, callback)
 * sync_publish(op)
 
-**Networking:**
+**Networking:** *(Planned)*
 * http_fetch(url)
 
-**Eventi:**
+**Eventi:** *(Planned)*
 * event_emit(topic, payload)
 * event_subscribe(topic, callback)
 
 TODO: definire meglio la semantica delle callback e eventuali limiti (timeout, dimensioni payload, ecc.).
 
-### 6.3 Configurazione e Deploy
-TO DO: aggiungere più info
+> TODO(allineamento - codice): aggiungere qui la nota che l'import module è `"nx"` e che esiste anche `host_log_v2` (oltre a `host_log` legacy).
+
+### 6.3 Configurazione e Deploy *(Planned / TODO(allineamento))*
+TO DO: aggiungere più info + esmepio reale 
 Il deploy consiste nell’invio di un file .wasm e una configurazione minimale.
 Esempio:
 
