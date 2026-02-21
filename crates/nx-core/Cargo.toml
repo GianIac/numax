@@ -8,3 +8,7 @@ anyhow = "1"
 wasmtime = "41.0.1"
 wasmtime-wasi = "41.0.0"
 nx-store = { path = "../nx-store" }
+nx-sync = { path = "../nx-sync" }
+nx-net = { path = "../nx-net" }
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"

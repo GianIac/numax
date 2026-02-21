@@ -1217,7 +1217,11 @@ name = "nx-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nx-net",
  "nx-store",
+ "nx-sync",
+ "tokio",
+ "tracing",
  "wasmtime",
  "wasmtime-wasi",
 ]

@@ -5,8 +5,11 @@ use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{p1, WasiCtx};
 
 use nx_store::Store as NxStore;
+use nx_sync::NodeId;
 
 use crate::host_api;
+use crate::sync_config::SyncConfig;
+use crate::sync_manager::SyncManager;
 
 /// Configurazione del runtime.
 #[derive(Debug, Clone)]
@@ -19,6 +22,9 @@ pub struct RuntimeConfig {
 
     /// The path to the datastore.
     pub datastore_path: PathBuf,
+
+    /// Configurazione sync (None = sync disabilitato).
+    pub sync: Option<SyncConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -27,6 +33,7 @@ impl Default for RuntimeConfig {
             enable_wasi: true,
             max_memory_bytes: None,
             datastore_path: PathBuf::from("./nx-data"),
+            sync: None,
         }
     }
 }
@@ -35,6 +42,7 @@ impl Default for RuntimeConfig {
 pub struct HostState {
     pub wasi: Option<p1::WasiP1Ctx>,
     pub store: Arc<NxStore>,
+    pub sync_manager: Option<Arc<SyncManager>>,
 }
 
 pub struct Runtime {
@@ -42,6 +50,7 @@ pub struct Runtime {
     linker: Linker<HostState>,
     config: RuntimeConfig,
     store: Arc<NxStore>,
+    sync_manager: Option<Arc<SyncManager>>,
 }
 
 impl Runtime {
@@ -73,12 +82,38 @@ impl Runtime {
             .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
         let store = Arc::new(store);
 
+        // Inizializza SyncManager se configurato
+        let sync_manager = if let Some(ref sync_config) = config.sync {
+            let node_id = NodeId::generate();
+            let manager = SyncManager::new(node_id, sync_config.clone());
+            Some(Arc::new(manager))
+        } else {
+            None
+        };
+
         Ok(Self {
             engine,
             linker,
             config,
             store,
+            sync_manager,
         })
+    }
+
+    /// Avvia il sync networking (se configurato).
+    /// Deve essere chiamato prima di run_module in contesto async.
+    pub async fn start_sync(&self) -> Result<()> {
+        if let Some(ref manager) = self.sync_manager {
+            // SyncManager::start richiede &mut self, ma abbiamo Arc
+            // Per ora skip - implementazione completa richiede refactor
+            tracing::info!("sync manager configured (full start requires async runtime integration)");
+        }
+        Ok(())
+    }
+
+    /// Restituisce il SyncManager (se presente).
+    pub fn sync_manager(&self) -> Option<Arc<SyncManager>> {
+        self.sync_manager.clone()
     }
 
     pub fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
@@ -95,11 +130,13 @@ impl Runtime {
             HostState {
                 wasi: Some(wasi),
                 store: store_db,
+                sync_manager: self.sync_manager.clone(),
             }
         } else {
             HostState {
                 wasi: None,
                 store: store_db,
+                sync_manager: self.sync_manager.clone(),
             }
         };
 

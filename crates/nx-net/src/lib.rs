@@ -19,4 +19,4 @@ mod node;
 pub use error::{NetError, NetResult};
 pub use message::{Message, MessageKind};
 pub use peer::{PeerId, PeerInfo};
-pub use node::{Node, NodeConfig};   
+pub use node::{Node, NodeConfig, NodeEvent};   
