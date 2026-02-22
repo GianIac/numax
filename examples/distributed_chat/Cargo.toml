@@ -8,3 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nx-sdk = { path = "../../crates/nx-sdk" }
+
+[workspace]
