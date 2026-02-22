@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nx_net::{Message, Node, NodeConfig, NodeEvent};
-use nx_store::Store as NxStore;
-use nx_sync::{GCounter, NodeId, Op, OpId, OpKind};
+use nx_net::{Node, NodeConfig, NodeEvent};
+use nx_sync::{GCounter, NodeId, Op, OpKind};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 

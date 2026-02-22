@@ -52,6 +52,7 @@ pub enum NodeEvent {
     PeerDisconnected { node_id: NodeId },
 }
 
+#[allow(dead_code)]
 /// Stato interno di una connessione peer.
 struct PeerConnection {
     info: PeerInfo,
@@ -208,10 +209,11 @@ impl Node {
         for (addr, conn) in peers.iter_mut() {
             if conn.state == PeerState::Connected
                 && let Some(ref mut writer) = conn.writer
-                    && let Err(e) = writer.write_all(&bytes).await {
-                        warn!(%addr, error = %e, "failed to send ops");
-                        conn.state = PeerState::Failed;
-                    }
+                && let Err(e) = writer.write_all(&bytes).await
+            {
+                warn!(%addr, error = %e, "failed to send ops");
+                conn.state = PeerState::Failed;
+            }
         }
 
         Ok(())

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 /// Identificatore di un peer (basato su NodeId).
 pub type PeerId = NodeId;
 
+#[allow(dead_code)]
 /// Stato di connessione di un peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {

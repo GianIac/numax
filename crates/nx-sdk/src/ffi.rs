@@ -7,6 +7,7 @@ unsafe extern "C" {
 
     // LOG
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
+    #[allow(dead_code)]
     pub fn host_log(msg_ptr: u32, msg_len: u32);
 
     // Preferred: allows error codes.

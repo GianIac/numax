@@ -103,7 +103,7 @@ impl Runtime {
     /// Avvia il sync networking (se configurato).
     /// Deve essere chiamato prima di run_module in contesto async.
     pub async fn start_sync(&self) -> Result<()> {
-        if let Some(ref manager) = self.sync_manager {
+        if let Some(ref _manager) = self.sync_manager {
             // SyncManager::start richiede &mut self, ma abbiamo Arc
             // Per ora skip - implementazione completa richiede refactor
             tracing::info!(

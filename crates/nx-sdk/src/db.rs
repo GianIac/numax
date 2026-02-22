@@ -36,10 +36,11 @@ pub fn delete(key: &str) -> Result<()> {
     map_rc_unit(rc)
 }
 
-/// get(key) -> Result<Option<Vec<u8>>, NxError>
-/// - Ok(None) => key missing
-/// - Ok(Some(bytes)) => value
-/// Gestisce automaticamente il caso buffer too small (-2) riallocando e riprovando.
+// get(key) -> Result<Option<Vec<u8>>, NxError>
+// - Ok(None) => key missing
+// - Ok(Some(bytes)) => value
+// Gestisce automaticamente il caso buffer too small "-2" riallocando e riprovando.
+
 pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 64;
 
