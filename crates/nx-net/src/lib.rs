@@ -13,10 +13,10 @@
 
 mod error;
 mod message;
-mod peer;
 mod node;
+mod peer;
 
 pub use error::{NetError, NetResult};
 pub use message::{Message, MessageKind};
+pub use node::{Node, NodeConfig, NodeEvent};
 pub use peer::{PeerId, PeerInfo};
-pub use node::{Node, NodeConfig, NodeEvent};   

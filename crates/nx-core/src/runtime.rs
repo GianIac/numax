@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::{p1, WasiCtx};
+use wasmtime_wasi::{WasiCtx, p1};
 
 use nx_store::Store as NxStore;
 use nx_sync::NodeId;
@@ -106,7 +106,9 @@ impl Runtime {
         if let Some(ref manager) = self.sync_manager {
             // SyncManager::start richiede &mut self, ma abbiamo Arc
             // Per ora skip - implementazione completa richiede refactor
-            tracing::info!("sync manager configured (full start requires async runtime integration)");
+            tracing::info!(
+                "sync manager configured (full start requires async runtime integration)"
+            );
         }
         Ok(())
     }
@@ -122,10 +124,7 @@ impl Runtime {
 
         // 1. Costruisce lo stato host per questo run
         let host_state = if self.config.enable_wasi {
-            let wasi = WasiCtx::builder()
-                .inherit_stdio()
-                .inherit_args()
-                .build_p1();
+            let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
 
             HostState {
                 wasi: Some(wasi),

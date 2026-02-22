@@ -4,7 +4,7 @@ use std::sync::Arc;
 use nx_net::{Message, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, NodeId, Op, OpId, OpKind};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::sync_config::SyncConfig;
@@ -103,7 +103,9 @@ impl SyncManager {
                     NodeEvent::OpsReceived { from, ops } => {
                         debug!(from = %from, count = ops.len(), "received ops from peer");
                         for op in ops {
-                            if let Err(e) = apply_remote_op(&op, &counters, &seen_ops, &config).await {
+                            if let Err(e) =
+                                apply_remote_op(&op, &counters, &seen_ops, &config).await
+                            {
                                 error!(error = %e, "failed to apply remote op");
                             }
                         }
@@ -135,7 +137,9 @@ impl SyncManager {
         // Applica localmente
         {
             let mut counters = self.counters.write().await;
-            let counter = counters.entry(key.to_string()).or_insert_with(GCounter::new);
+            let counter = counters
+                .entry(key.to_string())
+                .or_insert_with(GCounter::new);
             counter.increment(&self.node_id, 1);
             debug!(key = %key, value = counter.value(), "local counter updated");
         }

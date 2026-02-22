@@ -55,16 +55,12 @@ fn db_get_impl(
     };
 
     if key_len > MAX_KEY_LEN {
-        eprintln!(
-            "[nx-core] db_get: invalid key length: {key_len} (max {MAX_KEY_LEN})"
-        );
+        eprintln!("[nx-core] db_get: invalid key length: {key_len} (max {MAX_KEY_LEN})");
         return ERR_INTERNAL;
     }
 
     if out_cap > MAX_OUT_CAP {
-        eprintln!(
-            "[nx-core] db_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
-        );
+        eprintln!("[nx-core] db_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})");
         return ERR_INTERNAL;
     }
 
@@ -116,15 +112,11 @@ fn db_set_impl(
     };
 
     if key_len > MAX_KEY_LEN {
-        eprintln!(
-            "[nx-core] db_set: invalid key length: {key_len} (max {MAX_KEY_LEN})"
-        );
+        eprintln!("[nx-core] db_set: invalid key length: {key_len} (max {MAX_KEY_LEN})");
         return ERR_INTERNAL;
     }
     if val_len > MAX_VALUE_LEN {
-        eprintln!(
-            "[nx-core] db_set: invalid value length: {val_len} (max {MAX_VALUE_LEN})"
-        );
+        eprintln!("[nx-core] db_set: invalid value length: {val_len} (max {MAX_VALUE_LEN})");
         return ERR_INTERNAL;
     }
 
@@ -162,9 +154,7 @@ fn db_delete_impl(mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32)
     };
 
     if key_len > MAX_KEY_LEN {
-        eprintln!(
-            "[nx-core] db_delete: invalid key length: {key_len} (max {MAX_KEY_LEN})"
-        );
+        eprintln!("[nx-core] db_delete: invalid key length: {key_len} (max {MAX_KEY_LEN})");
         return ERR_INTERNAL;
     }
 
@@ -189,17 +179,23 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         "nx",
         "db_get",
-        |caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32| -> i32 {
-            db_get_impl(caller, key_ptr, key_len, out_ptr, out_cap)
-        },
+        |caller: Caller<'_, HostState>,
+         key_ptr: u32,
+         key_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 { db_get_impl(caller, key_ptr, key_len, out_ptr, out_cap) },
     )?;
 
     linker.func_wrap(
         "nx",
         "db_set",
-        |caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32| -> i32 {
-            db_set_impl(caller, key_ptr, key_len, val_ptr, val_len)
-        },
+        |caller: Caller<'_, HostState>,
+         key_ptr: u32,
+         key_len: u32,
+         val_ptr: u32,
+         val_len: u32|
+         -> i32 { db_set_impl(caller, key_ptr, key_len, val_ptr, val_len) },
     )?;
 
     linker.func_wrap(

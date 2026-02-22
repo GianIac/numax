@@ -63,8 +63,7 @@ mod tests {
 
     #[test]
     fn test_peer_info_with_node_id() {
-        let peer = PeerInfo::new("127.0.0.1:9000")
-            .with_node_id(NodeId::new("node-1"));
+        let peer = PeerInfo::new("127.0.0.1:9000").with_node_id(NodeId::new("node-1"));
         assert!(peer.node_id.is_some());
     }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use nx_sync::{NodeId, Op};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NetError, NetResult};
@@ -124,9 +124,9 @@ impl Node {
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
         info!(%addr, "connecting to peer");
 
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            NetError::ConnectionFailed(format!("{}: {}", addr, e))
-        })?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
 
         let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -167,9 +167,12 @@ impl Node {
         }
 
         // Notifica evento
-        let _ = self.event_tx.send(NodeEvent::PeerConnected {
-            node_id: peer_node_id.clone(),
-        }).await;
+        let _ = self
+            .event_tx
+            .send(NodeEvent::PeerConnected {
+                node_id: peer_node_id.clone(),
+            })
+            .await;
 
         // Avvia loop di lettura
         let peers = Arc::clone(&self.peers);
@@ -185,9 +188,11 @@ impl Node {
             let mut peers = peers.write().await;
             peers.remove(&addr_owned);
 
-            let _ = event_tx.send(NodeEvent::PeerDisconnected {
-                node_id: peer_node_id,
-            }).await;
+            let _ = event_tx
+                .send(NodeEvent::PeerDisconnected {
+                    node_id: peer_node_id,
+                })
+                .await;
         });
 
         Ok(())
@@ -201,14 +206,12 @@ impl Node {
         let mut peers = self.peers.write().await;
 
         for (addr, conn) in peers.iter_mut() {
-            if conn.state == PeerState::Connected {
-                if let Some(ref mut writer) = conn.writer {
-                    if let Err(e) = writer.write_all(&bytes).await {
+            if conn.state == PeerState::Connected
+                && let Some(ref mut writer) = conn.writer
+                    && let Err(e) = writer.write_all(&bytes).await {
                         warn!(%addr, error = %e, "failed to send ops");
                         conn.state = PeerState::Failed;
                     }
-                }
-            }
         }
 
         Ok(())
@@ -217,7 +220,10 @@ impl Node {
     /// Restituisce il numero di peer connessi.
     pub async fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
-        peers.values().filter(|c| c.state == PeerState::Connected).count()
+        peers
+            .values()
+            .filter(|c| c.state == PeerState::Connected)
+            .count()
     }
 }
 
@@ -225,7 +231,7 @@ impl Node {
 async fn handle_incoming(
     stream: TcpStream,
     our_node_id: NodeId,
-    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    _peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
 ) -> NetResult<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -251,16 +257,20 @@ async fn handle_incoming(
     info!(peer = %peer_node_id, "incoming peer connected");
 
     // Notifica
-    let _ = event_tx.send(NodeEvent::PeerConnected {
-        node_id: peer_node_id.clone(),
-    }).await;
+    let _ = event_tx
+        .send(NodeEvent::PeerConnected {
+            node_id: peer_node_id.clone(),
+        })
+        .await;
 
     // Loop lettura
     read_loop(reader, peer_node_id.clone(), event_tx.clone()).await?;
 
-    let _ = event_tx.send(NodeEvent::PeerDisconnected {
-        node_id: peer_node_id,
-    }).await;
+    let _ = event_tx
+        .send(NodeEvent::PeerDisconnected {
+            node_id: peer_node_id,
+        })
+        .await;
 
     Ok(())
 }
@@ -284,10 +294,12 @@ async fn read_loop(
         match msg.kind {
             MessageKind::PushOps { ops } => {
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");
-                let _ = event_tx.send(NodeEvent::OpsReceived {
-                    from: peer_node_id.clone(),
-                    ops,
-                }).await;
+                let _ = event_tx
+                    .send(NodeEvent::OpsReceived {
+                        from: peer_node_id.clone(),
+                        ops,
+                    })
+                    .await;
             }
             MessageKind::Ping => {
                 debug!(peer = %peer_node_id, "received ping");

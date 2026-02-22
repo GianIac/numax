@@ -12,32 +12,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageKind {
     /// Handshake iniziale.
-    Hello {
-        node_id: NodeId,
-        version: u32,
-    },
+    Hello { node_id: NodeId, version: u32 },
 
     /// Risposta a Hello.
-    HelloAck {
-        node_id: NodeId,
-        version: u32,
-    },
+    HelloAck { node_id: NodeId, version: u32 },
 
     /// Invia operazioni CRDT.
-    PushOps {
-        ops: Vec<Op>,
-    },
+    PushOps { ops: Vec<Op> },
 
     /// Conferma ricezione ops.
-    PushOpsAck {
-        received_count: usize,
-    },
+    PushOpsAck { received_count: usize },
 
     /// Richiedi operazioni da un certo punto.
     /// `since_op_id` è l'ultimo op_id conosciuto (None = voglio tutto).
-    PullSince {
-        since_op_id: Option<String>,
-    },
+    PullSince { since_op_id: Option<String> },
 
     /// Ping per keepalive.
     Ping,
@@ -127,7 +115,10 @@ mod tests {
         let msg = Message::hello(node_id.clone());
 
         match &msg.kind {
-            MessageKind::Hello { node_id: id, version } => {
+            MessageKind::Hello {
+                node_id: id,
+                version,
+            } => {
                 assert_eq!(id, &node_id);
                 assert_eq!(*version, PROTOCOL_VERSION);
             }
@@ -146,10 +137,7 @@ mod tests {
         let parsed = Message::from_bytes(&bytes[4..]).unwrap();
 
         match (&msg.kind, &parsed.kind) {
-            (
-                MessageKind::Hello { node_id: id1, .. },
-                MessageKind::Hello { node_id: id2, .. },
-            ) => {
+            (MessageKind::Hello { node_id: id1, .. }, MessageKind::Hello { node_id: id2, .. }) => {
                 assert_eq!(id1, id2);
             }
             _ => panic!("mismatch"),

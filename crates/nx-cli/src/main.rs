@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use nx_core::runtime::{Runtime, RuntimeConfig};
 use nx_core::SyncConfig;
+use nx_core::runtime::{Runtime, RuntimeConfig};
 use tracing::info;
 
 #[derive(Parser, Debug)]
