@@ -47,20 +47,87 @@
 ## Fasi Production-Ready
 
 ### Fase 6: Transport Security 🔒
-**Obiettivo**: Comunicazioni sicure tra nodi
+**Obiettivo**: Comunicazioni sicure e autenticate tra nodi (anti-MITM completo)
 
+**TLS Base:**
 - [ ] TLS 1.3 per connessioni TCP
-- [ ] Certificati auto-generati per sviluppo
+- [ ] Certificati auto-generati per sviluppo (`rcgen`)
 - [ ] Supporto certificati custom per produzione
-- [ ] Verifica hostname/identità peer
-- [ ] Test: connessione rifiutata senza certificato valido
+- [ ] Forward secrecy (ECDHE automatico con TLS 1.3)
+- [ ] TLS wrapper: `TlsAcceptor` (server), `TlsConnector` (client)
 
-**Librerie**: `rustls`, `tokio-rustls`
+**Mutual TLS (mTLS):**
+- [ ] Client deve presentare certificato
+- [ ] Server verifica certificato client
+- [ ] Supporto CA custom per verifica (`--tls-ca`)
+- [ ] Test: client senza cert → rifiutato
+- [ ] Test: client con cert invalido → rifiutato
 
-**CLI**:
+**Identity & NodeID:**
+- [ ] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)`
+- [ ] Funzione `derive_node_id_from_cert(cert) -> NodeId`
+- [ ] Verifica durante handshake Hello: cert.pubkey → NodeId atteso
+- [ ] Mismatch NodeID → disconnect immediato
+
+**Peer Verification:**
+- [ ] Verifica hostname/CN nel certificato
+- [ ] Allowlist opzionale di NodeID autorizzati
+- [ ] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
+
+**CLI Flags:**
+- [ ] `--tls-cert <path>` - Certificato nodo
+- [ ] `--tls-key <path>` - Chiave privata nodo
+- [ ] `--tls-ca <path>` - CA per verificare peer
+- [ ] `--allowed-peers <id1,id2,...>` - Allowlist NodeID
+- [ ] `--tls-insecure` - Dev only, skip verify (warning)
+
+**Test Security:**
+- [ ] Test: connessione TLS funziona tra 2 nodi
+- [ ] Test: connessione rifiutata senza certificato
+- [ ] Test: connessione rifiutata con cert scaduto/invalido
+- [ ] Test: mTLS - entrambi i peer autenticati
+- [ ] Test: NodeID mismatch → disconnect
+- [ ] Test: peer non in allowlist → rifiutato
+
+**Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
+
+**CLI esempio**:
 ```bash
-nx run module.wasm --sync --tls-cert cert.pem --tls-key key.pem
+# Server con mTLS
+nx run module.wasm --sync \
+    --sync-listen 0.0.0.0:9000 \
+    --tls-cert server.pem \
+    --tls-key server-key.pem \
+    --tls-ca ca.pem
+
+# Client con mTLS
+nx run module.wasm --sync \
+    --sync-peers 10.0.0.1:9000 \
+    --tls-cert client.pem \
+    --tls-key client-key.pem \
+    --tls-ca ca.pem
+
+# Con allowlist (rete permissioned)
+nx run module.wasm --sync \
+    --tls-cert node.pem \
+    --tls-key node-key.pem \
+    --allowed-peers "abc123,def456"
+
+# Dev mode (MAI in produzione!)
+nx run module.wasm --sync --tls-insecure
 ```
+
+**Matrice sicurezza raggiunta:**
+
+| Attacco | Protetto |
+|---------|----------|
+| Eavesdropping | ✅ TLS |
+| Tampering | ✅ TLS |
+| Replay | ✅ TLS |
+| MITM server | ✅ Cert verify |
+| MITM client | ✅ mTLS |
+| Rogue node | ✅ Allowlist |
+| Spoofed NodeID | ✅ hash(pubkey) |
 
 ---
 
