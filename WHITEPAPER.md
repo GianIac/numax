@@ -54,23 +54,23 @@ La sua architettura è semplice ed è composta da 3 blocchi:
 
 I concetti chiave di numax sono:
 
-- **Semplicità architetturale come principio guida**
+- **Semplicità architetturale come principio guida:**
   Il runtime integra solo ciò che è davvero necessario come compute, stato locale o sincronizzazione.
   Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e sopratutto capire.
 
-- **Stato e codice nello stesso ambiente**
+- **Stato e codice nello stesso ambiente:**
   Il datastore locale è parte integrante del runtime.
   Il calcolo non è separato dallo stato tramite un database remoto: vive nello stesso luogo, con benefici in termini di latenza, coerenza e resilienza offline.
 
-- **WASM come unità di calcolo portabile**
+- **WASM come unità di calcolo portabile:**
   Il modulo WASM è l'unico artefatto necessario per distribuire logica applicativa.
   Lo stesso modulo può essere eseguito su un po' ovunque senza modifiche, evitando codebase multiple o branching condizionale.
 
-- **CRDT invece di lock o transazioni distribuite**
+- **CRDT invece di lock o transazioni distribuite:**
   La sincronizzazione dello stato non richiede coordinamento centralizzato:
   i CRDT garantiscono convergenza automatica tra nodi anche in presenza di latenze, disconnessioni o aggiornamenti concorrenti.
 
-- **Funzionamento offline come caratteristica nativa**
+- **Funzionamento offline come caratteristica nativa:**
   Ogni nodo mantiene una copia locale dello stato e continua a funzionare autonomamente.
   Quando torna online, il runtime esegue la riconciliazione tramite CRDT, senza conflitti e senza codice applicativo aggiuntivo.
 
