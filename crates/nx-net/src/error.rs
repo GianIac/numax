@@ -1,4 +1,4 @@
-//! Errori per nx-net.
+//! Error for nx-net.
 
 use thiserror::Error;
 
@@ -26,4 +26,13 @@ pub enum NetError {
 
     #[error("channel closed")]
     ChannelClosed,
+
+    #[error("TLS error: {0}")]
+    TlsError(String),
+
+    #[error("peer not allowed: {0}")]
+    PeerNotAllowed(String),
+
+    #[error("node ID mismatch: expected {expected}, got {got}")]
+    NodeIdMismatch { expected: String, got: String },
 }

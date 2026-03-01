@@ -2,32 +2,32 @@ use nx_sync::NodeId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-/// Identificatore di un peer (basato su NodeId).
+/// Identifier of a peer (based on NodeId).
 pub type PeerId = NodeId;
 
 #[allow(dead_code)]
-/// Stato di connessione di un peer.
+/// Connection state of a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
-    /// Non ancora connesso.
+    /// Not yet connected.
     Disconnected,
-    /// Connessione in corso.
+    /// Connection in progress.
     Connecting,
-    /// Connesso, handshake in corso.
+    /// Connected, handshake in progress.
     Handshaking,
-    /// Connesso e operativo.
+    /// Connected and operational.
     Connected,
-    /// Errore, in attesa di retry.
+    /// Error, waiting for retry.
     Failed,
 }
 
-/// Informazioni su un peer.
+/// Information about a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
-    /// Indirizzo del peer.
+    /// Address of the peer.
     pub addr: String,
 
-    /// NodeId (noto dopo handshake).
+    /// NodeId (known after handshake).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<NodeId>,
 }
@@ -45,7 +45,7 @@ impl PeerInfo {
         self
     }
 
-    /// Parsa l'indirizzo come SocketAddr.
+    /// Parses the address as SocketAddr.
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         self.addr.parse()
     }
