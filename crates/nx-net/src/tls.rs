@@ -160,7 +160,9 @@ impl TlsConfig {
             let ca_store = Self::load_ca_store(Path::new(ca_path))?;
             let client_verifier = WebPkiClientVerifier::builder(Arc::new(ca_store))
                 .build()
-                .map_err(|e| NetError::TlsError(format!("failed to build client verifier: {}", e)))?;
+                .map_err(|e| {
+                    NetError::TlsError(format!("failed to build client verifier: {}", e))
+                })?;
 
             ServerConfig::builder()
                 .with_client_cert_verifier(client_verifier)
@@ -221,7 +223,7 @@ impl TlsConfig {
 
 /// Derive NodeId from certificate's public key.
 ///
-/// NodeId = SHA256(SubjectPublicKeyInfo)[0..16]
+/// NodeId = SHA256(DER-encoded certificate)[0..16]
 pub fn derive_node_id(cert_der: &CertificateDer<'_>) -> NodeId {
     let mut hasher = Sha256::new();
     hasher.update(cert_der.as_ref());
@@ -239,8 +241,8 @@ pub fn node_id_to_hex(node_id: &NodeId) -> String {
 
 /// Parse NodeId from hex string.
 pub fn node_id_from_hex(s: &str) -> NetResult<NodeId> {
-    let bytes = hex::decode(s)
-        .map_err(|e| NetError::TlsError(format!("invalid node_id hex: {}", e)))?;
+    let bytes =
+        hex::decode(s).map_err(|e| NetError::TlsError(format!("invalid node_id hex: {}", e)))?;
 
     if bytes.len() != 16 {
         return Err(NetError::TlsError(format!(
@@ -282,7 +284,7 @@ pub fn generate_self_signed(common_name: &str) -> NetResult<(String, String)> {
 ///
 /// Returns (ca_cert_pem, ca_key_pem).
 pub fn generate_ca(common_name: &str) -> NetResult<(String, String)> {
-    use rcgen::{CertificateParams, IsCa, KeyPair, BasicConstraints};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])
         .map_err(|e| NetError::TlsError(format!("failed to create CA params: {}", e)))?;
@@ -303,8 +305,169 @@ pub fn generate_ca(common_name: &str) -> NetResult<(String, String)> {
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
+/// Generate a certificate signed by a CA.
+///
+/// # Arguments
+/// * `_ca_cert_pem` - CA certificate in PEM format (kept for API consistency)
+/// * `ca_key_pem` - CA private key in PEM format
+/// * `common_name` - CN for the new certificate
+///
+/// # Returns
+/// (cert_pem, key_pem) for the new certificate
+pub fn generate_signed(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    common_name: &str,
+) -> NetResult<(String, String)> {
+    use rcgen::{CertificateParams, Issuer, KeyPair};
+
+    // Parse CA key
+    let ca_key = KeyPair::from_pem(ca_key_pem)
+        .map_err(|e| NetError::TlsError(format!("failed to parse CA key: {}", e)))?;
+
+    // Build Issuer from existing CA cert + CA key
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, &ca_key)
+        .map_err(|e| NetError::TlsError(format!("failed to parse CA cert: {}", e)))?;
+
+    // Create certificate params for the node
+    let mut params = CertificateParams::new(vec![common_name.to_string()])
+        .map_err(|e| NetError::TlsError(format!("failed to create cert params: {}", e)))?;
+
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        rcgen::DnValue::Utf8String(common_name.to_string()),
+    );
+
+    // Generate key for new cert
+    let key_pair = KeyPair::generate()
+        .map_err(|e| NetError::TlsError(format!("failed to generate key pair: {}", e)))?;
+
+    // Sign with CA (rcgen 0.14.x)
+    let cert = params
+        .signed_by(&key_pair, &issuer)
+        .map_err(|e| NetError::TlsError(format!("failed to sign certificate: {}", e)))?;
+
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// Write certificate and key to files.
+///
+/// Useful for test setup and development.
+pub fn write_cert_files(
+    cert_pem: &str,
+    key_pem: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> NetResult<()> {
+    fs::write(cert_path, cert_pem)
+        .map_err(|e| NetError::TlsError(format!("failed to write cert file: {}", e)))?;
+    fs::write(key_path, key_pem)
+        .map_err(|e| NetError::TlsError(format!("failed to write key file: {}", e)))?;
+    Ok(())
+}
+
+/// Complete test PKI (CA + node certs) for integration tests.
+///
+/// Creates a temp directory with:
+/// - ca.pem, ca-key.pem
+/// - node1.pem, node1-key.pem
+/// - node2.pem, node2-key.pem
+///
+/// Auto-cleanup on drop.
+pub struct TestPki {
+    /// Temp directory containing all cert files
+    pub dir: std::path::PathBuf,
+    /// CA certificate PEM
+    pub ca_cert: String,
+    /// CA private key PEM
+    pub ca_key: String,
+    /// Node 1 certificate PEM
+    pub node1_cert: String,
+    /// Node 1 private key PEM
+    pub node1_key: String,
+    /// Node 2 certificate PEM
+    pub node2_cert: String,
+    /// Node 2 private key PEM
+    pub node2_key: String,
+}
+
+impl TestPki {
+    /// Generate a complete test PKI with CA and two node certs.
+    pub fn generate() -> NetResult<Self> {
+        // Generate CA
+        let (ca_cert, ca_key) = generate_ca("test-ca")?;
+
+        // Generate node certs signed by CA
+        let (node1_cert, node1_key) = generate_signed(&ca_cert, &ca_key, "node-1")?;
+        let (node2_cert, node2_key) = generate_signed(&ca_cert, &ca_key, "node-2")?;
+
+        // Create temp directory
+        let dir = std::env::temp_dir().join(format!("numax-test-pki-{}", std::process::id()));
+        fs::create_dir_all(&dir)
+            .map_err(|e| NetError::TlsError(format!("failed to create temp dir: {}", e)))?;
+
+        // Write files
+        write_cert_files(&ca_cert, &ca_key, &dir.join("ca.pem"), &dir.join("ca-key.pem"))?;
+        write_cert_files(
+            &node1_cert,
+            &node1_key,
+            &dir.join("node1.pem"),
+            &dir.join("node1-key.pem"),
+        )?;
+        write_cert_files(
+            &node2_cert,
+            &node2_key,
+            &dir.join("node2.pem"),
+            &dir.join("node2-key.pem"),
+        )?;
+
+        Ok(Self {
+            dir,
+            ca_cert,
+            ca_key,
+            node1_cert,
+            node1_key,
+            node2_cert,
+            node2_key,
+        })
+    }
+
+    /// Get TlsConfig for node 1.
+    pub fn node1_config(&self) -> TlsConfig {
+        TlsConfig::new(
+            self.dir.join("node1.pem").to_string_lossy(),
+            self.dir.join("node1-key.pem").to_string_lossy(),
+            self.dir.join("ca.pem").to_string_lossy(),
+        )
+    }
+
+    /// Get TlsConfig for node 2.
+    pub fn node2_config(&self) -> TlsConfig {
+        TlsConfig::new(
+            self.dir.join("node2.pem").to_string_lossy(),
+            self.dir.join("node2-key.pem").to_string_lossy(),
+            self.dir.join("ca.pem").to_string_lossy(),
+        )
+    }
+
+    /// Cleanup temp files manually (also happens on drop).
+    pub fn cleanup(&self) -> NetResult<()> {
+        fs::remove_dir_all(&self.dir)
+            .map_err(|e| NetError::TlsError(format!("failed to cleanup: {}", e)))
+    }
+}
+
+impl Drop for TestPki {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Insecure certificate verifier for development.
 /// Accepts any certificate without validation.
+///
+/// # Warning
+/// NEVER use in production!
 #[derive(Debug)]
 struct InsecureVerifier;
 
@@ -363,7 +526,9 @@ mod tests {
         let (cert_pem, key_pem) = generate_self_signed("test-node").unwrap();
 
         assert!(cert_pem.contains("-----BEGIN CERTIFICATE-----"));
+        assert!(cert_pem.contains("-----END CERTIFICATE-----"));
         assert!(key_pem.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(key_pem.contains("-----END PRIVATE KEY-----"));
     }
 
     #[test]
@@ -375,8 +540,81 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_signed_by_ca() {
+        let (ca_cert, ca_key) = generate_ca("my-ca").unwrap();
+        let (node_cert, node_key) = generate_signed(&ca_cert, &ca_key, "my-node").unwrap();
+
+        assert!(node_cert.contains("-----BEGIN CERTIFICATE-----"));
+        assert!(node_key.contains("-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn test_different_nodes_different_certs() {
+        let (ca_cert, ca_key) = generate_ca("ca").unwrap();
+
+        let (cert1, _) = generate_signed(&ca_cert, &ca_key, "node-1").unwrap();
+        let (cert2, _) = generate_signed(&ca_cert, &ca_key, "node-2").unwrap();
+
+        assert_ne!(cert1, cert2);
+    }
+
+    #[test]
+    fn test_node_id_deterministic() {
+        let (cert_pem, _) = generate_self_signed("test").unwrap();
+
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let node_id_1 = derive_node_id(&certs[0]);
+        let node_id_2 = derive_node_id(&certs[0]);
+
+        assert_eq!(node_id_1, node_id_2);
+    }
+
+    #[test]
+    fn test_different_certs_different_node_ids() {
+        let (cert1_pem, _) = generate_self_signed("node-1").unwrap();
+        let (cert2_pem, _) = generate_self_signed("node-2").unwrap();
+
+        let mut reader1 = std::io::BufReader::new(cert1_pem.as_bytes());
+        let certs1: Vec<_> = rustls_pemfile::certs(&mut reader1)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let mut reader2 = std::io::BufReader::new(cert2_pem.as_bytes());
+        let certs2: Vec<_> = rustls_pemfile::certs(&mut reader2)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let node_id_1 = derive_node_id(&certs1[0]);
+        let node_id_2 = derive_node_id(&certs2[0]);
+
+        assert_ne!(node_id_1, node_id_2);
+    }
+
+    #[test]
+    fn test_node_id_hex_roundtrip() {
+        let node_id: NodeId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let hex = node_id_to_hex(&node_id);
+        let parsed = node_id_from_hex(&hex).unwrap();
+
+        assert_eq!(node_id, parsed);
+        assert_eq!(hex, "0102030405060708090a0b0c0d0e0f10");
+    }
+
+    #[test]
+    fn test_node_id_from_hex_invalid() {
+        assert!(node_id_from_hex("0102030405").is_err()); // too short
+        assert!(node_id_from_hex("not-hex").is_err()); // invalid
+        assert!(node_id_from_hex("0102030405060708090a0b0c0d0e0f101112").is_err()); // too long
+    }
+
+    #[test]
     fn test_tls_config_default() {
         let config = TlsConfig::default();
+
         assert!(!config.is_enabled());
         assert!(!config.is_mtls_enabled());
         assert!(!config.insecure);
@@ -385,6 +623,7 @@ mod tests {
     #[test]
     fn test_tls_config_with_paths() {
         let config = TlsConfig::new("cert.pem", "key.pem", "ca.pem");
+
         assert!(config.is_enabled());
         assert!(config.is_mtls_enabled());
     }
@@ -392,12 +631,13 @@ mod tests {
     #[test]
     fn test_tls_config_insecure() {
         let config = TlsConfig::insecure_dev();
+
         assert!(!config.is_enabled());
         assert!(config.insecure);
     }
 
     #[test]
-    fn test_allowlist() {
+    fn test_allowlist_check() {
         let mut allowed = HashSet::new();
         allowed.insert("abc123".to_string());
         allowed.insert("def456".to_string());
@@ -412,14 +652,80 @@ mod tests {
     #[test]
     fn test_no_allowlist_allows_all() {
         let config = TlsConfig::default();
+
         assert!(config.is_peer_allowed("any-peer"));
     }
 
     #[test]
-    fn test_node_id_hex_roundtrip() {
-        let node_id: NodeId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let hex = node_id_to_hex(&node_id);
-        let parsed = node_id_from_hex(&hex).unwrap();
-        assert_eq!(node_id, parsed);
+    fn test_test_pki_generation() {
+        let pki = TestPki::generate().unwrap();
+
+        assert!(pki.dir.join("ca.pem").exists());
+        assert!(pki.dir.join("ca-key.pem").exists());
+        assert!(pki.dir.join("node1.pem").exists());
+        assert!(pki.dir.join("node1-key.pem").exists());
+        assert!(pki.dir.join("node2.pem").exists());
+        assert!(pki.dir.join("node2-key.pem").exists());
+
+        let config1 = pki.node1_config();
+        let config2 = pki.node2_config();
+
+        assert!(config1.is_enabled());
+        assert!(config1.is_mtls_enabled());
+        assert!(config2.is_enabled());
+        assert!(config2.is_mtls_enabled());
+    }
+
+    #[test]
+    fn test_load_certs_from_generated_pki() {
+        let pki = TestPki::generate().unwrap();
+
+        let certs = TlsConfig::load_certs(&pki.dir.join("node1.pem")).unwrap();
+        assert_eq!(certs.len(), 1);
+
+        let _key = TlsConfig::load_key(&pki.dir.join("node1-key.pem")).unwrap();
+
+        let ca_store = TlsConfig::load_ca_store(&pki.dir.join("ca.pem")).unwrap();
+        assert!(!ca_store.is_empty());
+    }
+
+    #[test]
+    fn test_build_acceptor_with_pki() {
+        let pki = TestPki::generate().unwrap();
+        let config = pki.node1_config();
+
+        let acceptor = config.build_acceptor();
+        assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn test_build_connector_with_pki() {
+        let pki = TestPki::generate().unwrap();
+        let config = pki.node1_config();
+
+        let connector = config.build_connector();
+        assert!(connector.is_ok());
+    }
+
+    #[test]
+    fn test_build_acceptor_without_cert_fails() {
+        let config = TlsConfig::default();
+
+        let result = config.build_acceptor();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_connector_without_ca_fails() {
+        let config = TlsConfig {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            ca_path: None,
+            allowed_peers: None,
+            insecure: false,
+        };
+
+        let result = config.build_connector();
+        assert!(result.is_err());
     }
 }

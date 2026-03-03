@@ -1,15 +1,15 @@
 //! # nx-net
 //!
-//! Networking peer-to-peer for Numax.
-//! Manages communication between nodes for CRDT synchronization.
+//! Peer-to-peer networking for Numax.
+//! Handles communication between nodes for CRDT synchronization.
 //!
 //! ## Protocol
 //! - `HELLO`: initial handshake with node_id and version
-//! - `PUSH_OPS`: sends CRDT operations to peers
-//! - `PULL_SINCE`: requests missing operations (anti-entropy)
+//! - `PUSH_OPS`: send CRDT operations to peers
+//! - `PULL_SINCE`: request missing operations (anti-entropy)
 //!
 //! ## Transport
-//! TCP with TLS 1.3 / mTLS for secure and authenticated connections.
+//! TCP with TLS 1.3 / mTLS for secure, authenticated connections.
 //!
 //! ## Security
 //! - Mutual TLS: both peers authenticated
@@ -27,6 +27,6 @@ pub use message::{Message, MessageKind};
 pub use node::{Node, NodeConfig, NodeEvent};
 pub use peer::{PeerId, PeerInfo};
 pub use tls::{
-    derive_node_id, generate_ca, generate_self_signed, node_id_from_hex, node_id_to_hex, NodeId,
-    TlsConfig,
+    derive_node_id, generate_ca, generate_self_signed, generate_signed, node_id_from_hex,
+    node_id_to_hex, write_cert_files, NodeId, TestPki, TlsConfig,
 };

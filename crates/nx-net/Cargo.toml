@@ -14,8 +14,9 @@ tracing = "0.1"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2"
-rcgen = "0.14.7"
+rcgen = { version = "0.14.7", features = ["pem", "x509-parser"] }
 sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
