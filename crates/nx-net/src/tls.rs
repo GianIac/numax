@@ -284,12 +284,26 @@ pub fn generate_self_signed(common_name: &str) -> NetResult<(String, String)> {
 ///
 /// Returns (ca_cert_pem, ca_key_pem).
 pub fn generate_ca(common_name: &str) -> NetResult<(String, String)> {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, ExtendedKeyUsagePurpose,
+    };
 
-    let mut params = CertificateParams::new(vec![])
+    let mut params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| NetError::TlsError(format!("failed to create CA params: {}", e)))?;
 
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String(common_name.to_string()),
@@ -376,7 +390,7 @@ pub fn write_cert_files(
 /// Auto-cleanup on drop.
 pub struct TestPki {
     /// Temp directory containing all cert files
-    pub dir: std::path::PathBuf,
+    dir: tempfile::TempDir,
     /// CA certificate PEM
     pub ca_cert: String,
     /// CA private key PEM
@@ -392,33 +406,38 @@ pub struct TestPki {
 }
 
 impl TestPki {
+
+    // dir_path is needed for tests that want to load certs directly from files instead of using TlsConfig
+    pub fn dir_path(&self) -> &Path {
+        self.dir.path()
+    }
+
     /// Generate a complete test PKI with CA and two node certs.
     pub fn generate() -> NetResult<Self> {
         // Generate CA
         let (ca_cert, ca_key) = generate_ca("test-ca")?;
 
         // Generate node certs signed by CA
-        let (node1_cert, node1_key) = generate_signed(&ca_cert, &ca_key, "node-1")?;
+        let (node1_cert, node1_key) = generate_signed(&ca_cert, &ca_key, "localhost")?;
         let (node2_cert, node2_key) = generate_signed(&ca_cert, &ca_key, "node-2")?;
 
         // Create temp directory
-        let dir = std::env::temp_dir().join(format!("numax-test-pki-{}", std::process::id()));
-        fs::create_dir_all(&dir)
-            .map_err(|e| NetError::TlsError(format!("failed to create temp dir: {}", e)))?;
+        // Create a unique temp directory (safe with parallel tests)
+        let dir = tempfile::tempdir().map_err(|e| NetError::TlsError(format!("failed to create temp dir: {}", e)))?;
 
         // Write files
-        write_cert_files(&ca_cert, &ca_key, &dir.join("ca.pem"), &dir.join("ca-key.pem"))?;
+        write_cert_files(&ca_cert, &ca_key, &dir.path().join("ca.pem"), &dir.path().join("ca-key.pem"))?;
         write_cert_files(
             &node1_cert,
             &node1_key,
-            &dir.join("node1.pem"),
-            &dir.join("node1-key.pem"),
+            &dir.path().join("node1.pem"),
+            &dir.path().join("node1-key.pem"),
         )?;
         write_cert_files(
             &node2_cert,
             &node2_key,
-            &dir.join("node2.pem"),
-            &dir.join("node2-key.pem"),
+            &dir.path().join("node2.pem"),
+            &dir.path().join("node2-key.pem"),
         )?;
 
         Ok(Self {
@@ -435,31 +454,19 @@ impl TestPki {
     /// Get TlsConfig for node 1.
     pub fn node1_config(&self) -> TlsConfig {
         TlsConfig::new(
-            self.dir.join("node1.pem").to_string_lossy(),
-            self.dir.join("node1-key.pem").to_string_lossy(),
-            self.dir.join("ca.pem").to_string_lossy(),
+            self.dir.path().join("node1.pem").to_string_lossy(),
+            self.dir.path().join("node1-key.pem").to_string_lossy(),
+            self.dir.path().join("ca.pem").to_string_lossy(),
         )
     }
 
     /// Get TlsConfig for node 2.
     pub fn node2_config(&self) -> TlsConfig {
         TlsConfig::new(
-            self.dir.join("node2.pem").to_string_lossy(),
-            self.dir.join("node2-key.pem").to_string_lossy(),
-            self.dir.join("ca.pem").to_string_lossy(),
+            self.dir.path().join("node2.pem").to_string_lossy(),
+            self.dir.path().join("node2-key.pem").to_string_lossy(),
+            self.dir.path().join("ca.pem").to_string_lossy(),
         )
-    }
-
-    /// Cleanup temp files manually (also happens on drop).
-    pub fn cleanup(&self) -> NetResult<()> {
-        fs::remove_dir_all(&self.dir)
-            .map_err(|e| NetError::TlsError(format!("failed to cleanup: {}", e)))
-    }
-}
-
-impl Drop for TestPki {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -660,12 +667,12 @@ mod tests {
     fn test_test_pki_generation() {
         let pki = TestPki::generate().unwrap();
 
-        assert!(pki.dir.join("ca.pem").exists());
-        assert!(pki.dir.join("ca-key.pem").exists());
-        assert!(pki.dir.join("node1.pem").exists());
-        assert!(pki.dir.join("node1-key.pem").exists());
-        assert!(pki.dir.join("node2.pem").exists());
-        assert!(pki.dir.join("node2-key.pem").exists());
+        assert!(pki.dir_path().join("ca.pem").exists());
+        assert!(pki.dir_path().join("ca-key.pem").exists());
+        assert!(pki.dir_path().join("node1.pem").exists());
+        assert!(pki.dir_path().join("node1-key.pem").exists());
+        assert!(pki.dir_path().join("node2.pem").exists());
+        assert!(pki.dir_path().join("node2-key.pem").exists());
 
         let config1 = pki.node1_config();
         let config2 = pki.node2_config();
@@ -680,12 +687,12 @@ mod tests {
     fn test_load_certs_from_generated_pki() {
         let pki = TestPki::generate().unwrap();
 
-        let certs = TlsConfig::load_certs(&pki.dir.join("node1.pem")).unwrap();
+        let certs = TlsConfig::load_certs(&pki.dir_path().join("node1.pem")).unwrap();
         assert_eq!(certs.len(), 1);
 
-        let _key = TlsConfig::load_key(&pki.dir.join("node1-key.pem")).unwrap();
+        let _key = TlsConfig::load_key(&pki.dir_path().join("node1-key.pem")).unwrap();
 
-        let ca_store = TlsConfig::load_ca_store(&pki.dir.join("ca.pem")).unwrap();
+        let ca_store = TlsConfig::load_ca_store(&pki.dir_path().join("ca.pem")).unwrap();
         assert!(!ca_store.is_empty());
     }
 
@@ -695,7 +702,7 @@ mod tests {
         let config = pki.node1_config();
 
         let acceptor = config.build_acceptor();
-        assert!(acceptor.is_ok());
+        assert!(acceptor.is_ok(), "build_acceptor failed: {:?}", acceptor.err());
     }
 
     #[test]
@@ -704,7 +711,7 @@ mod tests {
         let config = pki.node1_config();
 
         let connector = config.build_connector();
-        assert!(connector.is_ok());
+        assert!(connector.is_ok(), "build_connector failed: {:?}", connector.err());
     }
 
     #[test]
