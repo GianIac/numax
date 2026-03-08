@@ -50,17 +50,17 @@
 **Obiettivo**: Comunicazioni sicure e autenticate tra nodi (anti-MITM completo)
 
 **TLS Base:**
-- [ ] TLS 1.3 per connessioni TCP
-- [ ] Certificati auto-generati per sviluppo (`rcgen`)
-- [ ] Supporto certificati custom per produzione
-- [ ] Forward secrecy (ECDHE automatico con TLS 1.3)
-- [ ] TLS wrapper: `TlsAcceptor` (server), `TlsConnector` (client)
+- [x] TLS 1.3 per connessioni TCP
+- [x] Certificati auto-generati per sviluppo (`rcgen`)
+- [x] Supporto certificati custom per produzione
+- [x] Forward secrecy (ECDHE automatico con TLS 1.3)
+- [x] TLS wrapper: `TlsAcceptor` (server), `TlsConnector` (client)
 
 **Mutual TLS (mTLS):**
-- [ ] Client deve presentare certificato
-- [ ] Server verifica certificato client
-- [ ] Supporto CA custom per verifica (`--tls-ca`)
-- [ ] Test: client senza cert → rifiutato
+- [x] Client deve presentare certificato
+- [x] Server verifica certificato client
+- [x] Supporto CA custom per verifica (`--tls-ca`)
+- [x] Test: client senza cert → rifiutato
 - [ ] Test: client con cert invalido → rifiutato
 
 **Identity & NodeID:**
@@ -70,7 +70,7 @@
 - [ ] Mismatch NodeID → disconnect immediato
 
 **Peer Verification:**
-- [ ] Verifica hostname/CN nel certificato
+- [x] Verifica hostname/CN nel certificato
 - [ ] Allowlist opzionale di NodeID autorizzati
 - [ ] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
 
@@ -82,10 +82,10 @@
 - [ ] `--tls-insecure` - Dev only, skip verify (warning)
 
 **Test Security:**
-- [ ] Test: connessione TLS funziona tra 2 nodi
-- [ ] Test: connessione rifiutata senza certificato
+- [x] Test: connessione TLS funziona tra 2 nodi
+- [x] Test: connessione rifiutata senza certificato
 - [ ] Test: connessione rifiutata con cert scaduto/invalido
-- [ ] Test: mTLS - entrambi i peer autenticati
+- [x] Test: mTLS - entrambi i peer autenticati
 - [ ] Test: NodeID mismatch → disconnect
 - [ ] Test: peer non in allowlist → rifiutato
 
