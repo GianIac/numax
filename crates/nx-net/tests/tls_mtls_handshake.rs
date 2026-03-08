@@ -105,3 +105,74 @@ async fn mtls_handshake_fails_without_client_cert() {
         .expect("client timeout")
         .expect("client join");
 }
+
+#[tokio::test]
+async fn mtls_handshake_fails_with_invalid_client_cert() {
+    let server_pki = TestPki::generate().expect("generate server PKI");
+    let attacker_pki = TestPki::generate().expect("generate attacker PKI");
+
+    // Server requires mTLS and trusts only server_pki's CA for client auth.
+    let server_cfg: TlsConfig = server_pki.node1_config();
+
+    // Client config:
+    // - trusts the server CA (so server cert verification succeeds),
+    // - but presents a client cert signed by a different CA (so client auth must fail).
+    let mut client_cfg: TlsConfig = TlsConfig::default();
+    client_cfg.ca_path = Some(
+        server_pki
+            .dir_path()
+            .join("ca.pem")
+            .to_string_lossy()
+            .to_string(),
+    );
+    client_cfg.cert_path = Some(
+        attacker_pki
+            .dir_path()
+            .join("node2.pem")
+            .to_string_lossy()
+            .to_string(),
+    );
+    client_cfg.key_path = Some(
+        attacker_pki
+            .dir_path()
+            .join("node2-key.pem")
+            .to_string_lossy()
+            .to_string(),
+    );
+    client_cfg.insecure = false;
+
+    let acceptor = server_cfg.build_acceptor().expect("build_acceptor");
+    let connector = client_cfg.build_connector().expect("build_connector");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let server_task = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept tcp");
+
+        // This should fail because the client certificate is not signed by the CA
+        // configured on the server for mTLS verification.
+        let res = acceptor.accept(tcp).await;
+        assert!(res.is_err(), "server expected mTLS handshake to fail");
+    });
+
+    let client_task = tokio::spawn(async move {
+        let tcp = TcpStream::connect(addr).await.expect("connect tcp");
+
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("valid server name");
+
+        // The client should be able to verify the server (correct CA),
+        // but the handshake must still fail because the server rejects the client cert.
+        let _ = connector.connect(server_name, tcp).await;
+    });
+
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+    timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client timeout")
+        .expect("client join");
+}
