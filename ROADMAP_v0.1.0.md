@@ -61,7 +61,7 @@
 - [x] Server verifica certificato client
 - [x] Supporto CA custom per verifica (`--tls-ca`)
 - [x] Test: client senza cert → rifiutato
-- [ ] Test: client con cert invalido → rifiutato
+- [x] Test: client con cert invalido → rifiutato
 
 **Identity & NodeID:**
 - [ ] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)`
