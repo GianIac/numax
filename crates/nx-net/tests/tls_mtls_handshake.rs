@@ -36,8 +36,8 @@ async fn mtls_handshake_succeeds_with_valid_certs() {
         let tcp = TcpStream::connect(addr).await.expect("connect tcp");
 
         // rustls wants a ServerName; we can use "localhost" for tests.
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .expect("valid server name");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("valid server name");
 
         let mut tls = connector
             .connect(server_name, tcp)
@@ -89,8 +89,8 @@ async fn mtls_handshake_fails_without_client_cert() {
     let client_task = tokio::spawn(async move {
         let tcp = TcpStream::connect(addr).await.expect("connect tcp");
 
-        let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .expect("valid server name");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("valid server name");
 
         // Client side may also error; either side failing is ok.
         let _ = connector.connect(server_name, tcp).await;

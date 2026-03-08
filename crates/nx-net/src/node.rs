@@ -10,18 +10,22 @@ use tracing::{debug, error, info, warn};
 use crate::error::{NetError, NetResult};
 use crate::message::{Message, MessageKind, PROTOCOL_VERSION};
 use crate::peer::{PeerInfo, PeerState};
+use crate::tls::{NetStream, TlsConfig};
 
-/// Configurazione del nodo.
+/// Node configuration.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
-    /// NodeId di questo nodo.
+    /// NodeId of this node.
     pub node_id: NodeId,
 
-    /// Indirizzo su cui ascoltare (es. "0.0.0.0:9000").
+    /// Address to listen on (e.g. "0.0.0.0:9000").
     pub listen_addr: String,
 
-    /// Peer iniziali a cui connettersi.
+    /// Initial peers to connect to.
     pub initial_peers: Vec<String>,
+
+    /// Optional TLS/mTLS configuration.
+    pub tls: Option<TlsConfig>,
 }
 
 impl NodeConfig {
@@ -30,6 +34,7 @@ impl NodeConfig {
             node_id,
             listen_addr: listen_addr.into(),
             initial_peers: Vec::new(),
+            tls: None,
         }
     }
 
@@ -37,30 +42,35 @@ impl NodeConfig {
         self.initial_peers = peers;
         self
     }
+
+    pub fn with_tls(mut self, tls: TlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
 }
 
-/// Evento in uscita dal nodo (per il runtime).
+/// Node exit event (for runtime).
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
-    /// Ricevute nuove operazioni da un peer.
+    /// received new operations from a peer.
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
-    /// Peer connesso.
+    /// Peer connected.
     PeerConnected { node_id: NodeId },
 
-    /// Peer disconnesso.
+    /// Peer disconnected.
     PeerDisconnected { node_id: NodeId },
 }
 
 #[allow(dead_code)]
-/// Stato interno di una connessione peer.
+/// internal state for each peer connection.
 struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
-    writer: Option<tokio::io::WriteHalf<TcpStream>>,
+    writer: Option<tokio::io::WriteHalf<crate::tls::NetStream>>,
 }
 
-/// Nodo di rete.
+/// node
 pub struct Node {
     config: NodeConfig,
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
@@ -69,7 +79,7 @@ pub struct Node {
 }
 
 impl Node {
-    /// Crea un nuovo nodo.
+    /// crate new node
     pub fn new(config: NodeConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
 
@@ -81,12 +91,12 @@ impl Node {
         }
     }
 
-    /// Prende il receiver degli eventi (può essere chiamato una sola volta).
+    /// Gets the event receiver (can only be called once).
     pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<NodeEvent>> {
         self.event_rx.take()
     }
 
-    /// Avvia il listener TCP.
+    /// Start listener TCP.
     pub async fn start_listener(&self) -> NetResult<()> {
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         info!(addr = %self.config.listen_addr, "listening");
@@ -94,6 +104,7 @@ impl Node {
         let peers = Arc::clone(&self.peers);
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
+        let tls = self.config.tls.clone();
 
         tokio::spawn(async move {
             loop {
@@ -103,9 +114,10 @@ impl Node {
                         let peers = Arc::clone(&peers);
                         let node_id = node_id.clone();
                         let event_tx = event_tx.clone();
+                        let tls = tls.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_incoming(stream, node_id, peers, event_tx).await
+                            if let Err(e) = handle_incoming(stream, tls, node_id, peers, event_tx).await
                             {
                                 error!(%addr, error = %e, "connection error");
                             }
@@ -121,21 +133,36 @@ impl Node {
         Ok(())
     }
 
-    /// Connetti a un peer.
+    /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
-        info!(%addr, "connecting to peer");
-
         let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
+    .await
+    .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
 
-        let (mut reader, mut writer) = tokio::io::split(stream);
+    let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
+        // Extract host from "host:port"
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
 
-        // Invia HELLO
+        // rustls verifies the presented certificate against this name
+        // ServerName returned above is not 'static; turn it into owned 'static
+        let server_name = rustls::pki_types::ServerName::try_from(host)
+            .or_else(|_| rustls::pki_types::ServerName::try_from("localhost"))
+            .map_err(|e| NetError::TlsError(format!("invalid server name '{}': {}", host, e)))?;
+
+        let server_name = server_name.to_owned();
+
+        tls_cfg.connect_stream(stream, server_name).await?
+    } else {
+        NetStream::Plain(stream)
+    };
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+        // Send HELLO
         let hello = Message::hello(self.config.node_id.clone());
         write_message(&mut writer, &hello).await?;
 
-        // Attendi HELLO_ACK
+        // Wait HELLO_ACK
         let response = read_message(&mut reader).await?;
         let peer_node_id = match response.kind {
             MessageKind::HelloAck { node_id, version } => {
@@ -154,7 +181,7 @@ impl Node {
             }
         };
 
-        // Salva connessione
+        // Save connection
         {
             let mut peers = self.peers.write().await;
             peers.insert(
@@ -167,7 +194,7 @@ impl Node {
             );
         }
 
-        // Notifica evento
+        // Notify Event
         let _ = self
             .event_tx
             .send(NodeEvent::PeerConnected {
@@ -175,7 +202,7 @@ impl Node {
             })
             .await;
 
-        // Avvia loop di lettura
+        // Start read loop
         let peers = Arc::clone(&self.peers);
         let event_tx = self.event_tx.clone();
         let addr_owned = addr.to_string();
@@ -199,7 +226,7 @@ impl Node {
         Ok(())
     }
 
-    /// Invia operazioni a tutti i peer connessi.
+    /// Send ops to all connected peers.
     pub async fn broadcast_ops(&self, ops: Vec<Op>) -> NetResult<()> {
         let msg = Message::push_ops(ops);
         let bytes = msg.to_bytes()?;
@@ -219,7 +246,7 @@ impl Node {
         Ok(())
     }
 
-    /// Restituisce il numero di peer connessi.
+    /// Returns the number of currently connected peers.
     pub async fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
         peers
@@ -229,16 +256,22 @@ impl Node {
     }
 }
 
-/// Gestisce una connessione in ingresso.
+/// Manage an incoming connection from a peer (handshake + read loop).
 async fn handle_incoming(
     stream: TcpStream,
+    tls: Option<TlsConfig>,
     our_node_id: NodeId,
     _peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
 ) -> NetResult<()> {
+    let stream: NetStream = match tls {
+        Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
+        None => NetStream::Plain(stream),
+    };
+
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // Attendi HELLO
+    // Wait for HELLO
     let msg = read_message(&mut reader).await?;
     let peer_node_id = match msg.kind {
         MessageKind::Hello { node_id, version } => {
@@ -252,20 +285,20 @@ async fn handle_incoming(
         }
     };
 
-    // Rispondi con HELLO_ACK
+    // Send HELLO_ACK
     let ack = Message::hello_ack(our_node_id);
     write_message(&mut writer, &ack).await?;
 
     info!(peer = %peer_node_id, "incoming peer connected");
 
-    // Notifica
+    // Notify Event
     let _ = event_tx
         .send(NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
         })
         .await;
 
-    // Loop lettura
+    // Read Loop
     read_loop(reader, peer_node_id.clone(), event_tx.clone()).await?;
 
     let _ = event_tx
@@ -277,9 +310,9 @@ async fn handle_incoming(
     Ok(())
 }
 
-/// Loop di lettura messaggi da un peer.
+/// Loop for reading messages from a peer until disconnection
 async fn read_loop(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
+    mut reader: tokio::io::ReadHalf<NetStream>,
     peer_node_id: NodeId,
     event_tx: mpsc::Sender<NodeEvent>,
 ) -> NetResult<()> {
@@ -305,7 +338,7 @@ async fn read_loop(
             }
             MessageKind::Ping => {
                 debug!(peer = %peer_node_id, "received ping");
-                // TODO: rispondere con Pong (serve writer)
+                // TODO: send Pong (serve writer)
             }
             _ => {
                 debug!(peer = %peer_node_id, kind = ?msg.kind, "unhandled message");
@@ -316,7 +349,7 @@ async fn read_loop(
     Ok(())
 }
 
-/// Scrive un messaggio su uno stream.
+/// Writes a message to a stream.
 async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Message) -> NetResult<()> {
     let bytes = msg.to_bytes()?;
     writer.write_all(&bytes).await?;
@@ -324,9 +357,9 @@ async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Message) 
     Ok(())
 }
 
-/// Legge un messaggio da uno stream.
+/// Reads a message from a stream.
 async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> NetResult<Message> {
-    // Leggi lunghezza (4 bytes)
+    // Read length (4 bytes)
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -336,7 +369,7 @@ async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> NetResult<Mess
         return Err(NetError::InvalidMessage("message too large".into()));
     }
 
-    // Leggi payload
+    // Read payload
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
 

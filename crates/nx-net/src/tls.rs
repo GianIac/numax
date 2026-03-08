@@ -16,18 +16,114 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{NetError, NetResult};
 
+pub type ClientTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+pub type ServerTlsStream = tokio_rustls::server::TlsStream<TcpStream>;
+
 /// 16-byte NodeId derived from certificate public key.
 pub type NodeId = [u8; 16];
+
+/// Network stream used by nx-net: plain TCP or TLS (client/server side).
+pub enum NetStream {
+    Plain(TcpStream),
+    TlsClient(ClientTlsStream),
+    TlsServer(ServerTlsStream),
+}
+
+impl AsyncRead for NetStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            NetStream::TlsClient(s) => Pin::new(s).poll_read(cx, buf),
+            NetStream::TlsServer(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for NetStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            NetStream::Plain(s) => Pin::new(s).poll_write(cx, data),
+            NetStream::TlsClient(s) => Pin::new(s).poll_write(cx, data),
+            NetStream::TlsServer(s) => Pin::new(s).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            NetStream::TlsClient(s) => Pin::new(s).poll_flush(cx),
+            NetStream::TlsServer(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            NetStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            NetStream::TlsClient(s) => Pin::new(s).poll_shutdown(cx),
+            NetStream::TlsServer(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Server-side: wrap a TCP stream into TLS if TLS is enabled.
+    pub async fn accept_stream(&self, tcp: TcpStream) -> NetResult<NetStream> {
+        if !self.is_enabled() {
+            return Ok(NetStream::Plain(tcp));
+        }
+
+        let acceptor = self.build_acceptor()?;
+        let tls = acceptor
+            .accept(tcp)
+            .await
+            .map_err(|e| NetError::TlsError(format!("tls accept failed: {}", e)))?;
+
+        Ok(NetStream::TlsServer(tls))
+    }
+
+    /// Client-side: wrap a TCP stream into TLS if TLS is enabled.
+    pub async fn connect_stream(
+        &self,
+        tcp: TcpStream,
+        server_name: rustls::pki_types::ServerName<'static>,
+    ) -> NetResult<NetStream> {
+        if !self.is_enabled() && !self.insecure {
+            return Ok(NetStream::Plain(tcp));
+        }
+
+        let connector = self.build_connector()?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| NetError::TlsError(format!("tls connect failed: {}", e)))?;
+
+        Ok(NetStream::TlsClient(tls))
+    }
+}
+
+// ___
 
 /// TLS configuration for a node.
 #[derive(Debug, Clone, Default)]
@@ -285,7 +381,8 @@ pub fn generate_self_signed(common_name: &str) -> NetResult<(String, String)> {
 /// Returns (ca_cert_pem, ca_key_pem).
 pub fn generate_ca(common_name: &str) -> NetResult<(String, String)> {
     use rcgen::{
-        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, ExtendedKeyUsagePurpose,
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
     };
 
     let mut params = CertificateParams::new(Vec::<String>::new())
@@ -406,7 +503,6 @@ pub struct TestPki {
 }
 
 impl TestPki {
-
     // dir_path is needed for tests that want to load certs directly from files instead of using TlsConfig
     pub fn dir_path(&self) -> &Path {
         self.dir.path()
@@ -423,10 +519,16 @@ impl TestPki {
 
         // Create temp directory
         // Create a unique temp directory (safe with parallel tests)
-        let dir = tempfile::tempdir().map_err(|e| NetError::TlsError(format!("failed to create temp dir: {}", e)))?;
+        let dir = tempfile::tempdir()
+            .map_err(|e| NetError::TlsError(format!("failed to create temp dir: {}", e)))?;
 
         // Write files
-        write_cert_files(&ca_cert, &ca_key, &dir.path().join("ca.pem"), &dir.path().join("ca-key.pem"))?;
+        write_cert_files(
+            &ca_cert,
+            &ca_key,
+            &dir.path().join("ca.pem"),
+            &dir.path().join("ca-key.pem"),
+        )?;
         write_cert_files(
             &node1_cert,
             &node1_key,
@@ -702,7 +804,11 @@ mod tests {
         let config = pki.node1_config();
 
         let acceptor = config.build_acceptor();
-        assert!(acceptor.is_ok(), "build_acceptor failed: {:?}", acceptor.err());
+        assert!(
+            acceptor.is_ok(),
+            "build_acceptor failed: {:?}",
+            acceptor.err()
+        );
     }
 
     #[test]
@@ -711,7 +817,11 @@ mod tests {
         let config = pki.node1_config();
 
         let connector = config.build_connector();
-        assert!(connector.is_ok(), "build_connector failed: {:?}", connector.err());
+        assert!(
+            connector.is_ok(),
+            "build_connector failed: {:?}",
+            connector.err()
+        );
     }
 
     #[test]
