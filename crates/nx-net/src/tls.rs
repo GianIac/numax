@@ -345,6 +345,18 @@ pub fn derive_node_id_from_cert(cert_der: &CertificateDer<'_>) -> NetResult<Node
     Ok(node_id)
 }
 
+/// Derive the protocol NodeId (nx_sync::NodeId) from the peer certificate public key.
+///
+/// Wire format choice:
+/// - protocol NodeId is the lowercase hex string of the 16-byte identity
+pub fn derive_protocol_node_id_from_cert(
+    cert_der: &CertificateDer<'_>,
+) -> NetResult<nx_sync::NodeId> {
+    let node_id16 = derive_node_id_from_cert(cert_der)?;
+    let hex = node_id_to_hex(&node_id16);
+    Ok(nx_sync::NodeId::new(hex))
+}
+
 /// Compute a debug fingerprint for a certificate public key.
 ///
 /// This is NOT used for protocol identity; it's meant for logs and diagnostics.
@@ -469,7 +481,7 @@ pub fn generate_ca(common_name: &str) -> NetResult<(String, String)> {
 ///
 /// # Arguments
 /// * `_ca_cert_pem` - CA certificate in PEM format (kept for API consistency)
-/// * `ca_key_pem` - CA private key in PEM format
+/// * `ca_key_pem` - CA private key PEM format
 /// * `common_name` - CN for the new certificate
 ///
 /// # Returns

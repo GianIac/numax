@@ -196,18 +196,15 @@ impl Node {
                     NetError::TlsError("missing peer certificate in TLS session".into())
                 })?;
 
-                let expected = crate::tls::derive_node_id_from_cert(&peer_cert)?;
-                let expected_hex = crate::tls::node_id_to_hex(&expected);
+                let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
 
-                let claimed_hex = peer_node_id.to_string();
-
-                if claimed_hex != expected_hex {
+                if peer_node_id != expected {
                     let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
                         .unwrap_or_else(|_| "<unavailable>".into());
 
                     return Err(NetError::TlsError(format!(
-                        "node_id mismatch (claimed={}, expected={}, fingerprint={})",
-                        claimed_hex, expected_hex, fingerprint
+                        "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
+                        peer_node_id, expected, fingerprint
                     )));
                 }
             }
@@ -327,18 +324,15 @@ async fn handle_incoming(
                 NetError::TlsError("missing peer certificate in TLS session".into())
             })?;
 
-            let expected = crate::tls::derive_node_id_from_cert(&peer_cert)?;
-            let expected_hex = crate::tls::node_id_to_hex(&expected);
+            let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
 
-            let claimed_hex = peer_node_id.to_string();
-
-            if claimed_hex != expected_hex {
+            if peer_node_id != expected {
                 let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
                     .unwrap_or_else(|_| "<unavailable>".into());
 
                 return Err(NetError::TlsError(format!(
-                    "node_id mismatch (claimed={}, expected={}, fingerprint={})",
-                    claimed_hex, expected_hex, fingerprint
+                    "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
+                    peer_node_id, expected, fingerprint
                 )));
             }
         }

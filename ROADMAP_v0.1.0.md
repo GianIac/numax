@@ -64,10 +64,10 @@
 - [x] Test: client con cert invalido → rifiutato
 
 **Identity & NodeID:**
-- [ ] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
-- [ ] Funzione `derive_node_id_from_cert(cert) -> NodeId`
-- [ ] Verifica durante handshake Hello: cert.pubkey → NodeId atteso
-- [ ] Mismatch NodeID → disconnect immediato
+- [x] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
+- [x] Funzione `derive_node_id_from_cert(cert) -> NodeId`
+- [x] Verifica durante handshake Hello: cert.pubkey → NodeId atteso
+- [x] Mismatch NodeID → disconnect immediato
 
 **Peer Verification:**
 - [x] Verifica hostname/CN nel certificato
@@ -86,7 +86,7 @@
 - [x] Test: connessione rifiutata senza certificato
 - [ ] Test: connessione rifiutata con cert scaduto/invalido
 - [x] Test: mTLS - entrambi i peer autenticati
-- [ ] Test: NodeID mismatch → disconnect
+- [x] Test: NodeID mismatch → disconnect
 - [ ] Test: peer non in allowlist → rifiutato
 
 **Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`

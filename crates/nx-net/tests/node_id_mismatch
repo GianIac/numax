@@ -40,7 +40,7 @@ async fn node_id_mismatch_disconnects_immediately() {
         let hello = Message {
             kind: MessageKind::Hello {
                 node_id: forged,
-                version: nx_net::message::PROTOCOL_VERSION,
+                version: 1,
             },
         };
 
