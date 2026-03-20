@@ -1446,6 +1446,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-test",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

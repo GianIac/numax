@@ -123,8 +123,6 @@ impl TlsConfig {
     }
 }
 
-// ___
-
 /// TLS configuration for a node.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
@@ -317,17 +315,52 @@ impl TlsConfig {
     }
 }
 
-/// Derive NodeId from certificate's public key.
-///
-/// NodeId = SHA256(DER-encoded certificate)[0..16]
-pub fn derive_node_id(cert_der: &CertificateDer<'_>) -> NodeId {
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let hash = hasher.finalize();
+// --- Identity (NodeId) helpers ---
 
+/// Derive the canonical NodeId from the peer certificate public key.
+///
+/// Spec:
+/// - Compute SHA-256 over the DER-encoded SubjectPublicKeyInfo (SPKI)
+/// - NodeId = first 16 bytes of that hash
+pub fn derive_node_id_from_cert(cert_der: &CertificateDer<'_>) -> NetResult<NodeId> {
+    let hash = pubkey_spki_sha256(cert_der)?;
     let mut node_id = [0u8; 16];
     node_id.copy_from_slice(&hash[..16]);
-    node_id
+    Ok(node_id)
+}
+
+/// Compute a debug fingerprint for a certificate public key.
+///
+/// This is NOT used for protocol identity; it's meant for logs and diagnostics.
+/// Returns a 64-char lowercase hex string (full SHA-256 of SPKI).
+pub fn cert_fingerprint_hex(cert_der: &CertificateDer<'_>) -> NetResult<String> {
+    let hash = pubkey_spki_sha256(cert_der)?;
+    Ok(hex::encode(hash))
+}
+
+/// Backward-compatible helper kept for existing call sites/tests.
+///
+/// Prefer `derive_node_id_from_cert`.
+pub fn derive_node_id(cert_der: &CertificateDer<'_>) -> NodeId {
+    derive_node_id_from_cert(cert_der).expect("derive_node_id_from_cert")
+}
+
+/// Hash the certificate public key (SPKI) with SHA-256.
+///
+/// Internal helper used by both NodeId derivation and debug fingerprint.
+fn pubkey_spki_sha256(cert_der: &CertificateDer<'_>) -> NetResult<[u8; 32]> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|e| NetError::TlsError(format!("failed to parse x509 cert: {}", e)))?;
+
+    let spki_der = cert.tbs_certificate.subject_pki.raw;
+
+    let mut hasher = Sha256::new();
+    hasher.update(spki_der);
+    let out = hasher.finalize();
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&out);
+    Ok(hash)
 }
 
 /// Convert NodeId to hex string for display/comparison.
