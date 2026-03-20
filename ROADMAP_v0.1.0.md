@@ -47,7 +47,7 @@
 ## Fasi Production-Ready
 
 ### Fase 6: Transport Security 🔒
-**Obiettivo**: Comunicazioni sicure e autenticate tra nodi (anti-MITM completo)
+**Obiettivo**: Comunicazioni sicure e autenticate tra nodi.
 
 **TLS Base:**
 - [x] TLS 1.3 per connessioni TCP
