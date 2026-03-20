@@ -43,6 +43,22 @@ pub enum NetStream {
     TlsServer(ServerTlsStream),
 }
 
+impl NetStream {
+    /// Returns the peer leaf certificate in DER form (owned), if this is a TLS stream.
+    ///
+    /// - Plain TCP streams return `None`.
+    /// - For secure TLS/mTLS connections, a peer certificate is expected to be present.
+    pub fn peer_cert_der(&self) -> Option<CertificateDer<'static>> {
+        let cert = match self {
+            NetStream::Plain(_) => return None,
+            NetStream::TlsClient(tls) => tls.get_ref().1.peer_certificates()?.first()?.clone(),
+            NetStream::TlsServer(tls) => tls.get_ref().1.peer_certificates()?.first()?.clone(),
+        };
+
+        Some(CertificateDer::from(cert.as_ref().to_vec()))
+    }
+}
+
 impl AsyncRead for NetStream {
     fn poll_read(
         self: Pin<&mut Self>,

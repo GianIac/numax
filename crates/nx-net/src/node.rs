@@ -97,9 +97,13 @@ impl Node {
     }
 
     /// Start listener TCP.
-    pub async fn start_listener(&self) -> NetResult<()> {
+    ///
+    /// Returns the actual bound address (useful when binding to port 0 in tests).
+    pub async fn start_listener(&self) -> NetResult<std::net::SocketAddr> {
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
-        info!(addr = %self.config.listen_addr, "listening");
+        let bound_addr = listener.local_addr()?;
+
+        info!(addr = %bound_addr, "listening");
 
         let peers = Arc::clone(&self.peers);
         let node_id = self.config.node_id.clone();
@@ -117,7 +121,8 @@ impl Node {
                         let tls = tls.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_incoming(stream, tls, node_id, peers, event_tx).await
+                            if let Err(e) =
+                                handle_incoming(stream, tls, node_id, peers, event_tx).await
                             {
                                 error!(%addr, error = %e, "connection error");
                             }
@@ -130,33 +135,36 @@ impl Node {
             }
         });
 
-        Ok(())
+        Ok(bound_addr)
     }
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
-        let stream = TcpStream::connect(addr)
-    .await
-    .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
 
-    let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
-        // Extract host from "host:port"
-        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
+            // Extract host from "host:port"
+            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
 
-        // rustls verifies the presented certificate against this name
-        // ServerName returned above is not 'static; turn it into owned 'static
-        let server_name = rustls::pki_types::ServerName::try_from(host)
-            .or_else(|_| rustls::pki_types::ServerName::try_from("localhost"))
-            .map_err(|e| NetError::TlsError(format!("invalid server name '{}': {}", host, e)))?;
+            // rustls verifies the presented certificate against this name
+            // ServerName returned above is not 'static; turn it into owned 'static
+            let server_name = rustls::pki_types::ServerName::try_from(host)
+                .or_else(|_| rustls::pki_types::ServerName::try_from("localhost"))
+                .map_err(|e| NetError::TlsError(format!("invalid server name '{}': {}", host, e)))?;
 
-        let server_name = server_name.to_owned();
+            let server_name = server_name.to_owned();
 
-        tls_cfg.connect_stream(stream, server_name).await?
-    } else {
-        NetStream::Plain(stream)
-    };
+            tls_cfg.connect_stream(tcp, server_name).await?
+        } else {
+            NetStream::Plain(tcp)
+        };
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+        // Capture the peer certificate (owned) before moving the stream into split().
+        let peer_cert = stream.peer_cert_der();
+
+        let (mut reader, mut writer) = tokio::io::split(stream);
 
         // Send HELLO
         let hello = Message::hello(self.config.node_id.clone());
@@ -180,6 +188,30 @@ impl Node {
                 return Err(NetError::InvalidMessage("expected HelloAck".into()));
             }
         };
+
+        // TLS identity binding: claimed NodeId must match the peer certificate public key.
+        if let Some(tls_cfg) = &self.config.tls {
+            if !tls_cfg.insecure {
+                let peer_cert = peer_cert.ok_or_else(|| {
+                    NetError::TlsError("missing peer certificate in TLS session".into())
+                })?;
+
+                let expected = crate::tls::derive_node_id_from_cert(&peer_cert)?;
+                let expected_hex = crate::tls::node_id_to_hex(&expected);
+
+                let claimed_hex = peer_node_id.to_string();
+
+                if claimed_hex != expected_hex {
+                    let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
+                        .unwrap_or_else(|_| "<unavailable>".into());
+
+                    return Err(NetError::TlsError(format!(
+                        "node_id mismatch (claimed={}, expected={}, fingerprint={})",
+                        claimed_hex, expected_hex, fingerprint
+                    )));
+                }
+            }
+        }
 
         // Save connection
         {
@@ -269,6 +301,9 @@ async fn handle_incoming(
         None => NetStream::Plain(stream),
     };
 
+    // Capture the peer certificate (owned) before moving the stream into split().
+    let peer_cert = stream.peer_cert_der();
+
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Wait for HELLO
@@ -284,6 +319,30 @@ async fn handle_incoming(
             return Err(NetError::InvalidMessage("expected Hello".into()));
         }
     };
+
+    // TLS identity binding: claimed NodeId must match the peer certificate public key.
+    if let Some(tls_cfg) = &tls {
+        if !tls_cfg.insecure {
+            let peer_cert = peer_cert.ok_or_else(|| {
+                NetError::TlsError("missing peer certificate in TLS session".into())
+            })?;
+
+            let expected = crate::tls::derive_node_id_from_cert(&peer_cert)?;
+            let expected_hex = crate::tls::node_id_to_hex(&expected);
+
+            let claimed_hex = peer_node_id.to_string();
+
+            if claimed_hex != expected_hex {
+                let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
+                    .unwrap_or_else(|_| "<unavailable>".into());
+
+                return Err(NetError::TlsError(format!(
+                    "node_id mismatch (claimed={}, expected={}, fingerprint={})",
+                    claimed_hex, expected_hex, fingerprint
+                )));
+            }
+        }
+    }
 
     // Send HELLO_ACK
     let ack = Message::hello_ack(our_node_id);

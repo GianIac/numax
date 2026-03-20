@@ -64,8 +64,7 @@
 - [x] Test: client con cert invalido → rifiutato
 
 **Identity & NodeID:**
-- [ ] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and
-Fingerprint/debug: 32 bytes)
+- [ ] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
 - [ ] Funzione `derive_node_id_from_cert(cert) -> NodeId`
 - [ ] Verifica durante handshake Hello: cert.pubkey → NodeId atteso
 - [ ] Mismatch NodeID → disconnect immediato
