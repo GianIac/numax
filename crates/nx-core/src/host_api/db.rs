@@ -7,15 +7,13 @@ const ERR_NOT_FOUND: i32 = -1;
 const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
 
-// Guardrail: evita allocazioni patologiche/DoS dal guest.
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB
 const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB
 const MAX_OUT_CAP: u32 = 1024 * 1024; // 1 MiB
 
-// Cap generico per read_bytes (safety net)
 const MAX_READ_LEN: u32 = 1024 * 1024; // 1 MiB
 
-/// Get guest linear memory export (`memory`).
+/// Get guest linear memory export as a wasmtime::Memory.
 fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     match caller.get_export("memory") {
         Some(wasmtime::Extern::Memory(mem)) => Some(mem),
@@ -23,7 +21,7 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     }
 }
 
-/// Read `len` bytes from guest memory at `ptr`.
+/// Read len bytes from guest memory at ptr, returning them as a Vec<u8>.
 fn read_bytes(
     caller: &mut Caller<'_, HostState>,
     memory: &Memory,
