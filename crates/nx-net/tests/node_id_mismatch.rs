@@ -10,8 +10,8 @@ async fn node_id_mismatch_disconnects_immediately() {
     let pki = TestPki::generate().expect("generate test PKI");
 
     // Server node with TLS enabled.
-    let server_cfg = NodeConfig::new(nx_sync::NodeId::new("server"), "127.0.0.1:0")
-        .with_tls(pki.node1_config());
+    let server_cfg =
+        NodeConfig::new(nx_sync::NodeId::new("server"), "127.0.0.1:0").with_tls(pki.node1_config());
 
     let mut server = Node::new(server_cfg);
     let mut events = server.take_event_receiver().expect("event receiver");

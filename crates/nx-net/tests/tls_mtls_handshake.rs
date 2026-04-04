@@ -69,9 +69,10 @@ async fn mtls_handshake_fails_without_client_cert() {
     let server_cfg: TlsConfig = pki.node1_config();
 
     // Client config: we provide CA, but NO client cert/key => server should reject (mTLS)
-    let mut client_cfg: TlsConfig = TlsConfig::default();
-    client_cfg.ca_path = Some(pki.dir_path().join("ca.pem").to_string_lossy().to_string());
-    client_cfg.insecure = false;
+    let client_cfg: TlsConfig = TlsConfig {
+        ca_path: Some(pki.dir_path().join("ca.pem").to_string_lossy().to_string()),
+        ..Default::default()
+    };
 
     let acceptor = server_cfg.build_acceptor().expect("build_acceptor");
     let connector = client_cfg.build_connector().expect("build_connector");
@@ -117,29 +118,30 @@ async fn mtls_handshake_fails_with_invalid_client_cert() {
     // Client config:
     // - trusts the server CA (so server cert verification succeeds),
     // - but presents a client cert signed by a different CA (so client auth must fail).
-    let mut client_cfg: TlsConfig = TlsConfig::default();
-    client_cfg.ca_path = Some(
-        server_pki
-            .dir_path()
-            .join("ca.pem")
-            .to_string_lossy()
-            .to_string(),
-    );
-    client_cfg.cert_path = Some(
-        attacker_pki
-            .dir_path()
-            .join("node2.pem")
-            .to_string_lossy()
-            .to_string(),
-    );
-    client_cfg.key_path = Some(
-        attacker_pki
-            .dir_path()
-            .join("node2-key.pem")
-            .to_string_lossy()
-            .to_string(),
-    );
-    client_cfg.insecure = false;
+    let client_cfg: TlsConfig = TlsConfig {
+        ca_path: Some(
+            server_pki
+                .dir_path()
+                .join("ca.pem")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        cert_path: Some(
+            attacker_pki
+                .dir_path()
+                .join("node2.pem")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        key_path: Some(
+            attacker_pki
+                .dir_path()
+                .join("node2-key.pem")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        ..Default::default()
+    };
 
     let acceptor = server_cfg.build_acceptor().expect("build_acceptor");
     let connector = client_cfg.build_connector().expect("build_connector");

@@ -152,7 +152,9 @@ impl Node {
             // ServerName returned above is not 'static; turn it into owned 'static
             let server_name = rustls::pki_types::ServerName::try_from(host)
                 .or_else(|_| rustls::pki_types::ServerName::try_from("localhost"))
-                .map_err(|e| NetError::TlsError(format!("invalid server name '{}': {}", host, e)))?;
+                .map_err(|e| {
+                    NetError::TlsError(format!("invalid server name '{}': {}", host, e))
+                })?;
 
             let server_name = server_name.to_owned();
 
@@ -190,34 +192,34 @@ impl Node {
         };
 
         // TLS identity binding: claimed NodeId must match the peer certificate public key.
-        if let Some(tls_cfg) = &self.config.tls {
-            if !tls_cfg.insecure {
-                let peer_cert = peer_cert.ok_or_else(|| {
-                    NetError::TlsError("missing peer certificate in TLS session".into())
-                })?;
+        if let Some(tls_cfg) = &self.config.tls
+            && !tls_cfg.insecure
+        {
+            let peer_cert = peer_cert.ok_or_else(|| {
+                NetError::TlsError("missing peer certificate in TLS session".into())
+            })?;
 
-                let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
+            let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
 
-                if peer_node_id != expected {
-                    let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
-                        .unwrap_or_else(|_| "<unavailable>".into());
+            if peer_node_id != expected {
+                let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
+                    .unwrap_or_else(|_| "<unavailable>".into());
 
+                return Err(NetError::TlsError(format!(
+                    "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
+                    peer_node_id, expected, fingerprint
+                )));
+            }
+
+            // Optional allowlist enforcement (permissioned network).
+            if let Some(_allowed) = &tls_cfg.allowed_peers {
+                // Peer NodeId on the wire is nx_sync::NodeId; allowlist stores strings.
+                let peer_id_str = peer_node_id.to_string();
+                if !tls_cfg.is_peer_allowed(&peer_id_str) {
                     return Err(NetError::TlsError(format!(
-                        "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
-                        peer_node_id, expected, fingerprint
+                        "peer node_id not in allowlist: {:?}",
+                        peer_node_id
                     )));
-                }
-
-                // Optional allowlist enforcement (permissioned network).
-                if let Some(_allowed) = &tls_cfg.allowed_peers {
-                    // Peer NodeId on the wire is nx_sync::NodeId; allowlist stores strings.
-                    let peer_id_str = peer_node_id.to_string();
-                    if !tls_cfg.is_peer_allowed(&peer_id_str) {
-                        return Err(NetError::TlsError(format!(
-                            "peer node_id not in allowlist: {:?}",
-                            peer_node_id
-                        )));
-                    }
                 }
             }
         }
@@ -330,33 +332,32 @@ async fn handle_incoming(
     };
 
     // TLS identity binding: claimed NodeId must match the peer certificate public key.
-    if let Some(tls_cfg) = &tls {
-        if !tls_cfg.insecure {
-            let peer_cert = peer_cert.ok_or_else(|| {
-                NetError::TlsError("missing peer certificate in TLS session".into())
-            })?;
+    if let Some(tls_cfg) = &tls
+        && !tls_cfg.insecure
+    {
+        let peer_cert = peer_cert
+            .ok_or_else(|| NetError::TlsError("missing peer certificate in TLS session".into()))?;
 
-            let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
+        let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
 
-            if peer_node_id != expected {
-                let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
-                    .unwrap_or_else(|_| "<unavailable>".into());
+        if peer_node_id != expected {
+            let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
+                .unwrap_or_else(|_| "<unavailable>".into());
 
+            return Err(NetError::TlsError(format!(
+                "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
+                peer_node_id, expected, fingerprint
+            )));
+        }
+
+        // Optional allowlist enforcement (permissioned network).
+        if let Some(_allowed) = &tls_cfg.allowed_peers {
+            let peer_id_str = peer_node_id.to_string();
+            if !tls_cfg.is_peer_allowed(&peer_id_str) {
                 return Err(NetError::TlsError(format!(
-                    "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
-                    peer_node_id, expected, fingerprint
+                    "peer node_id not in allowlist: {:?}",
+                    peer_node_id
                 )));
-            }
-
-            // Optional allowlist enforcement (permissioned network).
-            if let Some(_allowed) = &tls_cfg.allowed_peers {
-                let peer_id_str = peer_node_id.to_string();
-                if !tls_cfg.is_peer_allowed(&peer_id_str) {
-                    return Err(NetError::TlsError(format!(
-                        "peer node_id not in allowlist: {:?}",
-                        peer_node_id
-                    )));
-                }
             }
         }
     }

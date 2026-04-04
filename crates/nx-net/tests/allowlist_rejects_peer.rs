@@ -14,7 +14,8 @@ async fn allowlist_rejects_peer_not_in_list() {
 
     let server_tls: TlsConfig = pki.node1_config().with_allowed_peers(allowed);
 
-    let server_cfg = NodeConfig::new(nx_sync::NodeId::new("server"), "127.0.0.1:0").with_tls(server_tls);
+    let server_cfg =
+        NodeConfig::new(nx_sync::NodeId::new("server"), "127.0.0.1:0").with_tls(server_tls);
 
     let mut server = Node::new(server_cfg);
     let mut events = server.take_event_receiver().expect("event receiver");
@@ -23,12 +24,16 @@ async fn allowlist_rejects_peer_not_in_list() {
 
     // Client tries to connect with valid TLS/mTLS, but its NodeId won't be allowlisted.
     let client_tls: TlsConfig = pki.node2_config();
-    let client_cfg = NodeConfig::new(nx_sync::NodeId::new("client"), "127.0.0.1:0").with_tls(client_tls);
+    let client_cfg =
+        NodeConfig::new(nx_sync::NodeId::new("client"), "127.0.0.1:0").with_tls(client_tls);
     let client = Node::new(client_cfg);
 
     let _ = client.connect_to_peer(&addr.to_string()).await;
 
     // Server must NOT emit PeerConnected.
     let res = timeout(Duration::from_millis(300), events.recv()).await;
-    assert!(res.is_err(), "expected no PeerConnected event (peer rejected by allowlist)");
+    assert!(
+        res.is_err(),
+        "expected no PeerConnected event (peer rejected by allowlist)"
+    );
 }
