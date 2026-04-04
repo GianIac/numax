@@ -71,8 +71,8 @@
 
 **Peer Verification:**
 - [x] Verifica hostname/CN nel certificato
-- [ ] Allowlist opzionale di NodeID autorizzati
-- [ ] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
+- [x] Allowlist opzionale di NodeID autorizzati
+- [x] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
 
 **CLI Flags:**
 - [ ] `--tls-cert <path>` - Certificato nodo
@@ -87,7 +87,7 @@
 - [ ] Test: connessione rifiutata con cert scaduto/invalido
 - [x] Test: mTLS - entrambi i peer autenticati
 - [x] Test: NodeID mismatch → disconnect
-- [ ] Test: peer non in allowlist → rifiutato
+- [x] Test: peer non in allowlist → rifiutato
 
 **Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
 
@@ -113,7 +113,7 @@ nx run module.wasm --sync \
     --tls-key node-key.pem \
     --allowed-peers "abc123,def456"
 
-# Dev mode (MAI in produzione!)
+# Dev mode:
 nx run module.wasm --sync --tls-insecure
 ```
 

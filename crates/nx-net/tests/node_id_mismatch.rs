@@ -33,7 +33,7 @@ async fn node_id_mismatch_disconnects_immediately() {
             .await
             .expect("tls connect");
 
-        let mut stream = nx_net::tls::NetStream::TlsClient(tls);
+        let mut stream = nx_net::NetStream::TlsClient(tls);
 
         // Forge a NodeId that cannot match the cert-derived identity.
         let forged = nx_sync::NodeId::new("00000000000000000000000000000000");

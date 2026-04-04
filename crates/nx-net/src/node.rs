@@ -207,6 +207,18 @@ impl Node {
                         peer_node_id, expected, fingerprint
                     )));
                 }
+
+                // Optional allowlist enforcement (permissioned network).
+                if let Some(_allowed) = &tls_cfg.allowed_peers {
+                    // Peer NodeId on the wire is nx_sync::NodeId; allowlist stores strings.
+                    let peer_id_str = peer_node_id.to_string();
+                    if !tls_cfg.is_peer_allowed(&peer_id_str) {
+                        return Err(NetError::TlsError(format!(
+                            "peer node_id not in allowlist: {:?}",
+                            peer_node_id
+                        )));
+                    }
+                }
             }
         }
 
@@ -334,6 +346,17 @@ async fn handle_incoming(
                     "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
                     peer_node_id, expected, fingerprint
                 )));
+            }
+
+            // Optional allowlist enforcement (permissioned network).
+            if let Some(_allowed) = &tls_cfg.allowed_peers {
+                let peer_id_str = peer_node_id.to_string();
+                if !tls_cfg.is_peer_allowed(&peer_id_str) {
+                    return Err(NetError::TlsError(format!(
+                        "peer node_id not in allowlist: {:?}",
+                        peer_node_id
+                    )));
+                }
             }
         }
     }
