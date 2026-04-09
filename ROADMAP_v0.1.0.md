@@ -426,8 +426,6 @@ nx run module.wasm --sync --debug-protocol
 - [ ] Nessun warning clippy
 - [ ] Documentazione base
 
-**Target**: Production-ready per workload non-critici
-
 ---
 
 ## Dopo v0.1.0:
