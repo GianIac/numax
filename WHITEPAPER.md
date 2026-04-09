@@ -243,13 +243,13 @@ Di seguito una panoramica ad alto livello dei componenti principali di Numax e d
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      WASM Module (Guest)                     │
-│                    (compiled with nx-sdk)                    │
+│                      WASM Module (Guest)                    │
+│                    (compiled with nx-sdk)                   │
 └──────────────────────────┬──────────────────────────────────┘
                            │ Host API calls (namespace "nx")
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                       nx-core (Host)                         │
+│                       nx-core (Host)                        │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │  Wasmtime   │  │  Host API   │  │    WASI (preview1)  │  │
 │  │   Engine    │  │  db_*, log  │  │    stdio, args      │  │
@@ -766,9 +766,10 @@ Job eseguiti:
 
 ## 9. Dove si colloca Numax
 
-Numax si posiziona in uno spazio specifico dell'ecosistema:
+Numax NON si posiziona in uno spazio specifico dell'ecosistema.
+Numax non è solo un software, è un idea, è un modo diverso di vedere le cose.
 
-**Runtime portabile con stato locale integrato e sincronizzazione nativa.**
+Sarebbe riduttivo definirlo un **Runtime portabile con stato locale integrato e sincronizzazione nativa.**
 
 //TODO
 
