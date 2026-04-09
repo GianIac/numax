@@ -84,10 +84,11 @@
 **Test Security:**
 - [x] Test: connessione TLS funziona tra 2 nodi
 - [x] Test: connessione rifiutata senza certificato
-- [ ] Test: connessione rifiutata con cert scaduto/invalido
+- [x] Test: connessione rifiutata con cert scaduto/invalido
 - [x] Test: mTLS - entrambi i peer autenticati
 - [x] Test: NodeID mismatch → disconnect
 - [x] Test: peer non in allowlist → rifiutato
+- [ ] Test: test per nuovi cli flags
 
 **Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
 
@@ -428,5 +429,5 @@ nx run module.wasm --sync --debug-protocol
 
 ---
 
-## Dopo v0.1.0:
+## 0.2.0:
 > coming soon ...
