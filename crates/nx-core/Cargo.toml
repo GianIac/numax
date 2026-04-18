@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-wasmtime = "41.0.1"
-wasmtime-wasi = "41.0.0"
+wasmtime = "43.0.1"
+wasmtime-wasi = "43.0.1"
 nx-store = { path = "../nx-store" }
 nx-sync = { path = "../nx-sync" }
 nx-net = { path = "../nx-net" }
