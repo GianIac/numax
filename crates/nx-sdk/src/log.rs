@@ -2,8 +2,6 @@ use crate::ffi;
 
 const ERR_INTERNAL: i32 = -3;
 
-/// Log string to host.
-/// Prefer v2 if available (returns i32).
 pub fn log(s: &str) {
     unsafe {
         // If you exported only v2 on the host side, this must exist.
@@ -19,7 +17,7 @@ pub fn log(s: &str) {
     }
 }
 
-/// Macro comoda (public API for guests)
+/// public API for guests
 #[macro_export]
 macro_rules! nx_log {
     ($($arg:tt)*) => {{

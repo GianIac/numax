@@ -39,7 +39,7 @@ pub fn delete(key: &str) -> Result<()> {
 // get(key) -> Result<Option<Vec<u8>>, NxError>
 // - Ok(None) => key missing
 // - Ok(Some(bytes)) => value
-// Gestisce automaticamente il caso buffer too small "-2" riallocando e riprovando.
+// Automatically handle the buffer too small "-2" case by reallocating and retrying.
 
 pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 64;

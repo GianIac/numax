@@ -12,17 +12,17 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
 
-        // if exists, deve essere una dir
+        // if exists and error if not a dir
         if path.exists() && !path.is_dir() {
             return Err(StoreError::NotADirectory(path.display().to_string()));
         }
 
-        // if NOT exists, crea (inclusi parent)
+        // if NOT exists, create dir
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
 
-        // Apri sled dentro quella dir
+        // open sled in a specific dir
         let db = sled::open(path)?;
         Ok(Self { db })
     }
@@ -34,7 +34,7 @@ impl Store {
 
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.db.insert(key, value)?;
-        // per ora flush esplicito no; sled è safe. Prevedo u n“durability più forte”:
+        // For now, there's no explicit flush; sled is safe. I expect a stronger "durability":
         // self.db.flush()?;
         Ok(())
     }
