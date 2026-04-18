@@ -1,5 +1,3 @@
-//! Error for nx-net.
-
 use thiserror::Error;
 
 pub type NetResult<T> = Result<T, NetError>;

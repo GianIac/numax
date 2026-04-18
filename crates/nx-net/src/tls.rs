@@ -1,17 +1,3 @@
-//! TLS/mTLS support for nx-net.
-//!
-//! Provides secure, mutually-authenticated transport between peers.
-//!
-//! ## Security features
-//! - TLS 1.3 with forward secrecy
-//! - Mutual TLS (mTLS): both peers authenticate
-//! - NodeId derived from public key: `NodeId = SHA256(pubkey)[0..16]`
-//! - Optional allowlist for permissioned networks
-//!
-//! ## Usage
-//! - Production: provide cert/key/ca files via CLI
-//! - Development: use `generate_self_signed()` for testing
-
 use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader;
@@ -45,9 +31,6 @@ pub enum NetStream {
 
 impl NetStream {
     /// Returns the peer leaf certificate in DER form (owned), if this is a TLS stream.
-    ///
-    /// - Plain TCP streams return `None`.
-    /// - For secure TLS/mTLS connections, a peer certificate is expected to be present.
     pub fn peer_cert_der(&self) -> Option<CertificateDer<'static>> {
         let cert = match self {
             NetStream::Plain(_) => return None,
@@ -331,7 +314,7 @@ impl TlsConfig {
     }
 }
 
-// --- Identity (NodeId) helpers ---
+// Identity (NodeId) helpers
 
 /// Derive the canonical NodeId from the peer certificate public key.
 ///
@@ -539,13 +522,6 @@ pub fn write_cert_files(
 }
 
 /// Complete test PKI (CA + node certs) for integration tests.
-///
-/// Creates a temp directory with:
-/// - ca.pem, ca-key.pem
-/// - node1.pem, node1-key.pem
-/// - node2.pem, node2-key.pem
-///
-/// Auto-cleanup on drop.
 pub struct TestPki {
     /// Temp directory containing all cert files
     dir: tempfile::TempDir,

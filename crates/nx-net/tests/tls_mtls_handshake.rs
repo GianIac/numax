@@ -152,8 +152,7 @@ async fn mtls_handshake_fails_with_invalid_client_cert() {
     let server_task = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("accept tcp");
 
-        // This should fail because the client certificate is not signed by the CA
-        // configured on the server for mTLS verification.
+        // This should fail because the client certificate is not signed by the CA configured on the server for mTLS verification.
         let res = acceptor.accept(tcp).await;
         assert!(res.is_err(), "server expected mTLS handshake to fail");
     });
@@ -164,8 +163,7 @@ async fn mtls_handshake_fails_with_invalid_client_cert() {
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("valid server name");
 
-        // The client should be able to verify the server (correct CA),
-        // but the handshake must still fail because the server rejects the client cert.
+        // The client should be able to verify the server (correct CA), but the handshake must still fail because the server rejects the client cert.
         let _ = connector.connect(server_name, tcp).await;
     });
 

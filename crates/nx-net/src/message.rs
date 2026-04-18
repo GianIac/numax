@@ -1,40 +1,36 @@
-//! Messaggi del protocollo nx-net.
-//!
-//! Formato wire: lunghezza (4 bytes big-endian) + JSON payload.
-
 use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
-/// Versione del protocollo.
+/// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Tipo di messaggio.
+/// Message type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageKind {
-    /// Handshake iniziale.
+    /// Initial handshake.
     Hello { node_id: NodeId, version: u32 },
 
-    /// Risposta a Hello.
+    /// Response to Hello.
     HelloAck { node_id: NodeId, version: u32 },
 
-    /// Invia operazioni CRDT.
+    /// Send CRDT operations.
     PushOps { ops: Vec<Op> },
 
-    /// Conferma ricezione ops.
+    /// Acknowledge ops reception.
     PushOpsAck { received_count: usize },
 
-    /// Richiedi operazioni da un certo punto.
-    /// `since_op_id` è l'ultimo op_id conosciuto (None = voglio tutto).
+    /// Request operations from a certain point.
+    /// `since_op_id` is the last known op_id (None = I want everything).
     PullSince { since_op_id: Option<String> },
 
-    /// Ping per keepalive.
+    /// Ping for keepalive.
     Ping,
 
-    /// Risposta a Ping.
+    /// Response to Ping.
     Pong,
 }
 
-/// Messaggio completo con metadata.
+/// Complete message with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub kind: MessageKind,
@@ -89,7 +85,7 @@ impl Message {
         }
     }
 
-    /// Serializza in bytes (length-prefixed JSON).
+    /// Serialize to bytes (length-prefixed JSON).
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         let json = serde_json::to_vec(self)?;
         let len = (json.len() as u32).to_be_bytes();
@@ -99,7 +95,7 @@ impl Message {
         Ok(buf)
     }
 
-    /// Deserializza da JSON bytes (senza prefisso lunghezza).
+    /// Deserialize from JSON bytes (without length prefix).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }

@@ -1,21 +1,3 @@
-//! # nx-net
-//!
-//! Peer-to-peer networking for Numax.
-//! Handles communication between nodes for CRDT synchronization.
-//!
-//! ## Protocol
-//! - `HELLO`: initial handshake with node_id and version
-//! - `PUSH_OPS`: send CRDT operations to peers
-//! - `PULL_SINCE`: request missing operations (anti-entropy)
-//!
-//! ## Transport
-//! TCP with TLS 1.3 / mTLS for secure, authenticated connections.
-//!
-//! ## Security
-//! - Mutual TLS: both peers authenticated
-//! - NodeId = SHA256(pubkey): cryptographic identity
-//! - Allowlist: optional permissioned network
-
 mod error;
 mod message;
 mod node;
