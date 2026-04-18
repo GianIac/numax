@@ -253,7 +253,11 @@ mod tests {
         fn cert_without_key_fails() {
             let r = validate_tls_flags(&p("a.pem"), &None, &None, &None, false);
             assert!(r.is_err());
-            assert!(r.unwrap_err().to_string().contains("must be provided together"));
+            assert!(
+                r.unwrap_err()
+                    .to_string()
+                    .contains("must be provided together")
+            );
         }
 
         #[test]
@@ -287,9 +291,7 @@ mod tests {
         #[test]
         fn allowlist_without_ca_fails() {
             let list = Some("abc".to_string());
-            assert!(
-                validate_tls_flags(&p("a.pem"), &p("k.pem"), &None, &list, false).is_err()
-            );
+            assert!(validate_tls_flags(&p("a.pem"), &p("k.pem"), &None, &list, false).is_err());
         }
 
         #[test]
@@ -331,16 +333,14 @@ mod tests {
 
         #[test]
         fn cert_key_ca_enables_mtls() {
-            let cfg =
-                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), None, false).unwrap();
+            let cfg = build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), None, false).unwrap();
             assert!(cfg.is_mtls_enabled());
         }
 
         #[test]
         fn allowlist_parsed_with_trim_and_dedup() {
             let list = Some(" abc , def, abc ,  ".to_string());
-            let cfg =
-                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
+            let cfg = build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
             let allowed = cfg.allowed_peers.unwrap();
             assert_eq!(allowed.len(), 2);
             assert!(allowed.contains("abc"));
@@ -350,8 +350,7 @@ mod tests {
         #[test]
         fn empty_allowlist_string_does_not_set_allowed_peers() {
             let list = Some(",,,".to_string());
-            let cfg =
-                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
+            let cfg = build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
             assert!(cfg.allowed_peers.is_none());
         }
     }
@@ -367,16 +366,12 @@ mod tests {
 
         #[test]
         fn listen_without_prefix_is_none() {
-            assert!(
-                build_sync_config(Some("0.0.0.0:9000".into()), vec![], vec![], None).is_none()
-            );
+            assert!(build_sync_config(Some("0.0.0.0:9000".into()), vec![], vec![], None).is_none());
         }
 
         #[test]
         fn prefix_without_listen_is_none() {
-            assert!(
-                build_sync_config(None, vec![], vec!["counter:".into()], None).is_none()
-            );
+            assert!(build_sync_config(None, vec![], vec!["counter:".into()], None).is_none());
         }
 
         #[test]
@@ -451,10 +446,7 @@ mod tests {
         #[test]
         fn repeated_peers_collected() {
             let cli = Cli::try_parse_from([
-                "nx", "run", "x.wasm",
-                "--peer", "a:1",
-                "--peer", "b:2",
-                "--peer", "c:3",
+                "nx", "run", "x.wasm", "--peer", "a:1", "--peer", "b:2", "--peer", "c:3",
             ])
             .unwrap();
             match cli {
@@ -465,9 +457,13 @@ mod tests {
         #[test]
         fn repeated_prefixes_collected() {
             let cli = Cli::try_parse_from([
-                "nx", "run", "x.wasm",
-                "--sync-prefix", "counter:",
-                "--sync-prefix", "state:",
+                "nx",
+                "run",
+                "x.wasm",
+                "--sync-prefix",
+                "counter:",
+                "--sync-prefix",
+                "state:",
             ])
             .unwrap();
             match cli {
@@ -495,11 +491,8 @@ mod tests {
 
         #[test]
         fn datastore_path_parsed() {
-            let cli = Cli::try_parse_from([
-                "nx", "run", "x.wasm",
-                "--datastore-path", "/tmp/nx",
-            ])
-            .unwrap();
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--datastore-path", "/tmp/nx"])
+                .unwrap();
             match cli {
                 Cli::Run { datastore_path, .. } => {
                     assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
@@ -509,11 +502,8 @@ mod tests {
 
         #[test]
         fn listen_parsed() {
-            let cli = Cli::try_parse_from([
-                "nx", "run", "x.wasm",
-                "--listen", "127.0.0.1:9000",
-            ])
-            .unwrap();
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--listen", "127.0.0.1:9000"]).unwrap();
             match cli {
                 Cli::Run { listen, .. } => {
                     assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
@@ -524,11 +514,17 @@ mod tests {
         #[test]
         fn clap_parses_all_tls_flags() {
             let cli = Cli::try_parse_from([
-                "nx", "run", "x.wasm",
-                "--tls-cert", "c.pem",
-                "--tls-key", "k.pem",
-                "--tls-ca", "ca.pem",
-                "--allowed-peers", "abc,def",
+                "nx",
+                "run",
+                "x.wasm",
+                "--tls-cert",
+                "c.pem",
+                "--tls-key",
+                "k.pem",
+                "--tls-ca",
+                "ca.pem",
+                "--allowed-peers",
+                "abc,def",
             ])
             .expect("parse must succeed");
 
@@ -552,8 +548,7 @@ mod tests {
 
         #[test]
         fn tls_insecure_flag_parsed() {
-            let cli =
-                Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
             match cli {
                 Cli::Run { tls_insecure, .. } => assert!(tls_insecure),
             }
