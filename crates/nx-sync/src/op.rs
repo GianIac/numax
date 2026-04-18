@@ -8,12 +8,12 @@ use crate::NodeId;
 pub struct OpId(String);
 
 impl OpId {
-    /// Genera un nuovo OpId univoco.
+    /// Generates a new unique OpId.
     pub fn generate() -> Self {
         Self(Uuid::new_v4().to_string())
     }
 
-    /// Crea un OpId da una stringa esistente.
+    /// Creates an OpId from an existing string.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -30,25 +30,25 @@ impl fmt::Display for OpId {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
-    /// Incremento di un GCounter.
+    /// GCounter increment.
     GCounterIncrement { key: String, increment: u64 },
 }
 
-/// Un'operazione CRDT completa, pronta per essere inviata/ricevuta.
+/// A complete CRDT operation, ready to be sent/received.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Op {
-    /// Identificatore univoco dell'operazione.
+    /// Unique identifier of the operation.
     pub id: OpId,
 
-    /// Nodo che ha originato l'operazione.
+    /// Node that originated the operation.
     pub origin: NodeId,
 
-    /// Tipo e dati dell'operazione.
+    /// Type and data of the operation.
     pub kind: OpKind,
 }
 
 impl Op {
-    /// Crea una nuova operazione GCounterIncrement.
+    /// Creates a new GCounterIncrement operation.
     pub fn gcounter_increment(origin: NodeId, key: impl Into<String>, increment: u64) -> Self {
         Self {
             id: OpId::generate(),
@@ -60,26 +60,26 @@ impl Op {
         }
     }
 
-    /// Serializza l'operazione in JSON.
+    /// Serializes the operation to JSON.
     ///
-    /// TODO(phase4-serialization): aggiungere metodo per bincode/msgpack
+    /// TODO(phase4-serialization): add method for bincode/msgpack
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
-    /// Deserializza un'operazione da JSON.
+    /// Deserializes an operation from JSON.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
 
-    /// Serializza in bytes (JSON per ora).
+    /// Serializes to bytes (JSON for now).
     ///
-    /// TODO(phase4-serialization): quando si passa a bincode, cambiare qui.
+    /// TODO(phase4-serialization): when switching to bincode, change here.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
 
-    /// Deserializza da bytes.
+    /// Deserializes from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
@@ -116,12 +116,12 @@ mod tests {
         let op = Op::gcounter_increment(node, "counter:test", 42);
 
         let json = op.to_json().unwrap();
-        println!("Op JSON: {}", json); // utile per debug
+        println!("Op JSON: {}", json); // useful for debugging
 
         let parsed = Op::from_json(&json).unwrap();
         assert_eq!(op.origin, parsed.origin);
         assert_eq!(op.kind, parsed.kind);
-        // id sarà diverso solo se ri-generiamo, ma qui è lo stesso
+        // id will only differ if we regenerate, but here it's the same
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! Distributed Counter Example
 //!
-//! Questo modulo WASM incrementa un contatore replicato.
-//! Quando eseguito su più nodi con sync abilitato,
-//! il contatore converge allo stesso valore su tutti i nodi.
+//! This WASM module increments a replicated counter.
+//! When run on multiple nodes with sync enabled,
+//! the counter converges to the same value on all nodes.
 //!
-//! ## Uso
+//! ## Usage
 //!
-//! Terminale 1 (Nodo A):
+//! Terminal 1 (Node A):
 //! ```bash
 //! nx run distributed_counter.wasm \
 //!     --listen 0.0.0.0:9000 \
@@ -14,7 +14,7 @@
 //!     --datastore-path ./data-a
 //! ```
 //!
-//! Terminale 2 (Nodo B):
+//! Terminal 2 (Node B):
 //! ```bash
 //! nx run distributed_counter.wasm \
 //!     --listen 0.0.0.0:9001 \
@@ -36,7 +36,7 @@ const COUNTER_KEY: &str = "counter:visits";
 pub extern "C" fn run() {
     log("=== Distributed Counter ===");
 
-    // Leggi valore attuale
+    // Read current value
     let current = match db::get(COUNTER_KEY) {
         Ok(Some(bytes)) => {
             if bytes.len() >= 8 {
@@ -46,17 +46,17 @@ pub extern "C" fn run() {
                 0
             }
         }
-        Ok(None) => 0,  // Chiave non esiste
+        Ok(None) => 0,  // Key does not exist
         Err(_) => 0,
     };
 
     log("Current value:");
     log(&current.to_string());
 
-    // Incrementa
+    // Increment
     let new_value = current + 1;
 
-    // Salva
+    // Save
     let bytes = new_value.to_le_bytes();
     if let Err(_) = db::set(COUNTER_KEY, &bytes) {
         log("Error saving counter!");

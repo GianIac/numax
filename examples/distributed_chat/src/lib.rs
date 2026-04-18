@@ -1,17 +1,17 @@
 //! Distributed Chat Example (Basic)
 //!
-//! Ogni esecuzione:
-//! 1. Mostra tutti i messaggi esistenti
-//! 2. Aggiunge un nuovo messaggio (se fornito)
+//! Each execution:
+//! 1. Displays all existing messages
+//! 2. Adds a new message (if provided)
 //!
-//! ## Uso
+//! ## Usage
 //!
 //! ```bash
-//! # Nodo A - invia messaggio
+//! # Node A - send message
 //! nx run chat.wasm --sync-prefix "chat:" --datastore-path ./data-a
-//! 
-//! # Per aggiungere messaggio, usa variabile env MESSAGE
-//! MESSAGE="Ciao!" nx run chat.wasm --sync-prefix "chat:" --datastore-path ./data-a
+//!
+//! # To add a message, use the MESSAGE env variable
+//! MESSAGE="Hello!" nx run chat.wasm --sync-prefix "chat:" --datastore-path ./data-a
 //! ```
 
 extern crate alloc;
@@ -30,11 +30,11 @@ pub extern "C" fn run() {
     log("╚══════════════════════════════╝");
     log("");
 
-    // Leggi messaggi esistenti
+    // Read existing messages
     let messages = load_messages();
     
     if messages.is_empty() {
-        log("(nessun messaggio)");
+        log("(no messages)");
     } else {
         for msg in &messages {
             log(msg);
@@ -44,29 +44,29 @@ pub extern "C" fn run() {
     log("");
     log("────────────────────────────────");
 
-    // Aggiungi nuovo messaggio (hardcoded per ora)
-    // In futuro: leggere da args o stdin
+    // Add new message (hardcoded for now)
+    // In the future: read from args or stdin
     let new_msg = get_new_message();
     
     if let Some(msg) = new_msg {
-        log("Invio:");
+        log("Sending:");
         log(&msg);
         
         let mut messages = messages;
         messages.push(msg);
         save_messages(&messages);
         
-        log("✓ Messaggio salvato!");
+        log("✓ Message saved!");
     } else {
-        log("(nessun nuovo messaggio)");
+        log("(no new message)");
     }
 }
 
-/// Carica i messaggi dal DB
+/// Loads messages from the DB.
 fn load_messages() -> Vec<String> {
     match db::get(CHAT_KEY) {
         Ok(Some(bytes)) => {
-            // Split per separatore
+            // Split by separator
             bytes
                 .split(|&b| b == MSG_SEPARATOR)
                 .filter(|s| !s.is_empty())
@@ -78,7 +78,7 @@ fn load_messages() -> Vec<String> {
     }
 }
 
-/// Salva i messaggi nel DB
+/// Saves messages to the DB.
 fn save_messages(messages: &[String]) {
     let mut bytes = Vec::new();
     
@@ -92,14 +92,14 @@ fn save_messages(messages: &[String]) {
     let _ = db::set(CHAT_KEY, &bytes);
 }
 
-/// Genera un messaggio di test con timestamp simulato
+/// Generates a test message with a simulated timestamp.
 fn get_new_message() -> Option<String> {
-    // Per ora: messaggio incrementale basato sul contatore
+    // For now: incremental message based on the counter
     let count = load_messages().len();
     
-    // Ogni 3 esecuzioni aggiungiamo un messaggio
+    // Every 3 executions we add a message
     if count < 10 {
-        Some(alloc::format!("[User] Messaggio #{}", count + 1))
+        Some(alloc::format!("[User] Message #{}", count + 1))
     } else {
         None
     }

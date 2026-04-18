@@ -1,6 +1,6 @@
 # Distributed Chat Example
 
-Chat distribuita basilare con Numax.
+Basic distributed chat with Numax.
 
 ## Build
 
@@ -12,17 +12,17 @@ cargo build --release --target wasm32-unknown-unknown
 ## Run
 
 ```bash
-# Dalla root di numax
+# From the numax root
 ./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
     --sync-prefix "chat:" \
     --datastore-path ./chat-data
 ```
 
-Esegui più volte per vedere i messaggi accumularsi!
+Run multiple times to see messages accumulate!
 
-## Con Sync (due nodi)
+## With Sync (two nodes)
 
-Terminale 1:
+Terminal 1:
 ```bash
 ./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
     --listen 0.0.0.0:9000 \
@@ -30,7 +30,7 @@ Terminale 1:
     --datastore-path ./chat-a
 ```
 
-Terminale 2:
+Terminal 2:
 ```bash
 ./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
     --listen 0.0.0.0:9001 \

@@ -34,7 +34,7 @@ pub extern "C" fn run() {
     }
     log_str("kv_roundtrip: db_set ok");
 
-    // 2) db_get (Gotcha: buffer preallocato)
+    // 2) db_get (Gotcha: pre-allocated buffer)
     let mut out_buf = vec![0u8; 64];
 
     let n = unsafe {
@@ -46,7 +46,7 @@ pub extern "C" fn run() {
         )
     };
 
-    // Gotcha: gestisci error codes, soprattutto -2
+    // Gotcha: handle error codes, especially -2
     if n == -1 {
         log_str("kv_roundtrip: db_get -> not found (-1)");
         return;
@@ -89,7 +89,7 @@ pub extern "C" fn run() {
     }
     log_str("kv_roundtrip: db_delete ok");
 
-    // 4) db_get dopo delete -> deve tornare -1 (not found)
+    // 4) db_get after delete -> should return -1 (not found)
     let mut out_buf2 = vec![0u8; 64];
     let n2 = unsafe {
         db_get(
