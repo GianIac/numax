@@ -11,19 +11,19 @@ use crate::host_api;
 use crate::sync_config::SyncConfig;
 use crate::sync_manager::SyncManager;
 
-/// Configurazione del runtime.
+// Runtime config
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Abilita o meno il supporto WASI (stdout, args, ecc.).
+    /// enable or not wasi support
     pub enable_wasi: bool,
 
-    /// Limite massimo di memoria per modulo (non ancora applicato).
+    /// Maximum memory limit per module (not yet enforced)
     pub max_memory_bytes: Option<u64>,
 
     /// The path to the datastore.
     pub datastore_path: PathBuf,
 
-    /// Configurazione sync (None = sync disabilitato).
+    /// config sync (None = sync disabled).
     pub sync: Option<SyncConfig>,
 }
 
@@ -38,7 +38,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Stato host associato allo Store.
+/// Host status associated with the Store
 pub struct HostState {
     pub wasi: Option<p1::WasiP1Ctx>,
     pub store: Arc<NxStore>,
@@ -55,7 +55,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
-        // Engine con config (utile per debug/backtrace; limiti memory opzionali in futuro)
+        // Engine con config (for debug/backtrace; memory limit optional in the future)
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
         let engine = Engine::new(&wasm_cfg)?;
@@ -70,19 +70,15 @@ impl Runtime {
         // WASI base (preview1 / p1)
         if config.enable_wasi {
             wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
-                state
-                    .wasi
-                    .as_mut()
-                    .expect("WASI abilitato ma non inizializzato nello store")
+                state.wasi.as_mut().expect("WASI enabled but not initialized in the store")
             })?;
         }
 
-        // apri il datastore UNA SOLA VOLTA qui
-        let store = NxStore::open(&config.datastore_path)
-            .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
+        // open the datastore ONE TIME HERE
+        let store = NxStore::open(&config.datastore_path).map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
         let store = Arc::new(store);
 
-        // Inizializza SyncManager se configurato
+        // Initialize SyncManager if configured
         let sync_manager = if let Some(ref sync_config) = config.sync {
             let node_id = NodeId::generate();
             let manager = SyncManager::new(node_id, sync_config.clone());
@@ -91,45 +87,35 @@ impl Runtime {
             None
         };
 
-        Ok(Self {
-            engine,
-            linker,
-            config,
-            store,
-            sync_manager,
-        })
+        Ok(Self { engine, linker,config ,store ,sync_manager })
     }
 
-    /// Avvia il sync networking (se configurato).
-    /// Deve essere chiamato prima di run_module in contesto async.
+    /// Start sync networking (if configured).
     pub async fn start_sync(&self) -> Result<()> {
         if let Some(ref _manager) = self.sync_manager {
-            // SyncManager::start richiede &mut self, ma abbiamo Arc
-            // Per ora skip - implementazione completa richiede refactor
-            tracing::info!(
-                "sync manager configured (full start requires async runtime integration)"
-            );
+            // SyncManager::start requires &mut self, but we have Arc... nb: Skip for now, full implementation requires refactor
+            tracing::info!("sync manager configured (full start requires async runtime integration)");
         }
         Ok(())
     }
 
-    /// Restituisce il SyncManager (se presente).
+    /// Return the SyncManager (if is present).
     pub fn sync_manager(&self) -> Option<Arc<SyncManager>> {
         self.sync_manager.clone()
     }
 
     pub fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
-        // handle condiviso al DB
+        // handle shared to the DB
         let store_db = Arc::clone(&self.store);
 
-        // 1. Costruisce lo stato host per questo run
+        // Builds the host state for this run
         let host_state = if self.config.enable_wasi {
             let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
 
-            HostState {
-                wasi: Some(wasi),
-                store: store_db,
-                sync_manager: self.sync_manager.clone(),
+        HostState {
+            wasi: Some(wasi),
+            store: store_db,
+            sync_manager: self.sync_manager.clone(),
             }
         } else {
             HostState {
@@ -141,23 +127,23 @@ impl Runtime {
 
         let mut store = Store::new(&self.engine, host_state);
 
-        // 2. Compilazione / validazione modulo
+        // Form completion / validation
         let module = Module::new(&self.engine, wasm_bytes)
             .map_err(|e| anyhow!("Invalid module (compile/validate): {e}"))?;
 
-        // 3. Istanziazione (linking import/host)
+        // 3. Instantiation (linking import/host)
         let instance = self
             .linker
             .instantiate(&mut store, &module)
             .map_err(|e| anyhow!("Link error while instantiating module: {e}"))?;
 
-        // 4. Entrypoint: prima `run`, poi `_start`
+        // 4. Entrypoint: `run` - `_start`
         let run = instance
             .get_typed_func::<(), ()>(&mut store, "run")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
             .map_err(|e| anyhow!("No entrypoint found (expected `run` or `_start`): {e}"))?;
 
-        // 5. Esecuzione
+        // Execution
         run.call(&mut store, ())
             .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 

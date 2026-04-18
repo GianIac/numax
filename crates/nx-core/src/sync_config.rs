@@ -1,13 +1,13 @@
-/// Configurazione sync per il runtime.
+/// config sync fo the runtime.
 #[derive(Debug, Clone, Default)]
 pub struct SyncConfig {
-    /// Prefissi di chiavi da replicare (es. ["counter:", "state:"]).
+    /// Key prefixes to replicate (es. ["counter:", "state:"]).
     pub replicated_prefixes: Vec<String>,
 
-    /// Indirizzi dei peer iniziali (es. ["127.0.0.1:9001"]).
+    /// Initial peer addresses (es. ["127.0.0.1:9001"]).
     pub peers: Vec<String>,
 
-    /// Indirizzo su cui ascoltare (es. "0.0.0.0:9000").
+    /// Address to listen on (es. "0.0.0.0:9000").
     pub listen_addr: Option<String>,
 }
 
@@ -31,12 +31,12 @@ impl SyncConfig {
         self
     }
 
-    /// Controlla se una chiave appartiene a un prefisso replicato.
+    /// Check if a key belongs to a replicated prefix
     pub fn is_replicated(&self, key: &str) -> bool {
         self.replicated_prefixes.iter().any(|p| key.starts_with(p))
     }
 
-    /// Sync è abilitato se c'è almeno un prefisso e un listen_addr.
+    /// Sync is enabled if there is at least one prefix and one listen_addr.
     pub fn is_enabled(&self) -> bool {
         !self.replicated_prefixes.is_empty() && self.listen_addr.is_some()
     }

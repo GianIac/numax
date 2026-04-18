@@ -22,12 +22,8 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
 }
 
 /// Read len bytes from guest memory at ptr, returning them as a Vec<u8>.
-fn read_bytes(
-    caller: &mut Caller<'_, HostState>,
-    memory: &Memory,
-    ptr: u32,
-    len: u32,
-) -> Result<Vec<u8>> {
+fn read_bytes(caller: &mut Caller<'_, HostState>,memory: &Memory, ptr: u32,len: u32,) -> Result<Vec<u8>> {
+
     if len > MAX_READ_LEN {
         anyhow::bail!("requested length too large: {len} > {MAX_READ_LEN}");
     }
@@ -37,18 +33,14 @@ fn read_bytes(
     Ok(buf)
 }
 
-fn db_get_impl(
-    mut caller: Caller<'_, HostState>,
-    key_ptr: u32,
-    key_len: u32,
-    out_ptr: u32,
-    out_cap: u32,
-) -> i32 {
+fn db_get_impl(mut caller: Caller<'_, HostState>,key_ptr: u32,key_len: u32,out_ptr: u32,out_cap: u32,) -> i32 {
+
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {
             eprintln!("[nx-core] db_get: no `memory` export on guest");
             return ERR_INTERNAL;
+
         }
     };
 
@@ -94,13 +86,7 @@ fn db_get_impl(
     value.len() as i32
 }
 
-fn db_set_impl(
-    mut caller: Caller<'_, HostState>,
-    key_ptr: u32,
-    key_len: u32,
-    val_ptr: u32,
-    val_len: u32,
-) -> i32 {
+fn db_set_impl(mut caller: Caller<'_, HostState>,key_ptr: u32,key_len: u32,val_ptr: u32,val_len: u32,) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {

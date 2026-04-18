@@ -3,11 +3,6 @@ use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 
-/// Legacy ABI: kept for backwards compatibility with already-compiled guest modules.
-/// NOTE: do not change the signature or semantics of this function.
-/// Signature (WASM): (ptr: u32, len: u32) -> ()
-///
-/// New code should prefer `host_log_v2`.
 const MAX_MSG_LEN: u32 = 8 * 1024; // 8 KiB
 
 /// v2 return codes (only for host_log_v2)
@@ -21,12 +16,8 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     }
 }
 
-fn read_bytes(
-    caller: &mut Caller<'_, HostState>,
-    memory: &Memory,
-    ptr: u32,
-    len: u32,
-) -> Result<Vec<u8>> {
+fn read_bytes(caller: &mut Caller<'_, HostState>,memory: &Memory,ptr: u32,len: u32,) -> Result<Vec<u8>> {
+    
     if len > MAX_MSG_LEN {
         anyhow::bail!("message too large: {len} > {MAX_MSG_LEN}");
     }
@@ -36,13 +27,6 @@ fn read_bytes(
 }
 
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
-    // -------------------------------------------------------------------------
-    // LEGACY API (do not break):
-    // nx::host_log(ptr,len) -> ()
-    //
-    // Best-effort logging. Never traps intentionally. Does not return an error
-    // code because older guests expect `()`.
-    // -------------------------------------------------------------------------
     linker.func_wrap(
         "nx",
         "host_log",
@@ -67,18 +51,8 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // -------------------------------------------------------------------------
-    // V2 API (preferred):
-    // nx::host_log_v2(ptr,len) -> i32
-    //
-    // Returns:
-    //   0  => ok
-    //  -3  => internal error (no memory export / invalid read)
-    //
-    // Rationale:
-    // - allows guests to detect failures
-    // - enables future extensions (levels, structured logs, etc.)
-    // -------------------------------------------------------------------------
+
+    // Returns: 0  => ok or -3  => internal error (no memory export / invalid read)
     linker.func_wrap(
         "nx",
         "host_log_v2",
