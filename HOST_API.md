@@ -115,14 +115,13 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 Writes a log message.
 
 ```text
-fn host_log_v2(level: u32, msg_ptr: u32, msg_len: u32)
+fn host_log_v2(u32, msg_ptr: u32, msg_len: u32)
 ```
 
 **Parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `level` | `u32` | Log level (0=trace, 1=debug, 2=info, 3=warn, 4=error) |
 | `msg_ptr` | `u32` | Pointer to the message |
 | `msg_len` | `u32` | Length of the message |
 
