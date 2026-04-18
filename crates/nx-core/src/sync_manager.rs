@@ -73,8 +73,11 @@ impl SyncManager {
         };
 
         // crate and start the node
-        let node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
-            .with_peers(self.config.peers.clone());
+        let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr).with_peers(self.config.peers.clone());
+
+        if let Some(tls) = self.config.tls.clone() {
+            node_config = node_config.with_tls(tls);
+        }
 
         let mut node = Node::new(node_config);
         let mut event_rx = node.take_event_receiver().unwrap();

@@ -4,3 +4,4 @@ pub mod sync_config;
 pub mod sync_manager;
 
 pub use sync_config::SyncConfig;
+pub use nx_net::TlsConfig;

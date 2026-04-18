@@ -75,11 +75,11 @@
 - [x] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
 
 **CLI Flags:**
-- [ ] `--tls-cert <path>` - Certificato nodo
-- [ ] `--tls-key <path>` - Chiave privata nodo
-- [ ] `--tls-ca <path>` - CA per verificare peer
-- [ ] `--allowed-peers <id1,id2,...>` - Allowlist NodeID
-- [ ] `--tls-insecure` - Dev only, skip verify (warning)
+- [x] `--tls-cert <path>` - Certificato nodo
+- [x] `--tls-key <path>` - Chiave privata nodo
+- [x] `--tls-ca <path>` - CA per verificare peer
+- [x] `--allowed-peers <id1,id2,...>` - Allowlist NodeID
+- [x] `--tls-insecure` - Dev only, skip verify (warning)
 
 **Test Security:**
 - [x] Test: connessione TLS funziona tra 2 nodi
@@ -88,7 +88,7 @@
 - [x] Test: mTLS - entrambi i peer autenticati
 - [x] Test: NodeID mismatch → disconnect
 - [x] Test: peer non in allowlist → rifiutato
-- [ ] Test: test per nuovi cli flags
+- [x] Test: test per nuovi cli flags
 
 **Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
 
@@ -415,7 +415,7 @@ nx run module.wasm --sync --debug-protocol
 ## Criteri Release v0.1.0
 
 - [x] Fasi 0-5 complete
-- [ ] Fase 6 (TLS) completa
+- [x] Fase 6 (TLS) completa
 - [ ] Fase 7 (Graceful shutdown) completa
 - [ ] Fase 8 (Backpressure) completa
 - [ ] Fase 9 (Observability) almeno logging + health

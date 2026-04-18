@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
-use nx_core::SyncConfig;
 use nx_core::runtime::{Runtime, RuntimeConfig};
-use tracing::info;
+use nx_core::{SyncConfig, TlsConfig};
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "nx")]
@@ -35,6 +36,26 @@ enum Cli {
         /// Enable verbose logging
         #[arg(short, long)]
         verbose: bool,
+
+        /// Path to this node's TLS certificate (PEM)
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+
+        /// Path to this node's TLS private key (PEM)
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<PathBuf>,
+
+        /// Path to the CA certificate used to verify peers (PEM, enables mTLS)
+        #[arg(long, value_name = "PATH")]
+        tls_ca: Option<PathBuf>,
+
+        /// Comma-separated allowlist of peer NodeIds (hex). Requires --tls-ca.
+        #[arg(long, value_name = "ID1,ID2,...")]
+        allowed_peers: Option<String>,
+
+        /// Skip TLS certificate verification (DEVELOPMENT ONLY).
+        #[arg(long)]
+        tls_insecure: bool,
     },
 }
 
@@ -56,6 +77,11 @@ fn real_main() -> Result<()> {
             peers,
             sync_prefixes,
             verbose,
+            tls_cert,
+            tls_key,
+            tls_ca,
+            allowed_peers,
+            tls_insecure,
         } => {
             // Setup logging
             let log_level = if verbose { "debug" } else { "info" };
@@ -66,39 +92,32 @@ fn real_main() -> Result<()> {
                 )
                 .init();
 
+            // Validate TLS flag combinations
+            validate_tls_flags(&tls_cert, &tls_key, &tls_ca, &allowed_peers, tls_insecure)?;
+
+            // Build TlsConfig (if any TLS-related flag was provided)
+            let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
+
+            // Build SyncConfig (if listen or sync-prefix were provided)
+            let sync = build_sync_config(listen, peers, sync_prefixes, tls);
+
+            // Read the wasm module
             let bytes = fs::read(&module)?;
 
+            // Build the runtime config
             let mut cfg = RuntimeConfig::default();
-
             if let Some(p) = datastore_path {
                 cfg.datastore_path = p;
             }
-
-            // Configura sync se abilitato
-            if listen.is_some() || !sync_prefixes.is_empty() {
-                let mut sync_cfg = SyncConfig::new();
-
-                if let Some(addr) = listen {
-                    sync_cfg = sync_cfg.with_listen_addr(addr);
-                }
-
-                for peer in peers {
-                    sync_cfg = sync_cfg.with_peer(peer);
-                }
-
-                for prefix in sync_prefixes {
-                    sync_cfg = sync_cfg.with_prefix(prefix);
-                }
-
-                if sync_cfg.is_enabled() {
-                    info!(
-                        listen = ?sync_cfg.listen_addr,
-                        prefixes = ?sync_cfg.replicated_prefixes,
-                        peers = ?sync_cfg.peers,
-                        "sync enabled"
-                    );
-                    cfg.sync = Some(sync_cfg);
-                }
+            if let Some(s) = sync {
+                info!(
+                    listen = ?s.listen_addr,
+                    prefixes = ?s.replicated_prefixes,
+                    peers = ?s.peers,
+                    tls = s.tls.is_some(),
+                    "sync enabled"
+                );
+                cfg.sync = Some(s);
             }
 
             let rt = Runtime::new(cfg)?;
@@ -107,4 +126,437 @@ fn real_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Validate that the TLS-related CLI flags form a coherent combination.
+fn validate_tls_flags(
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    tls_ca: &Option<PathBuf>,
+    allowed_peers: &Option<String>,
+    tls_insecure: bool,
+) -> Result<()> {
+    if tls_cert.is_some() ^ tls_key.is_some() {
+        bail!("--tls-cert and --tls-key must be provided together");
+    }
+    if tls_insecure && (tls_ca.is_some() || allowed_peers.is_some()) {
+        bail!("--tls-insecure is mutually exclusive with --tls-ca and --allowed-peers");
+    }
+    if allowed_peers.is_some() && tls_ca.is_none() && !tls_insecure {
+        bail!("--allowed-peers requires --tls-ca (peers must be authenticated via mTLS)");
+    }
+    Ok(())
+}
+
+/// Build TlsConfig from CLI flags.
+fn build_tls_config(
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_ca: Option<PathBuf>,
+    allowed_peers: Option<String>,
+    tls_insecure: bool,
+) -> Option<TlsConfig> {
+    if tls_insecure {
+        warn!("--tls-insecure enabled: peer verification disabled, DO NOT USE IN PRODUCTION");
+        return Some(TlsConfig::insecure_dev());
+    }
+
+    let (cert, key) = match (tls_cert, tls_key) {
+        (Some(c), Some(k)) => (c, k),
+        _ => return None,
+    };
+
+    let cert_s = cert.to_string_lossy().into_owned();
+    let key_s = key.to_string_lossy().into_owned();
+
+    let mut cfg = match tls_ca {
+        Some(ca) => TlsConfig::new(cert_s, key_s, ca.to_string_lossy().into_owned()),
+        None => TlsConfig {
+            cert_path: Some(cert_s),
+            key_path: Some(key_s),
+            ca_path: None,
+            allowed_peers: None,
+            insecure: false,
+        },
+    };
+
+    if let Some(list) = allowed_peers {
+        let set: HashSet<String> = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !set.is_empty() {
+            cfg = cfg.with_allowed_peers(set);
+        }
+    }
+
+    Some(cfg)
+}
+
+/// Build a SyncConfig from CLI flags.
+fn build_sync_config(
+    listen: Option<String>,
+    peers: Vec<String>,
+    sync_prefixes: Vec<String>,
+    tls: Option<TlsConfig>,
+) -> Option<SyncConfig> {
+    if listen.is_none() && sync_prefixes.is_empty() {
+        return None;
+    }
+
+    let mut cfg = SyncConfig::new();
+    if let Some(addr) = listen {
+        cfg = cfg.with_listen_addr(addr);
+    }
+    for p in peers {
+        cfg = cfg.with_peer(p);
+    }
+    for p in sync_prefixes {
+        cfg = cfg.with_prefix(p);
+    }
+    if let Some(t) = tls {
+        cfg = cfg.with_tls(t);
+    }
+
+    if !cfg.is_enabled() {
+        warn!(
+            listen = ?cfg.listen_addr,
+            prefixes = ?cfg.replicated_prefixes,
+            "sync not enabled: both --listen and --sync-prefix are required"
+        );
+        return None;
+    }
+
+    Some(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(s))
+    }
+
+    // validate_tls_flags
+    mod validate_tls {
+        use super::*;
+
+        #[test]
+        fn no_tls_flags_is_ok() {
+            assert!(validate_tls_flags(&None, &None, &None, &None, false).is_ok());
+        }
+
+        #[test]
+        fn cert_without_key_fails() {
+            let r = validate_tls_flags(&p("a.pem"), &None, &None, &None, false);
+            assert!(r.is_err());
+            assert!(r.unwrap_err().to_string().contains("must be provided together"));
+        }
+
+        #[test]
+        fn key_without_cert_fails() {
+            assert!(validate_tls_flags(&None, &p("k.pem"), &None, &None, false).is_err());
+        }
+
+        #[test]
+        fn cert_and_key_ok() {
+            assert!(validate_tls_flags(&p("a.pem"), &p("k.pem"), &None, &None, false).is_ok());
+        }
+
+        #[test]
+        fn full_mtls_ok() {
+            assert!(
+                validate_tls_flags(&p("a.pem"), &p("k.pem"), &p("ca.pem"), &None, false).is_ok()
+            );
+        }
+
+        #[test]
+        fn insecure_with_ca_fails() {
+            assert!(validate_tls_flags(&None, &None, &p("ca.pem"), &None, true).is_err());
+        }
+
+        #[test]
+        fn insecure_with_allowlist_fails() {
+            let list = Some("abc,def".to_string());
+            assert!(validate_tls_flags(&None, &None, &None, &list, true).is_err());
+        }
+
+        #[test]
+        fn allowlist_without_ca_fails() {
+            let list = Some("abc".to_string());
+            assert!(
+                validate_tls_flags(&p("a.pem"), &p("k.pem"), &None, &list, false).is_err()
+            );
+        }
+
+        #[test]
+        fn allowlist_with_ca_ok() {
+            let list = Some("abc,def".to_string());
+            assert!(
+                validate_tls_flags(&p("a.pem"), &p("k.pem"), &p("ca.pem"), &list, false).is_ok()
+            );
+        }
+
+        #[test]
+        fn insecure_alone_ok() {
+            assert!(validate_tls_flags(&None, &None, &None, &None, true).is_ok());
+        }
+    }
+
+    // build_tls_config
+    mod build_tls {
+        use super::*;
+
+        #[test]
+        fn returns_none_without_flags() {
+            assert!(build_tls_config(None, None, None, None, false).is_none());
+        }
+
+        #[test]
+        fn insecure_overrides_everything() {
+            let cfg = build_tls_config(None, None, None, None, true).unwrap();
+            assert!(cfg.insecure);
+            assert!(!cfg.is_enabled());
+        }
+
+        #[test]
+        fn cert_key_only_no_mtls() {
+            let cfg = build_tls_config(p("c.pem"), p("k.pem"), None, None, false).unwrap();
+            assert!(cfg.is_enabled());
+            assert!(!cfg.is_mtls_enabled());
+        }
+
+        #[test]
+        fn cert_key_ca_enables_mtls() {
+            let cfg =
+                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), None, false).unwrap();
+            assert!(cfg.is_mtls_enabled());
+        }
+
+        #[test]
+        fn allowlist_parsed_with_trim_and_dedup() {
+            let list = Some(" abc , def, abc ,  ".to_string());
+            let cfg =
+                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
+            let allowed = cfg.allowed_peers.unwrap();
+            assert_eq!(allowed.len(), 2);
+            assert!(allowed.contains("abc"));
+            assert!(allowed.contains("def"));
+        }
+
+        #[test]
+        fn empty_allowlist_string_does_not_set_allowed_peers() {
+            let list = Some(",,,".to_string());
+            let cfg =
+                build_tls_config(p("c.pem"), p("k.pem"), p("ca.pem"), list, false).unwrap();
+            assert!(cfg.allowed_peers.is_none());
+        }
+    }
+
+    // build_sync_config
+    mod build_sync {
+        use super::*;
+
+        #[test]
+        fn no_listen_no_prefix_is_none() {
+            assert!(build_sync_config(None, vec![], vec![], None).is_none());
+        }
+
+        #[test]
+        fn listen_without_prefix_is_none() {
+            assert!(
+                build_sync_config(Some("0.0.0.0:9000".into()), vec![], vec![], None).is_none()
+            );
+        }
+
+        #[test]
+        fn prefix_without_listen_is_none() {
+            assert!(
+                build_sync_config(None, vec![], vec!["counter:".into()], None).is_none()
+            );
+        }
+
+        #[test]
+        fn full_config_is_some() {
+            let cfg = build_sync_config(
+                Some("0.0.0.0:9000".into()),
+                vec!["a:1".into(), "b:2".into()],
+                vec!["counter:".into()],
+                None,
+            )
+            .unwrap();
+            assert_eq!(cfg.peers.len(), 2);
+            assert_eq!(cfg.replicated_prefixes, vec!["counter:"]);
+            assert_eq!(cfg.listen_addr.as_deref(), Some("0.0.0.0:9000"));
+            assert!(cfg.tls.is_none());
+        }
+
+        #[test]
+        fn tls_is_propagated() {
+            let tls = Some(TlsConfig::insecure_dev());
+            let cfg = build_sync_config(
+                Some("0.0.0.0:9000".into()),
+                vec![],
+                vec!["counter:".into()],
+                tls,
+            )
+            .unwrap();
+            assert!(cfg.tls.is_some());
+        }
+    }
+
+    // clap parsing
+    mod clap_parsing {
+        use super::*;
+
+        #[test]
+        fn minimal_args() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm"]).unwrap();
+            match cli {
+                Cli::Run {
+                    module,
+                    peers,
+                    sync_prefixes,
+                    verbose,
+                    tls_insecure,
+                    ..
+                } => {
+                    assert_eq!(module, PathBuf::from("x.wasm"));
+                    assert!(peers.is_empty());
+                    assert!(sync_prefixes.is_empty());
+                    assert!(!verbose);
+                    assert!(!tls_insecure);
+                }
+            }
+        }
+
+        #[test]
+        fn missing_module_fails() {
+            assert!(Cli::try_parse_from(["nx", "run"]).is_err());
+        }
+
+        #[test]
+        fn unknown_flag_fails() {
+            assert!(Cli::try_parse_from(["nx", "run", "x.wasm", "--bogus"]).is_err());
+        }
+
+        #[test]
+        fn no_subcommand_fails() {
+            assert!(Cli::try_parse_from(["nx"]).is_err());
+        }
+
+        #[test]
+        fn repeated_peers_collected() {
+            let cli = Cli::try_parse_from([
+                "nx", "run", "x.wasm",
+                "--peer", "a:1",
+                "--peer", "b:2",
+                "--peer", "c:3",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run { peers, .. } => assert_eq!(peers, vec!["a:1", "b:2", "c:3"]),
+            }
+        }
+
+        #[test]
+        fn repeated_prefixes_collected() {
+            let cli = Cli::try_parse_from([
+                "nx", "run", "x.wasm",
+                "--sync-prefix", "counter:",
+                "--sync-prefix", "state:",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run { sync_prefixes, .. } => {
+                    assert_eq!(sync_prefixes, vec!["counter:", "state:"]);
+                }
+            }
+        }
+
+        #[test]
+        fn verbose_short_flag() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "-v"]).unwrap();
+            match cli {
+                Cli::Run { verbose, .. } => assert!(verbose),
+            }
+        }
+
+        #[test]
+        fn verbose_long_flag() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--verbose"]).unwrap();
+            match cli {
+                Cli::Run { verbose, .. } => assert!(verbose),
+            }
+        }
+
+        #[test]
+        fn datastore_path_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx", "run", "x.wasm",
+                "--datastore-path", "/tmp/nx",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run { datastore_path, .. } => {
+                    assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
+                }
+            }
+        }
+
+        #[test]
+        fn listen_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx", "run", "x.wasm",
+                "--listen", "127.0.0.1:9000",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run { listen, .. } => {
+                    assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
+                }
+            }
+        }
+
+        #[test]
+        fn clap_parses_all_tls_flags() {
+            let cli = Cli::try_parse_from([
+                "nx", "run", "x.wasm",
+                "--tls-cert", "c.pem",
+                "--tls-key", "k.pem",
+                "--tls-ca", "ca.pem",
+                "--allowed-peers", "abc,def",
+            ])
+            .expect("parse must succeed");
+
+            match cli {
+                Cli::Run {
+                    tls_cert,
+                    tls_key,
+                    tls_ca,
+                    allowed_peers,
+                    tls_insecure,
+                    ..
+                } => {
+                    assert_eq!(tls_cert.unwrap().to_string_lossy(), "c.pem");
+                    assert_eq!(tls_key.unwrap().to_string_lossy(), "k.pem");
+                    assert_eq!(tls_ca.unwrap().to_string_lossy(), "ca.pem");
+                    assert_eq!(allowed_peers.as_deref(), Some("abc,def"));
+                    assert!(!tls_insecure);
+                }
+            }
+        }
+
+        #[test]
+        fn tls_insecure_flag_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
+            match cli {
+                Cli::Run { tls_insecure, .. } => assert!(tls_insecure),
+            }
+        }
+    }
 }
