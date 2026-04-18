@@ -1,27 +1,3 @@
-//! GCounter - Grow-only Counter CRDT.
-//!
-//! Un GCounter è un contatore distribuito che supporta solo incrementi.
-//! Ogni nodo mantiene il proprio "slot" e può incrementare solo quello.
-//!
-//! ## Proprietà CRDT
-//! - **Commutatività**: merge(A, B) == merge(B, A)
-//! - **Associatività**: merge(merge(A, B), C) == merge(A, merge(B, C))
-//! - **Idempotenza**: merge(A, A) == A
-//!
-//! ## Esempio
-//! ```
-//! use nx_sync::{GCounter, NodeId};
-//!
-//! let mut counter = GCounter::new();
-//! let node_a = NodeId::new("node-a");
-//! let node_b = NodeId::new("node-b");
-//!
-//! counter.increment(&node_a, 5);
-//! counter.increment(&node_b, 3);
-//!
-//! assert_eq!(counter.value(), 8);
-//! ```
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -29,53 +5,43 @@ use crate::{NodeId, Op, OpKind, SyncResult};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GCounter {
-    /// Mappa: NodeId -> valore locale di quel nodo.
+    /// Map: NodeId -> local value of that node.
     counts: HashMap<String, u64>,
 }
 
 impl GCounter {
-    /// Crea un nuovo GCounter vuoto.
+    /// Creates a new empty GCounter.
     pub fn new() -> Self {
         Self {
             counts: HashMap::new(),
         }
     }
 
-    /// Restituisce il valore totale del contatore (somma di tutti gli slot).
+    /// Returns the total counter value (sum of all slots).
     pub fn value(&self) -> u64 {
         self.counts.values().sum()
     }
 
-    /// Restituisce il valore dello slot di un nodo specifico.
+    /// Returns the slot value for a specific node.
     pub fn value_for(&self, node: &NodeId) -> u64 {
         self.counts.get(node.as_str()).copied().unwrap_or(0)
     }
 
-    /// Incrementa lo slot del nodo specificato.
-    ///
-    /// Nota: in un sistema reale, un nodo dovrebbe incrementare
-    /// solo il proprio slot. Questa funzione è "trusted".
+    /// Increments the slot of the specified node.
     pub fn increment(&mut self, node: &NodeId, delta: u64) {
         let entry = self.counts.entry(node.as_str().to_string()).or_insert(0);
         *entry = entry.saturating_add(delta);
     }
 
-    /// Applica un'operazione al GCounter.
-    ///
-    /// Restituisce `true` se lo stato è cambiato, `false` se era già aggiornato.
+    /// Applies an operation to the GCounter.
     pub fn apply_op(&mut self, op: &Op) -> SyncResult<bool> {
         match &op.kind {
             OpKind::GCounterIncrement { key: _, increment } => {
                 let node_key = op.origin.as_str().to_string();
                 let current = self.counts.get(&node_key).copied().unwrap_or(0);
 
-                // In un GCounter, l'operazione contiene il delta.
-                // Per idempotenza, dobbiamo tenere traccia delle op già applicate
-                // oppure usare il valore assoluto. Qui usiamo delta semplice.
-                //
-                // NOTA: per vera idempotenza, servirebbe un set di OpId visti.
-                // Per ora, assumiamo che nx-net deduplichi prima di chiamare apply_op.
                 let new_value = current.saturating_add(*increment);
+
                 if new_value != current {
                     self.counts.insert(node_key, new_value);
                     Ok(true)
@@ -86,10 +52,7 @@ impl GCounter {
         }
     }
 
-    /// Merge di due GCounter: prende il max di ogni slot.
-    ///
-    /// Questa è l'operazione fondamentale che garantisce convergenza.
-    /// Dopo il merge, entrambi i nodi avranno lo stesso stato.
+    /// Merges two GCounters: takes the max of each slot.
     pub fn merge(&mut self, other: &GCounter) {
         for (node, &value) in &other.counts {
             let entry = self.counts.entry(node.clone()).or_insert(0);
@@ -97,37 +60,35 @@ impl GCounter {
         }
     }
 
-    /// Crea un nuovo GCounter risultato del merge (senza mutare self).
+    /// Creates a new GCounter as a result of the merge (without mutating self).
     pub fn merged_with(&self, other: &GCounter) -> GCounter {
         let mut result = self.clone();
         result.merge(other);
         result
     }
 
-    /// Restituisce tutti i nodi che hanno contribuito al counter.
+    /// Returns all nodes that have contributed to the counter.
     pub fn nodes(&self) -> impl Iterator<Item = &str> {
         self.counts.keys().map(|s| s.as_str())
     }
 
-    /// Restituisce il numero di nodi che hanno contribuito.
+    /// Returns the number of nodes that have contributed.
     pub fn node_count(&self) -> usize {
         self.counts.len()
     }
 
-    /// Serializza in JSON.
+    /// Serializes to JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
-    /// Deserializza da JSON.
+    /// Deserializes from JSON.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
 }
 
-/// Crea un'operazione di incremento per questo GCounter.
-///
-/// Utility per generare Op da inviare ai peer.
+/// Utility to generate an Op to send to peers.
 pub fn create_increment_op(node: &NodeId, key: &str, increment: u64) -> Op {
     Op::gcounter_increment(node.clone(), key, increment)
 }
@@ -171,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_gcounter_merge_takes_max() {
-        // Simula due nodi con stati diversi
+        // Simulate two nodes with different states
         let node_a = NodeId::new("node-a");
         let node_b = NodeId::new("node-b");
 
@@ -180,13 +141,13 @@ mod tests {
         counter1.increment(&node_b, 3);
 
         let mut counter2 = GCounter::new();
-        counter2.increment(&node_a, 2); // meno di counter1
-        counter2.increment(&node_b, 7); // più di counter1
+        counter2.increment(&node_a, 2); // less than counter1
+        counter2.increment(&node_b, 7); // more than counter1
 
         // Merge counter2 into counter1
         counter1.merge(&counter2);
 
-        // Deve prendere il max: A=5, B=7
+        // Must take the max: A=5, B=7
         assert_eq!(counter1.value_for(&node_a), 5);
         assert_eq!(counter1.value_for(&node_b), 7);
         assert_eq!(counter1.value(), 12);
@@ -211,7 +172,7 @@ mod tests {
         // merge(c2, c1)
         let merged_2_1 = c2.merged_with(&c1);
 
-        // Devono essere uguali (commutatività)
+        // Must be equal (commutativity)
         assert_eq!(merged_1_2.value(), merged_2_1.value());
         assert_eq!(merged_1_2.value_for(&node_a), merged_2_1.value_for(&node_a));
         assert_eq!(merged_1_2.value_for(&node_b), merged_2_1.value_for(&node_b));
@@ -226,10 +187,10 @@ mod tests {
 
         let before = counter.value();
 
-        // Merge con se stesso
+        // Merge with itself
         counter.merge(&counter.clone());
 
-        // Il valore non deve cambiare (idempotenza)
+        // Value must not change (idempotency)
         assert_eq!(counter.value(), before);
     }
 
@@ -256,7 +217,7 @@ mod tests {
         let right_inner = c2.merged_with(&c3);
         let right = c1.merged_with(&right_inner);
 
-        // Devono essere uguali (associatività)
+        // Must be equal (associativity)
         assert_eq!(left.value(), right.value());
     }
 
@@ -271,8 +232,6 @@ mod tests {
         assert!(changed);
         assert_eq!(counter.value(), 10);
 
-        // Applicare di nuovo incrementa ancora (delta-based)
-        // Per vera idempotenza servirebbero OpId tracking
         let changed2 = counter.apply_op(&op).unwrap();
         assert!(changed2);
         assert_eq!(counter.value(), 20);
@@ -301,7 +260,7 @@ mod tests {
         let node = NodeId::new("node");
 
         counter.increment(&node, u64::MAX);
-        counter.increment(&node, 1); // dovrebbe saturare, non overflow
+        counter.increment(&node, 1); // should saturate, not overflow
 
         assert_eq!(counter.value(), u64::MAX);
     }

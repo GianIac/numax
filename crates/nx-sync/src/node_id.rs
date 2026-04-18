@@ -6,17 +6,17 @@ use uuid::Uuid;
 pub struct NodeId(String);
 
 impl NodeId {
-    /// Crea un nuovo NodeId da una stringa.
+    /// Creates a new NodeId from a string.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
-    /// Genera un NodeId casuale (UUID v4).
+    /// Generates a random NodeId (UUID v4).
     pub fn generate() -> Self {
         Self(Uuid::new_v4().to_string())
     }
 
-    /// Restituisce il NodeId come stringa.
+    /// Returns the NodeId as a string.
     pub fn as_str(&self) -> &str {
         &self.0
     }

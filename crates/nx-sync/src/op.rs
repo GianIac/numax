@@ -31,7 +31,6 @@ impl fmt::Display for OpId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     /// Incremento di un GCounter.
-    /// Contiene: (chiave nel DB, incremento)
     GCounterIncrement { key: String, increment: u64 },
 }
 
