@@ -16,8 +16,12 @@ fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     }
 }
 
-fn read_bytes(caller: &mut Caller<'_, HostState>,memory: &Memory,ptr: u32,len: u32,) -> Result<Vec<u8>> {
-    
+fn read_bytes(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    ptr: u32,
+    len: u32,
+) -> Result<Vec<u8>> {
     if len > MAX_MSG_LEN {
         anyhow::bail!("message too large: {len} > {MAX_MSG_LEN}");
     }
@@ -50,7 +54,6 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
             eprintln!("[guest] {msg}");
         },
     )?;
-
 
     // Returns: 0  => ok or -3  => internal error (no memory export / invalid read)
     linker.func_wrap(

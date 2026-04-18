@@ -73,7 +73,8 @@ impl SyncManager {
         };
 
         // crate and start the node
-        let node_config = NodeConfig::new(self.node_id.clone(), &listen_addr).with_peers(self.config.peers.clone());
+        let node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
+            .with_peers(self.config.peers.clone());
 
         let mut node = Node::new(node_config);
         let mut event_rx = node.take_event_receiver().unwrap();
@@ -164,7 +165,12 @@ impl SyncManager {
 }
 
 /// Apply an operation received from a remote peer.
-async fn apply_remote_op(op: &Op,counters: &Arc<RwLock<HashMap<String, GCounter>>>,seen_ops: &Arc<RwLock<HashSet<String>>>,config: &SyncConfig,) -> anyhow::Result<()> {
+async fn apply_remote_op(
+    op: &Op,
+    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
+    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    config: &SyncConfig,
+) -> anyhow::Result<()> {
     // Deduplication
     {
         let seen = seen_ops.read().await;

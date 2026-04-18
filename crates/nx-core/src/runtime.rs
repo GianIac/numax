@@ -70,12 +70,16 @@ impl Runtime {
         // WASI base (preview1 / p1)
         if config.enable_wasi {
             wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
-                state.wasi.as_mut().expect("WASI enabled but not initialized in the store")
+                state
+                    .wasi
+                    .as_mut()
+                    .expect("WASI enabled but not initialized in the store")
             })?;
         }
 
         // open the datastore ONE TIME HERE
-        let store = NxStore::open(&config.datastore_path).map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
+        let store = NxStore::open(&config.datastore_path)
+            .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
         let store = Arc::new(store);
 
         // Initialize SyncManager if configured
@@ -87,14 +91,22 @@ impl Runtime {
             None
         };
 
-        Ok(Self { engine, linker,config ,store ,sync_manager })
+        Ok(Self {
+            engine,
+            linker,
+            config,
+            store,
+            sync_manager,
+        })
     }
 
     /// Start sync networking (if configured).
     pub async fn start_sync(&self) -> Result<()> {
         if let Some(ref _manager) = self.sync_manager {
             // SyncManager::start requires &mut self, but we have Arc... nb: Skip for now, full implementation requires refactor
-            tracing::info!("sync manager configured (full start requires async runtime integration)");
+            tracing::info!(
+                "sync manager configured (full start requires async runtime integration)"
+            );
         }
         Ok(())
     }
@@ -112,10 +124,10 @@ impl Runtime {
         let host_state = if self.config.enable_wasi {
             let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
 
-        HostState {
-            wasi: Some(wasi),
-            store: store_db,
-            sync_manager: self.sync_manager.clone(),
+            HostState {
+                wasi: Some(wasi),
+                store: store_db,
+                sync_manager: self.sync_manager.clone(),
             }
         } else {
             HostState {
