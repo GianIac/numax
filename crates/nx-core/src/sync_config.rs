@@ -1,15 +1,12 @@
 use nx_net::TlsConfig;
 
-/// config sync fo the runtime.
+/// Sync configuration for the runtime.
 #[derive(Debug, Clone, Default)]
 pub struct SyncConfig {
-    /// Key prefixes to replicate (es. ["counter:", "state:"]).
-    pub replicated_prefixes: Vec<String>,
-
-    /// Initial peer addresses (es. ["127.0.0.1:9001"]).
+    /// Initial peer addresses (e.g. ["127.0.0.1:9001"]).
     pub peers: Vec<String>,
 
-    /// Address to listen on (es. "0.0.0.0:9000").
+    /// Address to listen on (e.g. "0.0.0.0:9000").
     pub listen_addr: Option<String>,
 
     /// Optional TLS/mTLS configuration for peer connections.
@@ -19,11 +16,6 @@ pub struct SyncConfig {
 impl SyncConfig {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.replicated_prefixes.push(prefix.into());
-        self
     }
 
     pub fn with_peer(mut self, addr: impl Into<String>) -> Self {
@@ -41,14 +33,9 @@ impl SyncConfig {
         self
     }
 
-    /// Check if a key belongs to a replicated prefix
-    pub fn is_replicated(&self, key: &str) -> bool {
-        self.replicated_prefixes.iter().any(|p| key.starts_with(p))
-    }
-
-    /// Sync is enabled if there is at least one prefix and one listen_addr.
+    /// Sync is enabled iff we have a bound listen address.
     pub fn is_enabled(&self) -> bool {
-        !self.replicated_prefixes.is_empty() && self.listen_addr.is_some()
+        self.listen_addr.is_some()
     }
 }
 
@@ -57,26 +44,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_replicated() {
-        let config = SyncConfig::new()
-            .with_prefix("counter:")
-            .with_prefix("state:");
+    fn test_is_enabled_requires_listen() {
+        let cfg = SyncConfig::new();
+        assert!(!cfg.is_enabled());
 
-        assert!(config.is_replicated("counter:visits"));
-        assert!(config.is_replicated("state:user:123"));
-        assert!(!config.is_replicated("local:temp"));
-        assert!(!config.is_replicated("other"));
+        let cfg = SyncConfig::new().with_listen_addr("0.0.0.0:9000");
+        assert!(cfg.is_enabled());
     }
 
     #[test]
-    fn test_is_enabled() {
-        let config = SyncConfig::new();
-        assert!(!config.is_enabled());
-
-        let config = SyncConfig::new()
-            .with_prefix("counter:")
-            .with_listen_addr("0.0.0.0:9000");
-        assert!(config.is_enabled());
+    fn test_peers_alone_do_not_enable() {
+        let cfg = SyncConfig::new().with_peer("127.0.0.1:9000");
+        assert!(!cfg.is_enabled());
     }
 
     #[test]

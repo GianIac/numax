@@ -9,7 +9,7 @@ use nx_sync::NodeId;
 
 use crate::host_api;
 use crate::sync_config::SyncConfig;
-use crate::sync_manager::SyncManager;
+use crate::sync_manager::{SyncHandle, SyncManager};
 
 // Runtime config
 #[derive(Debug, Clone)]
@@ -38,11 +38,11 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Host status associated with the Store
+/// Host status associated with the Store.
 pub struct HostState {
     pub wasi: Option<p1::WasiP1Ctx>,
     pub store: Arc<NxStore>,
-    pub sync_manager: Option<Arc<SyncManager>>,
+    pub sync_handle: Option<SyncHandle>,
 }
 
 pub struct Runtime {
@@ -50,26 +50,29 @@ pub struct Runtime {
     linker: Linker<HostState>,
     config: RuntimeConfig,
     store: Arc<NxStore>,
-    sync_manager: Option<Arc<SyncManager>>,
+
+    sync_manager: Option<SyncManager>,
+    sync_handle: Option<SyncHandle>,
 }
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
-        // Engine con config (for debug/backtrace; memory limit optional in the future)
+        // Engine: async support is required so wasmtime can yield across host calls
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+        
         let engine = Engine::new(&wasm_cfg)?;
-
         let mut linker: Linker<HostState> = Linker::new(&engine);
 
         // host_log (namespace "nx", func "host_log")
         host_api::log::add_to_linker(&mut linker)?;
+
         // host_db (namespace "nx", func "db_get", "db_set" etc.)
         host_api::db::add_to_linker(&mut linker)?;
 
-        // WASI base (preview1 / p1)
+        // WASI base (preview1 / p1) — async variant, required by async engine.
         if config.enable_wasi {
-            wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
+            wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostState| {
                 state
                     .wasi
                     .as_mut()
@@ -82,13 +85,14 @@ impl Runtime {
             .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
         let store = Arc::new(store);
 
-        // Initialize SyncManager if configured
-        let sync_manager = if let Some(ref sync_config) = config.sync {
+        // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
+        let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
             let node_id = NodeId::generate();
             let manager = SyncManager::new(node_id, sync_config.clone());
-            Some(Arc::new(manager))
+            let handle = manager.handle();
+            (Some(manager), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -97,26 +101,33 @@ impl Runtime {
             config,
             store,
             sync_manager,
+            sync_handle,
         })
     }
 
-    /// Start sync networking (if configured).
-    pub async fn start_sync(&self) -> Result<()> {
-        if let Some(ref _manager) = self.sync_manager {
-            // SyncManager::start requires &mut self, but we have Arc... nb: Skip for now, full implementation requires refactor
-            tracing::info!(
-                "sync manager configured (full start requires async runtime integration)"
-            );
-        }
+    /// Start sync networking
+    pub async fn start_sync(&mut self) -> Result<()> {
+        let Some(manager) = self.sync_manager.as_mut() else {
+            tracing::debug!("start_sync: no sync configured, skipping");
+            return Ok(());
+        };
+        manager
+            .start()
+            .await
+            .map_err(|e| anyhow!("sync manager failed to start: {e}"))?;
+        tracing::info!(
+            node_id = %manager.node_id(),
+            "sync manager started"
+        );
         Ok(())
     }
 
-    /// Return the SyncManager (if is present).
-    pub fn sync_manager(&self) -> Option<Arc<SyncManager>> {
-        self.sync_manager.clone()
+    /// Return a clonable handle to the SyncManager (if present).
+    pub fn sync_handle(&self) -> Option<SyncHandle> {
+        self.sync_handle.clone()
     }
 
-    pub fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+    pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
 
@@ -127,13 +138,13 @@ impl Runtime {
             HostState {
                 wasi: Some(wasi),
                 store: store_db,
-                sync_manager: self.sync_manager.clone(),
+                sync_handle: self.sync_handle.clone(),
             }
         } else {
             HostState {
                 wasi: None,
                 store: store_db,
-                sync_manager: self.sync_manager.clone(),
+                sync_handle: self.sync_handle.clone(),
             }
         };
 
@@ -143,20 +154,22 @@ impl Runtime {
         let module = Module::new(&self.engine, wasm_bytes)
             .map_err(|e| anyhow!("Invalid module (compile/validate): {e}"))?;
 
-        // 3. Instantiation (linking import/host)
+        // Instantiation
         let instance = self
             .linker
-            .instantiate(&mut store, &module)
+            .instantiate_async(&mut store, &module)
+            .await
             .map_err(|e| anyhow!("Link error while instantiating module: {e}"))?;
 
-        // 4. Entrypoint: `run` - `_start`
+        // Entrypoint: run / _start
         let run = instance
             .get_typed_func::<(), ()>(&mut store, "run")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
             .map_err(|e| anyhow!("No entrypoint found (expected `run` or `_start`): {e}"))?;
 
         // Execution
-        run.call(&mut store, ())
+        run.call_async(&mut store, ())
+            .await
             .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 
         Ok(())

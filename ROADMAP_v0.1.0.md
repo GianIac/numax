@@ -110,36 +110,15 @@
 ---
 
 ### Fase 6.5: End-to-End Sync Wiring 🔗
-**Obiettivo**: chiudere i buchi nascosti tra guest WASM, SyncManager e
-datastore, in modo che le operazioni replicabili facciano davvero il giro
-completo tra peer. Include la ristrutturazione della host API per separare
-KV locale e CRDT replicato senza magie per-chiave.
-
-**Problema pre-6.5**:
-1. `Runtime::start_sync` era uno stub, non avviava il listener.
-2. `db_set` non emetteva Op verso il SyncManager.
-3. `apply_remote_op` aggiornava solo lo stato in-memory, non toccava sled.
-4. Semantica ambigua: il guest scriveva "valore assoluto" via `db_set`,
-   la rete propagava "increment" → nessuna traduzione coerente.
-
-**Design deciso**:
-- **API separate nel SDK**:
-  - `nx_sdk::db` → KV locale non-replicato (esistente).
-  - `nx_sdk::crdt::gcounter` → counter CRDT replicato (nuovo).
-- **Replicazione guidata dall'intent, non dalla chiave**:
-  - Chi chiama `crdt::gcounter::inc(key)` sa che è replicato.
-  - Chi chiama `db::set(key, value)` sa che è locale.
-  - `--sync-prefix` e `SyncConfig::replicated_prefixes` vengono rimossi.
-- **Namespace riservato nello sled**:
-  - Lo stato materializzato dei CRDT vive sotto `__nx/crdt/gcounter/<key>`.
-  - Non collide con le chiavi KV del guest.
+**Obiettivo**: chiudere i buchi nascosti tra guest WASM, SyncManager e datastore, in modo che le operazioni replicabili facciano davvero il giro completo tra peer. 
+Include la ristrutturazione della host API per separare KV locale e CRDT replicato senza magie per-chiave.
 
 **Runtime async**:
-- [ ] `Runtime::run_module` diventa `async` e gira dentro un `tokio::Runtime`.
-- [ ] CLI passa a `#[tokio::main]`; `real_main` diventa async.
-- [ ] `SyncManager` accessibile come `Arc<Mutex<SyncManager>>` (o handle clonabile).
-- [ ] `Runtime::start_sync` chiama davvero `SyncManager::start().await`.
-- [ ] `wasmtime` caricato con `add_to_linker_async` e `run.call_async` per non
+- [x] `Runtime::run_module` diventa `async` e gira dentro un `tokio::Runtime`.
+- [x] CLI passa a `#[tokio::main]`; `real_main` diventa async.
+- [x] `SyncManager` accessibile come `Arc<Mutex<SyncManager>>` (o handle clonabile).
+- [x] `Runtime::start_sync` chiama davvero `SyncManager::start().await`.
+- [x] `wasmtime` caricato con `add_to_linker_async` e `run.call_async` per non
       bloccare il tokio runtime durante le host call.
 
 **Host API CRDT (nuove)**:
@@ -156,10 +135,9 @@ KV locale e CRDT replicato senza magie per-chiave.
       logica (anche solo sled batch ok).
 
 **Cleanup del pregresso**:
-- [ ] Rimuovere `SyncConfig::replicated_prefixes` + `with_prefix` + `is_replicated`.
-- [ ] Rimuovere flag CLI `--sync-prefix`.
-- [ ] Aggiornare messaggi di log e help.
-- [ ] Aggiornare `HOST_API.md` con la separazione `db_*` vs `crdt_*`.
+- [x] Rimuovere flag CLI `--sync-prefix`.
+- [x] Aggiornare messaggi di log e help.
+- [x] Aggiornare `HOST_API.md` con la separazione `db_*` vs `crdt_*`.
 
 **Examples migration**:
 - [ ] `examples/distributed_counter`: riscrittura con `nx_sdk::crdt::gcounter`.

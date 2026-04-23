@@ -25,13 +25,9 @@ enum Cli {
         #[arg(long, value_name = "ADDR")]
         listen: Option<String>,
 
-        /// Peer addresses to connect to (can be repeated)
+        /// Peer addresses to connect to (can be repeated). Requires --listen.
         #[arg(long = "peer", value_name = "ADDR")]
         peers: Vec<String>,
-
-        /// Key prefixes to replicate (can be repeated, e.g., "counter:")
-        #[arg(long = "sync-prefix", value_name = "PREFIX")]
-        sync_prefixes: Vec<String>,
 
         /// Enable verbose logging
         #[arg(short, long)]
@@ -60,13 +56,18 @@ enum Cli {
 }
 
 fn main() {
-    if let Err(e) = real_main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    if let Err(e) = rt.block_on(real_main()) {
         eprintln!("[nx-cli] error: {e}");
         std::process::exit(1);
     }
 }
 
-fn real_main() -> Result<()> {
+async fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli {
@@ -75,7 +76,6 @@ fn real_main() -> Result<()> {
             datastore_path,
             listen,
             peers,
-            sync_prefixes,
             verbose,
             tls_cert,
             tls_key,
@@ -98,8 +98,8 @@ fn real_main() -> Result<()> {
             // Build TlsConfig (if any TLS-related flag was provided)
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
 
-            // Build SyncConfig (if listen or sync-prefix were provided)
-            let sync = build_sync_config(listen, peers, sync_prefixes, tls);
+            // Build SyncConfig (if sync flags were provided)
+            let sync = build_sync_config(listen, peers, tls)?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -112,7 +112,6 @@ fn real_main() -> Result<()> {
             if let Some(s) = sync {
                 info!(
                     listen = ?s.listen_addr,
-                    prefixes = ?s.replicated_prefixes,
                     peers = ?s.peers,
                     tls = s.tls.is_some(),
                     "sync enabled"
@@ -120,8 +119,9 @@ fn real_main() -> Result<()> {
                 cfg.sync = Some(s);
             }
 
-            let rt = Runtime::new(cfg)?;
-            rt.run_module(&bytes)?;
+            let mut rt = Runtime::new(cfg)?;
+            rt.start_sync().await?;
+            rt.run_module(&bytes).await?;
         }
     }
 
@@ -198,11 +198,17 @@ fn build_tls_config(
 fn build_sync_config(
     listen: Option<String>,
     peers: Vec<String>,
-    sync_prefixes: Vec<String>,
     tls: Option<TlsConfig>,
-) -> Option<SyncConfig> {
-    if listen.is_none() && sync_prefixes.is_empty() {
-        return None;
+) -> Result<Option<SyncConfig>> {
+    if listen.is_none() && peers.is_empty() {
+        return Ok(None);
+    }
+
+    if listen.is_none() {
+        bail!(
+            "--peer requires --listen: dialer-only mode is not yet supported. \
+             Pass --listen <addr> to enable sync."
+        );
     }
 
     let mut cfg = SyncConfig::new();
@@ -212,23 +218,12 @@ fn build_sync_config(
     for p in peers {
         cfg = cfg.with_peer(p);
     }
-    for p in sync_prefixes {
-        cfg = cfg.with_prefix(p);
-    }
     if let Some(t) = tls {
         cfg = cfg.with_tls(t);
     }
 
-    if !cfg.is_enabled() {
-        warn!(
-            listen = ?cfg.listen_addr,
-            prefixes = ?cfg.replicated_prefixes,
-            "sync not enabled: both --listen and --sync-prefix are required"
-        );
-        return None;
-    }
-
-    Some(cfg)
+    debug_assert!(cfg.is_enabled());
+    Ok(Some(cfg))
 }
 
 #[cfg(test)]
@@ -360,31 +355,39 @@ mod tests {
         use super::*;
 
         #[test]
-        fn no_listen_no_prefix_is_none() {
-            assert!(build_sync_config(None, vec![], vec![], None).is_none());
+        fn no_flags_is_none() {
+            let r = build_sync_config(None, vec![], None).unwrap();
+            assert!(r.is_none());
         }
 
         #[test]
-        fn listen_without_prefix_is_none() {
-            assert!(build_sync_config(Some("0.0.0.0:9000".into()), vec![], vec![], None).is_none());
+        fn listen_alone_is_some() {
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None)
+                .unwrap()
+                .expect("sync should be enabled with --listen alone");
+            assert!(cfg.is_enabled());
+            assert!(cfg.peers.is_empty());
+            assert_eq!(cfg.listen_addr.as_deref(), Some("0.0.0.0:9000"));
         }
 
         #[test]
-        fn prefix_without_listen_is_none() {
-            assert!(build_sync_config(None, vec![], vec!["counter:".into()], None).is_none());
+        fn peer_without_listen_is_error() {
+            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None);
+            assert!(r.is_err(), "peers without --listen must fail loudly");
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("--peer requires --listen"), "got: {err}");
         }
 
         #[test]
-        fn full_config_is_some() {
+        fn listen_and_peers_is_some() {
             let cfg = build_sync_config(
                 Some("0.0.0.0:9000".into()),
                 vec!["a:1".into(), "b:2".into()],
-                vec!["counter:".into()],
                 None,
             )
+            .unwrap()
             .unwrap();
-            assert_eq!(cfg.peers.len(), 2);
-            assert_eq!(cfg.replicated_prefixes, vec!["counter:"]);
+            assert_eq!(cfg.peers, vec!["a:1".to_string(), "b:2".to_string()]);
             assert_eq!(cfg.listen_addr.as_deref(), Some("0.0.0.0:9000"));
             assert!(cfg.tls.is_none());
         }
@@ -392,13 +395,9 @@ mod tests {
         #[test]
         fn tls_is_propagated() {
             let tls = Some(TlsConfig::insecure_dev());
-            let cfg = build_sync_config(
-                Some("0.0.0.0:9000".into()),
-                vec![],
-                vec!["counter:".into()],
-                tls,
-            )
-            .unwrap();
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls)
+                .unwrap()
+                .unwrap();
             assert!(cfg.tls.is_some());
         }
     }
@@ -414,14 +413,12 @@ mod tests {
                 Cli::Run {
                     module,
                     peers,
-                    sync_prefixes,
                     verbose,
                     tls_insecure,
                     ..
                 } => {
                     assert_eq!(module, PathBuf::from("x.wasm"));
                     assert!(peers.is_empty());
-                    assert!(sync_prefixes.is_empty());
                     assert!(!verbose);
                     assert!(!tls_insecure);
                 }
@@ -439,6 +436,15 @@ mod tests {
         }
 
         #[test]
+        fn sync_prefix_flag_removed() {
+            // Regression guard: `--sync-prefix` has been removed in favor of
+            // the replicate-by-intent model (nx_sdk::crdt::*).
+            assert!(
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--sync-prefix", "counter:"]).is_err()
+            );
+        }
+
+        #[test]
         fn no_subcommand_fails() {
             assert!(Cli::try_parse_from(["nx"]).is_err());
         }
@@ -451,25 +457,6 @@ mod tests {
             .unwrap();
             match cli {
                 Cli::Run { peers, .. } => assert_eq!(peers, vec!["a:1", "b:2", "c:3"]),
-            }
-        }
-
-        #[test]
-        fn repeated_prefixes_collected() {
-            let cli = Cli::try_parse_from([
-                "nx",
-                "run",
-                "x.wasm",
-                "--sync-prefix",
-                "counter:",
-                "--sync-prefix",
-                "state:",
-            ])
-            .unwrap();
-            match cli {
-                Cli::Run { sync_prefixes, .. } => {
-                    assert_eq!(sync_prefixes, vec!["counter:", "state:"]);
-                }
             }
         }
 
