@@ -122,11 +122,11 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
       bloccare il tokio runtime durante le host call.
 
 **Host API CRDT (nuove)**:
-- [ ] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
+- [x] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
       applica localmente, scrive totale in sled, emette Op via canale.
-- [ ] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
+- [x] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
       legge il totale materializzato in sled.
-- [ ] Wrapper SDK `nx_sdk::crdt::gcounter::{inc, value}`.
+- [x] Wrapper SDK `nx_sdk::crdt::gcounter::{inc, value}`.
 
 **Wiring end-to-end**:
 - [ ] `HostState` include handle al SyncManager (sender Op + accessor GCounter).
