@@ -8,7 +8,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::sync_config::SyncConfig;
 
-/// Clonable, cheap handle to the SyncManager exposed to host calls
+/// Upper bound on how many ops we coalesce into a single PushOps message.
+const BROADCAST_BATCH_MAX: usize = 64;
+
+/// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
     node_id: NodeId,
@@ -40,8 +43,9 @@ pub struct SyncManager {
     /// SyncConfig
     config: SyncConfig,
 
-    /// Node
-    node: Option<Node>,
+    /// Network node. Wrapped in `Arc` so the broadcast drain task spawned
+    /// by `start` can share ownership with the manager.
+    node: Option<Arc<Node>>,
 
     /// GCounter
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
@@ -52,7 +56,7 @@ pub struct SyncManager {
     /// Channel to send Ops to broadcast.
     op_tx: mpsc::Sender<Op>,
 
-    /// Receiver
+    /// Receiver drained by `start` into the broadcast task.
     op_rx: Option<mpsc::Receiver<Op>>,
 }
 
@@ -87,7 +91,7 @@ impl SyncManager {
         self.op_rx.take()
     }
 
-    /// Build a clonable handle exposing the op channel and the counter registry
+    /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
             node_id: self.node_id.clone(),
@@ -96,7 +100,7 @@ impl SyncManager {
         }
     }
 
-    /// start networking
+    /// Start networking: bind the listener, dial initial peers, spawn the inbound event loop and the outbound broadcast drain loop.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         let listen_addr = match &self.config.listen_addr {
             Some(addr) => addr.clone(),
@@ -106,7 +110,7 @@ impl SyncManager {
             }
         };
 
-        // crate and start the node
+        // Build the network node.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
             .with_peers(self.config.peers.clone());
 
@@ -119,19 +123,20 @@ impl SyncManager {
 
         node.start_listener().await?;
 
-        // Connect to initial peers
+        // Connect to initial peers.
         for peer_addr in &self.config.peers {
             if let Err(e) = node.connect_to_peer(peer_addr).await {
                 warn!(peer = %peer_addr, error = %e, "failed to connect to peer");
             }
         }
 
-        self.node = Some(node);
+        // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
+        let node = Arc::new(node);
+        self.node = Some(Arc::clone(&node));
 
-        // Start event loop in background.
+        // Inbound loop: apply remote ops into the counter registry.
         let counters = Arc::clone(&self.counters);
         let seen_ops = Arc::clone(&self.seen_ops);
-
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
@@ -151,7 +156,15 @@ impl SyncManager {
                     }
                 }
             }
+            debug!("event loop terminated");
         });
+
+        // Outbound loop: drain locally-produced ops into the network.
+        let op_rx = self
+            .op_rx
+            .take()
+            .expect("op_rx already taken: SyncManager::start called twice?");
+        spawn_broadcast_loop(Arc::clone(&node), op_rx);
 
         Ok(())
     }
@@ -168,7 +181,33 @@ impl SyncManager {
     }
 }
 
-/// Apply an operation received from a remote peer
+/// Spawn the outbound broadcast drain loop.
+fn spawn_broadcast_loop(node: Arc<Node>, mut op_rx: mpsc::Receiver<Op>) {
+    tokio::spawn(async move {
+        while let Some(first) = op_rx.recv().await {
+            let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
+            batch.push(first);
+
+            // Coalesce any ops already queued, without yielding.
+            while batch.len() < BROADCAST_BATCH_MAX {
+                match op_rx.try_recv() {
+                    Ok(op) => batch.push(op),
+                    Err(_) => break,
+                }
+            }
+
+            let count = batch.len();
+            if let Err(e) = node.broadcast_ops(batch).await {
+                warn!(error = %e, count, "broadcast failed; ops dropped for this round");
+            } else {
+                debug!(count, "broadcast batch sent");
+            }
+        }
+        debug!("broadcast loop terminated (op channel closed)");
+    });
+}
+
+/// Apply an operation received from a remote peer.
 async fn apply_remote_op(
     op: &Op,
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,

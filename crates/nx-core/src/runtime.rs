@@ -70,6 +70,9 @@ impl Runtime {
         // host_db (namespace "nx", func "db_get", "db_set" etc.)
         host_api::db::add_to_linker(&mut linker)?;
 
+        // host_crdt (namespace "nx", func "crdt_gcounter_inc", "crdt_gcounter_value")
+        host_api::crdt::add_to_linker(&mut linker)?;
+
         // WASI base (preview1 / p1) — async variant, required by async engine.
         if config.enable_wasi {
             wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostState| {

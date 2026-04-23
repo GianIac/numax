@@ -6,6 +6,7 @@ use crate::runtime::HostState;
 const ERR_NOT_FOUND: i32 = -1;
 const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
+const ERR_RESERVED_KEY: i32 = -4;
 
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB
 const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB
@@ -70,6 +71,10 @@ fn db_get_impl(
         }
     };
 
+    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
+        return ERR_RESERVED_KEY;
+    }
+
     let value = match caller.data().store.get(&key) {
         Ok(v) => v,
         Err(e) => {
@@ -126,6 +131,10 @@ fn db_set_impl(
         }
     };
 
+    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
+        return ERR_RESERVED_KEY;
+    }
+
     let val = match read_bytes(&mut caller, &memory, val_ptr, val_len) {
         Ok(v) => v,
         Err(e) => {
@@ -163,6 +172,10 @@ fn db_delete_impl(mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32)
             return ERR_INTERNAL;
         }
     };
+
+    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
+        return ERR_RESERVED_KEY;
+    }
 
     if let Err(e) = caller.data().store.delete(&key) {
         eprintln!("[nx-core] db_delete: store error: {e}");

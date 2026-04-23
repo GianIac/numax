@@ -7,11 +7,13 @@ use crate::ffi;
 const ERR_NOT_FOUND: i32 = -1;
 const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
+const ERR_RESERVED_KEY: i32 = -4;
 
 fn map_rc_unit(rc: i32) -> Result<()> {
     match rc {
         0 => Ok(()),
         ERR_INTERNAL => Err(NxError::Internal),
+        ERR_RESERVED_KEY => Err(NxError::ReservedKey),
         c if c < 0 => Err(NxError::UnknownCode(c)),
         _ => Err(NxError::UnknownCode(rc)),
     }
@@ -37,10 +39,6 @@ pub fn delete(key: &str) -> Result<()> {
 }
 
 // get(key) -> Result<Option<Vec<u8>>, NxError>
-// - Ok(None) => key missing
-// - Ok(Some(bytes)) => value
-// Automatically handle the buffer too small "-2" case by reallocating and retrying.
-
 pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 64;
 
@@ -59,6 +57,7 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
         match n {
             ERR_NOT_FOUND => return Ok(None),
             ERR_INTERNAL => return Err(NxError::Internal),
+            ERR_RESERVED_KEY => return Err(NxError::ReservedKey),
             ERR_BUF_TOO_SMALL => {
                 cap = cap.saturating_mul(2);
                 if cap > 1024 * 1024 {
