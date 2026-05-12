@@ -731,7 +731,7 @@ Numax è facile da descrivere per **differenza**.
 
 - **Non è Kubernetes.** Non orchestra container, non gestisce workload su cluster, non esiste un control plane. Numax è un singolo binario che esegue moduli WASM. Se Kubernetes risponde a "come orchestro centinaia di servizi?", Numax risponde a una domanda precedente: "perché ho bisogno di centinaia di servizi per fare una cosa distribuita?".
 
-- **Non è Redis (né un database distribuito).** Non è un servizio remoto a cui si fanno query. Lo stato non vive "da qualche parte nella rete": vive **dentro il runtime**, accanto al codice che lo usa. La replica avviene tra runtime peer, non tra client e server.
+- **Non è Redis (né un database distribuito).** Non è un servizio remoto a cui si fanno query. Lo stato non vive "da qualche parte nella rete": vive **dentro il runtime**, accanto al codice che lo usa. La replica avviene tra runtime peer, non tra client e server. (ps: amo redis)
 
 - **Non è Deno né un altro runtime "edge JavaScript".** Quei runtime portano un linguaggio ovunque. Numax porta **logica + stato + sincronizzazione** ovunque, in un singolo modello coerente. Il linguaggio è un dettaglio: l'unità è il modulo WASM, agnostico rispetto al sorgente.
 
