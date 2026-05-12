@@ -143,7 +143,7 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
 - [x] `examples/distributed_counter`: riscrittura con `nx_sdk::crdt::gcounter`.
 - [x] `examples/distributed_chat`: marcato come "non-replicato (LWW locale)"
       o rimosso finché non abbiamo ORSet/RGA (Fase 14).
-- [ ] `examples/vote_tally_tls`: nuovo esempio con mTLS + allowlist + counter
+- [x] `examples/vote_tally_tls`: nuovo esempio con mTLS + allowlist + counter
       CRDT reale tra 3 nodi.
 
 **Test**:
