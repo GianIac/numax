@@ -147,12 +147,12 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
       CRDT reale tra 3 nodi.
 
 **Test**:
-- [ ] Test E2E: 2 nodi, A fa `gcounter::inc("visits", 1)`, dopo handshake
+- [x] Test E2E: 2 nodi, A fa `gcounter::inc("visits", 1)`, dopo handshake
       e un round di PushOps B legge `gcounter::value("visits") == 1`.
-- [ ] Test E2E: 2 nodi, A e B incrementano in parallelo, convergono sullo stesso
+- [x] Test E2E: 2 nodi, A e B incrementano in parallelo, convergono sullo stesso
       totale.
-- [ ] Test: nessun Op emesso quando sync è disabilitato.
-- [ ] Test: `apply_remote_op` idempotente (stesso Op 2x → nessun doppio conteggio).
+- [x] Test: nessun Op emesso quando sync è disabilitato.
+- [x] Test: `apply_remote_op` idempotente (stesso Op 2x → nessun doppio conteggio).
 
 **Criterio di chiusura**:
 ```bash

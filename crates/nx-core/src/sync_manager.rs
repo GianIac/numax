@@ -184,6 +184,15 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Connect to a peer after the manager has started.
+    pub async fn connect_to_peer(&self, addr: &str) -> anyhow::Result<()> {
+        let Some(node) = self.node.as_ref() else {
+            anyhow::bail!("sync manager is not started");
+        };
+        node.connect_to_peer(addr).await?;
+        Ok(())
+    }
+
     /// Broadcast of pending operations, this method can be used for forced flush
     pub async fn broadcast_pending(&self) -> anyhow::Result<()> {
         Ok(())
@@ -281,7 +290,9 @@ async fn apply_remote_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{Runtime, RuntimeConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::time::{Duration, Instant, sleep};
 
     fn temp_store() -> Arc<NxStore> {
         let mut path = std::env::temp_dir();
@@ -291,6 +302,59 @@ mod tests {
             .as_nanos();
         path.push(format!("numax-core-sync-test-{nanos}"));
         Arc::new(NxStore::open(path).unwrap())
+    }
+
+    fn free_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        addr.to_string()
+    }
+
+    fn read_materialized(store: &NxStore, key: &str) -> u64 {
+        let key = materialized_gcounter_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        u64::from_le_bytes(buf)
+    }
+
+    async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_counter_value(key).await == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "counter {key} did not reach {expected}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
+        {
+            let counters_arc = handle.counters();
+            let mut counters = counters_arc.write().await;
+            let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
+            counter.increment(handle.node_id(), delta);
+            let total = counter.value();
+
+            materialize_gcounter_value(&handle.store(), key, total).unwrap();
+            counters.insert(key.to_string(), counter);
+        }
+
+        let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
+        let store = temp_store();
+        let config = SyncConfig::new().with_listen_addr(addr);
+        let mut manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+        let handle = manager.handle();
+        manager.start().await.unwrap();
+        (manager, handle, store)
     }
 
     #[tokio::test]
@@ -334,5 +398,59 @@ mod tests {
         buf.copy_from_slice(&bytes);
 
         assert_eq!(u64::from_le_bytes(buf), 3);
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_push_ops_materializes_on_peer() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, _store_a) = started_manager(addr_a).await;
+        let (manager_b, _handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        local_increment(&handle_a, key, 1).await;
+
+        wait_for_counter(&manager_b, key, 1).await;
+        assert_eq!(read_materialized(&store_b, key), 1);
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_parallel_increments_converge() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        tokio::join!(
+            local_increment(&handle_a, key, 1),
+            local_increment(&handle_b, key, 1),
+        );
+
+        wait_for_counter(&manager_a, key, 2).await;
+        wait_for_counter(&manager_b, key, 2).await;
+        assert_eq!(read_materialized(&store_a, key), 2);
+        assert_eq!(read_materialized(&store_b, key), 2);
+    }
+
+    #[test]
+    fn sync_disabled_runtime_has_no_sync_handle() {
+        let config = RuntimeConfig {
+            datastore_path: std::env::temp_dir().join(format!(
+                "numax-core-nosync-test-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
+            ..RuntimeConfig::default()
+        };
+
+        let runtime = Runtime::new(config).unwrap();
+        assert!(runtime.sync_handle().is_none());
     }
 }
