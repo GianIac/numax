@@ -10,6 +10,9 @@
 > - **(Planned)**: previsto in roadmap, non ancora implementato.
 >
 > **Riferimento di versione**: `v0.1.0-alpha.1` - preview tecnica, API e wire format possono cambiare prima della v0.1.0 stabile.
+>
+> > 📍 **Roadmap di riferimento:** le fasi citate in questo documento (Fase 7, Fase 8, …) sono definite in [`ROADMAP_v0.1.0.md`](./ROADMAP_v0.1.0.md).
+> Ogni volta che leggi *Fase N*, puoi consultare la roadmap per dettagli, criteri di completamento e stato di avanzamento :)
 
 ---
 
