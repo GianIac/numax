@@ -1,7 +1,44 @@
 # Roadmap Numax v0.1.0
 
-> **Obiettivo**: Runtime production-ready per workload non-critici
-> **Stato**: In sviluppo
+> **Release corrente**: `v0.1.0-alpha.1` - developer preview.
+> **Obiettivo finale `v0.1.0`**: runtime production-ready per workload non-critici.
+> **Stato**: alpha per feedback; hardening production ancora in corso.
+
+---
+
+## Stato Release
+
+### v0.1.0-alpha.1 ✅
+**Scopo**: prima preview tecnica da pubblicare per raccogliere feedback.
+
+Include:
+- Runtime Wasmtime + WASI preview1.
+- Host API KV locale (`db_get`, `db_set`, `db_delete`) e logging.
+- Store embedded sled.
+- GCounter CRDT con JSON serialization.
+- Networking base con Hello/PushOps/PullSince/Ping.
+- TLS/mTLS, NodeID derivato da certificato e allowlist.
+- Wiring end-to-end interno tra guest CRDT API, SyncManager e datastore.
+- Materializzazione sled del totale GCounter su update locale/remoto.
+- Test E2E `SyncManager` per handshake, PushOps, convergenza e idempotenza.
+- Esempi: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
+
+Limitazioni note:
+- `nx run` esegue il guest una volta e termina; il criterio CLI multi-process
+  della Fase 6.5 non è ancora completamente rispettato alla lettera.
+- Hydration del registry GCounter dai valori materializzati in sled non ancora
+  implementata.
+- Lifecycle long-running, graceful shutdown, backpressure, observability e
+  resilienza rete sono ancora fasi aperte.
+- API e wire format possono cambiare prima di `v0.1.0`.
+
+### v0.1.0 🎯
+**Scopo**: prima release production-ready per workload non-critici.
+
+Richiede il completamento delle fasi P0/P1 indicate sotto, in particolare:
+Fase 7 lifecycle, Fase 8 backpressure, Fase 9 observability minima,
+Fase 10 resilienza rete, Fase 11 serializzazione dual-mode, Fase 12 host API
+minime e Fase 13 test di carico.
 
 ---
 
@@ -165,17 +202,33 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 # entro pochi secondi.
 ```
 
+> Nota: il wiring interno della Fase 6.5 è coperto dai test E2E su `SyncManager`, inclusi handshake, PushOps, convergenza e materializzazione sled. 
+> Il criterio CLI qui sopra non è ancora completamente rispettato alla lettera perché `nx run` oggi esegue il guest una volta e poi termina: non ha ancora un lifecycle/settle mode che lasci tempo stabile a handshake, broadcast e apply remoto tra processi CLI. Inoltre il registry GCounter in memoria non viene ancora ricostruito dai valori materializzati in sled all'avvio. 
+>Questi aspetti sono tracciati nella Fase 7.
+
 ---
 
 ### Fase 7: Graceful Lifecycle 🔄
 **Obiettivo**: Shutdown pulito e recovery da crash
 
+- [ ] Modalità long-running robusta per runtime con sync attivo.
+- [ ] Hydration all'avvio: ricostruire il registry GCounter dai valori
+      materializzati in sled.
+- [ ] Modalità di settle per `nx run` con sync attivo: lasciare tempo a
+      handshake, PushOps e apply remoto prima dell'exit, oppure sostituirla con
+      lifecycle long-running.
+- [ ] Smoke test CLI multi-process: due `nx run distributed_counter.wasm`
+      convergono e stampano lo stesso valore entro pochi secondi.
 - [ ] Signal handling (SIGTERM, SIGINT, SIGHUP)
 - [ ] Graceful shutdown: completa ops in flight, chiudi connessioni
 - [ ] Flush dello store prima di exit
 - [ ] Timeout configurabile per shutdown (default 30s)
 - [ ] Test: kill -TERM → nessuna corruzione dati
 - [ ] Test: crash → restart → stato consistente
+
+> Questi task completano il criterio CLI rimasto aperto dalla Fase 6.5 e lo
+> portano dentro un lifecycle generale: loop di servizio, shutdown signal-aware,
+> flush finale e gestione ordinata delle connessioni.
 
 **Criteri**:
 ```bash
@@ -333,7 +386,7 @@ Per ognuno: implementazione, test proprietà, OpKind, docs, esempio.
 |------|------|-------|----------|
 | 0-5 | Foundation | ✅ | - |
 | 6 | Transport Security | ✅ | **P0** |
-| 6.5 | End-to-End Sync Wiring | ⏳ | **P0** |
+| 6.5 | End-to-End Sync Wiring | ✅* | **P0** |
 | 7 | Graceful Lifecycle | ⏳ | **P0** |
 | 8 | Backpressure | ⏳ | **P0** |
 | 9 | Observability | ⏳ | **P1** |
@@ -349,13 +402,16 @@ Per ognuno: implementazione, test proprietà, OpKind, docs, esempio.
 - **P1**: Necessario per produzione sicura
 - **P2**: Necessario per adoption
 
+`✅*`: chiusa per wiring interno e test E2E `SyncManager`; il criterio CLI
+letterale resta tracciato in Fase 7 come lifecycle/settle/hydration.
+
 ---
 
-## Criteri Release v0.1.0
+## Criteri Release v0.1.0 finale
 
 - [x] Fasi 0-5 complete
 - [x] Fase 6 (TLS) completa
-- [ ] Fase 6.5 (End-to-End Sync) completa
+- [x] Fase 6.5 (End-to-End Sync) completa
 - [ ] Fase 7 (Graceful shutdown) completa
 - [ ] Fase 8 (Backpressure) completa
 - [ ] Fase 9 (Observability) almeno logging + health
@@ -366,6 +422,18 @@ Per ognuno: implementazione, test proprietà, OpKind, docs, esempio.
 - [ ] Tutti i test passano
 - [ ] Nessun warning clippy
 - [ ] Documentazione base
+
+---
+
+## Criteri Release v0.1.0-alpha.1
+
+- [x] Fasi 0-5 complete
+- [x] Fase 6 (TLS) completa
+- [x] Fase 6.5 wiring interno coperto da test E2E `SyncManager`
+- [x] Esempi WASM di base presenti
+- [x] `cargo test` passa fuori sandbox
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passa
+- [x] Limitazioni note documentate in roadmap
 
 ---
 
