@@ -1,176 +1,149 @@
-# Numax Runtime - Whitepaper Tecnico (Versione 0.1 ITA)
+# Numax Runtime - Whitepaper Tecnico (ITA)
 
-> **Nota V0.1.0**  
-> Questo documento è una base di partenza. Alcune sezioni contengono `TODO:` per indicare parti da approfondire in iterazioni successive.
+> **Nota**
+> Questo whitepaper è allineato a **v0.1.0-alpha.1**, la prima preview tecnica pubblica di Numax.
+> Rispetto alle bozze precedenti, gran parte dei `TODO` è stata risolta sulla base del codice presente nel repository. Ciò che rimane aperto è esplicitamente etichettato come *(Planned)* e tracciato nella roadmap.
 >
-> **Label di stato (coerenza col codice):**
-> - **(Implemented)**: presente nel codice attuale
-> - **(Prototype)**: presente in forma iniziale, crate scaffolding, comportamento parziale
-> - **(Planned)**: previsto da roadmap, non ancora stabile/implementato
+> **Label di stato (coerenti con il codice):**
+> - **(Implemented)**: presente nel codice, funzionante e coperto da test.
+> - **(Prototype)**: presente in forma parziale; wiring interno o cammini critici già verificati, ma non ancora production-ready.
+> - **(Planned)**: previsto in roadmap, non ancora implementato.
 >
-> **Ultimo aggiornamento codice**: 2026-02-22
+> **Riferimento di versione**: `v0.1.0-alpha.1` - preview tecnica, API e wire format possono cambiare prima della v0.1.0 stabile.
 
 ---
 
 ## 1. Executive Summary
 
-### 1.1 The Problem
+### 1.1 Il problema
 
-L'idea di numax nasce da una riflessione fatta riguardo lo sviluppo di applicazioni distribuite, che risulta essere spesso eccessivamente complesse anche per quanto riguarda logiche semplici.
+Costruire applicazioni distribuite, oggi, è sproporzionatamente complesso rispetto a ciò che la maggior parte di queste applicazioni fa davvero.
 
-Spesso si ricorre a:
+Per qualsiasi logica anche solo parzialmente distribuita, lo sviluppatore si trova a dover comporre:
 
 - container e orchestratori,
-- db esterni,
-- sistemi di sincronizzazione ad hoc,
-- differenze significative tra ambienti (browser, server, edge, IoT),
+- database esterni,
+- sistemi di sincronizzazione costruiti ad hoc,
+- ambienti di esecuzione molto diversi tra loro (browser, server, edge, IoT),
 - catene di dipendenze, permessi, versioni, configurazioni.
 
-Il risultato è spesso un ecosistema:
-
-- fragile,
-- difficile da comprendere end-to-end,
-- costoso da mantenere,
-- poco portabile tra ambienti diversi.
+Il risultato è quasi sempre lo stesso: un ecosistema fragile, difficile da comprendere end-to-end, costoso da mantenere e poco portabile.
 
 ### 1.2 Numax
 
-Numax è un runtime portabile progettato per eseguire applicazioni distribuite in modo semplice, sicuro e coerente su qualsiasi ambiente. 
-La sua architettura è semplice ed è composta da 3 blocchi:
+Numax è un **runtime portabile scritto in Rust** progettato per eseguire applicazioni distribuite in modo semplice, sicuro e coerente tra ambienti diversi.
 
-1. **WebAssembly (WASM)** *(Implemented)*
-   Il runtime esegue moduli WASM in sandbox isolata, con un set controllato di host API.
-   Questo garantisce portabilità tra piattaforme, avvii rapidi e sicurezza memory-safe.
+L'architettura si fonda su tre e solo tre componenti:
+
+1. **Esecuzione di moduli WebAssembly in sandbox isolata** *(Implemented)*
+   Wasmtime come motore, WASI preview1 come base I/O, host API minimale e controllata sotto namespace `nx`.
 
 2. **Datastore key/value locale embedded** *(Implemented)*
-   Ogni istanza del runtime include un datastore locale persistente e sempre disponibile.
-   Lo stato vive vicino al calcolo, riducendo latenza, dipendenze esterne e permettendo il funzionamento offline.
+   Basato su `sled`. Lo stato vive vicino al calcolo: bassa latenza, nessuna dipendenza esterna, funzionamento offline nativo.
 
-3. **Sincronizzazione distribuita dello stato** *(Prototype)*
-   Il runtime replica automaticamente lo stato tra nodi tramite CRDT (Conflict-free replicated data type) e gossip.
-   Il protocollo gossip gestisce propagazione, resilienza e comunicazione tra nodi anche con rete intermittente.
+3. **Sincronizzazione distribuita dello stato tramite CRDT + gossip** *(Prototype)*
+   Replica automatica tra nodi, senza coordinamento centralizzato, senza lock distribuiti, con convergenza garantita dalle proprietà matematiche dei CRDT.
 
-## 1.3 Il cuore tecnologico
+Numax non è un container, non è un orchestratore, non è un database distribuito. È un runtime: l'unità minima necessaria per eseguire logica distribuita portando con sé stato e sincronizzazione.
 
-I concetti chiave di numax sono:
+### 1.3 Il cuore tecnologico
 
-- **Semplicità architetturale come principio guida:**
-  Il runtime integra solo ciò che è davvero necessario come compute, stato locale o sincronizzazione.
-  Tutto il resto rimane opzionale. Questo riduce drasticamente la quantità di infrastruttura da configurare, mantenere e sopratutto capire.
+I principi che guidano ogni scelta tecnica:
 
-- **Stato e codice nello stesso ambiente:**
-  Il datastore locale è parte integrante del runtime.
-  Il calcolo non è separato dallo stato tramite un database remoto: vive nello stesso luogo, con benefici in termini di latenza, coerenza e resilienza offline.
+- **Semplicità architetturale come principio guida.** Il runtime integra solo ciò che è davvero necessario: compute, stato locale, sincronizzazione. Tutto il resto resta opzionale o esterno.
 
-- **WASM come unità di calcolo portabile:**
-  Il modulo WASM è l'unico artefatto necessario per distribuire logica applicativa.
-  Lo stesso modulo può essere eseguito su un po' ovunque senza modifiche, evitando codebase multiple o branching condizionale.
+- **Stato e codice nello stesso ambiente.** Il datastore non è un servizio remoto: è parte del runtime. Latenza nulla tra calcolo e stato, coerenza locale ACID, resilienza offline come default.
 
-- **CRDT invece di lock o transazioni distribuite:**
-  La sincronizzazione dello stato non richiede coordinamento centralizzato:
-  i CRDT garantiscono convergenza automatica tra nodi anche in presenza di latenze, disconnessioni o aggiornamenti concorrenti.
+- **WASM come unità di calcolo portabile.** Un singolo artefatto `.wasm` può girare su server, edge, browser, dispositivi embedded, senza branching condizionale e senza codebase multiple.
 
-- **Funzionamento offline come caratteristica nativa:**
-  Ogni nodo mantiene una copia locale dello stato e continua a funzionare autonomamente.
-  Quando torna online, il runtime esegue la riconciliazione tramite CRDT, senza conflitti e senza codice applicativo aggiuntivo.
+- **CRDT al posto di lock o transazioni distribuite.** La sincronizzazione non richiede coordinamento centralizzato: i CRDT garantiscono convergenza automatica anche con latenze, partizioni e aggiornamenti concorrenti.
 
-In sintesi: l'obbiettivo è costruire applicazioni distribuite senza dipendere da una infrastruttura complessa, mantenendo al tempo stesso portabilità, resilienza e coerenza dei dati.
+- **Funzionamento offline come caratteristica nativa.** Ogni nodo è autosufficiente. Quando rientra in rete, riconcilia attraverso CRDT senza conflitti e senza codice applicativo aggiuntivo.
 
-Numax non elimina la complessità del dominio distribuito: la gestisce in modo sistematico, incorporandola nel runtime.
-
-L'obiettivo è ridurre drasticamente la complessità auto-imposta fornendo: un runtime portabile unificato basato su WebAssembly, uno store locale integrato vicino al calcolo e una sincronizzazione automatica basata su CRDT.
-
-In questo modo, lo sviluppatore mantiene il controllo sulla complessità necessaria del proprio dominio, senza dover pagare il costo dell'infrastruttura distribuita tradizionale.
+Numax non pretende di eliminare la complessità del dominio distribuito: la **incorpora nel runtime in modo sistematico**, e rifiuta la complessità auto-imposta che oggi domina lo sviluppo di sistemi distribuiti.
 
 ---
 
 ## 2. Contesto
 
-### 2.1 Complessità Necessaria vs Complessità Auto-Imposta
+### 2.1 Complessità necessaria vs complessità auto-imposta
 
-Per fare chiarezza, la progettazione di sistemi distribuiti comporta una parte di complessità che è intrinseca al dominio e non può essere eliminata. Tuttavia, l'ecosistema tecnologico moderno introduce spesso complessità aggiuntiva non strettamente necessaria.
-Questa sezione chiarisce questa distinzione.
+Costruire sistemi distribuiti comporta una quota irriducibile di complessità. Una buona parte di quella che vediamo oggi nei nostri stack, però, non viene dal problema: viene dagli strumenti.
 
-**Complessità Necessaria:**
+**Complessità necessaria** - intrinseca al dominio:
 
-È la complessità che deriva dalle proprietà naturali dei sistemi distribuiti:
-* la rete è inaffidabile e introduce ritardi, disconnessioni e partizioni
-* più nodi possono aggiornare lo stesso stato in parallelo
-* i client possono trovarsi offline e riconnettersi in momenti diversi
-* gli ambienti di esecuzione sono eterogenei (browser, server, mobile, IoT)
+- la rete è inaffidabile, introduce ritardi, disconnessioni, partizioni;
+- più nodi possono aggiornare lo stesso stato in parallelo;
+- i client possono andare offline e rientrare in momenti arbitrari;
+- gli ambienti di esecuzione sono eterogenei (browser, server, mobile, IoT).
 
-> Questi aspetti non possono essere evitati: richiedono modelli dati e meccanismi di sincronizzazione robusti.
+Questi aspetti **non si possono evitare**: richiedono modelli dati e meccanismi di sincronizzazione robusti.
 
-**Complessità Auto-Imposta:**
+**Complessità auto-imposta** - aggiunta dagli strumenti, non dal problema:
 
-È la complessità aggiunta dagli strumenti moderni e dal toolchain, non dal problema:
-* orchestratori complessi spesso anche per applicazioni piccole
-* dipendenze multiple tra servizi e infrastrutture esterne
-* configurazioni distribuite in molti file (YAML, operator custom, chart)
-* stato delegato spesso a DB remoti anche quando sarebbe più efficiente mantenerlo localmente
-* tool differenziati per ambiente (dev, browser, edge, IoT)
+- orchestratori complessi anche per applicazioni piccole;
+- catene di dipendenze tra servizi e infrastrutture esterne;
+- configurazione frammentata su decine di file (YAML, operator custom, chart);
+- stato delegato a database remoti anche quando una replica locale sarebbe più efficiente;
+- toolchain differenziate per ambiente (dev, browser, edge, IoT).
 
-> Questa complessità è spesso evitabile: nasce dalla stratificazione di tecnologie general-purpose applicate anche in scenari in cui non sono strettamente necessarie.
+Questa complessità è **largamente evitabile**: nasce dall'accumulo di tecnologie general-purpose applicate a contesti per cui non sono indispensabili.
 
 ### 2.2 Opportunità
 
-L'emergere di WebAssembly e di modelli di sincronizzazione come i CRDT apre la possibilità di ripensare la base su cui costruiamo sistemi distribuiti:
+WebAssembly e i CRDT, presi insieme, rendono possibile ripensare la base su cui costruiamo sistemi distribuiti:
 
-- esecuzione più portabile,
-- maggiore isolamento,
-- sincronizzazione dello stato basata su proprietà matematiche,
-- runtime più leggeri e indipendenti dall'infrastruttura specifica.
+- esecuzione realmente portabile tra architetture e ambienti,
+- isolamento sandbox per default,
+- sincronizzazione dello stato fondata su proprietà matematiche dimostrabili,
+- runtime leggeri, indipendenti da una specifica infrastruttura.
 
 Numax nasce in questo spazio.
 
 ---
 
-## 3. Principi di Design di Numax
-
-Questo paragrafo definisce cosa Numax è e cosa non è.
+## 3. Principi di design di Numax
 
 ### 3.1 I tre elementi principali
 
-Numax integra solo tre componenti fondamentali:
+Numax integra tre componenti, e solo tre:
 
 1. esecuzione di moduli WASM in sandbox *(Implemented)*
 2. datastore locale sempre disponibile *(Implemented)*
 3. sincronizzazione distribuita dello stato *(Prototype)*
 
-Qualsiasi altra funzionalità appartiene ai livelli superiori o a tool esterni.
-Il runtime rimane intenzionalmente minimo.
+Tutto il resto appartiene ai livelli superiori o a tool esterni. Il runtime resta intenzionalmente minimo: questa è una scelta, non una mancanza.
 
 ### 3.2 Portabilità radicale
 
 Un modulo WASM deve poter girare senza modifiche:
 
-- on premise
-- in cloud
-- su edge nodes
-- su dispositivi embedded
-- nel browser
+- on premise,
+- in cloud,
+- su nodi edge,
+- su dispositivi embedded,
+- nel browser.
 
-Questo approccio riduce configurazioni specifiche per ambiente, dipendenze da piattaforma e branching condizionale nel codice applicativo.
+Questo riduce a zero le configurazioni specifiche per ambiente, le dipendenze da piattaforma e il branching condizionale nel codice applicativo.
 
 ### 3.3 Stato vicino al calcolo
 
 Il runtime assume che lo stato debba:
 
-- essere locale per garantire velocità e resilienza
-- essere replicabile per garantire distribuzione *(Prototype)*
+- essere **locale**, per garantire velocità e resilienza;
+- essere **replicabile**, per garantire distribuzione *(Prototype)*.
 
-Per questo il datastore è integrato nel runtime e non dipende da componenti esterni.
+Il datastore è quindi integrato nel runtime e non dipende da componenti esterni. Il calcolo non viaggia verso lo stato: lo stato è già lì.
 
 ### 3.4 Sincronizzazione senza conflitti
 
-La sincronizzazione dello stato usa modelli CRDT che consentono:
+La replica si basa su modelli CRDT che permettono:
 
-- aggiornamenti concorrenti
-- consistenza eventuale
-- assenza di conflitti manuali
+- aggiornamenti concorrenti senza lock;
+- consistenza eventuale dimostrabile;
+- assenza di conflitti che richiedano risoluzione manuale.
 
-La rete è considerata fallibile per natura.
-Il runtime gestisce disconnessioni, latenze e rientri come condizioni normali, non eccezionali.
+La rete è considerata fallibile per natura. Disconnessioni, latenze e rientri sono condizioni **normali**, non eccezionali.
 
 ---
 
@@ -182,64 +155,76 @@ Numax è composto da sei crate Rust organizzati in un workspace:
 
 | Crate | Stato | Responsabilità |
 |-------|-------|----------------|
-| **nx-core** | *Implemented* | Runtime WASM, sandboxing, host API |
-| **nx-store** | *Implemented* | Datastore key/value locale persistente |
-| **nx-sync** | *Prototype* | Strutture dati CRDT, operazioni, identità nodi |
-| **nx-net** | *Prototype* | Networking TCP, protocollo messaggi, gossip |
+| **nx-core** | *Implemented* | Runtime WASM (Wasmtime), sandboxing, host API |
+| **nx-store** | *Implemented* | Datastore key/value locale persistente (sled) |
+| **nx-sync** | *Implemented* | Strutture dati CRDT, operazioni, identità nodi, SyncManager |
+| **nx-net** | *Implemented* | Networking TCP, protocollo messaggi, TLS 1.3 + mTLS |
 | **nx-sdk** | *Implemented* | SDK per sviluppare moduli WASM guest |
 | **nx-cli** | *Implemented* | Interfaccia a linea di comando |
 
-Questa separazione mantiene responsabilità chiare e permette di evolvere i componenti in modo indipendente.
+La separazione mantiene responsabilità chiare e permette ai componenti di evolvere in modo indipendente.
 
 ### 4.2 Ambienti supportati
 
 Numax è progettato per girare su:
 
 - server (x86_64, ARM64),
-- edge nodes,
+- nodi edge,
 - browser (tramite WASM),
 - mobile (tramite integrazione nativa),
 - IoT (ARM / RISC-V).
 
-La CI attuale verifica la compilazione su:
-- Ubuntu (x86_64)
-- macOS (x86_64, ARM64)
-- Windows (x86_64)
+La CI verifica oggi la compilazione e l'esecuzione dei test su:
 
-### 4.3 Modello di esecuzione e dati (overview)
-- **Compute**: un nodo Numax esegue moduli **WASM** in sandbox, esponendo un set limitato di Host API. *(Implemented)*
-- **State**: ogni nodo mantiene uno **store key/value locale** persistente basato su sled. *(Implemented)*
-- **Sync**: una parte dello stato può essere **replicata** tra nodi tramite **CRDT + gossip**. *(Prototype)*
-- **Consistency**: il sistema mira a **convergenza eventuale** (eventual consistency): in assenza di nuove scritture e con connettività sufficiente, tutti i nodi convergono allo stesso stato. *(Prototype)*
-- **Rete fallibile**: disconnessioni e rientri sono condizioni normali; Numax include meccanismi per recuperare delta mancanti. *(Prototype)*
+- Ubuntu (x86_64),
+- macOS (x86_64, ARM64),
+- Windows (x86_64).
+
+### 4.3 Modello di esecuzione e dati
+
+- **Compute**: un nodo Numax esegue moduli WASM in sandbox, esponendo un set limitato di host API. *(Implemented)*
+- **State**: ogni nodo mantiene uno store key/value locale persistente basato su sled. *(Implemented)*
+- **Sync**: una parte dello stato può essere replicata tra nodi tramite CRDT + gossip. *(Prototype)*
+- **Consistency**: il sistema mira a convergenza eventuale (eventual consistency); in assenza di nuove scritture e con connettività sufficiente, tutti i nodi convergono allo stesso stato. *(Prototype)*
+- **Rete fallibile**: disconnessioni e rientri sono condizioni normali; la roadmap include meccanismi espliciti per recuperare delta mancanti (anti-entropy). *(Planned, Fase 10)*
 
 ### 4.4 Security model & threat model
+
 **Assunzioni:**
-- La rete è potenzialmente **ostile** (osservazione, MITM, packet injection, route hijack). *(Planned)*
-- I nodi possono essere **offline** o intermittenti oppure alcuni peer possono essere **malevoli** o non affidabili. *(Planned)*
+
+- la rete è potenzialmente ostile (osservazione, MITM, packet injection, route hijack);
+- i nodi possono essere offline o intermittenti;
+- alcuni peer possono essere malevoli o non affidabili.
 
 **Obiettivi di sicurezza:**
+
 - Isolamento del compute (sandbox WASM). *(Implemented)*
-- Confidenzialità/integrità delle comunicazioni tra nodi. *(Planned)*
-- Autenticazione dei peer (evitare MITM). *(Planned)*
-- (valutare) Policy di membership (permissioned vs open). *(Planned)*
+- Confidenzialità e integrità delle comunicazioni tra nodi. *(Implemented - TLS 1.3)*
+- Autenticazione mutua dei peer. *(Implemented - mTLS, NodeID derivato dall'hash della chiave pubblica del certificato)*
+- Membership controllata via allowlist di peer trust. *(Implemented)*
+- Resilienza completa del canale rispetto a tutti gli scenari (replay, downgrade, certificate pinning evoluto, rotazione automatica). *(Prototype / Planned)*
 
 **Guardrail implementati:**
-- Limiti su lunghezza chiavi: 8 KiB
-- Limiti su lunghezza valori: 1 MiB
-- Limiti su buffer di output: 1 MiB
-- Validazione di tutti gli input dal guest prima di processarli
 
-**Fuori scope e idee future:**
-- Bug logici nel modulo applicativo.
-- Data poisoning se si accettano peer non trusted senza policy.
-- Compromissione host-level (se un nodo perde la chiave privata, serve revoca/rotazione).
+| Risorsa | Limite |
+|---------|--------|
+| Lunghezza chiave | 1024 byte |
+| Lunghezza valore | 1 MB |
+| Buffer di output | 10 MB |
+
+Tutti gli input provenienti dal guest sono validati prima di essere processati.
+
+**Fuori scope (oggi):**
+
+- bug logici nel modulo applicativo;
+- data poisoning se si accettano peer non trusted senza policy;
+- compromissione host-level (la perdita della chiave privata di un nodo richiede revoca/rotazione esterna).
 
 ---
 
 ## 5. Architettura del Sistema
 
-Di seguito una panoramica ad alto livello dei componenti principali di Numax e delle loro interazioni.
+Panoramica ad alto livello dei componenti e delle loro interazioni.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -252,17 +237,25 @@ Di seguito una panoramica ad alto livello dei componenti principali di Numax e d
 │                       nx-core (Host)                        │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │  Wasmtime   │  │  Host API   │  │    WASI (preview1)  │  │
-│  │   Engine    │  │  db_*, log  │  │    stdio, args      │  │
+│  │   Engine    │  │ db_*, log,  │  │    stdio, args      │  │
+│  │             │  │ crdt_*      │  │                     │  │
 │  └─────────────┘  └──────┬──────┘  └─────────────────────┘  │
 └──────────────────────────┼──────────────────────────────────┘
                            │
           ┌────────────────┼────────────────┐
           ▼                ▼                ▼
-   ┌────────────┐   ┌────────────┐   ┌────────────┐
-   │  nx-store  │   │  nx-sync   │   │   nx-net   │
-   │   (sled)   │   │  (CRDTs)   │   │   (TCP)    │
-   └────────────┘   └────────────┘   └────────────┘
+   ┌────────────┐   ┌────────────┐   ┌────────────────────┐
+   │  nx-store  │   │  nx-sync   │   │      nx-net        │
+   │   (sled)   │◄──┤ SyncMgr +  ├──►│  TCP + TLS 1.3     │
+   │            │   │   CRDTs    │   │  (mTLS, allowlist) │
+   └────────────┘   └────────────┘   └────────────────────┘
+                          ▲
+                          │ async runtime (tokio)
+                          ▼
+                  Peer nodes (gossip, K-fanout)
 ```
+
+Il runtime host è interamente **async, basato su tokio**: l'esecuzione del modulo WASM, l'I/O di rete, le operazioni sullo store e la propagazione delle operazioni CRDT sono coordinate dallo stesso scheduler asincrono. Il **SyncManager** è il punto di raccordo tra host API CRDT, store locale e rete: riceve le operazioni generate dal guest, le materializza su sled e le propaga ai peer attivi.
 
 ### 5.1 Numax Core - Runtime WASM *(Implemented)*
 
@@ -275,28 +268,17 @@ Di seguito una panoramica ad alto livello dei componenti principali di Numax e d
 
 **Tecnologie:**
 
-- Implementazione in Rust,
+- implementazione in Rust,
 - **Wasmtime** come motore WASM,
-- WASI preview1 come interfaccia di sistema.
+- WASI preview1 come interfaccia di sistema,
+- runtime asincrono **tokio** per l'host.
 
 **Caratteristiche:**
 
-- isolamento rigoroso: il guest non può accedere a risorse non esplicitamente concesse,
-- nessun accesso implicito al filesystem,
-- avvio rapido (< 5 ms tipico),
-- sicurezza memory-safe garantita da Rust e dal modello WASM.
-
-**Host API esposte (namespace `nx`):**
-
-Il modulo guest importa funzioni dal namespace `"nx"`. Attualmente sono disponibili:
-
-| Funzione | Stato | Descrizione |
-|----------|-------|-------------|
-| `db_get` | *Implemented* | Legge un valore dal datastore locale |
-| `db_set` | *Implemented* | Scrive un valore nel datastore locale |
-| `db_delete` | *Implemented* | Elimina una chiave dal datastore |
-| `host_log_v2` | *Implemented* | Scrive un messaggio di log con livello |
-| `db_scan` | *Planned* | Scansione per prefisso |
+- isolamento rigoroso: il guest non può accedere a risorse non esplicitamente concesse;
+- nessun accesso implicito al filesystem;
+- avvio rapido (tipicamente sotto la decina di millisecondi);
+- memory-safety garantita da Rust e dal modello WASM.
 
 **Convenzione dei return code:**
 
@@ -305,30 +287,31 @@ Le funzioni host restituiscono interi con semantica precisa:
 | Codice | Costante | Significato |
 |--------|----------|-------------|
 | `>= 0` | - | Successo (per `db_get`: lunghezza del valore letto) |
-| `0` | `OK` | Successo (per `db_set`, `db_delete`) |
+| `0` | `OK` | Successo (per `db_set`, `db_delete`, host API CRDT) |
 | `-1` | `ERR_NOT_FOUND` | Chiave non trovata |
-| `-2` | `ERR_BUF_TOO_SMALL` | Buffer output troppo piccolo, riprovare con buffer più grande |
+| `-2` | `ERR_BUFFER_TOO_SMALL` | Buffer output troppo piccolo, riprovare con buffer più grande |
 | `-3` | `ERR_INTERNAL` | Errore interno del runtime |
+| `-4` | `ERR_RESERVED_KEY` | Tentativo di usare una chiave riservata al runtime |
+| `-5` | `ERR_SYNC_DISABLED` | Operazione di sync richiesta ma sync non abilitato |
 
-Questa convenzione permette al guest di gestire gli errori in modo deterministico senza eccezioni o panic.
+Questa convenzione permette al guest di gestire gli errori in modo deterministico, senza eccezioni o panic.
 
 **Limiti di sicurezza (guardrail):**
 
-| Risorsa | Limite | Note |
-|---------|--------|------|
-| Lunghezza chiave | 8 KiB | Previene allocazioni eccessive |
-| Lunghezza valore | 1 MiB | Bilancia utilità e sicurezza |
-| Buffer output | 1 MiB | Limita memoria copiata verso il guest |
+| Risorsa | Limite |
+|---------|--------|
+| Lunghezza chiave | 1024 byte |
+| Lunghezza valore | 1 MB |
+| Buffer di output | 10 MB |
 
-Questi limiti proteggono l'host da comportamenti patologici o malevoli del guest.
-
-### 5.2 Numax Store - Datastore Locale *(Implemented)*
+### 5.2 Numax Store - Datastore locale *(Implemented)*
 
 Numax Store fornisce un key/value store persistente locale per ogni istanza di runtime.
 
 **Implementazione:**
 
 Il datastore è basato su **sled**, un embedded database scritto in Rust che offre:
+
 - persistenza su disco,
 - operazioni atomiche,
 - prestazioni elevate per workload misti read/write,
@@ -351,45 +334,29 @@ impl Store {
 ```rust
 use nx_sdk::db;
 
-// Lettura
 let value: Option<Vec<u8>> = db::get("my_key")?;
-
-// Scrittura
 db::set("my_key", b"my_value")?;
-
-// Eliminazione
 db::delete("my_key")?;
 ```
 
-L'SDK gestisce automaticamente la serializzazione, i buffer e i retry in caso di `ERR_BUF_TOO_SMALL`.
+L'SDK gestisce automaticamente la serializzazione, i buffer e i retry in caso di `ERR_BUFFER_TOO_SMALL`.
 
 **Proprietà:**
 
-- ACID locale per singole operazioni,
-- operazioni atomiche get/set/delete,
-- nessun lock esplicito richiesto dal chiamante,
+- ACID locale per singole operazioni;
+- get/set/delete atomiche;
+- nessun lock esplicito richiesto dal chiamante;
 - dati persistenti tra riavvii del runtime.
 
-### 5.3 Numax Sync - Replica Distribuita *(Prototype)*
+### 5.3 Numax Sync - Replica distribuita *(Implemented core, Prototype end-to-end)*
 
-Numax Sync è responsabile della replica dello stato tra nodi.
-La versione attuale fornisce le primitive fondamentali; l'integrazione completa con nx-net è in sviluppo.
+Numax Sync è responsabile della replica dello stato tra nodi. Le primitive fondamentali sono implementate e coperte da test (incluso il wiring end-to-end del SyncManager). Il ciclo CLI multi-process completo è tracciato come Fase 7 della roadmap.
 
-**Componenti implementati:**
+**Componenti:**
 
-**NodeId** *(Implemented)*
+**NodeId** *(Implemented)* - identifica univocamente un nodo. In modalità TLS, il NodeId è **derivato deterministicamente dall'hash della chiave pubblica del certificato**: l'identità di un nodo è la sua chiave.
 
-Identifica univocamente un nodo nella rete.
-Può essere generato casualmente (UUID) o assegnato esplicitamente.
-
-```rust
-let node = NodeId::new("node-alpha");
-let random_node = NodeId::generate(); // UUID v4
-```
-
-**Op e OpId** *(Implemented)*
-
-Rappresentano operazioni CRDT serializzabili e trasportabili tra nodi.
+**Op e OpId** *(Implemented)* - operazioni CRDT serializzabili e trasportabili tra nodi.
 
 ```rust
 pub struct Op {
@@ -400,14 +367,10 @@ pub struct Op {
 }
 ```
 
-Le operazioni sono serializzabili in JSON e binario per il trasporto via rete.
+Le operazioni sono serializzabili per il trasporto via rete (oggi JSON length-prefixed; dual-mode JSON/bincode previsto in Fase 11).
 
-**GCounter (Grow-only Counter)** *(Implemented)*
+**GCounter (Grow-only Counter)** *(Implemented)* - primo CRDT implementato, contatore distribuito che supporta solo incrementi. Ogni nodo possiede il proprio "slot" e può incrementare solo quello.
 
-Il primo CRDT implementato è un contatore distribuito che supporta solo incrementi.
-Ogni nodo mantiene il proprio "slot" e può incrementare solo quello.
-
-Struttura interna:
 ```rust
 pub struct GCounter {
     counts: HashMap<String, u64>,  // NodeId -> valore locale
@@ -416,20 +379,13 @@ pub struct GCounter {
 
 Il valore totale è la somma di tutti gli slot: `value() = Σ counts[node]`.
 
-**Proprietà CRDT garantite:**
+**Proprietà CRDT garantite e verificate:**
 
-I CRDT (Conflict-free Replicated Data Types) garantiscono convergenza automatica grazie a tre proprietà matematiche:
+1. **Commutatività** - `merge(A, B) == merge(B, A)`
+2. **Associatività** - `merge(merge(A, B), C) == merge(A, merge(B, C))`
+3. **Idempotenza** - `merge(A, A) == A`
 
-1. **Commutatività**: `merge(A, B) == merge(B, A)`
-   L'ordine in cui i nodi ricevono gli aggiornamenti non influisce sul risultato finale.
-
-2. **Associatività**: `merge(merge(A, B), C) == merge(A, merge(B, C))`
-   Non importa come vengono raggruppati i merge.
-
-3. **Idempotenza**: `merge(A, A) == A`
-   Applicare lo stesso aggiornamento più volte non cambia lo stato.
-
-Queste proprietà sono verificate dalla test suite con test dedicati.
+Verificate da test dedicati nella suite di `nx-sync`.
 
 **Operazione di merge:**
 
@@ -437,25 +393,23 @@ Queste proprietà sono verificate dalla test suite con test dedicati.
 pub fn merge(&mut self, other: &GCounter) {
     for (node, &value) in &other.counts {
         let entry = self.counts.entry(node.clone()).or_insert(0);
-        *entry = (*entry).max(value);  // Prende il massimo
+        *entry = (*entry).max(value); // Prende il massimo per slot
     }
 }
 ```
 
-Il merge prende il valore massimo per ogni slot.
-Questo garantisce che:
-- nessun incremento venga perso,
-- incrementi duplicati non vengano contati due volte,
-- l'ordine di ricezione non influenzi il risultato.
+**Protezione overflow:** gli incrementi usano `saturating_add` per saturare a `u64::MAX` invece di andare in overflow.
 
-**Protezione overflow:**
+**SyncManager** *(Implemented)* - componente async che integra CRDT, store e rete:
 
-Gli incrementi usano `saturating_add` per prevenire overflow:
-```rust
-*entry = entry.saturating_add(delta);  // Satura a u64::MAX invece di overflow
-```
+- riceve operazioni dal guest via host API CRDT,
+- materializza lo stato CRDT su sled,
+- propaga le operazioni ai peer attivi tramite nx-net,
+- coperto da test E2E end-to-end.
 
-**CRDT pianificati:**
+**Hydration** *(Planned, Fase 7)* - la ricostruzione dello stato GCounter da sled all'avvio del nodo non è ancora implementata. Oggi lo stato è ricostruito durante l'esecuzione tramite operazioni; la persistenza dello stato CRDT materializzato è presente ma il replay all'avvio è in roadmap.
+
+**CRDT pianificati (Fase 14):**
 
 | Tipo | Descrizione | Stato |
 |------|-------------|-------|
@@ -463,19 +417,15 @@ Gli incrementi usano `saturating_add` per prevenire overflow:
 | LWW-Register | Registro last-writer-wins | *Planned* |
 | ORSet | Set con add/remove osservati | *Planned* |
 | LWW-Map | Mappa con semantica LWW | *Planned* |
+| RGA | Replicated Growable Array (sequenze) | *Planned* |
 
-### 5.4 Numax Net - Networking *(Prototype)*
+### 5.4 Numax Net - Networking *(Implemented base, Prototype resilienza)*
 
 Numax Net gestisce la comunicazione tra nodi per la sincronizzazione dello stato.
 
-**Architettura:**
+**Architettura:** peer-to-peer. Ogni nodo può comunicare direttamente con altri nodi senza un server centrale. Trasporto TCP, **TLS 1.3 con mTLS** disponibile e raccomandato.
 
-La rete è peer-to-peer: ogni nodo può comunicare direttamente con altri nodi senza un server centrale.
-La versione attuale usa TCP come trasporto; TLS è pianificato per le versioni successive.
-
-**Protocollo messaggi:**
-
-I messaggi sono serializzati in JSON con un prefisso di lunghezza (4 byte big-endian):
+**Protocollo messaggi:** length-prefixed JSON (4 byte big-endian per la lunghezza, payload JSON):
 
 ```
 ┌──────────────┬─────────────────────────────┐
@@ -492,30 +442,42 @@ I messaggi sono serializzati in JSON con un prefisso di lunghezza (4 byte big-en
 | `HelloAck` | Server → Client | Conferma handshake |
 | `PushOps` | Bidirezionale | Invia batch di operazioni CRDT |
 | `PushOpsAck` | Bidirezionale | Conferma ricezione operazioni |
-| `PullSince` | Client → Server | Richiedi operazioni dopo un certo OpId |
+| `PullSince` | Client → Server | Richiede operazioni dopo un certo OpId |
 | `Ping` | Bidirezionale | Keepalive |
 | `Pong` | Bidirezionale | Risposta a Ping |
 
-**Struttura dei messaggi:**
+**Versioning del protocollo:** numero di versione (`PROTOCOL_VERSION = 1`) scambiato durante l'handshake. Permette evoluzione retrocompatibile e rilevamento di incompatibilità.
 
-```rust
-pub enum MessageKind {
-    Hello { node_id: NodeId, version: u32 },
-    HelloAck { node_id: NodeId, version: u32 },
-    PushOps { ops: Vec<Op> },
-    PushOpsAck { received_count: usize },
-    PullSince { since_op_id: Option<String> },
-    Ping,
-    Pong,
-}
-```
+**Stato corrente:**
 
-**Versioning del protocollo:**
+- canale TCP + TLS 1.3 + mTLS *(Implemented)*;
+- handshake, push/pull e keepalive *(Implemented)*;
+- gossip peer-to-peer con fanout K: architettura definita, integrazione completa in corso *(Prototype)*;
+- resilienza rete piena (reconnect con backoff esponenziale, anti-entropy automatica, dedup ops) *(Planned, Fase 10)*;
+- backpressure e limiti di connessione *(Planned, Fase 8)*.
 
-Il protocollo include un numero di versione (`PROTOCOL_VERSION = 1`) scambiato durante l'handshake.
-Questo permette evoluzione retrocompatibile e rilevamento di incompatibilità.
+### 5.5 Sicurezza del canale *(Implemented)*
 
-### 5.5 Numax SDK *(Implemented)*
+Numax assume una rete ostile: il trasporto può essere osservato, alterato o reindirizzato. Le comunicazioni tra nodi avvengono per default su canali cifrati e autenticati.
+
+**Garantito oggi:**
+
+- **Confidenzialità** - TLS 1.3 cifra tutto il traffico tra nodi.
+- **Integrità** - TLS 1.3 protegge da manipolazioni del payload.
+- **Autenticazione mutua** - mTLS: ogni nodo presenta un certificato e verifica quello del peer.
+- **Identità verificabile** - il `NodeId` è derivato dall'hash della chiave pubblica del certificato. L'identità di un nodo non può essere falsificata senza la sua chiave privata.
+- **Membership controllata** - allowlist esplicita dei NodeId/peer accettati.
+- **Forward Secrecy** - fornita dai cipher suite di TLS 1.3.
+
+**Flag CLI dedicati:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (quest'ultimo solo per sviluppo locale).
+
+**Fuori scope per v0.1.0-alpha.1:**
+
+- rotazione automatica dei certificati;
+- certificate pinning evoluto;
+- hardening completo del canale per tutti gli scenari operativi (oggetto di lavoro nelle fasi successive).
+
+### 5.6 Numax SDK *(Implemented)*
 
 L'SDK fornisce un'interfaccia ergonomica per sviluppare moduli WASM guest.
 
@@ -524,117 +486,94 @@ L'SDK fornisce un'interfaccia ergonomica per sviluppare moduli WASM guest.
 | Modulo | Funzionalità |
 |--------|--------------|
 | `nx_sdk::db` | Accesso al datastore (get, set, delete) |
-| `nx_sdk::log` | Logging verso l'host |
+| `nx_sdk::log` | Logging strutturato verso l'host |
+| `nx_sdk::crdt::gcounter` | API ergonomica per incrementare e leggere GCounter distribuiti |
 
-**Esempio completo:**
+**Esempio: contatore distribuito**
 
 ```rust
-use nx_sdk::{db, log};
+use nx_sdk::{log, crdt::gcounter};
 
 #[no_mangle]
 pub extern "C" fn run() {
-    log("Modulo avviato");
-    
-    // Scrivi un valore
-    if let Err(e) = db::set("visits", b"1") {
-        log(&format!("Errore scrittura: {:?}", e));
+    log::info("Modulo avviato");
+
+    if let Err(e) = gcounter::inc("visits", 1) {
+        log::error(&format!("Errore inc: {:?}", e));
         return;
     }
-    
-    // Leggi il valore
-    match db::get("visits") {
-        Ok(Some(value)) => {
-            log(&format!("Valore letto: {} bytes", value.len()));
-        }
-        Ok(None) => {
-            log("Chiave non trovata");
-        }
-        Err(e) => {
-            log(&format!("Errore lettura: {:?}", e));
-        }
+
+    match gcounter::value("visits") {
+        Ok(v) => log::info(&format!("visits = {}", v)),
+        Err(e) => log::error(&format!("Errore read: {:?}", e)),
     }
-    
-    log("Modulo completato");
 }
 ```
 
-**Gestione automatica dei buffer:**
+**Gestione automatica dei buffer:** l'SDK gestisce trasparentemente il caso `ERR_BUFFER_TOO_SMALL`, riallocando e ripetendo la chiamata, così il developer non deve mai pensare alla dimensione dei buffer.
 
-L'SDK gestisce automaticamente il caso `ERR_BUF_TOO_SMALL`:
+### 5.7 Numax CLI *(Implemented)*
 
-1. Prima chiamata con buffer di dimensione stimata
-2. Se il buffer è troppo piccolo, rialloca con la dimensione corretta
-3. Seconda chiamata con buffer adeguato
-
-Questo nasconde la complessità della gestione memoria al developer.
-
-### 5.6 Numax CLI *(Implemented)*
-
-La CLI fornisce l'interfaccia principale per interagire con il runtime.
-
-**Comandi disponibili:**
+La CLI è l'interfaccia principale per eseguire un nodo Numax.
 
 ```bash
-# Esegue un modulo WASM
+# Esegue un modulo WASM (single-shot oggi; long-running in Fase 7)
 nx run <module.wasm>
 
 # Esegue con directory dati custom
 nx run <module.wasm> --data-dir ./my-data
 
-# Esegue con sync abilitato (prototype)
+# Esegue con sync abilitato e TLS/mTLS
 nx run <module.wasm> --sync \
     --sync-listen 0.0.0.0:9000 \
     --sync-peers 192.168.1.10:9000,192.168.1.11:9000 \
-    --sync-keys "counter:,votes:"
+    --sync-keys "counter:,votes:" \
+    --tls-cert ./certs/node.crt \
+    --tls-key  ./certs/node.key \
+    --tls-ca   ./certs/ca.crt \
+    --allowed-peers ./peers.allow
 ```
 
-**Opzioni:**
+**Opzioni principali:**
 
 | Flag | Descrizione |
 |------|-------------|
-| `--data-dir` | Directory per dati persistenti |
+| `--data-dir` | Directory per i dati persistenti |
 | `--sync` | Abilita sincronizzazione |
-| `--sync-listen` | Indirizzo su cui ascoltare per connessioni peer |
+| `--sync-listen` | Indirizzo su cui accettare connessioni peer |
 | `--sync-peers` | Lista di peer iniziali (comma-separated) |
 | `--sync-keys` | Prefissi delle chiavi da sincronizzare |
+| `--tls-cert` / `--tls-key` / `--tls-ca` | Materiale TLS per mTLS |
+| `--allowed-peers` | Allowlist dei NodeID peer accettati |
+| `--tls-insecure` | Disattiva TLS (solo dev locale) |
 
-### 5.7 Topologia: epidemic gossip *(Prototype)*
+### 5.8 Topologia: epidemic gossip *(Prototype)*
 
-Numax Net non assume una topologia ad anello (es. `n1→n2→n3→…`) perché sarebbe fragile: la caduta di un nodo può spezzare la catena.
+Numax non assume una topologia ad anello (es. `n1→n2→n3→…`): sarebbe fragile, la caduta di un nodo spezzerebbe la catena.
 
-Utilizza invece un modello **peer-to-peer a gossip** in cui:
-- ogni nodo mantiene connessioni attive verso un **sottoinsieme** di peer (fanout **K**);
-- gli aggiornamenti (operazioni CRDT) vengono propagati in modo "epidemico": un nodo invia l'update ai suoi peer, i peer lo inoltrano ad altri peer, fino a coprire la rete;
-- ogni operazione ha un **identificatore univoco** (`OpId`) così i nodi possono **deduplicare** e prevenire loop.
+Il modello è **peer-to-peer a gossip**:
 
-Questo approccio scala meglio del full-mesh (tutti connessi con tutti) e rimane resiliente anche in presenza di disconnessioni temporanee.
+- ogni nodo mantiene connessioni attive verso un sottoinsieme di peer (fanout **K**);
+- gli aggiornamenti (operazioni CRDT) si propagano in modo "epidemico": un nodo invia l'update ai suoi peer, i peer lo inoltrano ad altri, fino a coprire la rete;
+- ogni operazione ha un identificatore univoco (`OpId`) per **deduplicare** e prevenire loop.
 
-### 5.8 Resilienza: nodo down, rete intermittente, rientro *(Planned)*
+L'approccio scala meglio del full-mesh e resta resiliente in presenza di disconnessioni temporanee. L'integrazione completa del fanout dinamico è in corso.
 
-La rete è considerata fallibile per natura: nodi possono spegnersi, perdere connettività o rientrare.
+### 5.9 Resilienza: nodo down, rete intermittente, rientro *(Planned - Fase 10)*
+
+La rete è considerata fallibile per natura. Le contromisure progettate:
 
 Quando un peer diventa irraggiungibile:
-- il nodo applica timeout e retry con **backoff esponenziale**;
-- marca il peer come **down** e lo rimuove dal set attivo;
-- seleziona un nuovo peer dal discovery per mantenere il fanout **K**.
+
+- timeout e retry con **backoff esponenziale**;
+- marcatura del peer come down e rimozione dal set attivo;
+- selezione di un nuovo peer dal discovery per mantenere il fanout **K**.
 
 Quando un nodo rientra:
-- ristabilisce connessioni con i peer noti;
-- esegue un meccanismo di **anti-entropy** (`PullSince`) per recuperare gli update mancanti;
-- converge allo stesso stato grazie alle proprietà dei CRDT.
 
-### 5.9 Sicurezza del canale *(Planned)*
-
-Numax assume una rete ostile: il trasporto può essere osservato, alterato o reindirizzato.
-Per questo, tutte le comunicazioni tra nodi dovranno avvenire su canali cifrati e autenticati.
-
-Obiettivi:
-- **Confidenzialità**: terzi non possono leggere il traffico.
-- **Integrità**: terzi non possono modificare i messaggi.
-- **Autenticazione**: un nodo parla solo con peer che dimostrano la propria identità.
-- **Forward Secrecy**: compromissione futura di una chiave non decifra traffico passato.
-
-Implementazione prevista: **TLS 1.3** con mutual authentication o protocollo equivalente.
+- ristabilimento delle connessioni con i peer noti;
+- meccanismo di **anti-entropy** (`PullSince`) per recuperare gli update mancanti;
+- convergenza allo stesso stato grazie alle proprietà dei CRDT.
 
 ---
 
@@ -644,12 +583,13 @@ Implementazione prevista: **TLS 1.3** con mutual authentication o protocollo equ
 
 Un'applicazione Numax è composta da uno o più moduli WASM che:
 
-* eseguono logica applicativa pura,
-* leggono/scrivono sul datastore locale tramite host API,
-* (futuro) pubblicano e ricevono aggiornamenti via Sync,
-* (futuro) effettuano chiamate HTTP se esplicitamente permesso.
+- eseguono logica applicativa pura,
+- leggono/scrivono sul datastore locale tramite host API,
+- pubblicano e ricevono aggiornamenti CRDT via host API dedicate,
+- (futuro) effettueranno chiamate HTTP se esplicitamente permesso.
 
 Il modulo deve esporre una funzione `run` con firma:
+
 ```rust
 #[no_mangle]
 pub extern "C" fn run() {
@@ -657,52 +597,49 @@ pub extern "C" fn run() {
 }
 ```
 
-### 6.2 API Host esposte ai moduli
+### 6.2 Host API esposte ai moduli
 
-**Namespace import:** `"nx"`
+**Namespace import:** `"nx"`. Tutte le funzioni host sono importate dal namespace `"nx"`; l'SDK fornisce wrapper type-safe.
 
-Tutte le funzioni host sono importate dal namespace `"nx"`.
-Il modulo WASM dichiara le import e l'SDK fornisce wrapper type-safe.
-
-**Database:**
+**Database** - *(Implemented)*
 
 | Funzione | Firma | Stato |
 |----------|-------|-------|
 | `db_get` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 | `db_set` | `(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32` | *Implemented* |
 | `db_delete` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
+| `db_scan` | scansione per prefisso | *Planned (Fase 12)* |
 
-**Logging:**
+**Logging** - *(Implemented)*
 
 | Funzione | Firma | Stato |
 |----------|-------|-------|
 | `host_log_v2` | `(level: u32, msg_ptr: u32, msg_len: u32) -> ()` | *Implemented* |
 
-Livelli di log:
-- 0 = trace
-- 1 = debug
-- 2 = info
-- 3 = warn
-- 4 = error
+Livelli di log: 0 = trace, 1 = debug, 2 = info, 3 = warn, 4 = error.
 
-**Sync (pianificate):**
+**CRDT** - *(Implemented)*
 
-| Funzione | Descrizione | Stato |
-|----------|-------------|-------|
-| `sync_publish` | Pubblica un'operazione CRDT | *Planned* |
-| `sync_on_update` | Registra callback per aggiornamenti | *Planned* |
+| Funzione | Firma | Stato |
+|----------|-------|-------|
+| `crdt_gcounter_inc` | `(key_ptr: u32, key_len: u32, delta: u64) -> i32` | *Implemented* |
+| `crdt_gcounter_value` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 
-**Networking (pianificate):**
+Le operazioni di incremento sono materializzate su sled e propagate ai peer tramite SyncManager. In assenza di sync abilitato, le funzioni restituiscono `ERR_SYNC_DISABLED` (-5).
+
+**Host API estese** - *(Planned, Fase 12)*
 
 | Funzione | Descrizione | Stato |
 |----------|-------------|-------|
-| `http_fetch` | HTTP request (con whitelist) | *Planned* |
+| `time_now` | Timestamp monotonico/UTC | *Planned* |
+| `random_bytes` | Sorgente di entropia controllata | *Planned* |
+| `hash_*` | Famiglia di funzioni di hashing | *Planned* |
+| `env_get` | Lettura variabili d'ambiente filtrate | *Planned* |
+| `http_fetch` | HTTP request con whitelist | *Planned* |
 
-### 6.3 Configurazione e Deploy *(Planned)*
+### 6.3 Configurazione e Deploy *(Planned - Fase 15)*
 
-Il deploy consiste nell'invio di un file `.wasm` e una configurazione minimale.
-
-Esempio di configurazione (formato in definizione):
+Il deploy consisterà nell'invio di un file `.wasm` e di una configurazione minimale. Esempio (formato in definizione):
 
 ```toml
 [module]
@@ -722,97 +659,138 @@ keys = ["cart:", "user:"]
 
 ## 7. Test Suite
 
-Il progetto include una test suite automatizzata che verifica il corretto funzionamento di tutti i componenti.
+Il progetto include una test suite automatizzata che copre runtime, store, CRDT, networking e flussi end-to-end.
 
-**Copertura attuale:**
+**Copertura attuale:** oltre **38 test** tra unit, integration ed end-to-end, distribuiti tra i crate del workspace (nx-core, nx-store, nx-sync, nx-net) e i flussi E2E del SyncManager.
 
-| Crate | Test | Note |
-|-------|------|------|
-| nx-core | 2 | Config sync |
-| nx-net | 7 | Messaggi, peer, roundtrip |
-| nx-store | 10 | 5 unit + 5 integration |
-| nx-sync | 19 | CRDT properties, serialization |
-| **Totale** | **38** | |
+**Test CRDT specifici** - verificano esplicitamente le proprietà matematiche:
 
-**Test CRDT specifici:**
+- `test_gcounter_merge_commutativity` - `merge(A, B) == merge(B, A)`
+- `test_gcounter_merge_associativity` - `(A⊕B)⊕C == A⊕(B⊕C)`
+- `test_gcounter_merge_idempotency` - `A⊕A == A`
+- `test_gcounter_overflow_protection` - saturazione invece di overflow
 
-La test suite verifica esplicitamente le proprietà matematiche dei CRDT:
+**Test E2E SyncManager** - verificano che un'operazione generata dal guest WASM venga materializzata su sled e propagata correttamente ai peer.
 
-- `test_gcounter_merge_commutativity` - Verifica merge(A,B) == merge(B,A)
-- `test_gcounter_merge_associativity` - Verifica (A⊕B)⊕C == A⊕(B⊕C)
-- `test_gcounter_merge_idempotency` - Verifica A⊕A == A
-- `test_gcounter_overflow_protection` - Verifica saturazione invece di overflow
+**CI/CD:** GitHub Actions esegue la pipeline su ogni push/PR su Ubuntu, macOS, Windows. Job principali:
 
-**CI/CD:**
+1. `check` - verifica compilazione
+2. `fmt` - verifica formattazione codice
+3. `clippy` - linter Rust
+4. `test` - esecuzione test suite completa
+5. `build-wasm` - compilazione esempi WASM
 
-GitHub Actions esegue la test suite su ogni push/PR:
-- Ubuntu latest (x86_64)
-- macOS latest (x86_64/ARM64)
-- Windows latest (x86_64)
-
-Job eseguiti:
-1. `check` - Verifica compilazione
-2. `fmt` - Verifica formattazione codice
-3. `clippy` - Linter Rust
-4. `test` - Esegue test suite completa
-5. `build-wasm` - Compila esempi WASM
+**Test di carico** - *Planned, Fase 13*.
 
 ---
 
 ## 8. Casi d'Uso
-//TODO
+
+I casi d'uso sotto sono **concretamente realizzabili oggi** con le primitive di v0.1.0-alpha.1. Non descrivono visioni: descrivono ciò che il runtime sa già fare, o saprà fare appena chiuse le ultime fasi della preview.
+
+### 8.1 Contatori e metriche distribuite (esempio: `distributed_counter`)
+
+**Problema.** Servono contatori globali - visite, eventi, like, throttle counter - su nodi geograficamente distribuiti, senza un singolo punto di centralizzazione.
+
+**Perché Numax.** Un GCounter CRDT garantisce che ogni nodo possa incrementare il proprio slot localmente, senza coordinamento, e che i totali convergano automaticamente. Nessun database centrale, nessun lock distribuito.
+
+**Cosa serve oggi.** Un modulo WASM che chiama `crdt_gcounter_inc` / `crdt_gcounter_value` via SDK; più istanze `nx run` con `--sync` e mTLS attivi. È esattamente ciò che fa l'esempio `distributed_counter` nel repo.
+
+### 8.2 Voto, polling, tally distribuito (esempio: `vote_tally_tls`)
+
+**Problema.** Aggregare conteggi (voti, segnalazioni, scelte) provenienti da nodi indipendenti - tipicamente in ambienti dove la fiducia tra nodi va verificata e il canale non può essere considerato sicuro.
+
+**Perché Numax.** GCounter per i conteggi + mTLS con allowlist per garantire che **solo i peer autorizzati** possano contribuire. L'identità del peer è la sua chiave (NodeID = hash della public key): un peer non autorizzato non può iniettare voti spacciandosi per un altro.
+
+**Cosa serve oggi.** Modulo WASM che incrementa il contatore corrispondente alla scelta votata + nodi `nx run` con TLS, certificati per ciascun nodo e `--allowed-peers`. È esattamente lo scenario dell'esempio `vote_tally_tls`.
+
+### 8.3 Edge computing con stato locale e riconciliazione
+
+**Problema.** Su nodi edge (gateway industriali, store fisici, veicoli, infrastrutture remote) si vuole eseguire logica applicativa **vicino al dato**, mantenendo lo stato anche se la connessione verso il "centro" è intermittente.
+
+**Perché Numax.** Lo stato vive nello store sled del nodo edge, sempre disponibile localmente. Le operazioni vengono replicate ai peer (altri nodi edge o nodi di backhaul) appena la rete è disponibile. Le proprietà CRDT garantiscono che, una volta riconnesso, il nodo non perda né duplichi nulla.
+
+Il calcolo è portabile: lo stesso modulo `.wasm` gira su gateway ARM, su server cloud per il rollup centrale e - in prospettiva - su browser per dashboard locali.
+
+### 8.4 Applicazioni offline-first e collaborative
+
+**Problema.** Applicazioni che devono funzionare senza connessione (note collaborative, configurazioni distribuite, applicazioni di campo, dispositivi marittimi/aerei/rurali) e riconciliarsi quando rientrano in rete, senza imporre risoluzione manuale dei conflitti.
+
+**Perché Numax.** È esattamente lo sweet spot dei CRDT: ogni nodo opera localmente sul proprio store, le modifiche si propagano in modo opportunistico, la convergenza è garantita matematicamente. Quando arriveranno PNCounter, LWW-Register, ORSet, LWW-Map e RGA (Fase 14), il modello coprirà la maggior parte dei pattern offline-first reali.
+
+L'esempio `distributed_chat` (oggi in modalità local-only) rappresenta l'ossatura di questo caso d'uso.
 
 ---
 
 ## 9. Dove si colloca Numax
 
-Numax NON si posiziona in uno spazio specifico dell'ecosistema.
-Numax non è solo un software, è un idea, è un modo diverso di vedere le cose.
+Numax è facile da descrivere per **differenza**.
 
-Sarebbe riduttivo definirlo un **Runtime portabile con stato locale integrato e sincronizzazione nativa.**
+- **Non è Kubernetes.** Non orchestra container, non gestisce workload su cluster, non esiste un control plane. Numax è un singolo binario che esegue moduli WASM. Se Kubernetes risponde a "come orchestro centinaia di servizi?", Numax risponde a una domanda precedente: "perché ho bisogno di centinaia di servizi per fare una cosa distribuita?".
 
-//TODO
+- **Non è Redis (né un database distribuito).** Non è un servizio remoto a cui si fanno query. Lo stato non vive "da qualche parte nella rete": vive **dentro il runtime**, accanto al codice che lo usa. La replica avviene tra runtime peer, non tra client e server.
 
-**Numax è il runtime per chi vuole costruire sistemi distribuiti senza costruire un'infrastruttura distribuita.**
+- **Non è Deno né un altro runtime "edge JavaScript".** Quei runtime portano un linguaggio ovunque. Numax porta **logica + stato + sincronizzazione** ovunque, in un singolo modello coerente. Il linguaggio è un dettaglio: l'unità è il modulo WASM, agnostico rispetto al sorgente.
+
+- **Non è un framework CRDT.** Yjs, Automerge e simili sono librerie eccellenti, ma sono librerie: lasciano allo sviluppatore l'onere di progettare trasporto, persistenza, identità, sandbox. Numax incorpora tutto questo in un runtime e fornisce le strutture CRDT come **primitive di prima classe** accessibili dal guest tramite host API.
+
+**Cosa è Numax, allora.** Un **runtime portabile minimale** che combina, in un unico processo, i tre elementi necessari per costruire applicazioni distribuite: compute isolato (WASM), stato locale (sled), sincronizzazione senza coordinamento (CRDT + gossip).
+
+L'idea è semplice e radicale: **eseguire applicazioni distribuite senza costruire un'infrastruttura distribuita**.
+
+### Una nota sull'era AI
+
+Numax stesso è stato scritto in parte usando l'AI. Sarebbe ipocrita fingere il contrario, e non è il punto: l'AI oggi è uno strumento di lavoro, esattamente come lo sono un compilatore, un debugger o un editor. La domanda interessante non è se si usa l'AI per costruire software, ma cosa si costruisce.
+
+E qui Numax fa qualcosa di diverso da gran parte del sw che nasce in questa "stagione". Non genera, non predice, non classifica. Non è un'altra interfaccia sopra un modello. Risolve un problema strutturale, quello di chi costruisce software distribuito che esiste a prescindere dall'AI e che, semmai, l'AI rende più urgente: i sistemi di oggi devono coordinare modelli, dati e calcolo su edge, cloud e device, in modo affidabile e portabile.
+
+Numax non è AI. È una delle cose su cui l'AI può, comodamente, girarci sopra.
+
+**Numax è un runtime per chi vuole costruire sistemi distribuiti senza costruire un'infrastruttura distribuita.**
 
 ---
 
 ## 10. Limitazioni
 
-La prima versione presenta alcune limitazioni:
+v0.1.0-alpha.1 è una preview tecnica. Ne riconosciamo i limiti, esplicitamente:
 
-- **Non sostituisce orchestratori complessi.**
-  Non è progettato per gestire cluster estesi o deployment ad alta scalabilità.
+- **`nx run` esegue il guest una sola volta e termina.** La modalità long-running con lifecycle gestito è in Fase 7.
+- **L'hydration del GCounter da sled all'avvio non è ancora implementata.** I dati persistono, ma il replay automatico dello stato CRDT al boot è in roadmap (Fase 7).
+- **Gossip a fanout K e resilienza rete completa sono in corso.** L'architettura è definita; reconnect con backoff, anti-entropy automatica e dedup ops sono in Fase 10.
+- **TLS/mTLS è implementato, ma non ancora hardened per tutti gli scenari.** Lo è abbastanza per scenari controllati (dev, lab, deployment definiti); l'hardening completo (rotazione, pinning evoluto, scenari ostili estremi) prosegue.
+- **Osservabilità minimale.** Logging strutturato avanzato, metriche Prometheus e health check sono in Fase 9.
+- **Wire format e Host API possono cambiare.** Prima della v0.1.0 stabile, ci aspettiamo modifiche non retrocompatibili. La serializzazione dual-mode JSON/bincode è prevista in Fase 11.
+- **CRDT disponibili limitati al GCounter.** PNCounter, LWW-Register, ORSet, LWW-Map e RGA arriveranno con la Fase 14.
+- **Non sostituisce orchestratori complessi.** Non è progettato per gestire cluster estesi o deployment ad alta scalabilità con scheduling avanzato.
+- **Non ottimizzato per workload CPU-bound.** Il focus è I/O e coordinamento, non calcolo intensivo.
+- **I modelli dati devono essere compatibili con i CRDT.** Pattern basati su lock o transazioni distribuite forti non si adattano direttamente.
 
-- **Non ottimizzato per workload CPU-bound.**
-  Il focus è su I/O e coordinamento, non su calcolo intensivo.
-
-- **I modelli dati devono essere compatibili con i CRDT.**
-  Pattern basati su lock o transazioni forti non si adattano direttamente.
-
-- **Debugging e osservabilità sono iniziali.**
-  Strumenti più avanzati arriveranno nelle versioni successive.
-
-- **TLS/mTLS non ancora implementato.**
-  Le comunicazioni in chiaro sono accettabili solo per sviluppo locale.
+Questi limiti non sono debolezze nascoste: sono il **perimetro onesto** di una preview che vuole far vedere la traiettoria, non vendere un prodotto finito.
 
 ---
 
 ## 11. Conclusioni
 
 Numax propone un runtime unificato che combina:
-* esecuzione sicura e portabile tramite WebAssembly,
-* datastore locale integrato per uno stato vicino al calcolo,
-* sincronizzazione distribuita basata su CRDT e gossip.
 
-L'obiettivo non è replicare l'ecosistema esistente, ma ridurre la complessità necessaria per costruire applicazioni distribuite moderne.
+- esecuzione sicura e portabile tramite WebAssembly,
+- datastore locale integrato per uno stato vicino al calcolo,
+- sincronizzazione distribuita basata su CRDT e gossip,
+- identità dei nodi e canale cifrato fondati su mTLS.
 
-Questo whitepaper rappresenta una base di partenza concettuale e tecnica.
-Le iterazioni successive ne affineranno dettagli, esempi pratici, confronti e risultati sperimentali.
+L'obiettivo non è replicare l'ecosistema esistente, ma **ridurre la complessità auto-imposta** che oggi domina lo sviluppo di sistemi distribuiti, mantenendo intatto il controllo sulla complessità necessaria del proprio dominio.
+
+v0.1.0-alpha.1 è una preview tecnica. Ciò che contiene è reale, testato, funzionante: runtime WASM, store sled, GCounter CRDT, SyncManager async, networking TCP, TLS 1.3 + mTLS con identità derivata dalla chiave, host API stabili per database, log e CRDT, CI multi-OS, esempi end-to-end.
+
+Ciò che ancora manca è dichiarato esplicitamente e tracciato in roadmap. Le iterazioni successive ne affineranno dettagli, esempi pratici, confronti e risultati sperimentali.
+
+**v0.1.0-alpha.1 è solo l'inizio.** Ma è un inizio costruito sul codice, non sulle promesse.
+
+In conclusione io adoro il software e adoro numax.
 
 ---
 
-## Appendice A: Struttura del Repository
+## Appendice A - Struttura del Repository
 
 ```
 numax/
@@ -820,13 +798,14 @@ numax/
 ├── crates/
 │   ├── nx-core/            # Runtime WASM + Host API
 │   ├── nx-store/           # Datastore locale (sled)
-│   ├── nx-sync/            # CRDT e operazioni
-│   ├── nx-net/             # Networking e messaggi
+│   ├── nx-sync/            # CRDT, operazioni, SyncManager
+│   ├── nx-net/             # Networking, protocollo, TLS/mTLS
 │   ├── nx-sdk/             # SDK per guest WASM
 │   └── nx-cli/             # CLI
 ├── examples/
 │   ├── distributed_counter/
-│   └── distributed_chat/
+│   ├── distributed_chat/
+│   └── vote_tally_tls/
 ├── docs/
 │   └── HOST_API.md
 ├── WHITEPAPER.md
@@ -836,10 +815,10 @@ numax/
 
 ---
 
-## Appendice B: Riferimenti
+## Appendice B - Riferimenti
 
 - WebAssembly: https://webassembly.org/
 - WASI: https://wasi.dev/
 - Wasmtime: https://wasmtime.dev/
 - sled: https://sled.rs/
-- CRDT: Shapiro et al., "A comprehensive study of Convergent and Commutative Replicated Data Types"
+- CRDT: Shapiro et al., *A comprehensive study of Convergent and Commutative Replicated Data Types*
