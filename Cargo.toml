@@ -9,4 +9,6 @@ members = [
   "crates/nx-sdk",
 ]
 
-exclude = ["examples/*"]
+exclude = [
+  "examples/*"
+]

@@ -1,6 +1,6 @@
 use std::env;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     println!("Hello from WASI via Numax!");
 

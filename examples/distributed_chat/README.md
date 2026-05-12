@@ -1,6 +1,10 @@
-# Distributed Chat Example
+# Local Chat Example
 
-Basic distributed chat with Numax.
+Basic local chat log with Numax's key-value API.
+
+> Note: this example is intentionally not replicated. It uses `nx_sdk::db::*`,
+> which writes local datastore entries only. Replicated chat needs a list/set
+> CRDT such as ORSet or RGA.
 
 ## Build
 
@@ -12,29 +16,8 @@ cargo build --release --target wasm32-unknown-unknown
 ## Run
 
 ```bash
-# From the numax root
-./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
-    --sync-prefix "chat:" \
+nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
     --datastore-path ./chat-data
 ```
 
 Run multiple times to see messages accumulate!
-
-## With Sync (two nodes)
-
-Terminal 1:
-```bash
-./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
-    --listen 0.0.0.0:9000 \
-    --sync-prefix "chat:" \
-    --datastore-path ./chat-a
-```
-
-Terminal 2:
-```bash
-./target/debug/nx run target/wasm32-unknown-unknown/release/distributed_chat.wasm \
-    --listen 0.0.0.0:9001 \
-    --peer 127.0.0.1:9000 \
-    --sync-prefix "chat:" \
-    --datastore-path ./chat-b
-```

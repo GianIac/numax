@@ -1,6 +1,6 @@
 # Distributed Counter Example
 
-Esempio di contatore distribuito che usa la sincronizzazione CRDT di Numax.
+Grow-only distributed counter using Numax's CRDT replication (GCounter).
 
 ## Build
 
@@ -11,36 +11,45 @@ cargo build --release --target wasm32-unknown-unknown
 
 ## Run
 
-### Nodo A (primo nodo)
+### Node A (first node)
 
 ```bash
 nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
     --listen 0.0.0.0:9000 \
-    --sync-prefix "counter:" \
     --datastore-path ./data-a \
     -v
 ```
 
-### Nodo B (si connette ad A)
+### Node B (connects to A)
 
 ```bash
 nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
     --listen 0.0.0.0:9001 \
     --peer 127.0.0.1:9000 \
-    --sync-prefix "counter:" \
     --datastore-path ./data-b \
     -v
 ```
 
-## Risultato Atteso
+## Expected behavior
 
-Eseguendo più volte su entrambi i nodi, il contatore converge:
-- Ogni nodo incrementa il proprio contatore locale
-- Le operazioni vengono replicate via CRDT
-- Alla fine, entrambi i nodi vedono lo stesso valore totale
+Running the guest repeatedly on both nodes, the counter converges:
+- each run performs one local increment (`crdt::gcounter::inc(key, 1)`)
+- the increment is broadcast to peers asynchronously
+- subsequent runs on any node observe the sum of all increments produced
+  across the cluster so far
 
-## Note
+Example: run 3 times on A, 2 times on B → after replication settles, both
+nodes report `value = 5`.
 
-- Il prefisso `counter:` indica che le chiavi che iniziano con "counter:" sono replicate
-- Ogni nodo ha il proprio datastore (`./data-a`, `./data-b`)
-- Il flag `-v` abilita il logging verbose per vedere la sincronizzazione
+## Notes
+
+- No `--sync-prefix` flag exists anymore: replication is driven by the API
+  surface (`nx_sdk::crdt::*`), not by key prefix. Everything written via
+  `nx_sdk::db::*` is purely local.
+- Sync requires `--listen <addr>`. Running the guest without `--listen`
+  will log a message and exit, since `crdt::*` APIs require replication
+  to be enabled on the runtime.
+- Each node has its own datastore (`./data-a`, `./data-b`). State is held
+  in memory for now; persistence across restarts arrives with the sled
+  materialization step.
+- The `-v` flag enables verbose logs to observe the broadcast / apply path.

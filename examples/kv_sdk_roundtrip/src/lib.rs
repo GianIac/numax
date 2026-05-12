@@ -1,6 +1,6 @@
 use nx_sdk::{db, nx_log};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     nx_log!("kv_sdk_roundtrip: start");
 
@@ -15,4 +15,3 @@ pub extern "C" fn run() {
 
     nx_log!("kv_sdk_roundtrip: done");
 }
-

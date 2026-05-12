@@ -1,4 +1,7 @@
-//! Distributed Chat Example (Basic)
+//! Local Chat Example (Basic)
+//!
+//! This example uses `nx_sdk::db::*`, so it is intentionally local-only.
+//! Replicated chat needs a list/set CRDT such as ORSet or RGA.
 //!
 //! Each execution:
 //! 1. Displays all existing messages
@@ -7,11 +10,11 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Node A - send message
-//! nx run chat.wasm --sync-prefix "chat:" --datastore-path ./data-a
+//! # Run local chat log
+//! nx run chat.wasm --datastore-path ./data-a
 //!
-//! # To add a message, use the MESSAGE env variable
-//! MESSAGE="Hello!" nx run chat.wasm --sync-prefix "chat:" --datastore-path ./data-a
+//! # Run repeatedly to append generated messages
+//! nx run chat.wasm --datastore-path ./data-a
 //! ```
 
 extern crate alloc;
@@ -23,7 +26,7 @@ use nx_sdk::{db, log};
 const CHAT_KEY: &str = "chat:messages";
 const MSG_SEPARATOR: u8 = 0x1E; // Record separator
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     log("╔══════════════════════════════╗");
     log("║     NUMAX DISTRIBUTED CHAT   ║");

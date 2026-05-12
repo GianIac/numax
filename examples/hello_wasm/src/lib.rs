@@ -1,6 +1,6 @@
 // namespace: "nx", name: "host_log"
 #[link(wasm_import_module = "nx")]
-extern "C" {
+unsafe extern "C" {
     fn host_log(ptr: i32, len: i32);
 }
 
@@ -11,7 +11,7 @@ fn log_str(s: &str) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     log_str("Hello from WASM by NumaX !!");
 }

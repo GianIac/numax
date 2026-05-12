@@ -7,7 +7,7 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
     core::str::from_utf8(bytes).ok()?.parse::<u64>().ok()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     // 1) read counter (default 0)
     let current = match db::get(KEY) {

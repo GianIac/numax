@@ -1,5 +1,5 @@
 #[link(wasm_import_module = "nx")]
-extern "C" {
+unsafe extern "C" {
     fn host_log(ptr: i32, len: i32);
 
     fn db_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
@@ -11,7 +11,7 @@ fn log_str(s: &str) {
     unsafe { host_log(s.as_ptr() as i32, s.len() as i32) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     log_str("kv_roundtrip: start");
 
