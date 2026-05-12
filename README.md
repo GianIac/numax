@@ -1,8 +1,9 @@
 <img width="1536" height="1024" alt="numax" src="https://github.com/user-attachments/assets/646b27ce-1ba8-4012-94a5-f1b186ebbcf3" />
 
-📄 [Whitepaper](./WHITEPAPER.md) · 🛣️ [Roadmap](./ROADMAP.md)
-
 # numax
+
+[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./WHITEPAPER.md)
+[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./ROADMAP.md)
 
 A portable runtime for distributed apps. Written in Rust.
 
