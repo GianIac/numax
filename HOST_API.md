@@ -108,6 +108,87 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 
 ---
 
+### CRDT
+
+CRDT functions operate on replicated data types. In the current implementation,
+GCounter state is held in the runtime sync manager's in-memory registry and
+operations are broadcast to peers when sync is enabled. Durable sled
+materialization is planned but not complete yet.
+
+#### `crdt_gcounter_inc`
+
+Increments a grow-only counter for the local node.
+
+```text
+fn crdt_gcounter_inc(key_ptr: u32, key_len: u32, delta: u64) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key_ptr` | `u32` | Pointer to the counter key |
+| `key_len` | `u32` | Length of the key in bytes |
+| `delta` | `u64` | Non-negative increment amount |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `0` | Success |
+| `-3` | Internal error |
+| `-4` | Reserved runtime key |
+| `-5` | Sync is disabled |
+
+**Example:**
+
+```rust
+use nx_sdk::crdt::gcounter;
+
+gcounter::inc("counter:visits", 1)?;
+```
+
+---
+
+#### `crdt_gcounter_value`
+
+Reads the current in-memory value of a grow-only counter.
+
+```text
+fn crdt_gcounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+The output is an 8-byte little-endian `u64`.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key_ptr` | `u32` | Pointer to the counter key |
+| `key_len` | `u32` | Length of the key in bytes |
+| `out_ptr` | `u32` | Pointer to an 8-byte output buffer |
+| `out_cap` | `u32` | Output buffer capacity |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `8` | Success; 8 bytes written |
+| `-2` | Buffer too small |
+| `-3` | Internal error |
+| `-4` | Reserved runtime key |
+| `-5` | Sync is disabled |
+
+**Example:**
+
+```rust
+use nx_sdk::crdt::gcounter;
+
+let visits = gcounter::value("counter:visits")?;
+```
+
+---
+
 ### Logging
 
 #### `host_log_v2`
@@ -115,7 +196,7 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 Writes a log message.
 
 ```text
-fn host_log_v2(u32, msg_ptr: u32, msg_len: u32)
+fn host_log_v2(msg_ptr: u32, msg_len: u32) -> i32
 ```
 
 **Parameters:**
@@ -153,6 +234,8 @@ log("Hello from WASM!");
 | `-1` | `ERR_NOT_FOUND` | Key not found |
 | `-2` | `ERR_BUFFER_TOO_SMALL` | Output buffer insufficient |
 | `-3` | `ERR_INTERNAL` | Internal error |
+| `-4` | `ERR_RESERVED_KEY` | Key uses a runtime-reserved prefix |
+| `-5` | `ERR_SYNC_DISABLED` | CRDT sync is not enabled |
 
 ---
 
@@ -208,8 +291,9 @@ pub extern "C" fn run() {
 - [ ] `hash_blake3` - BLAKE3 hash (faster)
 
 ### CRDT
-- [ ] `crdt_counter_inc` - Increment GCounter
-- [ ] `crdt_counter_get` - Read GCounter value
+- [x] `crdt_gcounter_inc` - Increment GCounter
+- [x] `crdt_gcounter_value` - Read GCounter value
+- [ ] Durable GCounter materialization in sled
 - [ ] `crdt_set_add` - Add element to ORSet
 - [ ] `crdt_set_remove` - Remove element from ORSet
 - [ ] `crdt_set_contains` - Check membership

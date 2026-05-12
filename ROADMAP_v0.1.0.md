@@ -123,13 +123,13 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
 
 **Host API CRDT (nuove)**:
 - [x] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
-      applica localmente, scrive totale in sled, emette Op via canale.
+      applica localmente in memoria ed emette Op via canale.
 - [x] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
-      legge il totale materializzato in sled.
+      legge il totale corrente dal registry in memoria.
 - [x] Wrapper SDK `nx_sdk::crdt::gcounter::{inc, value}`.
 
 **Wiring end-to-end**:
-- [ ] `HostState` include handle al SyncManager (sender Op + accessor GCounter).
+- [x] `HostState` include handle al SyncManager (sender Op + accessor GCounter).
 - [ ] `apply_remote_op` aggiorna il GCounter **e** riscrive il totale in sled.
 - [ ] Materializzazione atomica: update GCounter → write sled in una transazione
       logica (anche solo sled batch ok).
@@ -140,8 +140,8 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
 - [x] Aggiornare `HOST_API.md` con la separazione `db_*` vs `crdt_*`.
 
 **Examples migration**:
-- [ ] `examples/distributed_counter`: riscrittura con `nx_sdk::crdt::gcounter`.
-- [ ] `examples/distributed_chat`: marcato come "non-replicato (LWW locale)"
+- [x] `examples/distributed_counter`: riscrittura con `nx_sdk::crdt::gcounter`.
+- [x] `examples/distributed_chat`: marcato come "non-replicato (LWW locale)"
       o rimosso finché non abbiamo ORSet/RGA (Fase 14).
 - [ ] `examples/vote_tally_tls`: nuovo esempio con mTLS + allowlist + counter
       CRDT reale tra 3 nodi.

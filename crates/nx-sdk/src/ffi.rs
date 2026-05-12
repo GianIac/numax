@@ -10,6 +10,7 @@ unsafe extern "C" {
     pub fn crdt_gcounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
 
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
+    #[expect(dead_code, reason = "legacy guest import kept for compatibility")]
     pub fn host_log(msg_ptr: u32, msg_len: u32);
 
     // Preferred: allows error codes.

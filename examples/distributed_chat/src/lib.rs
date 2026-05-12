@@ -29,7 +29,7 @@ const MSG_SEPARATOR: u8 = 0x1E; // Record separator
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     log("╔══════════════════════════════╗");
-    log("║     NUMAX DISTRIBUTED CHAT   ║");
+    log("║       NUMAX LOCAL CHAT       ║");
     log("╚══════════════════════════════╝");
     log("");
 
