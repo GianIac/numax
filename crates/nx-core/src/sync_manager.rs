@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nx_net::{Node, NodeConfig, NodeEvent};
+use nx_store::Store as NxStore;
 use nx_sync::{GCounter, NodeId, Op, OpKind};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
@@ -10,6 +11,7 @@ use crate::sync_config::SyncConfig;
 
 /// Upper bound on how many ops we coalesce into a single PushOps message.
 const BROADCAST_BATCH_MAX: usize = 64;
+const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
@@ -17,6 +19,7 @@ pub struct SyncHandle {
     node_id: NodeId,
     op_tx: mpsc::Sender<Op>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
+    store: Arc<NxStore>,
 }
 
 impl SyncHandle {
@@ -34,6 +37,11 @@ impl SyncHandle {
     pub fn counters(&self) -> Arc<RwLock<HashMap<String, GCounter>>> {
         Arc::clone(&self.counters)
     }
+
+    /// Shared datastore used to materialize CRDT values.
+    pub fn store(&self) -> Arc<NxStore> {
+        Arc::clone(&self.store)
+    }
 }
 
 pub struct SyncManager {
@@ -50,6 +58,9 @@ pub struct SyncManager {
     /// GCounter
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
 
+    /// Store used to materialize replicated values.
+    store: Arc<NxStore>,
+
     /// OpId
     seen_ops: Arc<RwLock<HashSet<String>>>,
 
@@ -62,7 +73,7 @@ pub struct SyncManager {
 
 impl SyncManager {
     /// new SyncManager.
-    pub fn new(node_id: NodeId, config: SyncConfig) -> Self {
+    pub fn new(node_id: NodeId, config: SyncConfig, store: Arc<NxStore>) -> Self {
         let (op_tx, op_rx) = mpsc::channel(100);
 
         Self {
@@ -70,6 +81,7 @@ impl SyncManager {
             config,
             node: None,
             counters: Arc::new(RwLock::new(HashMap::new())),
+            store,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
             op_tx,
             op_rx: Some(op_rx),
@@ -97,6 +109,7 @@ impl SyncManager {
             node_id: self.node_id.clone(),
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
+            store: Arc::clone(&self.store),
         }
     }
 
@@ -137,13 +150,15 @@ impl SyncManager {
         // Inbound loop: apply remote ops into the counter registry.
         let counters = Arc::clone(&self.counters);
         let seen_ops = Arc::clone(&self.seen_ops);
+        let store = Arc::clone(&self.store);
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
                     NodeEvent::OpsReceived { from, ops } => {
                         debug!(from = %from, count = ops.len(), "received ops from peer");
                         for op in ops {
-                            if let Err(e) = apply_remote_op(&op, &counters, &seen_ops).await {
+                            if let Err(e) = apply_remote_op(&op, &counters, &seen_ops, &store).await
+                            {
                                 error!(error = %e, "failed to apply remote op");
                             }
                         }
@@ -207,11 +222,29 @@ fn spawn_broadcast_loop(node: Arc<Node>, mut op_rx: mpsc::Receiver<Op>) {
     });
 }
 
+pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GCOUNTER_STORE_PREFIX.len() + key.len());
+    out.extend_from_slice(GCOUNTER_STORE_PREFIX.as_bytes());
+    out.extend_from_slice(key.as_bytes());
+    out
+}
+
+pub(crate) fn materialize_gcounter_value(
+    store: &NxStore,
+    key: &str,
+    value: u64,
+) -> anyhow::Result<()> {
+    let store_key = materialized_gcounter_key(key);
+    store.set(&store_key, &value.to_le_bytes())?;
+    Ok(())
+}
+
 /// Apply an operation received from a remote peer.
 async fn apply_remote_op(
     op: &Op,
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: &Arc<RwLock<HashSet<String>>>,
+    store: &Arc<NxStore>,
 ) -> anyhow::Result<()> {
     // Deduplication
     {
@@ -226,10 +259,14 @@ async fn apply_remote_op(
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
             let mut counters = counters.write().await;
-            let counter = counters.entry(key.clone()).or_insert_with(GCounter::new);
+            let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
             counter.increment(&op.origin, *increment);
+            let total = counter.value();
 
-            debug!(key = %key, from = %op.origin, increment = %increment, total = counter.value(), "applied remote increment");
+            materialize_gcounter_value(store, key, total)?;
+            counters.insert(key.clone(), counter);
+
+            debug!(key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
         }
     }
 
@@ -239,4 +276,63 @@ async fn apply_remote_op(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_store() -> Arc<NxStore> {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("numax-core-sync-test-{nanos}"));
+        Arc::new(NxStore::open(path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn apply_remote_op_materializes_counter_value() {
+        let store = temp_store();
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let origin = NodeId::new("remote-a");
+        let op = Op::gcounter_increment(origin, "counter:visits", 3);
+
+        apply_remote_op(&op, &counters, &seen_ops, &store)
+            .await
+            .unwrap();
+
+        let key = materialized_gcounter_key("counter:visits");
+        let bytes = store.get(&key).unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+
+        assert_eq!(u64::from_le_bytes(buf), 3);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_op_duplicate_does_not_double_materialize() {
+        let store = temp_store();
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let origin = NodeId::new("remote-a");
+        let op = Op::gcounter_increment(origin, "counter:visits", 3);
+
+        apply_remote_op(&op, &counters, &seen_ops, &store)
+            .await
+            .unwrap();
+        apply_remote_op(&op, &counters, &seen_ops, &store)
+            .await
+            .unwrap();
+
+        let key = materialized_gcounter_key("counter:visits");
+        let bytes = store.get(&key).unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+
+        assert_eq!(u64::from_le_bytes(buf), 3);
+    }
 }

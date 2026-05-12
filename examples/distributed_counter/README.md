@@ -49,7 +49,7 @@ nodes report `value = 5`.
 - Sync requires `--listen <addr>`. Running the guest without `--listen`
   will log a message and exit, since `crdt::*` APIs require replication
   to be enabled on the runtime.
-- Each node has its own datastore (`./data-a`, `./data-b`). State is held
-  in memory for now; persistence across restarts arrives with the sled
-  materialization step.
+- Each node has its own datastore (`./data-a`, `./data-b`). Counter totals are
+  materialized to sled after local and remote updates; startup recovery from
+  those materialized values is still planned work.
 - The `-v` flag enables verbose logs to observe the broadcast / apply path.

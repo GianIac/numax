@@ -123,15 +123,15 @@ Include la ristrutturazione della host API per separare KV locale e CRDT replica
 
 **Host API CRDT (nuove)**:
 - [x] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
-      applica localmente in memoria ed emette Op via canale.
+      applica localmente, materializza il totale in sled ed emette Op via canale.
 - [x] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
       legge il totale corrente dal registry in memoria.
 - [x] Wrapper SDK `nx_sdk::crdt::gcounter::{inc, value}`.
 
 **Wiring end-to-end**:
 - [x] `HostState` include handle al SyncManager (sender Op + accessor GCounter).
-- [ ] `apply_remote_op` aggiorna il GCounter **e** riscrive il totale in sled.
-- [ ] Materializzazione atomica: update GCounter → write sled in una transazione
+- [x] `apply_remote_op` aggiorna il GCounter **e** riscrive il totale in sled.
+- [x] Materializzazione atomica: update GCounter → write sled in una transazione
       logica (anche solo sled batch ok).
 
 **Cleanup del pregresso**:

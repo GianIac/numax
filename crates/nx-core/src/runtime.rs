@@ -60,7 +60,7 @@ impl Runtime {
         // Engine: async support is required so wasmtime can yield across host calls
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
-        
+
         let engine = Engine::new(&wasm_cfg)?;
         let mut linker: Linker<HostState> = Linker::new(&engine);
 
@@ -91,7 +91,7 @@ impl Runtime {
         // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
         let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
             let node_id = NodeId::generate();
-            let manager = SyncManager::new(node_id, sync_config.clone());
+            let manager = SyncManager::new(node_id, sync_config.clone(), Arc::clone(&store));
             let handle = manager.handle();
             (Some(manager), Some(handle))
         } else {

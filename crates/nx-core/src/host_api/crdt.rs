@@ -3,6 +3,7 @@ use nx_sync::{GCounter, Op};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
+use crate::sync_manager::materialize_gcounter_value;
 
 // error codes
 const ERR_BUF_TOO_SMALL: i32 = -2;
@@ -10,7 +11,7 @@ const ERR_INTERNAL: i32 = -3;
 const ERR_RESERVED_KEY: i32 = -4;
 const ERR_SYNC_DISABLED: i32 = -5;
 
-// limits 
+// limits
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
 const U64_LEN: u32 = 8;
 
@@ -76,14 +77,20 @@ async fn crdt_gcounter_inc_impl(
         None => return ERR_SYNC_DISABLED,
     };
 
-    // Apply locally into the in-memory registry.
+    // Apply locally and materialize the value before exposing the new state.
     {
         let counters_arc = handle.counters();
         let mut counters = counters_arc.write().await;
-        let counter = counters
-            .entry(key.clone())
-            .or_insert_with(GCounter::new);
+        let mut counter = counters.get(&key).cloned().unwrap_or_else(GCounter::new);
         counter.increment(handle.node_id(), delta);
+        let total = counter.value();
+
+        if let Err(e) = materialize_gcounter_value(&handle.store(), &key, total) {
+            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to materialize counter");
+            return ERR_INTERNAL;
+        }
+
+        counters.insert(key.clone(), counter);
     }
 
     // Enqueue the Op for broadcast. Bounded-channel backpressure is
