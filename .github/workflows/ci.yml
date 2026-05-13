@@ -75,6 +75,8 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build distributed_chat
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
+      - name: Build vote_tally_tls
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
 
   ci-success:
     name: CI Success
