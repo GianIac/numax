@@ -809,8 +809,7 @@ numax/
 │   ├── distributed_counter/
 │   ├── distributed_chat/
 │   └── vote_tally_tls/
-├── docs/
-│   └── HOST_API.md
+├── HOST_API.md
 ├── WHITEPAPER.md
 ├── ROADMAP_v0.1.0.md
 └── LICENSE
