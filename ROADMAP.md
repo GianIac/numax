@@ -1,141 +1,141 @@
-# Roadmap Numax v0.1.0
+# Numax Roadmap v0.1.0
 
-> **Release corrente**: `v0.1.0-alpha.1` - developer preview.
-> **Obiettivo finale `v0.1.0`**: runtime production-ready per workload non-critici.
-> **Stato**: alpha per feedback; hardening production ancora in corso.
+> **Current release**: `v0.1.0-alpha.1` - developer preview.
+> **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
+> **Status**: alpha for feedback; production hardening still in progress.
 
 ---
 
-## Stato Release
+## Release Status
 
 ### v0.1.0-alpha.1 ✅
-**Scopo**: prima preview tecnica da pubblicare per raccogliere feedback.
+**Purpose**: first technical preview to publish in order to gather feedback.
 
-Include:
-- Runtime Wasmtime + WASI preview1.
-- Host API KV locale (`db_get`, `db_set`, `db_delete`) e logging.
-- Store embedded sled.
-- GCounter CRDT con JSON serialization.
-- Networking base con Hello/PushOps/PullSince/Ping.
-- TLS/mTLS, NodeID derivato da certificato e allowlist.
-- Wiring end-to-end interno tra guest CRDT API, SyncManager e datastore.
-- Materializzazione sled del totale GCounter su update locale/remoto.
-- Test E2E `SyncManager` per handshake, PushOps, convergenza e idempotenza.
-- Esempi: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
+Includes:
+- Wasmtime runtime + WASI preview1.
+- Local KV host API (`db_get`, `db_set`, `db_delete`) and logging.
+- Embedded sled store.
+- GCounter CRDT with JSON serialization.
+- Base networking with Hello/PushOps/PullSince/Ping.
+- TLS/mTLS, NodeID derived from certificate and allowlist.
+- End-to-end internal wiring between guest CRDT API, SyncManager and datastore.
+- Sled materialization of the GCounter total on local/remote update.
+- `SyncManager` E2E tests for handshake, PushOps, convergence and idempotency.
+- Examples: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
 
-Limitazioni note:
-- `nx run` esegue il guest una volta e termina; il criterio CLI multi-process
-  della Fase 6.5 non è ancora completamente rispettato alla lettera.
-- Hydration del registry GCounter dai valori materializzati in sled non ancora
-  implementata.
-- Lifecycle long-running, graceful shutdown, backpressure, observability e
-  resilienza rete sono ancora fasi aperte.
-- API e wire format possono cambiare prima di `v0.1.0`.
+Known limitations:
+- `nx run` executes the guest once and then terminates; the multi-process CLI
+  criterion from Phase 6.5 is not yet fully respected to the letter.
+- Hydration of the GCounter registry from the values materialized in sled is not
+  yet implemented.
+- Long-running lifecycle, graceful shutdown, backpressure, observability and
+  network resilience are still open phases.
+- API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
-**Scopo**: prima release production-ready per workload non-critici.
+**Purpose**: first production-ready release for non-critical workloads.
 
-Richiede il completamento delle fasi P0/P1 indicate sotto, in particolare:
-Fase 7 lifecycle, Fase 8 backpressure, Fase 9 observability minima,
-Fase 10 resilienza rete, Fase 11 serializzazione dual-mode, Fase 12 host API
-minime e Fase 13 test di carico.
+Requires the completion of the P0/P1 phases listed below, in particular:
+Phase 7 lifecycle, Phase 8 backpressure, Phase 9 minimal observability,
+Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 minimal
+host API and Phase 13 load testing.
 
 ---
 
-## Fasi Completate
+## Completed Phases
 
-### Fase 0: Bootstrap ✅
-- [x] Workspace Cargo multi-crate
-- [x] Struttura directory
-- [x] CI base
+### Phase 0: Bootstrap ✅
+- [x] Multi-crate Cargo workspace
+- [x] Directory structure
+- [x] Base CI
 
-### Fase 1: nx-core ✅
-- [x] Runtime Wasmtime
+### Phase 1: nx-core ✅
+- [x] Wasmtime runtime
 - [x] Host API (db_get, db_set, db_delete, host_log_v2)
-- [x] Integrazione WASI preview1
-- [x] Guardrail sicurezza (limiti chiavi/valori)
+- [x] WASI preview1 integration
+- [x] Security guardrails (key/value limits)
 
-### Fase 2: nx-store ✅
-- [x] Store sled embedded
-- [x] API get/set/delete/scan_prefix
-- [x] Test unitari e integrazione
+### Phase 2: nx-store ✅
+- [x] Embedded sled store
+- [x] get/set/delete/scan_prefix API
+- [x] Unit and integration tests
 
-### Fase 3: nx-sync ✅
-- [x] NodeId e Op/OpId
-- [x] GCounter CRDT completo
-- [x] Test proprietà CRDT (commutatività, associatività, idempotenza)
-- [x] Serializzazione JSON
+### Phase 3: nx-sync ✅
+- [x] NodeId and Op/OpId
+- [x] Complete GCounter CRDT
+- [x] CRDT property tests (commutativity, associativity, idempotency)
+- [x] JSON serialization
 
-### Fase 4: nx-net ✅
-- [x] Protocollo messaggi (Hello, PushOps, PullSince, Ping/Pong)
-- [x] Framing length-prefixed
-- [x] Versioning protocollo
+### Phase 4: nx-net ✅
+- [x] Message protocol (Hello, PushOps, PullSince, Ping/Pong)
+- [x] Length-prefixed framing
+- [x] Protocol versioning
 
-### Fase 5: Documentazione e CI ✅
-- [x] Test automatizzati
-- [x] CI multi-OS (Ubuntu, macOS, Windows)
+### Phase 5: Documentation and CI ✅
+- [x] Automated tests
+- [x] Multi-OS CI (Ubuntu, macOS, Windows)
 - [x] Clippy + rustfmt
-- [x] WHITEPAPER.md allineato al codice
+- [x] WHITEPAPER.md aligned with the code
 - [x] HOST_API.md
-- [x] Esempi WASM (distributed_counter, distributed_chat)
+- [x] WASM examples (distributed_counter, distributed_chat)
 
-> ⚠️ Nota: gli esempi di Fase 5 funzionavano solo localmente; la convergenza
-> end-to-end tra peer è stata effettivamente cablata in Fase 6.5.
+> ⚠️ Note: the Phase 5 examples worked only locally; end-to-end convergence
+> between peers was actually wired up in Phase 6.5.
 
 ---
 
-## Fasi Production-Ready
+## Production-Ready Phases
 
-### Fase 6: Transport Security 🔒 ✅
-**Obiettivo**: Comunicazioni sicure e autenticate tra nodi.
+### Phase 6: Transport Security 🔒 ✅
+**Goal**: Secure and authenticated communications between nodes.
 
-**TLS Base:**
-- [x] TLS 1.3 per connessioni TCP
-- [x] Certificati auto-generati per sviluppo (`rcgen`)
-- [x] Supporto certificati custom per produzione
-- [x] Forward secrecy (ECDHE automatico con TLS 1.3)
+**Base TLS:**
+- [x] TLS 1.3 for TCP connections
+- [x] Auto-generated certificates for development (`rcgen`)
+- [x] Custom certificates support for production
+- [x] Forward secrecy (ECDHE automatic with TLS 1.3)
 - [x] TLS wrapper: `TlsAcceptor` (server), `TlsConnector` (client)
 
 **Mutual TLS (mTLS):**
-- [x] Client deve presentare certificato
-- [x] Server verifica certificato client
-- [x] Supporto CA custom per verifica (`--tls-ca`)
-- [x] Test: client senza cert → rifiutato
-- [x] Test: client con cert invalido → rifiutato
+- [x] Client must present a certificate
+- [x] Server verifies the client certificate
+- [x] Custom CA support for verification (`--tls-ca`)
+- [x] Test: client without cert → rejected
+- [x] Test: client with invalid cert → rejected
 
 **Identity & NodeID:**
-- [x] NodeID derivato da chiave pubblica: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
-- [x] Funzione `derive_node_id_from_cert(cert) -> NodeId`
-- [x] Verifica durante handshake Hello: cert.pubkey → NodeId atteso
-- [x] Mismatch NodeID → disconnect immediato
+- [x] NodeID derived from public key: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
+- [x] Function `derive_node_id_from_cert(cert) -> NodeId`
+- [x] Verification during Hello handshake: cert.pubkey → expected NodeId
+- [x] NodeID mismatch → immediate disconnect
 
 **Peer Verification:**
-- [x] Verifica hostname/CN nel certificato
-- [x] Allowlist opzionale di NodeID autorizzati
-- [x] Connessione da NodeID non in lista → rifiutato (se allowlist attiva)
+- [x] Hostname/CN verification in the certificate
+- [x] Optional allowlist of authorized NodeIDs
+- [x] Connection from a NodeID not in the list → rejected (if allowlist is active)
 
 **CLI Flags:**
-- [x] `--tls-cert <path>` - Certificato nodo
-- [x] `--tls-key <path>` - Chiave privata nodo
-- [x] `--tls-ca <path>` - CA per verificare peer
-- [x] `--allowed-peers <id1,id2,...>` - Allowlist NodeID
+- [x] `--tls-cert <path>` - Node certificate
+- [x] `--tls-key <path>` - Node private key
+- [x] `--tls-ca <path>` - CA used to verify peers
+- [x] `--allowed-peers <id1,id2,...>` - NodeID allowlist
 - [x] `--tls-insecure` - Dev only, skip verify (warning)
 
-**Test Security:**
-- [x] Test: connessione TLS funziona tra 2 nodi
-- [x] Test: connessione rifiutata senza certificato
-- [x] Test: connessione rifiutata con cert scaduto/invalido
-- [x] Test: mTLS - entrambi i peer autenticati
+**Security Tests:**
+- [x] Test: TLS connection works between 2 nodes
+- [x] Test: connection rejected without certificate
+- [x] Test: connection rejected with expired/invalid cert
+- [x] Test: mTLS - both peers authenticated
 - [x] Test: NodeID mismatch → disconnect
-- [x] Test: peer non in allowlist → rifiutato
-- [x] Test: test per nuovi cli flags
+- [x] Test: peer not in allowlist → rejected
+- [x] Test: tests for the new CLI flags
 
-**Librerie**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
+**Libraries**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
 
-**Matrice sicurezza raggiunta:**
+**Achieved security matrix:**
 
-| Attacco | Protetto |
-|---------|----------|
+| Attack | Protected |
+|--------|-----------|
 | Eavesdropping | ✅ TLS |
 | Tampering | ✅ TLS |
 | Replay | ✅ TLS |
@@ -146,108 +146,108 @@ minime e Fase 13 test di carico.
 
 ---
 
-### Fase 6.5: End-to-End Sync Wiring 🔗
-**Obiettivo**: chiudere i buchi nascosti tra guest WASM, SyncManager e datastore, in modo che le operazioni replicabili facciano davvero il giro completo tra peer. 
-Include la ristrutturazione della host API per separare KV locale e CRDT replicato senza magie per-chiave.
+### Phase 6.5: End-to-End Sync Wiring 🔗
+**Goal**: close the hidden gaps between guest WASM, SyncManager and datastore, so that replicable operations actually make the full round trip between peers.
+Includes the restructuring of the host API to separate local KV and replicated CRDT without per-key magic.
 
-**Runtime async**:
-- [x] `Runtime::run_module` diventa `async` e gira dentro un `tokio::Runtime`.
-- [x] CLI passa a `#[tokio::main]`; `real_main` diventa async.
-- [x] `SyncManager` accessibile come `Arc<Mutex<SyncManager>>` (o handle clonabile).
-- [x] `Runtime::start_sync` chiama davvero `SyncManager::start().await`.
-- [x] `wasmtime` caricato con `add_to_linker_async` e `run.call_async` per non
-      bloccare il tokio runtime durante le host call.
+**Async runtime**:
+- [x] `Runtime::run_module` becomes `async` and runs inside a `tokio::Runtime`.
+- [x] CLI switches to `#[tokio::main]`; `real_main` becomes async.
+- [x] `SyncManager` accessible as `Arc<Mutex<SyncManager>>` (or cloneable handle).
+- [x] `Runtime::start_sync` actually calls `SyncManager::start().await`.
+- [x] `wasmtime` loaded with `add_to_linker_async` and `run.call_async` so it does
+      not block the tokio runtime during host calls.
 
-**Host API CRDT (nuove)**:
+**CRDT Host API (new)**:
 - [x] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
-      applica localmente, materializza il totale in sled ed emette Op via canale.
+      applies locally, materializes the total in sled and emits an Op via channel.
 - [x] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
-      legge il totale corrente dal registry in memoria.
-- [x] Wrapper SDK `nx_sdk::crdt::gcounter::{inc, value}`.
+      reads the current total from the in-memory registry.
+- [x] SDK wrapper `nx_sdk::crdt::gcounter::{inc, value}`.
 
-**Wiring end-to-end**:
-- [x] `HostState` include handle al SyncManager (sender Op + accessor GCounter).
-- [x] `apply_remote_op` aggiorna il GCounter **e** riscrive il totale in sled.
-- [x] Materializzazione atomica: update GCounter → write sled in una transazione
-      logica (anche solo sled batch ok).
+**End-to-end wiring**:
+- [x] `HostState` includes a handle to the SyncManager (Op sender + GCounter accessor).
+- [x] `apply_remote_op` updates the GCounter **and** rewrites the total in sled.
+- [x] Atomic materialization: GCounter update → sled write in a single logical
+      transaction (a sled batch is acceptable).
 
-**Cleanup del pregresso**:
-- [x] Rimuovere flag CLI `--sync-prefix`.
-- [x] Aggiornare messaggi di log e help.
-- [x] Aggiornare `HOST_API.md` con la separazione `db_*` vs `crdt_*`.
+**Cleanup of the past**:
+- [x] Remove the `--sync-prefix` CLI flag.
+- [x] Update log messages and help.
+- [x] Update `HOST_API.md` with the `db_*` vs `crdt_*` separation.
 
 **Examples migration**:
-- [x] `examples/distributed_counter`: riscrittura con `nx_sdk::crdt::gcounter`.
-- [x] `examples/distributed_chat`: marcato come "non-replicato (LWW locale)"
-      o rimosso finché non abbiamo ORSet/RGA (Fase 14).
-- [x] `examples/vote_tally_tls`: nuovo esempio con mTLS + allowlist + counter
-      CRDT reale tra 3 nodi.
+- [x] `examples/distributed_counter`: rewritten with `nx_sdk::crdt::gcounter`.
+- [x] `examples/distributed_chat`: marked as "non-replicated (local LWW)"
+      or removed until ORSet/RGA are available (Phase 14).
+- [x] `examples/vote_tally_tls`: new example with mTLS + allowlist + real
+      CRDT counter across 3 nodes.
 
-**Test**:
-- [x] Test E2E: 2 nodi, A fa `gcounter::inc("visits", 1)`, dopo handshake
-      e un round di PushOps B legge `gcounter::value("visits") == 1`.
-- [x] Test E2E: 2 nodi, A e B incrementano in parallelo, convergono sullo stesso
-      totale.
-- [x] Test: nessun Op emesso quando sync è disabilitato.
-- [x] Test: `apply_remote_op` idempotente (stesso Op 2x → nessun doppio conteggio).
+**Tests**:
+- [x] E2E test: 2 nodes, A runs `gcounter::inc("visits", 1)`, after handshake
+      and one round of PushOps B reads `gcounter::value("visits") == 1`.
+- [x] E2E test: 2 nodes, A and B increment in parallel, converge on the same
+      total.
+- [x] Test: no Op emitted when sync is disabled.
+- [x] Test: `apply_remote_op` is idempotent (same Op twice → no double counting).
 
-**Criterio di chiusura**:
+**Closing criterion**:
 ```bash
 # Terminal A
 nx run counter.wasm --listen 127.0.0.1:9000 --datastore-path ./data-a
 # Terminal B
 nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
     --datastore-path ./data-b
-# Entrambi i nodi stampano lo stesso valore di gcounter::value("visits")
-# entro pochi secondi.
+# Both nodes print the same value of gcounter::value("visits")
+# within a few seconds.
 ```
 
-> Nota: il wiring interno della Fase 6.5 è coperto dai test E2E su `SyncManager`, inclusi handshake, PushOps, convergenza e materializzazione sled. 
-> Il criterio CLI qui sopra non è ancora completamente rispettato alla lettera perché `nx run` oggi esegue il guest una volta e poi termina: non ha ancora un lifecycle/settle mode che lasci tempo stabile a handshake, broadcast e apply remoto tra processi CLI. Inoltre il registry GCounter in memoria non viene ancora ricostruito dai valori materializzati in sled all'avvio. 
->Questi aspetti sono tracciati nella Fase 7.
+> Note: the internal wiring of Phase 6.5 is covered by E2E tests on `SyncManager`, including handshake, PushOps, convergence and sled materialization.
+> The CLI criterion above is not yet fully respected to the letter because today `nx run` executes the guest once and then terminates: it does not yet have a lifecycle/settle mode that would give stable time for handshake, broadcast and remote apply between CLI processes. Furthermore, the in-memory GCounter registry is not yet rebuilt from the values materialized in sled at startup.
+> These aspects are tracked in Phase 7.
 
 ---
 
-### Fase 7: Graceful Lifecycle 🔄
-**Obiettivo**: Shutdown pulito e recovery da crash
+### Phase 7: Graceful Lifecycle 🔄
+**Goal**: Clean shutdown and recovery from crash
 
-- [ ] Modalità long-running robusta per runtime con sync attivo.
-- [ ] Hydration all'avvio: ricostruire il registry GCounter dai valori
-      materializzati in sled.
-- [ ] Modalità di settle per `nx run` con sync attivo: lasciare tempo a
-      handshake, PushOps e apply remoto prima dell'exit, oppure sostituirla con
-      lifecycle long-running.
-- [ ] Smoke test CLI multi-process: due `nx run distributed_counter.wasm`
-      convergono e stampano lo stesso valore entro pochi secondi.
+- [ ] Robust long-running mode for the runtime with sync enabled.
+- [ ] Hydration on startup: rebuild the GCounter registry from the values
+      materialized in sled.
+- [ ] Settle mode for `nx run` with sync enabled: give time to handshake,
+      PushOps and remote apply before exit, or replace it with a long-running
+      lifecycle.
+- [ ] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
+      converge and print the same value within a few seconds.
 - [ ] Signal handling (SIGTERM, SIGINT, SIGHUP)
-- [ ] Graceful shutdown: completa ops in flight, chiudi connessioni
-- [ ] Flush dello store prima di exit
-- [ ] Timeout configurabile per shutdown (default 30s)
-- [ ] Test: kill -TERM → nessuna corruzione dati
-- [ ] Test: crash → restart → stato consistente
+- [ ] Graceful shutdown: complete in-flight ops, close connections
+- [ ] Store flush before exit
+- [ ] Configurable timeout for shutdown (default 30s)
+- [ ] Test: kill -TERM → no data corruption
+- [ ] Test: crash → restart → consistent state
 
-> Questi task completano il criterio CLI rimasto aperto dalla Fase 6.5 e lo
-> portano dentro un lifecycle generale: loop di servizio, shutdown signal-aware,
-> flush finale e gestione ordinata delle connessioni.
+> These tasks complete the CLI criterion left open by Phase 6.5 and bring it
+> inside a general lifecycle: service loop, signal-aware shutdown, final flush
+> and orderly handling of connections.
 
-**Criteri**:
+**Criteria**:
 ```bash
-kill -TERM $PID  # Completa operazioni, esce con code 0
+kill -TERM $PID  # Completes operations, exits with code 0
 ```
 
 ---
 
-### Fase 8: Backpressure e Limiti ⚡
-**Obiettivo**: Stabilità sotto carico
+### Phase 8: Backpressure and Limits ⚡
+**Goal**: Stability under load
 
-- [ ] Limite connessioni peer (default: 64)
-- [ ] Limite ops in coda (default: 10000)
-- [ ] Limite dimensione messaggio (default: 16 MiB)
-- [ ] Rifiuto graceful quando sovraccarico
-- [ ] Timeout lettura/scrittura socket (default: 30s)
-- [ ] Test: 1000 connessioni simultanee → no crash
+- [ ] Peer connection limit (default: 64)
+- [ ] Queued ops limit (default: 10000)
+- [ ] Message size limit (default: 16 MiB)
+- [ ] Graceful rejection when overloaded
+- [ ] Socket read/write timeouts (default: 30s)
+- [ ] Test: 1000 simultaneous connections → no crash
 
-**Configurazione**:
+**Configuration**:
 ```toml
 [limits]
 max_peers = 64
@@ -258,182 +258,182 @@ socket_timeout_secs = 30
 
 ---
 
-### Fase 9: Observability 📊
-**Obiettivo**: Visibilità su cosa fa il runtime
+### Phase 9: Observability 📊
+**Goal**: Visibility into what the runtime is doing
 
-**Logging strutturato**:
-- [ ] Formato JSON per log
-- [ ] Livelli configurabili (trace/debug/info/warn/error)
-- [ ] Correlation ID per tracciare operazioni
+**Structured logging**:
+- [ ] JSON format for logs
+- [ ] Configurable levels (trace/debug/info/warn/error)
+- [ ] Correlation ID to trace operations
 
-**Metriche**:
-- [ ] `numax_ops_total` - Operazioni processate
-- [ ] `numax_peers_connected` - Peer attivi
-- [ ] `numax_sync_latency_ms` - Latenza sync
-- [ ] `numax_store_keys` - Chiavi nello store
-- [ ] `numax_store_bytes` - Bytes usati
-- [ ] Endpoint `/metrics` (Prometheus format)
+**Metrics**:
+- [ ] `numax_ops_total` - Operations processed
+- [ ] `numax_peers_connected` - Active peers
+- [ ] `numax_sync_latency_ms` - Sync latency
+- [ ] `numax_store_keys` - Keys in the store
+- [ ] `numax_store_bytes` - Bytes used
+- [ ] `/metrics` endpoint (Prometheus format)
 
 **Health check**:
-- [ ] Endpoint `/health` (liveness)
-- [ ] Endpoint `/ready` (readiness)
+- [ ] `/health` endpoint (liveness)
+- [ ] `/ready` endpoint (readiness)
 
-**Librerie**: `tracing`, `tracing-subscriber`, `metrics`, `metrics-exporter-prometheus`
-
----
-
-### Fase 10: Resilienza Rete 🌐
-**Obiettivo**: Funzionamento robusto con rete instabile
-
-- [ ] Reconnect automatico con backoff esponenziale
-- [ ] Peer health tracking (mark dead dopo N timeout)
-- [ ] Peer rotation (sostituisci peer morti)
-- [ ] Anti-entropy periodico (pull ogni N secondi)
-- [ ] Deduplicazione ops (bloom filter o set OpId)
-- [ ] Test: rete intermittente (packet loss 10%)
-- [ ] Test: nodo muore e torna → converge
+**Libraries**: `tracing`, `tracing-subscriber`, `metrics`, `metrics-exporter-prometheus`
 
 ---
 
-### Fase 11: Serializzazione Dual-Mode 📦
-**Obiettivo**: JSON per debug, bincode per produzione
+### Phase 10: Network Resilience 🌐
+**Goal**: Robust operation with an unstable network
 
-**Motivazione**:
-- JSON: leggibile, debuggabile, ispezionabile con tcpdump/wireshark
-- bincode: compatto (~50% size), veloce (~10x faster parse)
+- [ ] Automatic reconnect with exponential backoff
+- [ ] Peer health tracking (mark dead after N timeouts)
+- [ ] Peer rotation (replace dead peers)
+- [ ] Periodic anti-entropy (pull every N seconds)
+- [ ] Op deduplication (bloom filter or set of OpIds)
+- [ ] Test: intermittent network (10% packet loss)
+- [ ] Test: node dies and comes back → converges
 
-**Task**:
-- [ ] Aggiungere `bincode` a dipendenze
-- [ ] Enum `SerializationFormat` con header di 1 byte nel wire
-- [ ] Flag CLI `--debug-protocol`
-- [ ] Negoziazione formato in Hello/HelloAck
-- [ ] Test: roundtrip entrambi i formati
+---
+
+### Phase 11: Dual-Mode Serialization 📦
+**Goal**: JSON for debugging, bincode for production
+
+**Motivation**:
+- JSON: readable, debuggable, inspectable with tcpdump/wireshark
+- bincode: compact (~50% size), fast (~10x faster parse)
+
+**Tasks**:
+- [ ] Add `bincode` to dependencies
+- [ ] `SerializationFormat` enum with a 1-byte header on the wire
+- [ ] CLI flag `--debug-protocol`
+- [ ] Format negotiation in Hello/HelloAck
+- [ ] Test: roundtrip for both formats
 - [ ] Benchmark: JSON vs bincode (size, speed)
 
-**Librerie**: `bincode`, `serde` (già presente)
+**Libraries**: `bincode`, `serde` (already present)
 
 ---
 
-### Fase 12: Host API Estese 🔌
-**Obiettivo**: API complete per moduli WASM
+### Phase 12: Extended Host API 🔌
+**Goal**: Complete API for WASM modules
 
 **Database**:
 - [ ] `db_scan`, `db_exists`, `db_keys`
 
-**Tempo**:
+**Time**:
 - [ ] `time_now`, `time_monotonic`
 
 **Crypto**:
 - [ ] `random_bytes`, `hash_sha256`, `hash_blake3`
 
-**Sistema**:
+**System**:
 - [ ] `env_get`, `module_id`, `abort`
 
-**Rete**:
+**Network**:
 - [ ] `net_node_id`, `net_peers`
 
-**Librerie**: `sha2`, `blake3`, `getrandom`
+**Libraries**: `sha2`, `blake3`, `getrandom`
 
 ---
 
-### Fase 13: Test di Carico 🔥
-**Obiettivo**: Verificare comportamento sotto stress
+### Phase 13: Load Testing 🔥
+**Goal**: Verify behavior under stress
 
-**Scenari**:
-- [ ] Singolo nodo: 10k ops/sec per 1 ora
-- [ ] 3 nodi: 1k ops/sec ciascuno, sync continuo
-- [ ] 10 nodi: mesh completo, 100 ops/sec ciascuno
-- [ ] Chaos: kill random nodo ogni 60s
+**Scenarios**:
+- [ ] Single node: 10k ops/sec for 1 hour
+- [ ] 3 nodes: 1k ops/sec each, continuous sync
+- [ ] 10 nodes: full mesh, 100 ops/sec each
+- [ ] Chaos: kill a random node every 60s
 
-**Metriche**: Throughput, latenza p50/p95/p99, RAM, CPU, tempo convergenza.
+**Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
 
-**Tool**: script custom o `criterion`.
+**Tools**: custom script or `criterion`.
 
 ---
 
-### Fase 14: CRDT Completi 🧮
-**Obiettivo**: Strutture dati per casi d'uso reali
+### Phase 14: Complete CRDTs 🧮
+**Goal**: Data structures for real use cases
 
-| CRDT | Descrizione | Priorità |
+| CRDT | Description | Priority |
 |------|-------------|----------|
-| **PNCounter** | Counter con increment/decrement | Alta |
-| **LWW-Register** | Singolo valore, last-writer-wins | Alta |
-| **ORSet** | Set con add/remove osservati | Alta |
-| **LWW-Map** | Mappa chiave→valore con LWW | Media |
-| **RGA** | Replicated Growable Array (liste ordinate) | Bassa |
+| **PNCounter** | Counter with increment/decrement | High |
+| **LWW-Register** | Single value, last-writer-wins | High |
+| **ORSet** | Set with observed add/remove | High |
+| **LWW-Map** | Key→value map with LWW | Medium |
+| **RGA** | Replicated Growable Array (ordered lists) | Low |
 
-Per ognuno: implementazione, test proprietà, OpKind, docs, esempio.
+For each one: implementation, property tests, OpKind, docs, example.
 
 ---
 
-### Fase 15: Deployment & Docs 📦
-**Obiettivo**: Pronto per utenti esterni
+### Phase 15: Deployment & Docs 📦
+**Goal**: Ready for external users
 
-- [ ] Binari precompilati (Linux x86_64, ARM64, macOS, Windows)
+- [ ] Precompiled binaries (Linux x86_64, ARM64, macOS, Windows)
 - [ ] `cargo install numax`
-- [ ] Tutorial: "Hello World distribuito in 5 minuti"
-- [ ] Tutorial: "Deploy 3+ nodi con mTLS"
-- [ ] Guida: configurazione produzione
-- [ ] Guida: troubleshooting
+- [ ] Tutorial: "Distributed Hello World in 5 minutes"
+- [ ] Tutorial: "Deploy 3+ nodes with mTLS"
+- [ ] Guide: production configuration
+- [ ] Guide: troubleshooting
 - [ ] CHANGELOG.md
 - [ ] CONTRIBUTING.md
 
 ---
 
-## Riepilogo Fasi
+## Phases Summary
 
-| Fase | Nome | Stato | Priorità |
-|------|------|-------|----------|
+| Phase | Name | Status | Priority |
+|-------|------|--------|----------|
 | 0-5 | Foundation | ✅ | - |
 | 6 | Transport Security | ✅ | **P0** |
 | 6.5 | End-to-End Sync Wiring | ✅* | **P0** |
 | 7 | Graceful Lifecycle | ⏳ | **P0** |
 | 8 | Backpressure | ⏳ | **P0** |
 | 9 | Observability | ⏳ | **P1** |
-| 10 | Resilienza Rete | ⏳ | **P1** |
-| 11 | Serializzazione Dual | ⏳ | **P1** |
-| 12 | Host API Estese | ⏳ | **P1** |
-| 13 | Test di Carico | ⏳ | **P1** |
-| 14 | CRDT Completi | ⏳ | **P2** |
+| 10 | Network Resilience | ⏳ | **P1** |
+| 11 | Dual Serialization | ⏳ | **P1** |
+| 12 | Extended Host API | ⏳ | **P1** |
+| 13 | Load Testing | ⏳ | **P1** |
+| 14 | Complete CRDTs | ⏳ | **P2** |
 | 15 | Deployment & Docs | ⏳ | **P2** |
 
-**Legenda**:
-- **P0**: Bloccante per produzione
-- **P1**: Necessario per produzione sicura
-- **P2**: Necessario per adoption
+**Legend**:
+- **P0**: Blocking for production
+- **P1**: Required for safe production
+- **P2**: Required for adoption
 
-`✅*`: chiusa per wiring interno e test E2E `SyncManager`; il criterio CLI
-letterale resta tracciato in Fase 7 come lifecycle/settle/hydration.
-
----
-
-## Criteri Release v0.1.0 finale
-
-- [x] Fasi 0-5 complete
-- [x] Fase 6 (TLS) completa
-- [x] Fase 6.5 (End-to-End Sync) completa
-- [ ] Fase 7 (Graceful shutdown) completa
-- [ ] Fase 8 (Backpressure) completa
-- [ ] Fase 9 (Observability) almeno logging + health
-- [ ] Fase 10 (Resilienza) almeno reconnect + dedup
-- [ ] Fase 11 (Serializzazione) JSON + bincode funzionanti
-- [ ] Fase 12 (Host API) almeno db_scan, time_now, random_bytes
-- [ ] Fase 13 (Test carico) almeno scenario 3 nodi 1h
-- [ ] Tutti i test passano
-- [ ] Nessun warning clippy
-- [ ] Documentazione base
+`✅*`: closed for internal wiring and `SyncManager` E2E tests; the literal CLI
+criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 
 ---
 
-## Criteri Release v0.1.0-alpha.1
+## Final v0.1.0 Release Criteria
 
-- [x] Fasi 0-5 complete
-- [x] Fase 6 (TLS) completa
-- [x] Fase 6.5 wiring interno coperto da test E2E `SyncManager`
-- [x] Esempi WASM di base presenti
-- [x] `cargo test` passa fuori sandbox
-- [x] `cargo clippy --all-targets --all-features -- -D warnings` passa
-- [x] Limitazioni note documentate in roadmap
+- [x] Phases 0-5 complete
+- [x] Phase 6 (TLS) complete
+- [x] Phase 6.5 (End-to-End Sync) complete
+- [ ] Phase 7 (Graceful shutdown) complete
+- [ ] Phase 8 (Backpressure) complete
+- [ ] Phase 9 (Observability) at least logging + health
+- [ ] Phase 10 (Resilience) at least reconnect + dedup
+- [ ] Phase 11 (Serialization) JSON + bincode working
+- [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
+- [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
+- [ ] All tests pass
+- [ ] No clippy warnings
+- [ ] Base documentation
+
+---
+
+## v0.1.0-alpha.1 Release Criteria
+
+- [x] Phases 0-5 complete
+- [x] Phase 6 (TLS) complete
+- [x] Phase 6.5 internal wiring covered by `SyncManager` E2E tests
+- [x] Base WASM examples present
+- [x] `cargo test` passes outside the sandbox
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
 
 ---
 
