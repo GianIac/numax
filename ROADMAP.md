@@ -1,4 +1,4 @@
-# Numax Roadmap v0.1.0
+# Numax Roadmap
 
 > **Current release**: `v0.1.0-alpha.1` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
