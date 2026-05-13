@@ -11,7 +11,7 @@
 >
 > **Version reference**: `v0.1.0-alpha.1` - technical preview, API and wire format may change before the stable v0.1.0.
 >
-> > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP_v0.1.0.md`](./ROADMAP_v0.1.0.md).
+> > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
 
 ---
