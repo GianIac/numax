@@ -1,4 +1,4 @@
-# Numax Runtime - Technical Whitepaper (ENG)
+# Numax Runtime - Technical Whitepaper
 
 > **Note**
 > This whitepaper is aligned with **v0.1.0-alpha.1**, the first public technical preview of Numax.
