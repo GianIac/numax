@@ -1,4 +1,4 @@
-<img width="1536" height="1024" alt="numax" src="https://github.com/user-attachments/assets/646b27ce-1ba8-4012-94a5-f1b186ebbcf3" />
+<img width="1536" height="1024" alt="895e85af-930d-4d7e-9fc2-1804aa90852d" src="https://github.com/user-attachments/assets/c628c233-8523-4abd-a57c-a15e32c6947a" />
 
 # numax
 
