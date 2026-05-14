@@ -94,7 +94,7 @@ Same module, any node. State stays local. Sync happens through the runtime.
 
 - [`WHITEPAPER.md`](./WHITEPAPER.md) - the vision, the architecture, the principles.
 - [`ROADMAP_v0.1.0.md`](./ROADMAP.md) - where we are, where we're going, what's still missing.
-- [`docs/HOST_API.md`](./HOST_API.md) - the host API available to WASM modules.
+- [`HOST_API.md`](./HOST_API.md) - the host API available to WASM modules.
 
 ---
 
