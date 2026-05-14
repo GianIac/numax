@@ -223,8 +223,8 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 - [x] Graceful shutdown: complete in-flight ops, close connections
 - [x] Store flush before exit
 - [x] Configurable timeout for shutdown (default 30s)
-- [ ] Test: kill -TERM → no data corruption
-- [ ] Test: crash → restart → consistent state
+- [x] Test: kill -TERM → no data corruption
+- [x] Test: crash → restart → consistent state
 
 > These tasks complete the CLI criterion left open by Phase 6.5 and bring it
 > inside a general lifecycle: service loop, signal-aware shutdown, final flush

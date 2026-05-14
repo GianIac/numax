@@ -58,14 +58,63 @@ fn assert_printed_counter(output: &Output, label: &str, expected: u64) {
     );
 }
 
-#[test]
-#[ignore = "requires built distributed_counter.wasm and local TCP sockets"]
-fn two_nx_run_processes_converge_distributed_counter() {
+fn printed_counter_value(output: &Output, label: &str) -> u64 {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{COUNTER_KEY} = ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "{label} did not print a final counter value\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+}
+
+fn assert_counter_wasm_exists() -> PathBuf {
     let wasm = distributed_counter_wasm();
     assert!(
         wasm.exists(),
         "missing {wasm:?}; build it with: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml"
     );
+    wasm
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("send signal with kill");
+    assert!(status.success(), "kill -{signal} {pid} failed: {status}");
+}
+
+fn restart_and_print_counter(nx: &Path, wasm: &Path, data_dir: &Path, label: &str) -> Output {
+    let output = Command::new(nx)
+        .arg("run")
+        .arg(wasm)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--datastore-path")
+        .arg(data_dir)
+        .arg("--settle-for")
+        .arg("200ms")
+        .arg("--print-gcounter")
+        .arg(COUNTER_KEY)
+        .output()
+        .unwrap_or_else(|e| panic!("restart {label}: {e}"));
+
+    assert_success(&output, label);
+    output
+}
+
+#[test]
+#[ignore = "requires built distributed_counter.wasm and local TCP sockets"]
+fn two_nx_run_processes_converge_distributed_counter() {
+    let wasm = assert_counter_wasm_exists();
 
     let addr_a = free_addr();
     let addr_b = free_addr();
@@ -119,4 +168,71 @@ fn two_nx_run_processes_converge_distributed_counter() {
     assert_success(&output_b, "node B");
     assert_printed_counter(&output_a, "node A", 2);
     assert_printed_counter(&output_b, "node B", 2);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires built distributed_counter.wasm, local TCP sockets and Unix signals"]
+fn sigterm_shutdown_preserves_counter_state() {
+    let wasm = assert_counter_wasm_exists();
+    let data = temp_path("cli-sigterm-data");
+    let nx = nx_bin();
+
+    let child = Command::new(&nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--datastore-path")
+        .arg(&data)
+        .arg("--shutdown-timeout")
+        .arg("3s")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn SIGTERM node");
+
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    send_signal(child.id(), "TERM");
+    let output = child.wait_with_output().expect("wait SIGTERM node");
+    assert_success(&output, "SIGTERM node");
+
+    let restart = restart_and_print_counter(&nx, &wasm, &data, "restart after SIGTERM");
+    assert_printed_counter(&restart, "restart after SIGTERM", 2);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires built distributed_counter.wasm, local TCP sockets and Unix signals"]
+fn crash_restart_keeps_counter_state_consistent() {
+    let wasm = assert_counter_wasm_exists();
+    let data = temp_path("cli-crash-data");
+    let nx = nx_bin();
+
+    let child = Command::new(&nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--datastore-path")
+        .arg(&data)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn crash node");
+
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    send_signal(child.id(), "KILL");
+    let output = child.wait_with_output().expect("wait crash node");
+    assert!(
+        !output.status.success(),
+        "crash node should not exit successfully after SIGKILL"
+    );
+
+    let restart = restart_and_print_counter(&nx, &wasm, &data, "restart after crash");
+    let value = printed_counter_value(&restart, "restart after crash");
+    assert!(
+        (1..=2).contains(&value),
+        "restart after crash produced inconsistent value {value}"
+    );
 }
