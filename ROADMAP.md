@@ -211,7 +211,7 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 ### Phase 7: Graceful Lifecycle 🔄
 **Goal**: Clean shutdown and recovery from crash
 
-- [ ] Robust long-running mode for the runtime with sync enabled.
+- [x] Robust long-running mode for the runtime with sync enabled.
 - [x] Hydration on startup: rebuild the GCounter registry from the values
       materialized in sled.
 - [ ] Settle mode for `nx run` with sync enabled: give time to handshake,

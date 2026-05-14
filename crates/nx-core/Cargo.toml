@@ -10,5 +10,5 @@ wasmtime-wasi = "43.0.1"
 nx-store = { path = "../nx-store" }
 nx-sync = { path = "../nx-sync" }
 nx-net = { path = "../nx-net" }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["signal", "sync"] }
 tracing = "0.1"

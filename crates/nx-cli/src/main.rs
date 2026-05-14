@@ -122,6 +122,9 @@ async fn real_main() -> Result<()> {
             let mut rt = Runtime::new(cfg)?;
             rt.start_sync().await?;
             rt.run_module(&bytes).await?;
+            if rt.sync_enabled() {
+                rt.serve().await?;
+            }
         }
     }
 

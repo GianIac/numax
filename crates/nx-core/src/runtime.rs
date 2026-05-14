@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Linker, Module, Store};
@@ -130,6 +131,38 @@ impl Runtime {
         self.sync_handle.clone()
     }
 
+    /// Return true when this runtime owns an active sync manager.
+    pub fn sync_enabled(&self) -> bool {
+        self.sync_handle.is_some()
+    }
+
+    /// Keep the runtime alive while sync background tasks do their work.
+    pub async fn serve(&self) -> Result<()> {
+        self.serve_until_shutdown(async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %e, "failed to listen for shutdown signal");
+            }
+        })
+        .await
+    }
+
+    /// Testable variant of `serve`: the caller provides the shutdown signal.
+    pub async fn serve_until_shutdown<S>(&self, shutdown: S) -> Result<()>
+    where
+        S: Future<Output = ()>,
+    {
+        if !self.sync_enabled() {
+            tracing::debug!("serve: sync disabled, nothing to keep alive");
+            return Ok(());
+        }
+
+        tracing::info!("runtime entering long-running sync mode");
+        shutdown.await;
+        tracing::info!("runtime shutdown requested");
+
+        Ok(())
+    }
+
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
@@ -176,5 +209,75 @@ impl Runtime {
             .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_config::SyncConfig;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+
+    fn temp_datastore_path(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{prefix}-{nanos}"));
+        path
+    }
+
+    #[tokio::test]
+    async fn serve_returns_immediately_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        runtime
+            .serve_until_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_runtime_alive_until_shutdown() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-serve-test"),
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        assert!(
+            timeout(
+                Duration::from_millis(25),
+                runtime.serve_until_shutdown(async {
+                    let _ = rx.await;
+                })
+            )
+            .await
+            .is_err()
+        );
+
+        let (tx, rx) = oneshot::channel::<()>();
+        tx.send(()).unwrap();
+        timeout(
+            Duration::from_secs(1),
+            runtime.serve_until_shutdown(async {
+                let _ = rx.await;
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 }
