@@ -75,12 +75,18 @@ impl SyncManager {
     /// new SyncManager.
     pub fn new(node_id: NodeId, config: SyncConfig, store: Arc<NxStore>) -> Self {
         let (op_tx, op_rx) = mpsc::channel(100);
+        let mut counters = HashMap::new();
+
+        if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
+            warn!(error = %e, "failed to hydrate GCounter registry");
+        }
+        let counters = Arc::new(RwLock::new(counters));
 
         Self {
             node_id,
             config,
             node: None,
-            counters: Arc::new(RwLock::new(HashMap::new())),
+            counters,
             store,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
             op_tx,
@@ -236,6 +242,60 @@ pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
     out.extend_from_slice(GCOUNTER_STORE_PREFIX.as_bytes());
     out.extend_from_slice(key.as_bytes());
     out
+}
+
+fn logical_gcounter_key(store_key: &[u8]) -> anyhow::Result<String> {
+    let key = store_key
+        .strip_prefix(GCOUNTER_STORE_PREFIX.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("invalid GCounter materialized key"))?;
+
+    String::from_utf8(key.to_vec())
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in GCounter materialized key: {e}"))
+}
+
+fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
+    let buf: [u8; 8] = bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid materialized GCounter value length: expected 8, got {}",
+            bytes.len()
+        )
+    })?;
+
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn hydrate_gcounter_registry(
+    store: &NxStore,
+    node_id: &NodeId,
+    counters: &mut HashMap<String, GCounter>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(GCOUNTER_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_gcounter_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid materialized GCounter key");
+                continue;
+            }
+        };
+        let value = match parse_materialized_gcounter_value(&value_bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid materialized GCounter value");
+                continue;
+            }
+        };
+
+        let mut counter = GCounter::new();
+        counter.increment(node_id, value);
+        counters.insert(key, counter);
+        hydrated += 1;
+    }
+
+    debug!(count = hydrated, "hydrated GCounter registry from sled");
+    Ok(hydrated)
 }
 
 pub(crate) fn materialize_gcounter_value(
@@ -398,6 +458,22 @@ mod tests {
         buf.copy_from_slice(&bytes);
 
         assert_eq!(u64::from_le_bytes(buf), 3);
+    }
+
+    #[tokio::test]
+    async fn manager_hydrates_gcounter_registry_from_materialized_values() {
+        let store = temp_store();
+        materialize_gcounter_value(&store, "counter:visits", 42).unwrap();
+
+        let node_id = NodeId::new("local-node");
+        let config = SyncConfig::new();
+        let manager = SyncManager::new(node_id.clone(), config, Arc::clone(&store));
+
+        assert_eq!(manager.get_counter_value("counter:visits").await, 42);
+
+        let counters = manager.counters.read().await;
+        let counter = counters.get("counter:visits").unwrap();
+        assert_eq!(counter.value_for(&node_id), 42);
     }
 
     #[tokio::test]
