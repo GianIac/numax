@@ -14,6 +14,8 @@ use crate::host_api;
 use crate::sync_config::SyncConfig;
 use crate::sync_manager::{SyncHandle, SyncManager};
 
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownSignal {
     Interrupt,
@@ -137,15 +139,29 @@ impl Runtime {
 
     /// Stop sync background tasks and close network connections.
     pub async fn shutdown(&mut self) -> Result<()> {
-        let Some(manager) = self.sync_manager.as_mut() else {
-            tracing::debug!("shutdown: no sync configured, skipping");
-            return Ok(());
-        };
+        self.shutdown_with_timeout(DEFAULT_SHUTDOWN_TIMEOUT).await
+    }
 
-        manager
-            .shutdown()
+    /// Stop background tasks and flush the local store, bounded by `timeout`.
+    pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.shutdown_inner())
             .await
-            .map_err(|e| anyhow!("sync manager failed to shut down: {e}"))?;
+            .map_err(|_| anyhow!("shutdown timed out after {:?}", timeout))?
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<()> {
+        if let Some(manager) = self.sync_manager.as_mut() {
+            manager
+                .shutdown()
+                .await
+                .map_err(|e| anyhow!("sync manager failed to shut down: {e}"))?;
+        } else {
+            tracing::debug!("shutdown: no sync configured, skipping sync manager");
+        }
+
+        self.store
+            .flush()
+            .map_err(|e| anyhow!("failed to flush datastore: {e}"))?;
         tracing::info!("runtime shutdown complete");
         Ok(())
     }
@@ -445,5 +461,22 @@ mod tests {
         runtime.settle_for(duration).await.unwrap();
 
         assert!(started.elapsed() >= duration);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_timeout_flushes_store_without_sync() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-shutdown-flush-test"),
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = Runtime::new(config).unwrap();
+
+        runtime.store.set(b"key", b"value").unwrap();
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.store.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 }

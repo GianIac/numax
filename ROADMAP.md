@@ -221,8 +221,8 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
       converge and print the same value within a few seconds.
 - [x] Signal handling (SIGTERM, SIGINT, SIGHUP)
 - [x] Graceful shutdown: complete in-flight ops, close connections
-- [ ] Store flush before exit
-- [ ] Configurable timeout for shutdown (default 30s)
+- [x] Store flush before exit
+- [x] Configurable timeout for shutdown (default 30s)
 - [ ] Test: kill -TERM → no data corruption
 - [ ] Test: crash → restart → consistent state
 

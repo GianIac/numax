@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use nx_core::runtime::{Runtime, RuntimeConfig};
+use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::{SyncConfig, TlsConfig};
 use tracing::{info, warn};
 
@@ -41,6 +41,10 @@ enum Cli {
         /// Print the final value of a GCounter after settle/serve completes.
         #[arg(long, value_name = "KEY")]
         print_gcounter: Option<String>,
+
+        /// Maximum time allowed for shutdown before returning an error.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        shutdown_timeout: Option<Duration>,
 
         /// Enable verbose logging
         #[arg(short, long)]
@@ -92,6 +96,7 @@ async fn real_main() -> Result<()> {
             settle_for,
             wait_before_run,
             print_gcounter,
+            shutdown_timeout,
             verbose,
             tls_cert,
             tls_key,
@@ -156,7 +161,8 @@ async fn real_main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
                 println!("{key} = {value}");
             }
-            rt.shutdown().await?;
+            rt.shutdown_with_timeout(shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT))
+                .await?;
         }
     }
 
@@ -724,6 +730,26 @@ mod tests {
                     assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
                 }
             }
+        }
+
+        #[test]
+        fn shutdown_timeout_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--shutdown-timeout", "10s"]).unwrap();
+            match cli {
+                Cli::Run {
+                    shutdown_timeout, ..
+                } => {
+                    assert_eq!(shutdown_timeout, Some(Duration::from_secs(10)));
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_shutdown_timeout_fails() {
+            assert!(
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--shutdown-timeout", "nope"]).is_err()
+            );
         }
 
         #[test]

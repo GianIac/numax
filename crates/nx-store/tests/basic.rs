@@ -38,6 +38,17 @@ fn scan_prefix_works() {
 }
 
 #[test]
+fn flush_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+
+    store.set(b"key", b"value").unwrap();
+    store.flush().unwrap();
+
+    assert_eq!(store.get(b"key").unwrap(), Some(b"value".to_vec()));
+}
+
+#[test]
 fn open_creates_dir_if_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let db_dir = tmp.path().join("nx-store-data-does-not-exist-yet");
