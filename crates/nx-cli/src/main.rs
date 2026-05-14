@@ -144,25 +144,34 @@ async fn real_main() -> Result<()> {
             }
 
             let mut rt = Runtime::new(cfg)?;
-            rt.start_sync().await?;
-            if let Some(duration) = wait_before_run {
-                rt.wait_before_run(duration).await?;
+            let run_result: Result<()> = async {
+                rt.start_sync().await?;
+                if let Some(duration) = wait_before_run {
+                    rt.wait_before_run(duration).await?;
+                }
+                rt.run_module(&bytes).await?;
+                match settle_for {
+                    Some(duration) => rt.settle_for(duration).await?,
+                    None if rt.sync_enabled() => rt.serve().await?,
+                    None => {}
+                }
+                if let Some(key) = print_gcounter {
+                    let value = rt
+                        .get_counter_value(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
+                    println!("{key} = {value}");
+                }
+                Ok(())
             }
-            rt.run_module(&bytes).await?;
-            match settle_for {
-                Some(duration) => rt.settle_for(duration).await?,
-                None if rt.sync_enabled() => rt.serve().await?,
-                None => {}
-            }
-            if let Some(key) = print_gcounter {
-                let value = rt
-                    .get_counter_value(&key)
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
-                println!("{key} = {value}");
-            }
-            rt.shutdown_with_timeout(shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT))
-                .await?;
+            .await;
+
+            let shutdown_result = rt
+                .shutdown_with_timeout(shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT))
+                .await;
+
+            run_result?;
+            shutdown_result?;
         }
     }
 

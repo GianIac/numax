@@ -192,7 +192,7 @@ fn sigterm_shutdown_preserves_counter_state() {
         .spawn()
         .expect("spawn SIGTERM node");
 
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     send_signal(child.id(), "TERM");
     let output = child.wait_with_output().expect("wait SIGTERM node");
     assert_success(&output, "SIGTERM node");
@@ -221,7 +221,7 @@ fn crash_restart_keeps_counter_state_consistent() {
         .spawn()
         .expect("spawn crash node");
 
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     send_signal(child.id(), "KILL");
     let output = child.wait_with_output().expect("wait crash node");
     assert!(
