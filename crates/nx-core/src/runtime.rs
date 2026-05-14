@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{WasiCtx, p1};
 
@@ -163,6 +164,20 @@ impl Runtime {
         Ok(())
     }
 
+    /// Keep sync alive for a bounded settle window, then return.
+    pub async fn settle_for(&self, duration: Duration) -> Result<()> {
+        if !self.sync_enabled() {
+            tracing::debug!("settle_for: sync disabled, nothing to settle");
+            return Ok(());
+        }
+
+        tracing::info!(?duration, "runtime entering sync settle mode");
+        tokio::time::sleep(duration).await;
+        tracing::info!("runtime settle complete");
+
+        Ok(())
+    }
+
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
@@ -218,6 +233,7 @@ mod tests {
     use crate::sync_config::SyncConfig;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::oneshot;
+    use tokio::time::Instant;
     use tokio::time::{Duration, timeout};
 
     fn temp_datastore_path(prefix: &str) -> PathBuf {
@@ -279,5 +295,35 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn settle_returns_immediately_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-settle-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let started = Instant::now();
+
+        runtime.settle_for(Duration::from_secs(5)).await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn settle_waits_for_requested_duration_when_sync_is_enabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-settle-test"),
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let duration = Duration::from_millis(25);
+        let started = Instant::now();
+
+        runtime.settle_for(duration).await.unwrap();
+
+        assert!(started.elapsed() >= duration);
     }
 }
