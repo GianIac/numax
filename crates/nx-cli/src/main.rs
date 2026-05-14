@@ -156,6 +156,7 @@ async fn real_main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
                 println!("{key} = {value}");
             }
+            rt.shutdown().await?;
         }
     }
 

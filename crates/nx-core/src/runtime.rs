@@ -135,6 +135,21 @@ impl Runtime {
         Ok(())
     }
 
+    /// Stop sync background tasks and close network connections.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        let Some(manager) = self.sync_manager.as_mut() else {
+            tracing::debug!("shutdown: no sync configured, skipping");
+            return Ok(());
+        };
+
+        manager
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("sync manager failed to shut down: {e}"))?;
+        tracing::info!("runtime shutdown complete");
+        Ok(())
+    }
+
     /// Return a clonable handle to the SyncManager (if present).
     pub fn sync_handle(&self) -> Option<SyncHandle> {
         self.sync_handle.clone()

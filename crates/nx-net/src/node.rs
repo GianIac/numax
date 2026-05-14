@@ -121,8 +121,15 @@ impl Node {
                         let tls = tls.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_incoming(stream, tls, node_id, peers, event_tx).await
+                            if let Err(e) = handle_incoming(
+                                stream,
+                                addr.to_string(),
+                                tls,
+                                node_id,
+                                peers,
+                                event_tx,
+                            )
+                            .await
                             {
                                 error!(%addr, error = %e, "connection error");
                             }
@@ -297,14 +304,23 @@ impl Node {
             .filter(|c| c.state == PeerState::Connected)
             .count()
     }
+
+    /// Close outbound peer connections by dropping their writers.
+    pub async fn shutdown(&self) {
+        let mut peers = self.peers.write().await;
+        let count = peers.len();
+        peers.clear();
+        debug!(count, "node peer connections closed");
+    }
 }
 
 /// Manage an incoming connection from a peer (handshake + read loop).
 async fn handle_incoming(
     stream: TcpStream,
+    addr: String,
     tls: Option<TlsConfig>,
     our_node_id: NodeId,
-    _peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
@@ -366,6 +382,18 @@ async fn handle_incoming(
     let ack = Message::hello_ack(our_node_id);
     write_message(&mut writer, &ack).await?;
 
+    {
+        let mut peers = peers.write().await;
+        peers.insert(
+            addr.clone(),
+            PeerConnection {
+                info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
+                state: PeerState::Connected,
+                writer: Some(writer),
+            },
+        );
+    }
+
     info!(peer = %peer_node_id, "incoming peer connected");
 
     // Notify Event
@@ -377,6 +405,11 @@ async fn handle_incoming(
 
     // Read Loop
     read_loop(reader, peer_node_id.clone(), event_tx.clone()).await?;
+
+    {
+        let mut peers = peers.write().await;
+        peers.remove(&addr);
+    }
 
     let _ = event_tx
         .send(NodeEvent::PeerDisconnected {

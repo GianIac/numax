@@ -220,7 +220,7 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 - [x] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
       converge and print the same value within a few seconds.
 - [x] Signal handling (SIGTERM, SIGINT, SIGHUP)
-- [ ] Graceful shutdown: complete in-flight ops, close connections
+- [x] Graceful shutdown: complete in-flight ops, close connections
 - [ ] Store flush before exit
 - [ ] Configurable timeout for shutdown (default 30s)
 - [ ] Test: kill -TERM → no data corruption
