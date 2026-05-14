@@ -1,4 +1,6 @@
-<img width="1536" height="1024" alt="numax" src="https://github.com/user-attachments/assets/646b27ce-1ba8-4012-94a5-f1b186ebbcf3" />
+<p align="center">
+  <img width="800" alt="NUMAX" src="https://github.com/user-attachments/assets/c628c233-8523-4abd-a57c-a15e32c6947a" />
+</p>
 
 # numax
 
@@ -16,7 +18,7 @@ Three things, and only three:
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
 > **Status:** `v0.1.0-alpha.1` - first public technical preview.
-> It works, it's tested, it's honest about what's missing. See [`ROADMAP_v0.1.0.md`](./ROADMAP.md).
+> It works, it's tested, it's honest about what's missing. See [`ROADMAP.md`](./ROADMAP.md).
 
 ---
 
