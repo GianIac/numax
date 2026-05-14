@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::{Duration as TokioDuration, Instant};
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{WasiCtx, p1};
 
@@ -137,6 +138,12 @@ impl Runtime {
         self.sync_handle.is_some()
     }
 
+    /// Return the current value of a GCounter, if sync is enabled.
+    pub async fn get_counter_value(&self, key: &str) -> Option<u64> {
+        let manager = self.sync_manager.as_ref()?;
+        Some(manager.get_counter_value(key).await)
+    }
+
     /// Keep the runtime alive while sync background tasks do their work.
     pub async fn serve(&self) -> Result<()> {
         self.serve_until_shutdown(async {
@@ -174,6 +181,33 @@ impl Runtime {
         tracing::info!(?duration, "runtime entering sync settle mode");
         tokio::time::sleep(duration).await;
         tracing::info!("runtime settle complete");
+
+        Ok(())
+    }
+
+    /// Keep sync alive before the guest runs, retrying configured peers during the window.
+    pub async fn wait_before_run(&self, duration: Duration) -> Result<()> {
+        if !self.sync_enabled() {
+            tracing::debug!("wait_before_run: sync disabled, nothing to wait for");
+            return Ok(());
+        }
+
+        tracing::info!(?duration, "runtime waiting before guest run");
+        let deadline = Instant::now() + TokioDuration::from(duration);
+
+        loop {
+            if let Some(manager) = self.sync_manager.as_ref() {
+                manager.reconnect_configured_peers().await;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline - now;
+            tokio::time::sleep(remaining.min(TokioDuration::from_millis(100))).await;
+        }
 
         Ok(())
     }

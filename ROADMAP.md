@@ -217,7 +217,7 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 - [x] Settle mode for `nx run` with sync enabled: give time to handshake,
       PushOps and remote apply before exit, or replace it with a long-running
       lifecycle.
-- [ ] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
+- [x] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
       converge and print the same value within a few seconds.
 - [ ] Signal handling (SIGTERM, SIGINT, SIGHUP)
 - [ ] Graceful shutdown: complete in-flight ops, close connections

@@ -199,6 +199,15 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Retry connecting to the peers configured at startup.
+    pub async fn reconnect_configured_peers(&self) {
+        for peer_addr in &self.config.peers {
+            if let Err(e) = self.connect_to_peer(peer_addr).await {
+                debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
+            }
+        }
+    }
+
     /// Broadcast of pending operations, this method can be used for forced flush
     pub async fn broadcast_pending(&self) -> anyhow::Result<()> {
         Ok(())

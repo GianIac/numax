@@ -34,6 +34,14 @@ enum Cli {
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         settle_for: Option<Duration>,
 
+        /// Wait for a bounded duration after starting sync and before running the module.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        wait_before_run: Option<Duration>,
+
+        /// Print the final value of a GCounter after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_gcounter: Option<String>,
+
         /// Enable verbose logging
         #[arg(short, long)]
         verbose: bool,
@@ -82,6 +90,8 @@ async fn real_main() -> Result<()> {
             listen,
             peers,
             settle_for,
+            wait_before_run,
+            print_gcounter,
             verbose,
             tls_cert,
             tls_key,
@@ -107,6 +117,8 @@ async fn real_main() -> Result<()> {
             // Build SyncConfig (if sync flags were provided)
             let sync = build_sync_config(listen, peers, tls)?;
             validate_settle_mode(&sync, settle_for)?;
+            validate_wait_before_run(&sync, wait_before_run)?;
+            validate_print_gcounter(&sync, &print_gcounter)?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -128,11 +140,21 @@ async fn real_main() -> Result<()> {
 
             let mut rt = Runtime::new(cfg)?;
             rt.start_sync().await?;
+            if let Some(duration) = wait_before_run {
+                rt.wait_before_run(duration).await?;
+            }
             rt.run_module(&bytes).await?;
             match settle_for {
                 Some(duration) => rt.settle_for(duration).await?,
                 None if rt.sync_enabled() => rt.serve().await?,
                 None => {}
+            }
+            if let Some(key) = print_gcounter {
+                let value = rt
+                    .get_counter_value(&key)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
+                println!("{key} = {value}");
             }
         }
     }
@@ -193,6 +215,28 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
 fn validate_settle_mode(sync: &Option<SyncConfig>, settle_for: Option<Duration>) -> Result<()> {
     if settle_for.is_some() && sync.is_none() {
         bail!("--settle-for requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_wait_before_run(
+    sync: &Option<SyncConfig>,
+    wait_before_run: Option<Duration>,
+) -> Result<()> {
+    if wait_before_run.is_some() && sync.is_none() {
+        bail!("--wait-before-run requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_gcounter(
+    sync: &Option<SyncConfig>,
+    print_gcounter: &Option<String>,
+) -> Result<()> {
+    if print_gcounter.is_some() && sync.is_none() {
+        bail!("--print-gcounter requires sync to be enabled with --listen");
     }
 
     Ok(())
@@ -410,6 +454,42 @@ mod tests {
         }
     }
 
+    mod validate_wait_before_run {
+        use super::*;
+
+        #[test]
+        fn wait_without_sync_fails() {
+            let err = validate_wait_before_run(&None, Some(Duration::from_secs(1)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--wait-before-run requires sync"));
+        }
+
+        #[test]
+        fn wait_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_wait_before_run(&sync, Some(Duration::from_secs(1))).is_ok());
+        }
+    }
+
+    mod validate_print_counter {
+        use super::*;
+
+        #[test]
+        fn print_without_sync_fails() {
+            let err = validate_print_gcounter(&None, &Some("counter:visits".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-gcounter requires sync"));
+        }
+
+        #[test]
+        fn print_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_gcounter(&sync, &Some("counter:visits".to_string())).is_ok());
+        }
+    }
+
     // build_tls_config
     mod build_tls {
         use super::*;
@@ -618,6 +698,31 @@ mod tests {
         #[test]
         fn invalid_settle_for_fails() {
             assert!(Cli::try_parse_from(["nx", "run", "x.wasm", "--settle-for", "later"]).is_err());
+        }
+
+        #[test]
+        fn wait_before_run_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--wait-before-run", "500ms"]).unwrap();
+            match cli {
+                Cli::Run {
+                    wait_before_run, ..
+                } => {
+                    assert_eq!(wait_before_run, Some(Duration::from_millis(500)));
+                }
+            }
+        }
+
+        #[test]
+        fn print_gcounter_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--print-gcounter", "counter:visits"])
+                    .unwrap();
+            match cli {
+                Cli::Run { print_gcounter, .. } => {
+                    assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
+                }
+            }
         }
 
         #[test]
