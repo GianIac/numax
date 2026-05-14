@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Duration as TokioDuration, Instant};
+use tokio::time::Instant;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{WasiCtx, p1};
 
@@ -229,7 +229,7 @@ impl Runtime {
         }
 
         tracing::info!(?duration, "runtime waiting before guest run");
-        let deadline = Instant::now() + TokioDuration::from(duration);
+        let deadline = Instant::now() + duration;
 
         loop {
             if let Some(manager) = self.sync_manager.as_ref() {
@@ -242,7 +242,7 @@ impl Runtime {
             }
 
             let remaining = deadline - now;
-            tokio::time::sleep(remaining.min(TokioDuration::from_millis(100))).await;
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
         }
 
         Ok(())
