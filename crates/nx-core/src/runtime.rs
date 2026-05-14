@@ -14,6 +14,13 @@ use crate::host_api;
 use crate::sync_config::SyncConfig;
 use crate::sync_manager::{SyncHandle, SyncManager};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
+}
+
 // Runtime config
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -146,29 +153,27 @@ impl Runtime {
 
     /// Keep the runtime alive while sync background tasks do their work.
     pub async fn serve(&self) -> Result<()> {
-        self.serve_until_shutdown(async {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::warn!(error = %e, "failed to listen for shutdown signal");
-            }
-        })
-        .await
+        let _ = self
+            .serve_until_shutdown(wait_for_shutdown_signal())
+            .await?;
+        Ok(())
     }
 
     /// Testable variant of `serve`: the caller provides the shutdown signal.
-    pub async fn serve_until_shutdown<S>(&self, shutdown: S) -> Result<()>
+    pub async fn serve_until_shutdown<S>(&self, shutdown: S) -> Result<Option<ShutdownSignal>>
     where
-        S: Future<Output = ()>,
+        S: Future<Output = ShutdownSignal>,
     {
         if !self.sync_enabled() {
             tracing::debug!("serve: sync disabled, nothing to keep alive");
-            return Ok(());
+            return Ok(None);
         }
 
         tracing::info!("runtime entering long-running sync mode");
-        shutdown.await;
-        tracing::info!("runtime shutdown requested");
+        let signal = shutdown.await;
+        tracing::info!(?signal, "runtime shutdown requested");
 
-        Ok(())
+        Ok(Some(signal))
     }
 
     /// Keep sync alive for a bounded settle window, then return.
@@ -261,6 +266,51 @@ impl Runtime {
     }
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGINT; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGTERM; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGHUP; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+
+    tokio::select! {
+        _ = sigint.recv() => ShutdownSignal::Interrupt,
+        _ = sigterm.recv() => ShutdownSignal::Terminate,
+        _ = sighup.recv() => ShutdownSignal::Hangup,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %e, "failed to listen for Ctrl+C");
+    }
+
+    ShutdownSignal::Interrupt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +342,7 @@ mod tests {
         runtime
             .serve_until_shutdown(async {
                 let _ = rx.await;
+                ShutdownSignal::Interrupt
             })
             .await
             .unwrap();
@@ -312,6 +363,7 @@ mod tests {
                 Duration::from_millis(25),
                 runtime.serve_until_shutdown(async {
                     let _ = rx.await;
+                    ShutdownSignal::Interrupt
                 })
             )
             .await
@@ -320,15 +372,34 @@ mod tests {
 
         let (tx, rx) = oneshot::channel::<()>();
         tx.send(()).unwrap();
-        timeout(
+        let signal = timeout(
             Duration::from_secs(1),
             runtime.serve_until_shutdown(async {
                 let _ = rx.await;
+                ShutdownSignal::Terminate
             }),
         )
         .await
         .unwrap()
         .unwrap();
+
+        assert_eq!(signal, Some(ShutdownSignal::Terminate));
+    }
+
+    #[tokio::test]
+    async fn serve_returns_none_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-nosync-signal-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+
+        let signal = runtime
+            .serve_until_shutdown(async { ShutdownSignal::Hangup })
+            .await
+            .unwrap();
+
+        assert_eq!(signal, None);
     }
 
     #[tokio::test]
