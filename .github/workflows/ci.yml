@@ -18,25 +18,29 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
       - name: Rust toolchain
         run: |
-          rustup show
-          rustup run stable cargo --version
+          rustc --version
+          cargo --version
       - name: Check
-        run: rustup run stable cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: rustfmt
+          rustflags: ""
       - name: Format check
-        run: rustup run stable cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -46,12 +50,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+          rustflags: ""
       - name: Clippy
-        run: rustup run stable cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -61,40 +66,44 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
       - name: Run tests
-        run: rustup run stable cargo test --workspace --verbose
+        run: cargo test --workspace --verbose
 
   build-wasm:
     name: Build WASM Examples
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          rustflags: ""
       - name: Build distributed_counter
-        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build distributed_chat
-        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
       - name: Build vote_tally_tls
-        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
 
   cli-smoke:
     name: CLI Multi-process Smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          rustflags: ""
       - name: Build distributed_counter
-        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Run multi-process CLI smoke test
-        run: rustup run stable cargo test -p nx-cli --test multiprocess_smoke -- --ignored
+        run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
   ci-success:
     name: CI Success
