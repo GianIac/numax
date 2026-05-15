@@ -58,6 +58,7 @@ fn assert_printed_counter(output: &Output, label: &str, expected: u64) {
     );
 }
 
+#[cfg(unix)]
 fn printed_counter_value(output: &Output, label: &str) -> u64 {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let prefix = format!("{COUNTER_KEY} = ");
@@ -92,6 +93,7 @@ fn send_signal(pid: u32, signal: &str) {
     assert!(status.success(), "kill -{signal} {pid} failed: {status}");
 }
 
+#[cfg(unix)]
 fn restart_and_print_counter(nx: &Path, wasm: &Path, data_dir: &Path, label: &str) -> Output {
     let output = Command::new(nx)
         .arg("run")
