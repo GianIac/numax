@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.1**, the first public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-alpha.2**, the current public technical preview of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.1` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-alpha.2` - technical preview, API and wire format may change before the stable v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -474,7 +474,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.1:**
+**Out of scope for v0.1.0-alpha.2:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -520,32 +520,47 @@ pub extern "C" fn run() {
 The CLI is the main interface to run a Numax node.
 
 ```bash
-# Runs a WASM module (single-shot today; long-running in Phase 7)
+# Runs a WASM module once
 nx run <module.wasm>
 
 # Runs with a custom data directory
-nx run <module.wasm> --data-dir ./my-data
+nx run <module.wasm> --datastore-path ./my-data
 
-# Runs with sync enabled and TLS/mTLS
-nx run <module.wasm> --sync \
-    --sync-listen 0.0.0.0:9000 \
-    --sync-peers 192.168.1.10:9000,192.168.1.11:9000 \
-    --sync-keys "counter:,votes:" \
+# Runs as a sync-enabled node
+nx run <module.wasm> \
+    --listen 0.0.0.0:9000 \
+    --peer 192.168.1.10:9000 \
+    --peer 192.168.1.11:9000 \
+    --datastore-path ./node-data
+
+# Runs a bounded sync demo and prints a final GCounter value
+nx run <module.wasm> \
+    --listen 0.0.0.0:9000 \
+    --peer 192.168.1.10:9000 \
+    --wait-before-run 1500ms \
+    --settle-for 2s \
+    --print-gcounter counter:visits
+
+# Adds mTLS and peer allowlisting to a sync node
+nx run <module.wasm> \
+    --listen 0.0.0.0:9000 \
     --tls-cert ./certs/node.crt \
-    --tls-key  ./certs/node.key \
-    --tls-ca   ./certs/ca.crt \
-    --allowed-peers ./peers.allow
+    --tls-key ./certs/node.key \
+    --tls-ca ./certs/ca.crt \
+    --allowed-peers id1,id2,id3
 ```
 
 **Main options:**
 
 | Flag | Description |
 |------|-------------|
-| `--data-dir` | Directory for persistent data |
-| `--sync` | Enables synchronization |
-| `--sync-listen` | Address on which to accept peer connections |
-| `--sync-peers` | List of initial peers (comma-separated) |
-| `--sync-keys` | Prefixes of the keys to synchronize |
+| `--datastore-path` | Directory for persistent data |
+| `--listen` | Address on which to accept peer connections and enable sync |
+| `--peer` | Initial peer address (repeatable) |
+| `--wait-before-run` | Bounded pre-run window for peer handshakes |
+| `--settle-for` | Bounded post-run window for PushOps and remote apply |
+| `--print-gcounter` | Print a final host-side GCounter value |
+| `--shutdown-timeout` | Maximum graceful shutdown duration (default 30s) |
 | `--tls-cert` / `--tls-key` / `--tls-ca` | TLS material for mTLS |
 | `--allowed-peers` | Allowlist of accepted peer NodeIDs |
 | `--tls-insecure` | Disables TLS (local dev only) |
@@ -689,7 +704,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.1. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.2. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -697,7 +712,7 @@ The use cases below are **concretely achievable today** with the primitives of v
 
 **Why Numax.** A GCounter CRDT guarantees that each node can increment its own slot locally, without coordination, and that totals converge automatically. No central database, no distributed locks.
 
-**What you need today.** A WASM module that calls `crdt_gcounter_inc` / `crdt_gcounter_value` via the SDK; multiple `nx run` instances with `--sync` and mTLS active. This is exactly what the `distributed_counter` example in the repo does.
+**What you need today.** A WASM module that calls `crdt_gcounter_inc` / `crdt_gcounter_value` via the SDK; multiple `nx run` instances with `--listen` / `--peer`, optionally protected by mTLS. This is exactly what the `distributed_counter` example in the repo does.
 
 ### 8.2 Voting, polling, distributed tally (example: `vote_tally_tls`)
 
@@ -755,10 +770,9 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.1 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-alpha.2 is a technical preview. We recognize its limits, explicitly:
 
-- **`nx run` runs the guest only once and terminates.** Long-running mode with managed lifecycle is in Phase 7.
-- **GCounter hydration from sled at startup is not yet implemented.** Data persists, but the automatic replay of the CRDT state at boot is on the roadmap (Phase 7).
+- **Anti-entropy is not implemented yet.** Nodes exchange live PushOps, but automatic recovery of missed deltas after long disconnections is Phase 10 work.
 - **K-fanout gossip and full network resilience are in progress.** The architecture is defined; reconnect with backoff, automatic anti-entropy and op dedup are in Phase 10.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Minimal observability.** Advanced structured logging, Prometheus metrics and health checks are in Phase 9.
@@ -783,11 +797,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.1 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, multi-OS CI, end-to-end examples.
+v0.1.0-alpha.2 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, multi-OS CI, end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.1 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-alpha.2 is just the beginning.** But it is a beginning built on code, not on promises.
 
 In closing, I love software and I love numax.
 

@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.1` - developer preview.
+> **Current release**: `v0.1.0-alpha.2` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -8,8 +8,8 @@
 
 ## Release Status
 
-### v0.1.0-alpha.1 ✅
-**Purpose**: first technical preview to publish in order to gather feedback.
+### v0.1.0-alpha.2 ✅
+**Purpose**: second technical preview, focused on making sync usable from the CLI.
 
 Includes:
 - Wasmtime runtime + WASI preview1.
@@ -20,16 +20,14 @@ Includes:
 - TLS/mTLS, NodeID derived from certificate and allowlist.
 - End-to-end internal wiring between guest CRDT API, SyncManager and datastore.
 - Sled materialization of the GCounter total on local/remote update.
+- Runtime lifecycle for sync-enabled nodes: long-running mode, settle mode,
+  signal-aware shutdown and final store flush.
+- Startup hydration of materialized GCounter values.
 - `SyncManager` E2E tests for handshake, PushOps, convergence and idempotency.
 - Examples: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
 
 Known limitations:
-- `nx run` executes the guest once and then terminates; the multi-process CLI
-  criterion from Phase 6.5 is not yet fully respected to the letter.
-- Hydration of the GCounter registry from the values materialized in sled is not
-  yet implemented.
-- Long-running lifecycle, graceful shutdown, backpressure, observability and
-  network resilience are still open phases.
+- Backpressure, observability and full network resilience are still open phases.
 - API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
@@ -194,37 +192,38 @@ Includes the restructuring of the host API to separate local KV and replicated C
 **Closing criterion**:
 ```bash
 # Terminal A
-nx run counter.wasm --listen 127.0.0.1:9000 --datastore-path ./data-a
+nx run counter.wasm --listen 127.0.0.1:9000 --peer 127.0.0.1:9001 \
+    --datastore-path ./data-a --wait-before-run 1500ms \
+    --settle-for 2s --print-gcounter counter:visits
 # Terminal B
 nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
-    --datastore-path ./data-b
-# Both nodes print the same value of gcounter::value("visits")
-# within a few seconds.
+    --datastore-path ./data-b --wait-before-run 1500ms \
+    --settle-for 2s --print-gcounter counter:visits
+# Both nodes print: counter:visits = 2
 ```
 
 > Note: the internal wiring of Phase 6.5 is covered by E2E tests on `SyncManager`, including handshake, PushOps, convergence and sled materialization.
-> The CLI criterion above is not yet fully respected to the letter because today `nx run` executes the guest once and then terminates: it does not yet have a lifecycle/settle mode that would give stable time for handshake, broadcast and remote apply between CLI processes. Furthermore, the in-memory GCounter registry is not yet rebuilt from the values materialized in sled at startup.
-> These aspects are tracked in Phase 7.
+> The CLI criterion above is now covered by the Phase 7 lifecycle/smoke tests: startup hydration, settle mode, signal-aware shutdown, final flush and multi-process convergence.
 
 ---
 
 ### Phase 7: Graceful Lifecycle 🔄
 **Goal**: Clean shutdown and recovery from crash
 
-- [ ] Robust long-running mode for the runtime with sync enabled.
-- [ ] Hydration on startup: rebuild the GCounter registry from the values
+- [x] Robust long-running mode for the runtime with sync enabled.
+- [x] Hydration on startup: rebuild the GCounter registry from the values
       materialized in sled.
-- [ ] Settle mode for `nx run` with sync enabled: give time to handshake,
+- [x] Settle mode for `nx run` with sync enabled: give time to handshake,
       PushOps and remote apply before exit, or replace it with a long-running
       lifecycle.
-- [ ] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
+- [x] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
       converge and print the same value within a few seconds.
-- [ ] Signal handling (SIGTERM, SIGINT, SIGHUP)
-- [ ] Graceful shutdown: complete in-flight ops, close connections
-- [ ] Store flush before exit
-- [ ] Configurable timeout for shutdown (default 30s)
-- [ ] Test: kill -TERM → no data corruption
-- [ ] Test: crash → restart → consistent state
+- [x] Signal handling (SIGTERM, SIGINT, SIGHUP)
+- [x] Graceful shutdown: complete in-flight ops, close connections
+- [x] Store flush before exit
+- [x] Configurable timeout for shutdown (default 30s)
+- [x] Test: kill -TERM → no data corruption
+- [x] Test: crash → restart → consistent state
 
 > These tasks complete the CLI criterion left open by Phase 6.5 and bring it
 > inside a general lifecycle: service loop, signal-aware shutdown, final flush
@@ -412,7 +411,7 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phases 0-5 complete
 - [x] Phase 6 (TLS) complete
 - [x] Phase 6.5 (End-to-End Sync) complete
-- [ ] Phase 7 (Graceful shutdown) complete
+- [x] Phase 7 (Graceful shutdown) complete
 - [ ] Phase 8 (Backpressure) complete
 - [ ] Phase 9 (Observability) at least logging + health
 - [ ] Phase 10 (Resilience) at least reconnect + dedup
@@ -425,11 +424,12 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 
 ---
 
-## v0.1.0-alpha.1 Release Criteria
+## v0.1.0-alpha.2 Release Criteria
 
 - [x] Phases 0-5 complete
 - [x] Phase 6 (TLS) complete
 - [x] Phase 6.5 internal wiring covered by `SyncManager` E2E tests
+- [x] Phase 7 graceful lifecycle complete
 - [x] Base WASM examples present
 - [x] `cargo test` passes outside the sandbox
 - [x] `cargo clippy --all-targets --all-features -- -D warnings` passes

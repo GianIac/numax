@@ -44,6 +44,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.db.flush()?;
+        Ok(())
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
         let mut out = Vec::new();

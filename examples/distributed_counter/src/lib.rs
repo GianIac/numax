@@ -11,7 +11,11 @@
 //! ```bash
 //! nx run distributed_counter.wasm \
 //!     --listen 0.0.0.0:9000 \
-//!     --datastore-path ./data-a
+//!     --peer 127.0.0.1:9001 \
+//!     --datastore-path ./data-a \
+//!     --wait-before-run 1500ms \
+//!     --settle-for 2s \
+//!     --print-gcounter counter:visits
 //! ```
 //!
 //! Terminal 2 (Node B):
@@ -19,7 +23,10 @@
 //! nx run distributed_counter.wasm \
 //!     --listen 0.0.0.0:9001 \
 //!     --peer 127.0.0.1:9000 \
-//!     --datastore-path ./data-b
+//!     --datastore-path ./data-b \
+//!     --wait-before-run 1500ms \
+//!     --settle-for 2s \
+//!     --print-gcounter counter:visits
 //! ```
 
 extern crate alloc;

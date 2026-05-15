@@ -4,7 +4,7 @@ use std::sync::Arc;
 use nx_sync::{NodeId, Op};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NetError, NetResult};
@@ -76,18 +76,21 @@ pub struct Node {
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Option<mpsc::Receiver<NodeEvent>>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl Node {
     /// crate new node
     pub fn new(config: NodeConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             event_rx: Some(event_rx),
+            shutdown_tx,
         }
     }
 
@@ -109,27 +112,45 @@ impl Node {
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
         let tls = self.config.tls.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        info!(%addr, "incoming connection");
-                        let peers = Arc::clone(&peers);
-                        let node_id = node_id.clone();
-                        let event_tx = event_tx.clone();
-                        let tls = tls.clone();
-
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_incoming(stream, tls, node_id, peers, event_tx).await
-                            {
-                                error!(%addr, error = %e, "connection error");
-                            }
-                        });
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            debug!("listener shutdown requested");
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        error!(error = %e, "accept error");
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((stream, addr)) => {
+                                info!(%addr, "incoming connection");
+                                let peers = Arc::clone(&peers);
+                                let node_id = node_id.clone();
+                                let event_tx = event_tx.clone();
+                                let tls = tls.clone();
+
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_incoming(
+                                        stream,
+                                        addr.to_string(),
+                                        tls,
+                                        node_id,
+                                        peers,
+                                        event_tx,
+                                    )
+                                    .await
+                                    {
+                                        error!(%addr, error = %e, "connection error");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!(error = %e, "accept error");
+                            }
+                        }
                     }
                 }
             }
@@ -297,14 +318,24 @@ impl Node {
             .filter(|c| c.state == PeerState::Connected)
             .count()
     }
+
+    /// Close outbound peer connections by dropping their writers.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let mut peers = self.peers.write().await;
+        let count = peers.len();
+        peers.clear();
+        debug!(count, "node peer connections closed");
+    }
 }
 
 /// Manage an incoming connection from a peer (handshake + read loop).
 async fn handle_incoming(
     stream: TcpStream,
+    addr: String,
     tls: Option<TlsConfig>,
     our_node_id: NodeId,
-    _peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
@@ -366,6 +397,18 @@ async fn handle_incoming(
     let ack = Message::hello_ack(our_node_id);
     write_message(&mut writer, &ack).await?;
 
+    {
+        let mut peers = peers.write().await;
+        peers.insert(
+            addr.clone(),
+            PeerConnection {
+                info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
+                state: PeerState::Connected,
+                writer: Some(writer),
+            },
+        );
+    }
+
     info!(peer = %peer_node_id, "incoming peer connected");
 
     // Notify Event
@@ -377,6 +420,11 @@ async fn handle_incoming(
 
     // Read Loop
     read_loop(reader, peer_node_id.clone(), event_tx.clone()).await?;
+
+    {
+        let mut peers = peers.write().await;
+        peers.remove(&addr);
+    }
 
     let _ = event_tx
         .send(NodeEvent::PeerDisconnected {

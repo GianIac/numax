@@ -105,6 +105,9 @@ nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
     --tls-key tls/node-a-key.pem \
     --tls-ca tls/ca.pem \
     --allowed-peers "$ALLOWLIST" \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
     -v
 ```
 
@@ -120,6 +123,9 @@ nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
     --tls-key tls/node-b-key.pem \
     --tls-ca tls/ca.pem \
     --allowed-peers "$ALLOWLIST" \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
     -v
 ```
 
@@ -135,7 +141,18 @@ nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
     --tls-key tls/node-c-key.pem \
     --tls-ca tls/ca.pem \
     --allowed-peers "$ALLOWLIST" \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
     -v
+```
+
+With the three commands above, each process casts one local vote, waits for
+peer replication, prints the final host-side tally and exits. Once all three
+nodes have exchanged their PushOps, each node should print:
+
+```text
+vote:tally:yes = 3
 ```
 
 ## Notes
@@ -144,5 +161,8 @@ nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
 - The allowlist admits only the three certificate-derived NodeIds.
 - The guest never writes votes through `nx_sdk::db::*`; replicated state goes
   through `nx_sdk::crdt::gcounter`.
-- Current runtime lifecycle is one guest run per `nx run`. Run the nodes again
-  after peers have connected to observe newly replicated/materialized totals.
+- `--wait-before-run` gives the three TLS handshakes time to complete before
+  the guest emits its vote.
+- `--settle-for` gives PushOps and remote apply time to complete before exit.
+- Without `--settle-for`, a sync-enabled runtime stays alive until SIGINT,
+  SIGTERM or SIGHUP and flushes the store during shutdown.

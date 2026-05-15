@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use nx_core::runtime::{Runtime, RuntimeConfig};
+use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::{SyncConfig, TlsConfig};
 use tracing::{info, warn};
 
@@ -28,6 +29,22 @@ enum Cli {
         /// Peer addresses to connect to (can be repeated). Requires --listen.
         #[arg(long = "peer", value_name = "ADDR")]
         peers: Vec<String>,
+
+        /// Keep sync alive for a bounded duration after running the module (e.g. 500ms, 5s, 2m).
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        settle_for: Option<Duration>,
+
+        /// Wait for a bounded duration after starting sync and before running the module.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        wait_before_run: Option<Duration>,
+
+        /// Print the final value of a GCounter after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_gcounter: Option<String>,
+
+        /// Maximum time allowed for shutdown before returning an error.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        shutdown_timeout: Option<Duration>,
 
         /// Enable verbose logging
         #[arg(short, long)]
@@ -76,6 +93,10 @@ async fn real_main() -> Result<()> {
             datastore_path,
             listen,
             peers,
+            settle_for,
+            wait_before_run,
+            print_gcounter,
+            shutdown_timeout,
             verbose,
             tls_cert,
             tls_key,
@@ -100,6 +121,9 @@ async fn real_main() -> Result<()> {
 
             // Build SyncConfig (if sync flags were provided)
             let sync = build_sync_config(listen, peers, tls)?;
+            validate_settle_mode(&sync, settle_for)?;
+            validate_wait_before_run(&sync, wait_before_run)?;
+            validate_print_gcounter(&sync, &print_gcounter)?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -120,8 +144,34 @@ async fn real_main() -> Result<()> {
             }
 
             let mut rt = Runtime::new(cfg)?;
-            rt.start_sync().await?;
-            rt.run_module(&bytes).await?;
+            let run_result: Result<()> = async {
+                rt.start_sync().await?;
+                if let Some(duration) = wait_before_run {
+                    rt.wait_before_run(duration).await?;
+                }
+                rt.run_module(&bytes).await?;
+                match settle_for {
+                    Some(duration) => rt.settle_for(duration).await?,
+                    None if rt.sync_enabled() => rt.serve().await?,
+                    None => {}
+                }
+                if let Some(key) = print_gcounter {
+                    let value = rt
+                        .get_counter_value(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
+                    println!("{key} = {value}");
+                }
+                Ok(())
+            }
+            .await;
+
+            let shutdown_result = rt
+                .shutdown_with_timeout(shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT))
+                .await;
+
+            run_result?;
+            shutdown_result?;
         }
     }
 
@@ -145,6 +195,66 @@ fn validate_tls_flags(
     if allowed_peers.is_some() && tls_ca.is_none() && !tls_insecure {
         bail!("--allowed-peers requires --tls-ca (peers must be authenticated via mTLS)");
     }
+    Ok(())
+}
+
+fn parse_duration(input: &str) -> Result<Duration, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("expected duration like 500ms, 5s, or 2m".to_string());
+    }
+
+    let (number, multiplier) = if let Some(number) = input.strip_suffix("ms") {
+        (number, 1)
+    } else if let Some(number) = input.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = input.strip_suffix('m') {
+        (number, 60_000)
+    } else {
+        (input, 1_000)
+    };
+
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| "expected duration like 500ms, 5s, or 2m".to_string())?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_string())?;
+
+    Ok(Duration::from_millis(millis))
+}
+
+fn validate_settle_mode(sync: &Option<SyncConfig>, settle_for: Option<Duration>) -> Result<()> {
+    if settle_for.is_some() && sync.is_none() {
+        bail!("--settle-for requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_wait_before_run(
+    sync: &Option<SyncConfig>,
+    wait_before_run: Option<Duration>,
+) -> Result<()> {
+    if wait_before_run.is_some() && sync.is_none() {
+        bail!("--wait-before-run requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_gcounter(
+    sync: &Option<SyncConfig>,
+    print_gcounter: &Option<String>,
+) -> Result<()> {
+    if print_gcounter.is_some() && sync.is_none() {
+        bail!("--print-gcounter requires sync to be enabled with --listen");
+    }
+
     Ok(())
 }
 
@@ -235,6 +345,40 @@ mod tests {
         Some(PathBuf::from(s))
     }
 
+    mod duration_parser {
+        use super::*;
+
+        #[test]
+        fn parses_milliseconds() {
+            assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        }
+
+        #[test]
+        fn parses_seconds() {
+            assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        }
+
+        #[test]
+        fn parses_minutes() {
+            assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        }
+
+        #[test]
+        fn parses_plain_number_as_seconds() {
+            assert_eq!(parse_duration("3").unwrap(), Duration::from_secs(3));
+        }
+
+        #[test]
+        fn rejects_invalid_duration() {
+            assert!(parse_duration("soon").is_err());
+        }
+
+        #[test]
+        fn rejects_zero_duration() {
+            assert!(parse_duration("0s").is_err());
+        }
+    }
+
     // validate_tls_flags
     mod validate_tls {
         use super::*;
@@ -300,6 +444,65 @@ mod tests {
         #[test]
         fn insecure_alone_ok() {
             assert!(validate_tls_flags(&None, &None, &None, &None, true).is_ok());
+        }
+    }
+
+    mod validate_settle {
+        use super::*;
+
+        #[test]
+        fn settle_without_sync_fails() {
+            let err = validate_settle_mode(&None, Some(Duration::from_secs(1)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--settle-for requires sync"));
+        }
+
+        #[test]
+        fn settle_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_settle_mode(&sync, Some(Duration::from_secs(1))).is_ok());
+        }
+
+        #[test]
+        fn no_settle_without_sync_is_ok() {
+            assert!(validate_settle_mode(&None, None).is_ok());
+        }
+    }
+
+    mod validate_wait_before_run {
+        use super::*;
+
+        #[test]
+        fn wait_without_sync_fails() {
+            let err = validate_wait_before_run(&None, Some(Duration::from_secs(1)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--wait-before-run requires sync"));
+        }
+
+        #[test]
+        fn wait_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_wait_before_run(&sync, Some(Duration::from_secs(1))).is_ok());
+        }
+    }
+
+    mod validate_print_counter {
+        use super::*;
+
+        #[test]
+        fn print_without_sync_fails() {
+            let err = validate_print_gcounter(&None, &Some("counter:visits".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-gcounter requires sync"));
+        }
+
+        #[test]
+        fn print_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_gcounter(&sync, &Some("counter:visits".to_string())).is_ok());
         }
     }
 
@@ -496,6 +699,66 @@ mod tests {
                     assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
                 }
             }
+        }
+
+        #[test]
+        fn settle_for_parsed() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--settle-for", "5s"]).unwrap();
+            match cli {
+                Cli::Run { settle_for, .. } => {
+                    assert_eq!(settle_for, Some(Duration::from_secs(5)));
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_settle_for_fails() {
+            assert!(Cli::try_parse_from(["nx", "run", "x.wasm", "--settle-for", "later"]).is_err());
+        }
+
+        #[test]
+        fn wait_before_run_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--wait-before-run", "500ms"]).unwrap();
+            match cli {
+                Cli::Run {
+                    wait_before_run, ..
+                } => {
+                    assert_eq!(wait_before_run, Some(Duration::from_millis(500)));
+                }
+            }
+        }
+
+        #[test]
+        fn print_gcounter_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--print-gcounter", "counter:visits"])
+                    .unwrap();
+            match cli {
+                Cli::Run { print_gcounter, .. } => {
+                    assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
+                }
+            }
+        }
+
+        #[test]
+        fn shutdown_timeout_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--shutdown-timeout", "10s"]).unwrap();
+            match cli {
+                Cli::Run {
+                    shutdown_timeout, ..
+                } => {
+                    assert_eq!(shutdown_timeout, Some(Duration::from_secs(10)));
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_shutdown_timeout_fails() {
+            assert!(
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--shutdown-timeout", "nope"]).is_err()
+            );
         }
 
         #[test]

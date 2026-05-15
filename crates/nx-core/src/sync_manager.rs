@@ -4,7 +4,8 @@ use std::sync::Arc;
 use nx_net::{Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, NodeId, Op, OpKind};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::sync_config::SyncConfig;
@@ -69,22 +70,41 @@ pub struct SyncManager {
 
     /// Receiver drained by `start` into the broadcast task.
     op_rx: Option<mpsc::Receiver<Op>>,
+
+    /// Shutdown signal shared with background tasks.
+    shutdown_tx: watch::Sender<bool>,
+
+    /// Inbound event loop task.
+    event_task: Option<JoinHandle<()>>,
+
+    /// Outbound broadcast drain task.
+    broadcast_task: Option<JoinHandle<()>>,
 }
 
 impl SyncManager {
     /// new SyncManager.
     pub fn new(node_id: NodeId, config: SyncConfig, store: Arc<NxStore>) -> Self {
         let (op_tx, op_rx) = mpsc::channel(100);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut counters = HashMap::new();
+
+        if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
+            warn!(error = %e, "failed to hydrate GCounter registry");
+        }
+        let counters = Arc::new(RwLock::new(counters));
 
         Self {
             node_id,
             config,
             node: None,
-            counters: Arc::new(RwLock::new(HashMap::new())),
+            counters,
             store,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
             op_tx,
             op_rx: Some(op_rx),
+            shutdown_tx,
+            event_task: None,
+            broadcast_task: None,
         }
     }
 
@@ -151,35 +171,38 @@ impl SyncManager {
         let counters = Arc::clone(&self.counters);
         let seen_ops = Arc::clone(&self.seen_ops);
         let store = Arc::clone(&self.store);
-        tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    NodeEvent::OpsReceived { from, ops } => {
-                        debug!(from = %from, count = ops.len(), "received ops from peer");
-                        for op in ops {
-                            if let Err(e) = apply_remote_op(&op, &counters, &seen_ops, &store).await
-                            {
-                                error!(error = %e, "failed to apply remote op");
-                            }
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        self.event_task = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            debug!("event loop shutdown requested");
+                            drain_node_events(&mut event_rx, &counters, &seen_ops, &store).await;
+                            break;
                         }
                     }
-                    NodeEvent::PeerConnected { node_id } => {
-                        info!(peer = %node_id, "peer connected");
-                    }
-                    NodeEvent::PeerDisconnected { node_id } => {
-                        info!(peer = %node_id, "peer disconnected");
+                    event = event_rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        handle_node_event(event, &counters, &seen_ops, &store).await;
                     }
                 }
             }
             debug!("event loop terminated");
-        });
+        }));
 
         // Outbound loop: drain locally-produced ops into the network.
         let op_rx = self
             .op_rx
             .take()
             .expect("op_rx already taken: SyncManager::start called twice?");
-        spawn_broadcast_loop(Arc::clone(&node), op_rx);
+        self.broadcast_task = Some(spawn_broadcast_loop(
+            Arc::clone(&node),
+            op_rx,
+            self.shutdown_tx.subscribe(),
+        ));
 
         Ok(())
     }
@@ -193,6 +216,15 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Retry connecting to the peers configured at startup.
+    pub async fn reconnect_configured_peers(&self) {
+        for peer_addr in &self.config.peers {
+            if let Err(e) = self.connect_to_peer(peer_addr).await {
+                debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
+            }
+        }
+    }
+
     /// Broadcast of pending operations, this method can be used for forced flush
     pub async fn broadcast_pending(&self) -> anyhow::Result<()> {
         Ok(())
@@ -203,32 +235,119 @@ impl SyncManager {
         let counters = self.counters.read().await;
         counters.get(key).map(|c| c.value()).unwrap_or(0)
     }
+
+    /// Gracefully stop sync tasks and close network connections.
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        let _ = self.shutdown_tx.send(true);
+
+        if let Some(task) = self.broadcast_task.take()
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, "broadcast task failed during shutdown");
+        }
+
+        if let Some(node) = self.node.as_ref() {
+            node.shutdown().await;
+        }
+
+        if let Some(task) = self.event_task.take()
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, "event task failed during shutdown");
+        }
+
+        info!("sync manager shut down");
+        Ok(())
+    }
 }
 
 /// Spawn the outbound broadcast drain loop.
-fn spawn_broadcast_loop(node: Arc<Node>, mut op_rx: mpsc::Receiver<Op>) {
+fn spawn_broadcast_loop(
+    node: Arc<Node>,
+    mut op_rx: mpsc::Receiver<Op>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(first) = op_rx.recv().await {
-            let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
-            batch.push(first);
-
-            // Coalesce any ops already queued, without yielding.
-            while batch.len() < BROADCAST_BATCH_MAX {
-                match op_rx.try_recv() {
-                    Ok(op) => batch.push(op),
-                    Err(_) => break,
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!("broadcast loop shutdown requested");
+                        drain_broadcast_queue(&node, &mut op_rx).await;
+                        break;
+                    }
+                }
+                op = op_rx.recv() => {
+                    let Some(first) = op else {
+                        break;
+                    };
+                    broadcast_batch(&node, &mut op_rx, first).await;
                 }
             }
+        }
+        debug!("broadcast loop terminated");
+    })
+}
 
-            let count = batch.len();
-            if let Err(e) = node.broadcast_ops(batch).await {
-                warn!(error = %e, count, "broadcast failed; ops dropped for this round");
-            } else {
-                debug!(count, "broadcast batch sent");
+async fn broadcast_batch(node: &Arc<Node>, op_rx: &mut mpsc::Receiver<Op>, first: Op) {
+    let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
+    batch.push(first);
+
+    // Coalesce any ops already queued, without yielding.
+    while batch.len() < BROADCAST_BATCH_MAX {
+        match op_rx.try_recv() {
+            Ok(op) => batch.push(op),
+            Err(_) => break,
+        }
+    }
+
+    let count = batch.len();
+    if let Err(e) = node.broadcast_ops(batch).await {
+        warn!(error = %e, count, "broadcast failed; ops dropped for this round");
+    } else {
+        debug!(count, "broadcast batch sent");
+    }
+}
+
+async fn drain_broadcast_queue(node: &Arc<Node>, op_rx: &mut mpsc::Receiver<Op>) {
+    while let Ok(first) = op_rx.try_recv() {
+        broadcast_batch(node, op_rx, first).await;
+    }
+}
+
+async fn drain_node_events(
+    event_rx: &mut mpsc::Receiver<NodeEvent>,
+    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
+    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    store: &Arc<NxStore>,
+) {
+    while let Ok(event) = event_rx.try_recv() {
+        handle_node_event(event, counters, seen_ops, store).await;
+    }
+}
+
+async fn handle_node_event(
+    event: NodeEvent,
+    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
+    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    store: &Arc<NxStore>,
+) {
+    match event {
+        NodeEvent::OpsReceived { from, ops } => {
+            debug!(from = %from, count = ops.len(), "received ops from peer");
+            for op in ops {
+                if let Err(e) = apply_remote_op(&op, counters, seen_ops, store).await {
+                    error!(error = %e, "failed to apply remote op");
+                }
             }
         }
-        debug!("broadcast loop terminated (op channel closed)");
-    });
+        NodeEvent::PeerConnected { node_id } => {
+            info!(peer = %node_id, "peer connected");
+        }
+        NodeEvent::PeerDisconnected { node_id } => {
+            info!(peer = %node_id, "peer disconnected");
+        }
+    }
 }
 
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
@@ -236,6 +355,60 @@ pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
     out.extend_from_slice(GCOUNTER_STORE_PREFIX.as_bytes());
     out.extend_from_slice(key.as_bytes());
     out
+}
+
+fn logical_gcounter_key(store_key: &[u8]) -> anyhow::Result<String> {
+    let key = store_key
+        .strip_prefix(GCOUNTER_STORE_PREFIX.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("invalid GCounter materialized key"))?;
+
+    String::from_utf8(key.to_vec())
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in GCounter materialized key: {e}"))
+}
+
+fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
+    let buf: [u8; 8] = bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid materialized GCounter value length: expected 8, got {}",
+            bytes.len()
+        )
+    })?;
+
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn hydrate_gcounter_registry(
+    store: &NxStore,
+    node_id: &NodeId,
+    counters: &mut HashMap<String, GCounter>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(GCOUNTER_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_gcounter_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid materialized GCounter key");
+                continue;
+            }
+        };
+        let value = match parse_materialized_gcounter_value(&value_bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid materialized GCounter value");
+                continue;
+            }
+        };
+
+        let mut counter = GCounter::new();
+        counter.increment(node_id, value);
+        counters.insert(key, counter);
+        hydrated += 1;
+    }
+
+    debug!(count = hydrated, "hydrated GCounter registry from sled");
+    Ok(hydrated)
 }
 
 pub(crate) fn materialize_gcounter_value(
@@ -401,6 +574,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_hydrates_gcounter_registry_from_materialized_values() {
+        let store = temp_store();
+        materialize_gcounter_value(&store, "counter:visits", 42).unwrap();
+
+        let node_id = NodeId::new("local-node");
+        let config = SyncConfig::new();
+        let manager = SyncManager::new(node_id.clone(), config, Arc::clone(&store));
+
+        assert_eq!(manager.get_counter_value("counter:visits").await, 42);
+
+        let counters = manager.counters.read().await;
+        let counter = counters.get("counter:visits").unwrap();
+        assert_eq!(counter.value_for(&node_id), 42);
+    }
+
+    #[tokio::test]
     async fn e2e_two_nodes_push_ops_materializes_on_peer() {
         let key = "visits";
         let addr_a = free_addr();
@@ -435,6 +624,24 @@ mod tests {
         wait_for_counter(&manager_b, key, 2).await;
         assert_eq!(read_materialized(&store_a, key), 2);
         assert_eq!(read_materialized(&store_b, key), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_queued_ops_before_closing_connections() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (mut manager_a, handle_a, _store_a) = started_manager(addr_a).await;
+        let (manager_b, _handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+
+        let op = Op::gcounter_increment(handle_a.node_id().clone(), key, 1);
+        handle_a.op_sender().send(op).await.unwrap();
+        manager_a.shutdown().await.unwrap();
+
+        wait_for_counter(&manager_b, key, 1).await;
+        assert_eq!(read_materialized(&store_b, key), 1);
     }
 
     #[test]

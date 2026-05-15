@@ -78,9 +78,23 @@ jobs:
       - name: Build vote_tally_tls
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
 
+  cli-smoke:
+    name: CLI Multi-process Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build distributed_counter
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+      - name: Run multi-process CLI smoke test
+        run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
+
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, build-wasm]
+    needs: [check, fmt, clippy, test, build-wasm, cli-smoke]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -90,7 +104,8 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
-             [[ "${{ needs.build-wasm.result }}" != "success" ]]; then
+             [[ "${{ needs.build-wasm.result }}" != "success" ]] || \
+             [[ "${{ needs.cli-smoke.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

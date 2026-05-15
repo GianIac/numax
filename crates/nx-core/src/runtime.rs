@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{WasiCtx, p1};
 
@@ -10,6 +13,15 @@ use nx_sync::NodeId;
 use crate::host_api;
 use crate::sync_config::SyncConfig;
 use crate::sync_manager::{SyncHandle, SyncManager};
+
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
+}
 
 // Runtime config
 #[derive(Debug, Clone)]
@@ -125,9 +137,115 @@ impl Runtime {
         Ok(())
     }
 
+    /// Stop sync background tasks and close network connections.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.shutdown_with_timeout(DEFAULT_SHUTDOWN_TIMEOUT).await
+    }
+
+    /// Stop background tasks and flush the local store, bounded by `timeout`.
+    pub async fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.shutdown_inner())
+            .await
+            .map_err(|_| anyhow!("shutdown timed out after {:?}", timeout))?
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<()> {
+        if let Some(manager) = self.sync_manager.as_mut() {
+            manager
+                .shutdown()
+                .await
+                .map_err(|e| anyhow!("sync manager failed to shut down: {e}"))?;
+        } else {
+            tracing::debug!("shutdown: no sync configured, skipping sync manager");
+        }
+
+        self.store
+            .flush()
+            .map_err(|e| anyhow!("failed to flush datastore: {e}"))?;
+        tracing::info!("runtime shutdown complete");
+        Ok(())
+    }
+
     /// Return a clonable handle to the SyncManager (if present).
     pub fn sync_handle(&self) -> Option<SyncHandle> {
         self.sync_handle.clone()
+    }
+
+    /// Return true when this runtime owns an active sync manager.
+    pub fn sync_enabled(&self) -> bool {
+        self.sync_handle.is_some()
+    }
+
+    /// Return the current value of a GCounter, if sync is enabled.
+    pub async fn get_counter_value(&self, key: &str) -> Option<u64> {
+        let manager = self.sync_manager.as_ref()?;
+        Some(manager.get_counter_value(key).await)
+    }
+
+    /// Keep the runtime alive while sync background tasks do their work.
+    pub async fn serve(&self) -> Result<()> {
+        let _ = self
+            .serve_until_shutdown(wait_for_shutdown_signal())
+            .await?;
+        Ok(())
+    }
+
+    /// Testable variant of `serve`: the caller provides the shutdown signal.
+    pub async fn serve_until_shutdown<S>(&self, shutdown: S) -> Result<Option<ShutdownSignal>>
+    where
+        S: Future<Output = ShutdownSignal>,
+    {
+        if !self.sync_enabled() {
+            tracing::debug!("serve: sync disabled, nothing to keep alive");
+            return Ok(None);
+        }
+
+        tracing::info!("runtime entering long-running sync mode");
+        let signal = shutdown.await;
+        tracing::info!(?signal, "runtime shutdown requested");
+
+        Ok(Some(signal))
+    }
+
+    /// Keep sync alive for a bounded settle window, then return.
+    pub async fn settle_for(&self, duration: Duration) -> Result<()> {
+        if !self.sync_enabled() {
+            tracing::debug!("settle_for: sync disabled, nothing to settle");
+            return Ok(());
+        }
+
+        tracing::info!(?duration, "runtime entering sync settle mode");
+        tokio::time::sleep(duration).await;
+        tracing::info!("runtime settle complete");
+
+        Ok(())
+    }
+
+    /// Keep sync alive before the guest runs, retrying configured peers during the window.
+    pub async fn wait_before_run(&self, duration: Duration) -> Result<()> {
+        if !self.sync_enabled() {
+            tracing::debug!("wait_before_run: sync disabled, nothing to wait for");
+            return Ok(());
+        }
+
+        tracing::info!(?duration, "runtime waiting before guest run");
+        let deadline = Instant::now() + duration;
+
+        loop {
+            if let Some(manager) = self.sync_manager.as_ref() {
+                manager.reconnect_configured_peers().await;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline - now;
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+
+        Ok(())
     }
 
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
@@ -176,5 +294,189 @@ impl Runtime {
             .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGINT; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGTERM; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to listen for SIGHUP; falling back to ctrl_c");
+            let _ = tokio::signal::ctrl_c().await;
+            return ShutdownSignal::Interrupt;
+        }
+    };
+
+    tokio::select! {
+        _ = sigint.recv() => ShutdownSignal::Interrupt,
+        _ = sigterm.recv() => ShutdownSignal::Terminate,
+        _ = sighup.recv() => ShutdownSignal::Hangup,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %e, "failed to listen for Ctrl+C");
+    }
+
+    ShutdownSignal::Interrupt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_config::SyncConfig;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+    use tokio::time::{Duration, timeout};
+
+    fn temp_datastore_path(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{prefix}-{nanos}"));
+        path
+    }
+
+    #[tokio::test]
+    async fn serve_returns_immediately_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        runtime
+            .serve_until_shutdown(async {
+                let _ = rx.await;
+                ShutdownSignal::Interrupt
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_runtime_alive_until_shutdown() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-serve-test"),
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        assert!(
+            timeout(
+                Duration::from_millis(25),
+                runtime.serve_until_shutdown(async {
+                    let _ = rx.await;
+                    ShutdownSignal::Interrupt
+                })
+            )
+            .await
+            .is_err()
+        );
+
+        let (tx, rx) = oneshot::channel::<()>();
+        tx.send(()).unwrap();
+        let signal = timeout(
+            Duration::from_secs(1),
+            runtime.serve_until_shutdown(async {
+                let _ = rx.await;
+                ShutdownSignal::Terminate
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(signal, Some(ShutdownSignal::Terminate));
+    }
+
+    #[tokio::test]
+    async fn serve_returns_none_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-nosync-signal-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+
+        let signal = runtime
+            .serve_until_shutdown(async { ShutdownSignal::Hangup })
+            .await
+            .unwrap();
+
+        assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn settle_returns_immediately_when_sync_is_disabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-settle-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let started = Instant::now();
+
+        runtime.settle_for(Duration::from_secs(5)).await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn settle_waits_for_requested_duration_when_sync_is_enabled() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-settle-test"),
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let duration = Duration::from_millis(25);
+        let started = Instant::now();
+
+        runtime.settle_for(duration).await.unwrap();
+
+        assert!(started.elapsed() >= duration);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_timeout_flushes_store_without_sync() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-shutdown-flush-test"),
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = Runtime::new(config).unwrap();
+
+        runtime.store.set(b"key", b"value").unwrap();
+        runtime
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.store.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 }
