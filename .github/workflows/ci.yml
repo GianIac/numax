@@ -20,8 +20,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Rust toolchain
+        run: |
+          rustup show
+          rustup run stable cargo --version
       - name: Check
-        run: cargo check --workspace --all-targets
+        run: rustup run stable cargo check --workspace --all-targets
 
   fmt:
     name: Format
@@ -32,7 +36,7 @@ jobs:
         with:
           components: rustfmt
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: rustup run stable cargo fmt --all -- --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -47,7 +51,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: rustup run stable cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -60,7 +64,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: rustup run stable cargo test --workspace --verbose
 
   build-wasm:
     name: Build WASM Examples
@@ -72,11 +76,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Build distributed_counter
-        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build distributed_chat
-        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
+        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
       - name: Build vote_tally_tls
-        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
+        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
 
   cli-smoke:
     name: CLI Multi-process Smoke
@@ -88,9 +92,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Build distributed_counter
-        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+        run: rustup run stable cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Run multi-process CLI smoke test
-        run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
+        run: rustup run stable cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
   ci-success:
     name: CI Success
