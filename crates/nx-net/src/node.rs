@@ -355,18 +355,22 @@ impl Node {
             }
 
             // Cleanup
-            let peers_connected = {
+            let disconnected = {
                 let mut peers = peers.write().await;
-                peers.remove(&addr_owned);
-                connected_peer_count(&peers)
+                peers.remove(&addr_owned).and_then(|removed| {
+                    (removed.state == PeerState::Connected)
+                        .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
+                })
             };
 
-            let _ = event_tx
-                .send(NodeEvent::PeerDisconnected {
-                    node_id: peer_node_id,
-                    peers_connected,
-                })
-                .await;
+            if let Some((node_id, peers_connected)) = disconnected {
+                let _ = event_tx
+                    .send(NodeEvent::PeerDisconnected {
+                        node_id,
+                        peers_connected,
+                    })
+                    .await;
+            }
         });
 
         Ok(())
@@ -550,18 +554,23 @@ async fn handle_incoming(
     )
     .await;
 
-    let peers_connected = {
+    let disconnected = {
         let mut peers = peers.write().await;
-        peers.remove(&addr);
-        connected_peer_count(&peers)
+        let Some(removed) = peers.remove(&addr) else {
+            return read_result;
+        };
+        (removed.state == PeerState::Connected)
+            .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
     };
 
-    let _ = event_tx
-        .send(NodeEvent::PeerDisconnected {
-            node_id: peer_node_id,
-            peers_connected,
-        })
-        .await;
+    if let Some((node_id, peers_connected)) = disconnected {
+        let _ = event_tx
+            .send(NodeEvent::PeerDisconnected {
+                node_id,
+                peers_connected,
+            })
+            .await;
+    }
 
     read_result
 }

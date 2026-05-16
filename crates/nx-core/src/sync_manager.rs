@@ -333,8 +333,10 @@ async fn broadcast_batch(
     let count = batch.len();
     let started = std::time::Instant::now();
     if let Err(e) = node.broadcast_ops(batch).await {
+        metrics.record_sync_error();
         warn!(error = %e, count, "broadcast failed; ops dropped for this round");
     } else {
+        metrics.record_broadcast_batch(count);
         metrics.record_sync_latency(started.elapsed());
         debug!(count, "broadcast batch sent");
     }
@@ -374,6 +376,7 @@ async fn handle_node_event(
             debug!(from = %from, count = ops.len(), "received ops from peer");
             for op in ops {
                 if let Err(e) = apply_remote_op(&op, counters, seen_ops, store, metrics).await {
+                    metrics.record_sync_error();
                     error!(error = %e, "failed to apply remote op");
                 }
             }
@@ -382,6 +385,7 @@ async fn handle_node_event(
             node_id,
             peers_connected,
         } => {
+            metrics.record_peer_connect();
             metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, "peer connected");
         }
@@ -389,6 +393,7 @@ async fn handle_node_event(
             node_id,
             peers_connected,
         } => {
+            metrics.record_peer_disconnect();
             metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, "peer disconnected");
         }

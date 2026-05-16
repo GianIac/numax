@@ -12,18 +12,25 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_OBSERVABILITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
     pub listen_addr: String,
+    pub request_timeout: Duration,
 }
 
 impl ObservabilityConfig {
     pub fn new(listen_addr: impl Into<String>) -> Self {
         Self {
             listen_addr: listen_addr.into(),
+            request_timeout: DEFAULT_OBSERVABILITY_REQUEST_TIMEOUT,
         }
+    }
+
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 }
 
@@ -32,6 +39,13 @@ pub struct RuntimeMetrics {
     ops_total: AtomicU64,
     peers_connected: AtomicUsize,
     sync_latency_ms: AtomicU64,
+    sync_errors_total: AtomicU64,
+    observability_requests_total: AtomicU64,
+    observability_errors_total: AtomicU64,
+    peer_connects_total: AtomicU64,
+    peer_disconnects_total: AtomicU64,
+    broadcast_batches_total: AtomicU64,
+    broadcast_ops_total: AtomicU64,
     ready: AtomicBool,
 }
 
@@ -47,6 +61,34 @@ impl RuntimeMetrics {
     pub fn record_sync_latency(&self, duration: Duration) {
         self.sync_latency_ms
             .store(duration.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_sync_error(&self) {
+        self.sync_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_observability_request(&self) {
+        self.observability_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_observability_error(&self) {
+        self.observability_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_peer_connect(&self) {
+        self.peer_connects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_peer_disconnect(&self) {
+        self.peer_disconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_broadcast_batch(&self, ops: usize) {
+        self.broadcast_batches_total.fetch_add(1, Ordering::Relaxed);
+        self.broadcast_ops_total
+            .fetch_add(ops as u64, Ordering::Relaxed);
     }
 
     pub fn set_ready(&self, ready: bool) {
@@ -66,6 +108,13 @@ impl RuntimeMetrics {
             ops_total: self.ops_total.load(Ordering::Relaxed),
             peers_connected: self.peers_connected.load(Ordering::Relaxed),
             sync_latency_ms: self.sync_latency_ms.load(Ordering::Relaxed),
+            sync_errors_total: self.sync_errors_total.load(Ordering::Relaxed),
+            observability_requests_total: self.observability_requests_total.load(Ordering::Relaxed),
+            observability_errors_total: self.observability_errors_total.load(Ordering::Relaxed),
+            peer_connects_total: self.peer_connects_total.load(Ordering::Relaxed),
+            peer_disconnects_total: self.peer_disconnects_total.load(Ordering::Relaxed),
+            broadcast_batches_total: self.broadcast_batches_total.load(Ordering::Relaxed),
+            broadcast_ops_total: self.broadcast_ops_total.load(Ordering::Relaxed),
             store_keys: store_stats.keys,
             store_bytes: store_stats.bytes,
         }
@@ -80,6 +129,13 @@ struct MetricsSnapshot {
     ops_total: u64,
     peers_connected: usize,
     sync_latency_ms: u64,
+    sync_errors_total: u64,
+    observability_requests_total: u64,
+    observability_errors_total: u64,
+    peer_connects_total: u64,
+    peer_disconnects_total: u64,
+    broadcast_batches_total: u64,
+    broadcast_ops_total: u64,
     store_keys: u64,
     store_bytes: u64,
 }
@@ -105,6 +161,7 @@ pub async fn start_server(
 ) -> Result<(SocketAddr, ObservabilityServer)> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let bound_addr = listener.local_addr()?;
+    let request_timeout = config.request_timeout;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let task = tokio::spawn(async move {
@@ -122,7 +179,9 @@ pub async fn start_server(
                             let metrics = Arc::clone(&metrics);
                             let store = Arc::clone(&store);
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, metrics, store).await {
+                                let metrics_for_error = Arc::clone(&metrics);
+                                if let Err(e) = handle_connection(stream, metrics, store, request_timeout).await {
+                                    metrics_for_error.record_observability_error();
                                     debug!(error = %e, "observability request failed");
                                 }
                             });
@@ -141,9 +200,12 @@ async fn handle_connection(
     mut stream: TcpStream,
     metrics: Arc<RuntimeMetrics>,
     store: Arc<NxStore>,
+    request_timeout: Duration,
 ) -> Result<()> {
+    metrics.record_observability_request();
+
     let mut buf = [0u8; 1024];
-    let n = timeout(REQUEST_TIMEOUT, stream.read(&mut buf))
+    let n = timeout(request_timeout, stream.read(&mut buf))
         .await
         .map_err(|_| anyhow!("observability request timed out"))??;
     let request =
@@ -180,10 +242,10 @@ async fn handle_connection(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
-    timeout(REQUEST_TIMEOUT, stream.write_all(response.as_bytes()))
+    timeout(request_timeout, stream.write_all(response.as_bytes()))
         .await
         .map_err(|_| anyhow!("observability response write timed out"))??;
-    timeout(REQUEST_TIMEOUT, stream.flush())
+    timeout(request_timeout, stream.flush())
         .await
         .map_err(|_| anyhow!("observability response flush timed out"))??;
     Ok(())
@@ -200,6 +262,27 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
          # HELP numax_sync_latency_ms Last sync latency in milliseconds\n\
          # TYPE numax_sync_latency_ms gauge\n\
          numax_sync_latency_ms {}\n\
+         # HELP numax_sync_errors_total Sync errors\n\
+         # TYPE numax_sync_errors_total counter\n\
+         numax_sync_errors_total {}\n\
+         # HELP numax_observability_requests_total Observability requests\n\
+         # TYPE numax_observability_requests_total counter\n\
+         numax_observability_requests_total {}\n\
+         # HELP numax_observability_errors_total Observability request errors\n\
+         # TYPE numax_observability_errors_total counter\n\
+         numax_observability_errors_total {}\n\
+         # HELP numax_peer_connects_total Peer connections observed\n\
+         # TYPE numax_peer_connects_total counter\n\
+         numax_peer_connects_total {}\n\
+         # HELP numax_peer_disconnects_total Peer disconnections observed\n\
+         # TYPE numax_peer_disconnects_total counter\n\
+         numax_peer_disconnects_total {}\n\
+         # HELP numax_broadcast_batches_total Broadcast batches sent\n\
+         # TYPE numax_broadcast_batches_total counter\n\
+         numax_broadcast_batches_total {}\n\
+         # HELP numax_broadcast_ops_total Broadcast ops sent\n\
+         # TYPE numax_broadcast_ops_total counter\n\
+         numax_broadcast_ops_total {}\n\
          # HELP numax_store_keys Keys in the local store\n\
          # TYPE numax_store_keys gauge\n\
          numax_store_keys {}\n\
@@ -209,6 +292,13 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
         snapshot.ops_total,
         snapshot.peers_connected,
         snapshot.sync_latency_ms,
+        snapshot.sync_errors_total,
+        snapshot.observability_requests_total,
+        snapshot.observability_errors_total,
+        snapshot.peer_connects_total,
+        snapshot.peer_disconnects_total,
+        snapshot.broadcast_batches_total,
+        snapshot.broadcast_ops_total,
         snapshot.store_keys,
         snapshot.store_bytes
     )
@@ -235,6 +325,13 @@ mod tests {
             ops_total: 7,
             peers_connected: 2,
             sync_latency_ms: 15,
+            sync_errors_total: 1,
+            observability_requests_total: 9,
+            observability_errors_total: 1,
+            peer_connects_total: 3,
+            peer_disconnects_total: 2,
+            broadcast_batches_total: 4,
+            broadcast_ops_total: 8,
             store_keys: 3,
             store_bytes: 42,
         };
@@ -243,6 +340,13 @@ mod tests {
         assert!(rendered.contains("numax_ops_total 7"));
         assert!(rendered.contains("numax_peers_connected 2"));
         assert!(rendered.contains("numax_sync_latency_ms 15"));
+        assert!(rendered.contains("numax_sync_errors_total 1"));
+        assert!(rendered.contains("numax_observability_requests_total 9"));
+        assert!(rendered.contains("numax_observability_errors_total 1"));
+        assert!(rendered.contains("numax_peer_connects_total 3"));
+        assert!(rendered.contains("numax_peer_disconnects_total 2"));
+        assert!(rendered.contains("numax_broadcast_batches_total 4"));
+        assert!(rendered.contains("numax_broadcast_ops_total 8"));
         assert!(rendered.contains("numax_store_keys 3"));
         assert!(rendered.contains("numax_store_bytes 42"));
     }
@@ -264,11 +368,71 @@ mod tests {
 
         assert!(request(addr, "/health").await.contains("ok"));
         assert!(request(addr, "/ready").await.contains("ready"));
-        assert!(
-            request(addr, "/metrics")
-                .await
-                .contains("numax_ops_total 2")
-        );
+
+        let metrics_response = request(addr, "/metrics").await;
+        assert!(metrics_response.contains("HTTP/1.1 200 OK"));
+        assert!(metrics_response.contains("text/plain; version=0.0.4"));
+        assert!(metrics_response.contains("numax_ops_total 2"));
+        assert!(metrics_response.contains("numax_observability_requests_total 3"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ready_returns_503_before_runtime_is_ready() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let store = temp_store();
+        let (addr, server) = start_server(
+            ObservabilityConfig::new("127.0.0.1:0"),
+            Arc::clone(&metrics),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+
+        let response = request(addr, "/ready").await;
+
+        assert!(response.contains("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("not ready"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_path_returns_404() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let store = temp_store();
+        let (addr, server) = start_server(
+            ObservabilityConfig::new("127.0.0.1:0"),
+            Arc::clone(&metrics),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+
+        let response = request(addr, "/missing").await;
+
+        assert!(response.contains("HTTP/1.1 404 Not Found"));
+        assert!(response.contains("not found"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_observability_connection_times_out() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let store = temp_store();
+        let config =
+            ObservabilityConfig::new("127.0.0.1:0").with_request_timeout(Duration::from_millis(25));
+        let (addr, server) = start_server(config, Arc::clone(&metrics), Arc::clone(&store))
+            .await
+            .unwrap();
+
+        let _stream = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        let metrics_response = request(addr, "/metrics").await;
+        assert!(metrics_response.contains("numax_observability_errors_total 1"));
 
         server.shutdown().await;
     }

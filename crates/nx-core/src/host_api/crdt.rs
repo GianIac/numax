@@ -81,6 +81,7 @@ async fn crdt_gcounter_inc_impl(
     let op_permit = match op_tx.try_reserve() {
         Ok(permit) => permit,
         Err(e) => {
+            handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_gcounter_inc: broadcast queue full");
             return ERR_INTERNAL;
         }
@@ -95,6 +96,7 @@ async fn crdt_gcounter_inc_impl(
         let total = counter.value();
 
         if let Err(e) = materialize_gcounter_value(&handle.store(), &key, total) {
+            handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_gcounter_inc: failed to materialize counter");
             return ERR_INTERNAL;
         }

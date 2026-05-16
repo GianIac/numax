@@ -596,6 +596,7 @@ socket_timeout_secs = 30
 listen = "127.0.0.1:9100"
 log_level = "info"
 log_format = "text"
+request_timeout_secs = 5
 ```
 
 The same limit values are the runtime defaults when no config file is provided.
@@ -609,6 +610,11 @@ The endpoint exposes:
 | `/metrics` | Prometheus-compatible text metrics |
 | `/health` | Liveness |
 | `/ready` | Readiness |
+
+The first metric set is deliberately operational:
+operation counts, connected peers, last sync latency, sync errors,
+observability request/error counters, peer connect/disconnect counters,
+broadcast batch/op counters and local store size.
 
 ### 5.8 Topology: epidemic gossip *(Prototype)*
 

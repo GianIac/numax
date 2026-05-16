@@ -272,11 +272,21 @@ socket_timeout_secs = 30
 - [x] `numax_sync_latency_ms` - Sync latency
 - [x] `numax_store_keys` - Keys in the store
 - [x] `numax_store_bytes` - Bytes used
+- [x] `numax_sync_errors_total` - Sync errors
+- [x] `numax_observability_requests_total` - Observability requests
+- [x] `numax_observability_errors_total` - Observability request errors
+- [x] `numax_peer_connects_total` - Peer connections observed
+- [x] `numax_peer_disconnects_total` - Peer disconnections observed
+- [x] `numax_broadcast_batches_total` - Broadcast batches sent
+- [x] `numax_broadcast_ops_total` - Broadcast ops sent
 - [x] `/metrics` endpoint (Prometheus format)
 
 **Health check**:
 - [x] `/health` endpoint (liveness)
 - [x] `/ready` endpoint (readiness)
+- [x] Test: `/ready` returns 503 before runtime readiness
+- [x] Test: unknown observability paths return 404
+- [x] Test: observability request timeout is bounded
 
 **Configuration**:
 ```toml
@@ -284,6 +294,7 @@ socket_timeout_secs = 30
 listen = "127.0.0.1:9100"
 log_level = "info"
 log_format = "text"
+request_timeout_secs = 5
 ```
 
 **Implementation**: `tracing`, `tracing-subscriber`, minimal Prometheus-compatible

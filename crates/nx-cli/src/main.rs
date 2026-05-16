@@ -149,7 +149,7 @@ async fn real_main() -> Result<()> {
             let observability = build_observability_config(
                 observability_listen,
                 file_config.observability.as_ref(),
-            );
+            )?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -232,6 +232,7 @@ struct ObservabilityFileConfig {
     listen: Option<String>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
+    request_timeout_secs: Option<u64>,
 }
 
 fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
@@ -294,10 +295,21 @@ fn resolve_log_format(
 fn build_observability_config(
     listen: Option<String>,
     observability: Option<&ObservabilityFileConfig>,
-) -> Option<ObservabilityConfig> {
-    listen
-        .or_else(|| observability.and_then(|cfg| cfg.listen.clone()))
-        .map(ObservabilityConfig::new)
+) -> Result<Option<ObservabilityConfig>> {
+    let Some(listen_addr) = listen.or_else(|| observability.and_then(|cfg| cfg.listen.clone()))
+    else {
+        return Ok(None);
+    };
+
+    let mut config = ObservabilityConfig::new(listen_addr);
+    if let Some(request_timeout_secs) = observability.and_then(|cfg| cfg.request_timeout_secs) {
+        if request_timeout_secs == 0 {
+            bail!("observability.request_timeout_secs must be greater than zero");
+        }
+        config = config.with_request_timeout(Duration::from_secs(request_timeout_secs));
+    }
+
+    Ok(Some(config))
 }
 
 fn apply_limit_config(
@@ -616,6 +628,7 @@ mod tests {
                 listen = "127.0.0.1:9100"
                 log_level = "debug"
                 log_format = "json"
+                request_timeout_secs = 7
                 "#,
             )
             .unwrap();
@@ -624,6 +637,7 @@ mod tests {
             assert_eq!(observability.listen.as_deref(), Some("127.0.0.1:9100"));
             assert_eq!(observability.log_level.as_deref(), Some("debug"));
             assert_eq!(observability.log_format, Some(LogFormat::Json));
+            assert_eq!(observability.request_timeout_secs, Some(7));
         }
 
         #[test]
@@ -661,11 +675,15 @@ mod tests {
                 listen: Some("127.0.0.1:9100".into()),
                 log_level: None,
                 log_format: None,
+                request_timeout_secs: Some(7),
             };
 
-            let observability = build_observability_config(None, Some(&cfg)).unwrap();
+            let observability = build_observability_config(None, Some(&cfg))
+                .unwrap()
+                .unwrap();
 
             assert_eq!(observability.listen_addr, "127.0.0.1:9100");
+            assert_eq!(observability.request_timeout, Duration::from_secs(7));
         }
 
         #[test]
@@ -674,12 +692,27 @@ mod tests {
                 listen: Some("127.0.0.1:9100".into()),
                 log_level: None,
                 log_format: None,
+                request_timeout_secs: None,
             };
 
             let observability =
-                build_observability_config(Some("127.0.0.1:9200".into()), Some(&cfg)).unwrap();
+                build_observability_config(Some("127.0.0.1:9200".into()), Some(&cfg))
+                    .unwrap()
+                    .unwrap();
 
             assert_eq!(observability.listen_addr, "127.0.0.1:9200");
+        }
+
+        #[test]
+        fn rejects_empty_observability_timeout() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+                request_timeout_secs: Some(0),
+            };
+
+            assert!(build_observability_config(None, Some(&cfg)).is_err());
         }
 
         #[test]
@@ -688,6 +721,7 @@ mod tests {
                 listen: None,
                 log_level: Some("warn".into()),
                 log_format: None,
+                request_timeout_secs: None,
             };
 
             assert_eq!(
