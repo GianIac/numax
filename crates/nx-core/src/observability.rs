@@ -186,7 +186,10 @@ pub async fn start_server(
                                 }
                             });
                         }
-                        Err(e) => warn!(error = %e, "observability accept failed"),
+                        Err(e) => {
+                            metrics.record_observability_error();
+                            warn!(error = %e, "observability accept failed");
+                        }
                     }
                 }
             }

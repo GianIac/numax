@@ -397,10 +397,12 @@ impl Node {
                 .collect::<Vec<_>>()
         };
 
+        let mut failed = Vec::new();
         for (addr, writer) in writers {
             let mut writer = writer.lock().await;
             if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
                 warn!(%addr, error = %e, "failed to send ops");
+                failed.push(addr.clone());
                 if let Some((node_id, peers_connected)) = self.mark_peer_failed(&addr).await {
                     let _ = self
                         .event_tx
@@ -411,6 +413,10 @@ impl Node {
                         .await;
                 }
             }
+        }
+
+        if !failed.is_empty() {
+            return Err(NetError::PeerDisconnected(failed.join(",")));
         }
 
         Ok(())

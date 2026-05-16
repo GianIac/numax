@@ -179,6 +179,7 @@ impl SyncManager {
         // Connect to initial peers.
         for peer_addr in &self.config.peers {
             if let Err(e) = node.connect_to_peer(peer_addr).await {
+                self.metrics.record_sync_error();
                 warn!(peer = %peer_addr, error = %e, "failed to connect to peer");
             }
         }
@@ -242,6 +243,7 @@ impl SyncManager {
     pub async fn reconnect_configured_peers(&self) {
         for peer_addr in &self.config.peers {
             if let Err(e) = self.connect_to_peer(peer_addr).await {
+                self.metrics.record_sync_error();
                 debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
             }
         }
@@ -334,7 +336,7 @@ async fn broadcast_batch(
     let started = std::time::Instant::now();
     if let Err(e) = node.broadcast_ops(batch).await {
         metrics.record_sync_error();
-        warn!(error = %e, count, "broadcast failed; ops dropped for this round");
+        warn!(error = %e, count, "broadcast partially failed; ops dropped for failed peers");
     } else {
         metrics.record_broadcast_batch(count);
         metrics.record_sync_latency(started.elapsed());
