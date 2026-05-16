@@ -306,6 +306,10 @@ This convention allows the guest to handle errors deterministically, without exc
 | Key length | 1024 bytes |
 | Value length | 1 MB |
 | Output buffer | 10 MB |
+| Peer connections | 64 |
+| Queued CRDT ops | 10000 |
+| Wire message size | 16 MiB |
+| Socket read/write timeout | 30s |
 
 ### 5.2 Numax Store - Local datastore *(Implemented)*
 
@@ -455,9 +459,10 @@ Numax Net handles communication between nodes for state synchronization.
 
 - TCP + TLS 1.3 + mTLS channel *(Implemented)*;
 - handshake, push/pull and keepalive *(Implemented)*;
+- peer connection limit, queued-op limit, message-size limit and socket read/write timeouts *(Implemented)*;
 - peer-to-peer gossip with K-fanout: architecture defined, full integration in progress *(Prototype)*;
 - full network resilience (reconnect with exponential backoff, automatic anti-entropy, op dedup) *(Planned, Phase 10)*;
-- backpressure and connection limits *(Planned, Phase 8)*.
+- automatic anti-entropy after long disconnections *(Planned, Phase 10)*.
 
 ### 5.5 Channel security *(Implemented)*
 
@@ -526,6 +531,9 @@ nx run <module.wasm>
 # Runs with a custom data directory
 nx run <module.wasm> --datastore-path ./my-data
 
+# Runs with a TOML configuration file
+nx run <module.wasm> --config ./numax.toml
+
 # Runs as a sync-enabled node
 nx run <module.wasm> \
     --listen 0.0.0.0:9000 \
@@ -555,6 +563,7 @@ nx run <module.wasm> \
 | Flag | Description |
 |------|-------------|
 | `--datastore-path` | Directory for persistent data |
+| `--config` | TOML configuration file |
 | `--listen` | Address on which to accept peer connections and enable sync |
 | `--peer` | Initial peer address (repeatable) |
 | `--wait-before-run` | Bounded pre-run window for peer handshakes |
@@ -564,6 +573,18 @@ nx run <module.wasm> \
 | `--tls-cert` / `--tls-key` / `--tls-ca` | TLS material for mTLS |
 | `--allowed-peers` | Allowlist of accepted peer NodeIDs |
 | `--tls-insecure` | Disables TLS (local dev only) |
+
+The implemented `limits` section is intentionally small:
+
+```toml
+[limits]
+max_peers = 64
+queued_ops_limit = 10000
+max_message_size = "16MiB"
+socket_timeout_secs = 30
+```
+
+The same values are the runtime defaults when no config file is provided.
 
 ### 5.8 Topology: epidemic gossip *(Prototype)*
 
@@ -655,11 +676,20 @@ Increment operations are materialized on sled and propagated to peers through th
 | `env_get` | Filtered environment variable reading | *Planned* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
-### 6.3 Configuration and Deployment *(Planned - Phase 15)*
+### 6.3 Configuration and Deployment *(Prototype)*
 
-Deployment will consist in shipping a `.wasm` file and a minimal configuration. Example (format being defined):
+Deployment will consist in shipping a `.wasm` file and a minimal configuration.
+
+The `limits` section below is implemented today. The other deployment sections
+remain planned work.
 
 ```toml
+[limits]
+max_peers = 64
+queued_ops_limit = 10000
+max_message_size = "16MiB"
+socket_timeout_secs = 30
+
 [module]
 name = "cart_handler"
 path = "cart_handler.wasm"
