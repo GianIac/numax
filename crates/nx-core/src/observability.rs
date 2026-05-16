@@ -9,7 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::{debug, warn};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
@@ -140,7 +143,9 @@ async fn handle_connection(
     store: Arc<NxStore>,
 ) -> Result<()> {
     let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
+    let n = timeout(REQUEST_TIMEOUT, stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow!("observability request timed out"))??;
     let request =
         std::str::from_utf8(&buf[..n]).map_err(|e| anyhow!("invalid HTTP request: {e}"))?;
     let path = request
@@ -175,8 +180,12 @@ async fn handle_connection(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
+    timeout(REQUEST_TIMEOUT, stream.write_all(response.as_bytes()))
+        .await
+        .map_err(|_| anyhow!("observability response write timed out"))??;
+    timeout(REQUEST_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| anyhow!("observability response flush timed out"))??;
     Ok(())
 }
 

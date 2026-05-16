@@ -397,8 +397,14 @@ impl Node {
             let mut writer = writer.lock().await;
             if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
                 warn!(%addr, error = %e, "failed to send ops");
-                if let Some(conn) = self.peers.write().await.get_mut(&addr) {
-                    conn.state = PeerState::Failed;
+                if let Some((node_id, peers_connected)) = self.mark_peer_failed(&addr).await {
+                    let _ = self
+                        .event_tx
+                        .send(NodeEvent::PeerDisconnected {
+                            node_id,
+                            peers_connected,
+                        })
+                        .await;
                 }
             }
         }
@@ -415,6 +421,16 @@ impl Node {
     async fn ensure_peer_slot_available(&self) -> NetResult<()> {
         let peers = self.peers.read().await;
         ensure_peer_slot_available(&peers, self.config.max_peers, None)
+    }
+
+    async fn mark_peer_failed(&self, addr: &str) -> Option<(NodeId, usize)> {
+        let mut peers = self.peers.write().await;
+        let node_id = {
+            let conn = peers.get_mut(addr)?;
+            conn.state = PeerState::Failed;
+            conn.info.node_id.clone()?
+        };
+        Some((node_id, connected_peer_count(&peers)))
     }
 
     /// Close outbound peer connections by dropping their writers.
@@ -723,6 +739,35 @@ mod tests {
         );
 
         ensure_peer_slot_available(&peers, 1, Some("127.0.0.1:9001")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mark_peer_failed_returns_updated_connected_count() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000"));
+        {
+            let mut peers = node.peers.write().await;
+            peers.insert(
+                "127.0.0.1:9001".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
+                    state: PeerState::Connected,
+                    writer: None,
+                },
+            );
+            peers.insert(
+                "127.0.0.1:9002".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
+                    state: PeerState::Connected,
+                    writer: None,
+                },
+            );
+        }
+
+        let (node_id, connected) = node.mark_peer_failed("127.0.0.1:9001").await.unwrap();
+
+        assert_eq!(node_id, NodeId::new("peer-a"));
+        assert_eq!(connected, 1);
     }
 
     #[test]
