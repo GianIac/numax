@@ -127,7 +127,7 @@ async fn real_main() -> Result<()> {
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
 
             // Build SyncConfig (if sync flags were provided)
-            let sync = build_sync_config(listen, peers, tls)?
+            let sync = build_sync_config(listen, peers, tls, file_config.limits.is_some())?
                 .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
                 .transpose()?;
             validate_settle_mode(&sync, settle_for)?;
@@ -399,14 +399,15 @@ fn build_sync_config(
     listen: Option<String>,
     peers: Vec<String>,
     tls: Option<TlsConfig>,
+    force_enabled: bool,
 ) -> Result<Option<SyncConfig>> {
-    if listen.is_none() && peers.is_empty() {
+    if listen.is_none() && peers.is_empty() && !force_enabled {
         return Ok(None);
     }
 
     if listen.is_none() {
         bail!(
-            "--peer requires --listen: dialer-only mode is not yet supported. \
+            "sync configuration requires --listen: dialer-only mode is not yet supported. \
              Pass --listen <addr> to enable sync."
         );
     }
@@ -726,13 +727,13 @@ mod tests {
 
         #[test]
         fn no_flags_is_none() {
-            let r = build_sync_config(None, vec![], None).unwrap();
+            let r = build_sync_config(None, vec![], None, false).unwrap();
             assert!(r.is_none());
         }
 
         #[test]
         fn listen_alone_is_some() {
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false)
                 .unwrap()
                 .expect("sync should be enabled with --listen alone");
             assert!(cfg.is_enabled());
@@ -742,10 +743,18 @@ mod tests {
 
         #[test]
         fn peer_without_listen_is_error() {
-            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None);
+            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false);
             assert!(r.is_err(), "peers without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
-            assert!(err.contains("--peer requires --listen"), "got: {err}");
+            assert!(err.contains("requires --listen"), "got: {err}");
+        }
+
+        #[test]
+        fn limits_config_without_listen_is_error() {
+            let r = build_sync_config(None, vec![], None, true);
+            assert!(r.is_err(), "limits without --listen must fail loudly");
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("requires --listen"), "got: {err}");
         }
 
         #[test]
@@ -754,6 +763,7 @@ mod tests {
                 Some("0.0.0.0:9000".into()),
                 vec!["a:1".into(), "b:2".into()],
                 None,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -765,7 +775,7 @@ mod tests {
         #[test]
         fn tls_is_propagated() {
             let tls = Some(TlsConfig::insecure_dev());
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false)
                 .unwrap()
                 .unwrap();
             assert!(cfg.tls.is_some());

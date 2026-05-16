@@ -112,7 +112,7 @@ pub enum NodeEvent {
 struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
-    writer: Option<tokio::io::WriteHalf<crate::tls::NetStream>>,
+    writer: Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<crate::tls::NetStream>>>>,
 }
 
 /// node
@@ -313,7 +313,7 @@ impl Node {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     state: PeerState::Connected,
-                    writer: Some(writer),
+                    writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
                 },
             );
         }
@@ -365,15 +365,29 @@ impl Node {
         let msg = Message::push_ops(ops);
         let bytes = msg.to_bytes()?;
 
-        let mut peers = self.peers.write().await;
+        let writers = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .filter_map(|(addr, conn)| {
+                    (conn.state == PeerState::Connected)
+                        .then(|| {
+                            conn.writer
+                                .as_ref()
+                                .map(|writer| (addr.clone(), Arc::clone(writer)))
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        };
 
-        for (addr, conn) in peers.iter_mut() {
-            if conn.state == PeerState::Connected
-                && let Some(ref mut writer) = conn.writer
-                && let Err(e) = write_bytes(writer, &bytes, self.config.socket_timeout).await
-            {
+        for (addr, writer) in writers {
+            let mut writer = writer.lock().await;
+            if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
                 warn!(%addr, error = %e, "failed to send ops");
-                conn.state = PeerState::Failed;
+                if let Some(conn) = self.peers.write().await.get_mut(&addr) {
+                    conn.state = PeerState::Failed;
+                }
             }
         }
 
@@ -482,7 +496,7 @@ async fn handle_incoming(
             PeerConnection {
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 state: PeerState::Connected,
-                writer: Some(writer),
+                writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
             },
         );
     }
