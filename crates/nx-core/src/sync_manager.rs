@@ -84,7 +84,7 @@ pub struct SyncManager {
 impl SyncManager {
     /// new SyncManager.
     pub fn new(node_id: NodeId, config: SyncConfig, store: Arc<NxStore>) -> Self {
-        let (op_tx, op_rx) = mpsc::channel(100);
+        let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
 
@@ -145,7 +145,8 @@ impl SyncManager {
 
         // Build the network node.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
-            .with_peers(self.config.peers.clone());
+            .with_peers(self.config.peers.clone())
+            .with_max_peers(self.config.max_peers);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);
@@ -642,6 +643,24 @@ mod tests {
 
         wait_for_counter(&manager_b, key, 1).await;
         assert_eq!(read_materialized(&store_b, key), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_uses_configured_queued_ops_limit() {
+        let store = temp_store();
+        let config = SyncConfig::new().with_queued_ops_limit(256);
+        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+
+        assert_eq!(manager.op_sender().max_capacity(), 256);
+    }
+
+    #[tokio::test]
+    async fn manager_normalizes_empty_queued_ops_limit() {
+        let store = temp_store();
+        let config = SyncConfig::new().with_queued_ops_limit(0);
+        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+
+        assert_eq!(manager.op_sender().max_capacity(), 1);
     }
 
     #[test]

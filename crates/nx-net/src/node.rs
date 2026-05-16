@@ -12,6 +12,9 @@ use crate::message::{Message, MessageKind, PROTOCOL_VERSION};
 use crate::peer::{PeerInfo, PeerState};
 use crate::tls::{NetStream, TlsConfig};
 
+/// Default maximum number of simultaneously connected peers.
+pub const DEFAULT_MAX_PEERS: usize = 64;
+
 /// Node configuration.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -26,6 +29,9 @@ pub struct NodeConfig {
 
     /// Optional TLS/mTLS configuration.
     pub tls: Option<TlsConfig>,
+
+    /// Maximum number of simultaneously connected peers.
+    pub max_peers: usize,
 }
 
 impl NodeConfig {
@@ -35,6 +41,7 @@ impl NodeConfig {
             listen_addr: listen_addr.into(),
             initial_peers: Vec::new(),
             tls: None,
+            max_peers: DEFAULT_MAX_PEERS,
         }
     }
 
@@ -45,6 +52,11 @@ impl NodeConfig {
 
     pub fn with_tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    pub fn with_max_peers(mut self, max_peers: usize) -> Self {
+        self.max_peers = max_peers;
         self
     }
 }
@@ -112,6 +124,7 @@ impl Node {
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
         let tls = self.config.tls.clone();
+        let max_peers = self.config.max_peers;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -131,6 +144,7 @@ impl Node {
                                 let node_id = node_id.clone();
                                 let event_tx = event_tx.clone();
                                 let tls = tls.clone();
+                                let max_peers = max_peers;
 
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_incoming(
@@ -140,6 +154,7 @@ impl Node {
                                         node_id,
                                         peers,
                                         event_tx,
+                                        max_peers,
                                     )
                                     .await
                                     {
@@ -161,6 +176,8 @@ impl Node {
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
+        self.ensure_peer_slot_available().await?;
+
         let tcp = TcpStream::connect(addr)
             .await
             .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
@@ -248,6 +265,7 @@ impl Node {
         // Save connection
         {
             let mut peers = self.peers.write().await;
+            ensure_peer_slot_available(&peers, self.config.max_peers, Some(addr))?;
             peers.insert(
                 addr.to_string(),
                 PeerConnection {
@@ -313,10 +331,12 @@ impl Node {
     /// Returns the number of currently connected peers.
     pub async fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
-        peers
-            .values()
-            .filter(|c| c.state == PeerState::Connected)
-            .count()
+        connected_peer_count(&peers)
+    }
+
+    async fn ensure_peer_slot_available(&self) -> NetResult<()> {
+        let peers = self.peers.read().await;
+        ensure_peer_slot_available(&peers, self.config.max_peers, None)
     }
 
     /// Close outbound peer connections by dropping their writers.
@@ -337,6 +357,7 @@ async fn handle_incoming(
     our_node_id: NodeId,
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
+    max_peers: usize,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
@@ -399,6 +420,7 @@ async fn handle_incoming(
 
     {
         let mut peers = peers.write().await;
+        ensure_peer_slot_available(&peers, max_peers, Some(&addr))?;
         peers.insert(
             addr.clone(),
             PeerConnection {
@@ -431,6 +453,30 @@ async fn handle_incoming(
             node_id: peer_node_id,
         })
         .await;
+
+    Ok(())
+}
+
+fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
+    peers
+        .values()
+        .filter(|c| c.state == PeerState::Connected)
+        .count()
+}
+
+fn ensure_peer_slot_available(
+    peers: &HashMap<String, PeerConnection>,
+    max_peers: usize,
+    replacing_addr: Option<&str>,
+) -> NetResult<()> {
+    if replacing_addr.is_some_and(|addr| peers.contains_key(addr)) {
+        return Ok(());
+    }
+
+    let count = connected_peer_count(peers);
+    if count >= max_peers {
+        return Err(NetError::PeerLimitReached(max_peers));
+    }
 
     Ok(())
 }
@@ -512,5 +558,45 @@ mod tests {
 
         assert_eq!(config.listen_addr, "127.0.0.1:9000");
         assert_eq!(config.initial_peers.len(), 1);
+        assert_eq!(config.max_peers, DEFAULT_MAX_PEERS);
+    }
+
+    #[test]
+    fn node_config_allows_custom_peer_limit() {
+        let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000").with_max_peers(2);
+
+        assert_eq!(config.max_peers, 2);
+    }
+
+    #[test]
+    fn peer_slot_limit_rejects_new_peer_when_full() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "127.0.0.1:9001".to_string(),
+            PeerConnection {
+                info: PeerInfo::new("127.0.0.1:9001"),
+                state: PeerState::Connected,
+                writer: None,
+            },
+        );
+
+        let err = ensure_peer_slot_available(&peers, 1, None).unwrap_err();
+
+        assert!(matches!(err, NetError::PeerLimitReached(1)));
+    }
+
+    #[test]
+    fn peer_slot_limit_allows_replacing_same_addr() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "127.0.0.1:9001".to_string(),
+            PeerConnection {
+                info: PeerInfo::new("127.0.0.1:9001"),
+                state: PeerState::Connected,
+                writer: None,
+            },
+        );
+
+        ensure_peer_slot_available(&peers, 1, Some("127.0.0.1:9001")).unwrap();
     }
 }

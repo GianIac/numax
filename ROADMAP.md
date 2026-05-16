@@ -239,8 +239,8 @@ kill -TERM $PID  # Completes operations, exits with code 0
 ### Phase 8: Backpressure and Limits ⚡
 **Goal**: Stability under load
 
-- [ ] Peer connection limit (default: 64)
-- [ ] Queued ops limit (default: 10000)
+- [x] Peer connection limit (default: 64)
+- [x] Queued ops limit (default: 10000)
 - [ ] Message size limit (default: 16 MiB)
 - [ ] Graceful rejection when overloaded
 - [ ] Socket read/write timeouts (default: 30s)
