@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
-use nx_core::{SyncConfig, TlsConfig};
+use nx_core::{ObservabilityConfig, SyncConfig, TlsConfig};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -54,6 +54,18 @@ enum Cli {
         /// Enable verbose logging
         #[arg(short, long)]
         verbose: bool,
+
+        /// Logging level (trace, debug, info, warn, error).
+        #[arg(long, value_name = "LEVEL")]
+        log_level: Option<String>,
+
+        /// Logging format.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        log_format: Option<LogFormat>,
+
+        /// Enable the observability HTTP endpoint (e.g. "127.0.0.1:9100").
+        #[arg(long, value_name = "ADDR")]
+        observability_listen: Option<String>,
 
         /// Path to this node's TLS certificate (PEM)
         #[arg(long, value_name = "PATH")]
@@ -104,24 +116,25 @@ async fn real_main() -> Result<()> {
             print_gcounter,
             shutdown_timeout,
             verbose,
+            log_level,
+            log_format,
+            observability_listen,
             tls_cert,
             tls_key,
             tls_ca,
             allowed_peers,
             tls_insecure,
         } => {
+            let file_config = load_run_config(config.as_ref())?;
+
             // Setup logging
-            let log_level = if verbose { "debug" } else { "info" };
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-                )
-                .init();
+            let log_level =
+                resolve_log_level(verbose, log_level, file_config.observability.as_ref())?;
+            let log_format = resolve_log_format(log_format, file_config.observability.as_ref());
+            init_logging(&log_level, log_format);
 
             // Validate TLS flag combinations
             validate_tls_flags(&tls_cert, &tls_key, &tls_ca, &allowed_peers, tls_insecure)?;
-            let file_config = load_run_config(config.as_ref())?;
 
             // Build TlsConfig (if any TLS-related flag was provided)
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
@@ -133,6 +146,10 @@ async fn real_main() -> Result<()> {
             validate_settle_mode(&sync, settle_for)?;
             validate_wait_before_run(&sync, wait_before_run)?;
             validate_print_gcounter(&sync, &print_gcounter)?;
+            let observability = build_observability_config(
+                observability_listen,
+                file_config.observability.as_ref(),
+            );
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -151,9 +168,11 @@ async fn real_main() -> Result<()> {
                 );
                 cfg.sync = Some(s);
             }
+            cfg.observability = observability;
 
             let mut rt = Runtime::new(cfg)?;
             let run_result: Result<()> = async {
+                rt.start_observability().await?;
                 rt.start_sync().await?;
                 if let Some(duration) = wait_before_run {
                     rt.wait_before_run(duration).await?;
@@ -187,9 +206,17 @@ async fn real_main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RunFileConfig {
     limits: Option<LimitsFileConfig>,
+    observability: Option<ObservabilityFileConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +227,13 @@ struct LimitsFileConfig {
     socket_timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ObservabilityFileConfig {
+    listen: Option<String>,
+    log_level: Option<String>,
+    log_format: Option<LogFormat>,
+}
+
 fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
     let Some(path) = path else {
         return Ok(RunFileConfig::default());
@@ -207,6 +241,63 @@ fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
 
     let text = fs::read_to_string(path)?;
     toml::from_str(&text).map_err(Into::into)
+}
+
+fn init_logging(log_level: &str, log_format: LogFormat) {
+    match log_format {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
+            .init(),
+    }
+}
+
+fn resolve_log_level(
+    verbose: bool,
+    cli_log_level: Option<String>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> Result<String> {
+    let level = cli_log_level
+        .or_else(|| observability.and_then(|cfg| cfg.log_level.clone()))
+        .unwrap_or_else(|| {
+            if verbose {
+                "debug".to_string()
+            } else {
+                "info".to_string()
+            }
+        });
+
+    match level.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => Ok(level),
+        _ => bail!("log level must be one of trace, debug, info, warn, error"),
+    }
+}
+
+fn resolve_log_format(
+    cli_log_format: Option<LogFormat>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> LogFormat {
+    cli_log_format
+        .or_else(|| observability.and_then(|cfg| cfg.log_format))
+        .unwrap_or(LogFormat::Text)
+}
+
+fn build_observability_config(
+    listen: Option<String>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> Option<ObservabilityConfig> {
+    listen
+        .or_else(|| observability.and_then(|cfg| cfg.listen.clone()))
+        .map(ObservabilityConfig::new)
 }
 
 fn apply_limit_config(
@@ -518,6 +609,24 @@ mod tests {
         }
 
         #[test]
+        fn parses_observability_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [observability]
+                listen = "127.0.0.1:9100"
+                log_level = "debug"
+                log_format = "json"
+                "#,
+            )
+            .unwrap();
+
+            let observability = cfg.observability.unwrap();
+            assert_eq!(observability.listen.as_deref(), Some("127.0.0.1:9100"));
+            assert_eq!(observability.log_level.as_deref(), Some("debug"));
+            assert_eq!(observability.log_format, Some(LogFormat::Json));
+        }
+
+        #[test]
         fn applies_limits_to_sync_config() {
             let limits = LimitsFileConfig {
                 max_peers: Some(8),
@@ -544,6 +653,54 @@ mod tests {
             };
 
             assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());
+        }
+
+        #[test]
+        fn builds_observability_from_file_config() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+            };
+
+            let observability = build_observability_config(None, Some(&cfg)).unwrap();
+
+            assert_eq!(observability.listen_addr, "127.0.0.1:9100");
+        }
+
+        #[test]
+        fn cli_observability_listen_overrides_file_config() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+            };
+
+            let observability =
+                build_observability_config(Some("127.0.0.1:9200".into()), Some(&cfg)).unwrap();
+
+            assert_eq!(observability.listen_addr, "127.0.0.1:9200");
+        }
+
+        #[test]
+        fn resolves_log_level_from_cli_then_file_then_verbose() {
+            let cfg = ObservabilityFileConfig {
+                listen: None,
+                log_level: Some("warn".into()),
+                log_format: None,
+            };
+
+            assert_eq!(
+                resolve_log_level(false, Some("debug".into()), Some(&cfg)).unwrap(),
+                "debug"
+            );
+            assert_eq!(resolve_log_level(false, None, Some(&cfg)).unwrap(), "warn");
+            assert_eq!(resolve_log_level(true, None, None).unwrap(), "debug");
+        }
+
+        #[test]
+        fn rejects_invalid_log_level() {
+            assert!(resolve_log_level(false, Some("loud".into()), None).is_err());
         }
     }
 
@@ -874,6 +1031,34 @@ mod tests {
             match cli {
                 Cli::Run { config, .. } => {
                     assert_eq!(config, Some(PathBuf::from("numax.toml")));
+                }
+            }
+        }
+
+        #[test]
+        fn observability_flags_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "run",
+                "x.wasm",
+                "--observability-listen",
+                "127.0.0.1:9100",
+                "--log-level",
+                "debug",
+                "--log-format",
+                "json",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run {
+                    observability_listen,
+                    log_level,
+                    log_format,
+                    ..
+                } => {
+                    assert_eq!(observability_listen.as_deref(), Some("127.0.0.1:9100"));
+                    assert_eq!(log_level.as_deref(), Some("debug"));
+                    assert_eq!(log_format, Some(LogFormat::Json));
                 }
             }
         }

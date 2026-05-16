@@ -103,7 +103,9 @@ async fn crdt_gcounter_inc_impl(
     }
 
     let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
+    tracing::debug!(op_id = %op.id, "queued local GCounter increment");
     op_permit.send(op);
+    handle.metrics().record_ops(1);
 
     0
 }

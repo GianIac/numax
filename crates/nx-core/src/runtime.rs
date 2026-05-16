@@ -11,6 +11,9 @@ use nx_store::Store as NxStore;
 use nx_sync::NodeId;
 
 use crate::host_api;
+use crate::observability::{
+    ObservabilityConfig, ObservabilityServer, RuntimeMetrics, start_server,
+};
 use crate::sync_config::SyncConfig;
 use crate::sync_manager::{SyncHandle, SyncManager};
 
@@ -37,6 +40,9 @@ pub struct RuntimeConfig {
 
     /// config sync (None = sync disabled).
     pub sync: Option<SyncConfig>,
+
+    /// Observability HTTP endpoint (None = disabled).
+    pub observability: Option<ObservabilityConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -46,6 +52,7 @@ impl Default for RuntimeConfig {
             max_memory_bytes: None,
             datastore_path: PathBuf::from("./nx-data"),
             sync: None,
+            observability: None,
         }
     }
 }
@@ -62,9 +69,11 @@ pub struct Runtime {
     linker: Linker<HostState>,
     config: RuntimeConfig,
     store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
 
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
+    observability_server: Option<ObservabilityServer>,
 }
 
 impl Runtime {
@@ -99,11 +108,18 @@ impl Runtime {
         let store = NxStore::open(&config.datastore_path)
             .map_err(|e| anyhow!("Failed to open datastore: {e}"))?;
         let store = Arc::new(store);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        metrics.set_ready(config.sync.is_none());
 
         // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
         let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
             let node_id = NodeId::generate();
-            let manager = SyncManager::new(node_id, sync_config.clone(), Arc::clone(&store));
+            let manager = SyncManager::new(
+                node_id,
+                sync_config.clone(),
+                Arc::clone(&store),
+                Arc::clone(&metrics),
+            );
             let handle = manager.handle();
             (Some(manager), Some(handle))
         } else {
@@ -115,9 +131,27 @@ impl Runtime {
             linker,
             config,
             store,
+            metrics,
             sync_manager,
             sync_handle,
+            observability_server: None,
         })
+    }
+
+    /// Start the optional observability HTTP endpoint.
+    pub async fn start_observability(&mut self) -> Result<Option<std::net::SocketAddr>> {
+        let Some(config) = self.config.observability.clone() else {
+            return Ok(None);
+        };
+        if self.observability_server.is_some() {
+            return Ok(None);
+        }
+
+        let (addr, server) =
+            start_server(config, Arc::clone(&self.metrics), Arc::clone(&self.store)).await?;
+        self.observability_server = Some(server);
+        tracing::info!(addr = %addr, "observability endpoint started");
+        Ok(Some(addr))
     }
 
     /// Start sync networking
@@ -130,6 +164,7 @@ impl Runtime {
             .start()
             .await
             .map_err(|e| anyhow!("sync manager failed to start: {e}"))?;
+        self.metrics.set_ready(true);
         tracing::info!(
             node_id = %manager.node_id(),
             "sync manager started"
@@ -150,6 +185,8 @@ impl Runtime {
     }
 
     async fn shutdown_inner(&mut self) -> Result<()> {
+        self.metrics.set_ready(false);
+
         if let Some(manager) = self.sync_manager.as_mut() {
             manager
                 .shutdown()
@@ -162,6 +199,11 @@ impl Runtime {
         self.store
             .flush()
             .map_err(|e| anyhow!("failed to flush datastore: {e}"))?;
+
+        if let Some(server) = self.observability_server.take() {
+            server.shutdown().await;
+        }
+
         tracing::info!("runtime shutdown complete");
         Ok(())
     }

@@ -57,8 +57,10 @@ counter:visits = 2
 ## Notes
 
 - The same run can use a TOML config file with `--config ./numax.toml`.
-  Today the implemented section is `[limits]`: `max_peers`,
-  `queued_ops_limit`, `max_message_size`, and `socket_timeout_secs`.
+  Today the implemented sections are `[limits]` and `[observability]`.
+  Limits cover `max_peers`, `queued_ops_limit`, `max_message_size`, and
+  `socket_timeout_secs`; observability can enable `/metrics`, `/health` and
+  `/ready`.
 - No `--sync-prefix` flag exists anymore: replication is driven by the API
   surface (`nx_sdk::crdt::*`), not by key prefix. Everything written via
   `nx_sdk::db::*` is purely local.
@@ -71,4 +73,5 @@ counter:visits = 2
 - Without `--settle-for`, a sync-enabled runtime stays alive until it receives
   SIGINT/SIGTERM/SIGHUP.
 - The `-v` flag enables verbose logs to observe lifecycle, broadcast and apply
-  paths.
+  paths. Use `--log-format json` for structured logs, and
+  `--observability-listen 127.0.0.1:9300` to expose the local metrics endpoint.

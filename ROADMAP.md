@@ -27,7 +27,8 @@ Includes:
 - Examples: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
 
 Known limitations:
-- Backpressure, observability and full network resilience are still open phases.
+- Full network resilience, serialization hardening and the extended host API are
+  still open phases.
 - API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
@@ -261,23 +262,32 @@ socket_timeout_secs = 30
 **Goal**: Visibility into what the runtime is doing
 
 **Structured logging**:
-- [ ] JSON format for logs
-- [ ] Configurable levels (trace/debug/info/warn/error)
-- [ ] Correlation ID to trace operations
+- [x] JSON format for logs
+- [x] Configurable levels (trace/debug/info/warn/error)
+- [x] Correlation ID to trace operations
 
 **Metrics**:
-- [ ] `numax_ops_total` - Operations processed
-- [ ] `numax_peers_connected` - Active peers
-- [ ] `numax_sync_latency_ms` - Sync latency
-- [ ] `numax_store_keys` - Keys in the store
-- [ ] `numax_store_bytes` - Bytes used
-- [ ] `/metrics` endpoint (Prometheus format)
+- [x] `numax_ops_total` - Operations processed
+- [x] `numax_peers_connected` - Active peers
+- [x] `numax_sync_latency_ms` - Sync latency
+- [x] `numax_store_keys` - Keys in the store
+- [x] `numax_store_bytes` - Bytes used
+- [x] `/metrics` endpoint (Prometheus format)
 
 **Health check**:
-- [ ] `/health` endpoint (liveness)
-- [ ] `/ready` endpoint (readiness)
+- [x] `/health` endpoint (liveness)
+- [x] `/ready` endpoint (readiness)
 
-**Libraries**: `tracing`, `tracing-subscriber`, `metrics`, `metrics-exporter-prometheus`
+**Configuration**:
+```toml
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
+```
+
+**Implementation**: `tracing`, `tracing-subscriber`, minimal Prometheus-compatible
+HTTP endpoint over Tokio.
 
 ---
 

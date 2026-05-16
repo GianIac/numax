@@ -534,6 +534,12 @@ nx run <module.wasm> --datastore-path ./my-data
 # Runs with a TOML configuration file
 nx run <module.wasm> --config ./numax.toml
 
+# Runs with the observability endpoint enabled
+nx run <module.wasm> \
+    --observability-listen 127.0.0.1:9100 \
+    --log-level info \
+    --log-format json
+
 # Runs as a sync-enabled node
 nx run <module.wasm> \
     --listen 0.0.0.0:9000 \
@@ -564,6 +570,9 @@ nx run <module.wasm> \
 |------|-------------|
 | `--datastore-path` | Directory for persistent data |
 | `--config` | TOML configuration file |
+| `--observability-listen` | Enable `/metrics`, `/health` and `/ready` on the given address |
+| `--log-level` | Logging level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--log-format` | Logging format: `text` or `json` |
 | `--listen` | Address on which to accept peer connections and enable sync |
 | `--peer` | Initial peer address (repeatable) |
 | `--wait-before-run` | Bounded pre-run window for peer handshakes |
@@ -582,9 +591,24 @@ max_peers = 64
 queued_ops_limit = 10000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
+
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
 ```
 
-The same values are the runtime defaults when no config file is provided.
+The same limit values are the runtime defaults when no config file is provided.
+The observability endpoint is opt-in: without `--observability-listen` or
+`[observability].listen`, no HTTP endpoint is opened.
+
+The endpoint exposes:
+
+| Path | Meaning |
+|------|---------|
+| `/metrics` | Prometheus-compatible text metrics |
+| `/health` | Liveness |
+| `/ready` | Readiness |
 
 ### 5.8 Topology: epidemic gossip *(Prototype)*
 
@@ -805,7 +829,7 @@ v0.1.0-alpha.2 is a technical preview. We recognize its limits, explicitly:
 - **Anti-entropy is not implemented yet.** Nodes exchange live PushOps, but automatic recovery of missed deltas after long disconnections is Phase 10 work.
 - **K-fanout gossip and full network resilience are in progress.** The architecture is defined; reconnect with backoff, automatic anti-entropy and op dedup are in Phase 10.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
-- **Minimal observability.** Advanced structured logging, Prometheus metrics and health checks are in Phase 9.
+- **Minimal observability.** Structured logs, Prometheus-compatible metrics and health checks are available as an opt-in endpoint; richer dashboards and alerting remain outside the current preview.
 - **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. Dual-mode JSON/bincode serialization is planned in Phase 11.
 - **Available CRDTs limited to GCounter.** PNCounter, LWW-Register, ORSet, LWW-Map and RGA will arrive with Phase 14.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.

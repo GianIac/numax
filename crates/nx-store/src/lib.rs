@@ -2,7 +2,7 @@ mod error;
 mod store;
 
 pub use error::StoreError;
-pub use store::Store;
+pub use store::{Store, StoreStats};
 
 #[cfg(test)]
 mod tests {
@@ -65,5 +65,19 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
         assert_eq!(store.get(b"key2").unwrap(), Some(b"value2".to_vec()));
         assert_eq!(store.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_stats_counts_keys_and_bytes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.set(b"a", b"one").unwrap();
+        store.set(b"bb", b"two").unwrap();
+
+        let stats = store.stats().unwrap();
+
+        assert_eq!(stats.keys, 2);
+        assert_eq!(stats.bytes, 9);
     }
 }

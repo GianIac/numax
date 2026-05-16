@@ -8,6 +8,7 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::observability::RuntimeMetrics;
 use crate::sync_config::SyncConfig;
 
 /// Upper bound on how many ops we coalesce into a single PushOps message.
@@ -21,6 +22,7 @@ pub struct SyncHandle {
     op_tx: mpsc::Sender<Op>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl SyncHandle {
@@ -43,6 +45,11 @@ impl SyncHandle {
     pub fn store(&self) -> Arc<NxStore> {
         Arc::clone(&self.store)
     }
+
+    /// Shared runtime metrics.
+    pub fn metrics(&self) -> Arc<RuntimeMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 pub struct SyncManager {
@@ -61,6 +68,9 @@ pub struct SyncManager {
 
     /// Store used to materialize replicated values.
     store: Arc<NxStore>,
+
+    /// Shared runtime metrics.
+    metrics: Arc<RuntimeMetrics>,
 
     /// OpId
     seen_ops: Arc<RwLock<HashSet<String>>>,
@@ -83,7 +93,12 @@ pub struct SyncManager {
 
 impl SyncManager {
     /// new SyncManager.
-    pub fn new(node_id: NodeId, config: SyncConfig, store: Arc<NxStore>) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        config: SyncConfig,
+        store: Arc<NxStore>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Self {
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
@@ -99,6 +114,7 @@ impl SyncManager {
             node: None,
             counters,
             store,
+            metrics,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
             op_tx,
             op_rx: Some(op_rx),
@@ -130,6 +146,7 @@ impl SyncManager {
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
             store: Arc::clone(&self.store),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 
@@ -174,6 +191,7 @@ impl SyncManager {
         let counters = Arc::clone(&self.counters);
         let seen_ops = Arc::clone(&self.seen_ops);
         let store = Arc::clone(&self.store);
+        let metrics = Arc::clone(&self.metrics);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.event_task = Some(tokio::spawn(async move {
             loop {
@@ -181,7 +199,7 @@ impl SyncManager {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             debug!("event loop shutdown requested");
-                            drain_node_events(&mut event_rx, &counters, &seen_ops, &store).await;
+                            drain_node_events(&mut event_rx, &counters, &seen_ops, &store, &metrics).await;
                             break;
                         }
                     }
@@ -189,7 +207,7 @@ impl SyncManager {
                         let Some(event) = event else {
                             break;
                         };
-                        handle_node_event(event, &counters, &seen_ops, &store).await;
+                        handle_node_event(event, &counters, &seen_ops, &store, &metrics).await;
                     }
                 }
             }
@@ -205,6 +223,7 @@ impl SyncManager {
             Arc::clone(&node),
             op_rx,
             self.shutdown_tx.subscribe(),
+            Arc::clone(&self.metrics),
         ));
 
         Ok(())
@@ -252,6 +271,7 @@ impl SyncManager {
         if let Some(node) = self.node.as_ref() {
             node.shutdown().await;
         }
+        self.metrics.set_peers_connected(0);
 
         if let Some(task) = self.event_task.take()
             && let Err(e) = task.await
@@ -269,6 +289,7 @@ fn spawn_broadcast_loop(
     node: Arc<Node>,
     mut op_rx: mpsc::Receiver<Op>,
     mut shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<RuntimeMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -276,7 +297,7 @@ fn spawn_broadcast_loop(
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!("broadcast loop shutdown requested");
-                        drain_broadcast_queue(&node, &mut op_rx).await;
+                        drain_broadcast_queue(&node, &mut op_rx, &metrics).await;
                         break;
                     }
                 }
@@ -284,7 +305,7 @@ fn spawn_broadcast_loop(
                     let Some(first) = op else {
                         break;
                     };
-                    broadcast_batch(&node, &mut op_rx, first).await;
+                    broadcast_batch(&node, &mut op_rx, first, &metrics).await;
                 }
             }
         }
@@ -292,7 +313,12 @@ fn spawn_broadcast_loop(
     })
 }
 
-async fn broadcast_batch(node: &Arc<Node>, op_rx: &mut mpsc::Receiver<Op>, first: Op) {
+async fn broadcast_batch(
+    node: &Arc<Node>,
+    op_rx: &mut mpsc::Receiver<Op>,
+    first: Op,
+    metrics: &Arc<RuntimeMetrics>,
+) {
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
 
@@ -305,16 +331,22 @@ async fn broadcast_batch(node: &Arc<Node>, op_rx: &mut mpsc::Receiver<Op>, first
     }
 
     let count = batch.len();
+    let started = std::time::Instant::now();
     if let Err(e) = node.broadcast_ops(batch).await {
         warn!(error = %e, count, "broadcast failed; ops dropped for this round");
     } else {
+        metrics.record_sync_latency(started.elapsed());
         debug!(count, "broadcast batch sent");
     }
 }
 
-async fn drain_broadcast_queue(node: &Arc<Node>, op_rx: &mut mpsc::Receiver<Op>) {
+async fn drain_broadcast_queue(
+    node: &Arc<Node>,
+    op_rx: &mut mpsc::Receiver<Op>,
+    metrics: &Arc<RuntimeMetrics>,
+) {
     while let Ok(first) = op_rx.try_recv() {
-        broadcast_batch(node, op_rx, first).await;
+        broadcast_batch(node, op_rx, first, metrics).await;
     }
 }
 
@@ -323,9 +355,10 @@ async fn drain_node_events(
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: &Arc<RwLock<HashSet<String>>>,
     store: &Arc<NxStore>,
+    metrics: &Arc<RuntimeMetrics>,
 ) {
     while let Ok(event) = event_rx.try_recv() {
-        handle_node_event(event, counters, seen_ops, store).await;
+        handle_node_event(event, counters, seen_ops, store, metrics).await;
     }
 }
 
@@ -334,20 +367,29 @@ async fn handle_node_event(
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: &Arc<RwLock<HashSet<String>>>,
     store: &Arc<NxStore>,
+    metrics: &Arc<RuntimeMetrics>,
 ) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
             for op in ops {
-                if let Err(e) = apply_remote_op(&op, counters, seen_ops, store).await {
+                if let Err(e) = apply_remote_op(&op, counters, seen_ops, store, metrics).await {
                     error!(error = %e, "failed to apply remote op");
                 }
             }
         }
-        NodeEvent::PeerConnected { node_id } => {
+        NodeEvent::PeerConnected {
+            node_id,
+            peers_connected,
+        } => {
+            metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, "peer connected");
         }
-        NodeEvent::PeerDisconnected { node_id } => {
+        NodeEvent::PeerDisconnected {
+            node_id,
+            peers_connected,
+        } => {
+            metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, "peer disconnected");
         }
     }
@@ -430,6 +472,7 @@ async fn apply_remote_op(
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: &Arc<RwLock<HashSet<String>>>,
     store: &Arc<NxStore>,
+    metrics: &Arc<RuntimeMetrics>,
 ) -> anyhow::Result<()> {
     // Deduplication
     {
@@ -451,7 +494,8 @@ async fn apply_remote_op(
             materialize_gcounter_value(store, key, total)?;
             counters.insert(key.clone(), counter);
 
-            debug!(key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
+            metrics.record_ops(1);
+            debug!(op_id = %op.id, key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
         }
     }
 
@@ -478,6 +522,10 @@ mod tests {
             .as_nanos();
         path.push(format!("numax-core-sync-test-{nanos}"));
         Arc::new(NxStore::open(path).unwrap())
+    }
+
+    fn metrics() -> Arc<RuntimeMetrics> {
+        Arc::new(RuntimeMetrics::default())
     }
 
     fn free_addr() -> String {
@@ -527,7 +575,8 @@ mod tests {
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
         let store = temp_store();
         let config = SyncConfig::new().with_listen_addr(addr);
-        let mut manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+        let mut manager =
+            SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
         let handle = manager.handle();
         manager.start().await.unwrap();
         (manager, handle, store)
@@ -541,7 +590,7 @@ mod tests {
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &store)
+        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
             .await
             .unwrap();
 
@@ -561,10 +610,10 @@ mod tests {
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &store)
+        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
             .await
             .unwrap();
-        apply_remote_op(&op, &counters, &seen_ops, &store)
+        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
             .await
             .unwrap();
 
@@ -583,7 +632,7 @@ mod tests {
 
         let node_id = NodeId::new("local-node");
         let config = SyncConfig::new();
-        let manager = SyncManager::new(node_id.clone(), config, Arc::clone(&store));
+        let manager = SyncManager::new(node_id.clone(), config, Arc::clone(&store), metrics());
 
         assert_eq!(manager.get_counter_value("counter:visits").await, 42);
 
@@ -651,7 +700,7 @@ mod tests {
     async fn manager_uses_configured_queued_ops_limit() {
         let store = temp_store();
         let config = SyncConfig::new().with_queued_ops_limit(256);
-        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
 
         assert_eq!(manager.op_sender().max_capacity(), 256);
     }
@@ -660,7 +709,7 @@ mod tests {
     async fn manager_normalizes_empty_queued_ops_limit() {
         let store = temp_store();
         let config = SyncConfig::new().with_queued_ops_limit(0);
-        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store));
+        let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
 
         assert_eq!(manager.op_sender().max_capacity(), 1);
     }

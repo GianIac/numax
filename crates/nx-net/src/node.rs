@@ -101,10 +101,16 @@ pub enum NodeEvent {
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
     /// Peer connected.
-    PeerConnected { node_id: NodeId },
+    PeerConnected {
+        node_id: NodeId,
+        peers_connected: usize,
+    },
 
     /// Peer disconnected.
-    PeerDisconnected { node_id: NodeId },
+    PeerDisconnected {
+        node_id: NodeId,
+        peers_connected: usize,
+    },
 }
 
 #[allow(dead_code)]
@@ -305,7 +311,7 @@ impl Node {
         }
 
         // Save connection
-        {
+        let peers_connected = {
             let mut peers = self.peers.write().await;
             ensure_peer_slot_available(&peers, self.config.max_peers, Some(addr))?;
             peers.insert(
@@ -316,13 +322,15 @@ impl Node {
                     writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
                 },
             );
-        }
+            connected_peer_count(&peers)
+        };
 
         // Notify Event
         let _ = self
             .event_tx
             .send(NodeEvent::PeerConnected {
                 node_id: peer_node_id.clone(),
+                peers_connected,
             })
             .await;
 
@@ -347,12 +355,16 @@ impl Node {
             }
 
             // Cleanup
-            let mut peers = peers.write().await;
-            peers.remove(&addr_owned);
+            let peers_connected = {
+                let mut peers = peers.write().await;
+                peers.remove(&addr_owned);
+                connected_peer_count(&peers)
+            };
 
             let _ = event_tx
                 .send(NodeEvent::PeerDisconnected {
                     node_id: peer_node_id,
+                    peers_connected,
                 })
                 .await;
         });
@@ -488,7 +500,7 @@ async fn handle_incoming(
     let ack = Message::hello_ack(our_node_id);
     write_message(&mut writer, &ack, limits.socket_timeout).await?;
 
-    {
+    let peers_connected = {
         let mut peers = peers.write().await;
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
         peers.insert(
@@ -499,7 +511,8 @@ async fn handle_incoming(
                 writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
             },
         );
-    }
+        connected_peer_count(&peers)
+    };
 
     info!(peer = %peer_node_id, "incoming peer connected");
 
@@ -507,31 +520,34 @@ async fn handle_incoming(
     let _ = event_tx
         .send(NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
+            peers_connected,
         })
         .await;
 
     // Read Loop
-    read_loop(
+    let read_result = read_loop(
         reader,
         peer_node_id.clone(),
         event_tx.clone(),
         limits.max_message_size,
         limits.socket_timeout,
     )
-    .await?;
+    .await;
 
-    {
+    let peers_connected = {
         let mut peers = peers.write().await;
         peers.remove(&addr);
-    }
+        connected_peer_count(&peers)
+    };
 
     let _ = event_tx
         .send(NodeEvent::PeerDisconnected {
             node_id: peer_node_id,
+            peers_connected,
         })
         .await;
 
-    Ok(())
+    read_result
 }
 
 fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
