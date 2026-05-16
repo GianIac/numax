@@ -1468,7 +1468,9 @@ dependencies = [
  "anyhow",
  "clap",
  "nx-core",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

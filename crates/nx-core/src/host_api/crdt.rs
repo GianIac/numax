@@ -77,6 +77,15 @@ async fn crdt_gcounter_inc_impl(
         None => return ERR_SYNC_DISABLED,
     };
 
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::warn!(error = %e, "crdt_gcounter_inc: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
     // Apply locally and materialize the value before exposing the new state.
     {
         let counters_arc = handle.counters();
@@ -93,12 +102,8 @@ async fn crdt_gcounter_inc_impl(
         counters.insert(key.clone(), counter);
     }
 
-    // Enqueue the Op for broadcast. Bounded-channel backpressure is
-
     let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
-    if let Err(e) = handle.op_sender().send(op).await {
-        tracing::warn!(error = %e, "crdt_gcounter_inc: broadcast channel closed");
-    }
+    op_permit.send(op);
 
     0
 }

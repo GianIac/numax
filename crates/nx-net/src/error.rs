@@ -19,6 +19,9 @@ pub enum NetError {
     #[error("invalid message: {0}")]
     InvalidMessage(String),
 
+    #[error("message too large: {len} > {limit}")]
+    MessageTooLarge { len: usize, limit: usize },
+
     #[error("timeout")]
     Timeout,
 

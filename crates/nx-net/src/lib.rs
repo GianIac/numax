@@ -6,7 +6,10 @@ mod tls;
 
 pub use error::{NetError, NetResult};
 pub use message::{Message, MessageKind};
-pub use node::{DEFAULT_MAX_PEERS, Node, NodeConfig, NodeEvent};
+pub use node::{
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS, DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig,
+    NodeEvent,
+};
 pub use peer::{PeerId, PeerInfo};
 pub use tls::{
     NetStream, NodeId, TestPki, TlsConfig, derive_node_id, generate_ca, generate_self_signed,

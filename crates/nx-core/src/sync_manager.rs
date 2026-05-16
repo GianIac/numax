@@ -146,7 +146,9 @@ impl SyncManager {
         // Build the network node.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
             .with_peers(self.config.peers.clone())
-            .with_max_peers(self.config.max_peers);
+            .with_max_peers(self.config.max_peers)
+            .with_max_message_size(self.config.max_message_size)
+            .with_socket_timeout(self.config.socket_timeout);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);

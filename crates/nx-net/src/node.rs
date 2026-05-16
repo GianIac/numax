@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nx_sync::{NodeId, Op};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc, watch};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NetError, NetResult};
@@ -14,6 +16,19 @@ use crate::tls::{NetStream, TlsConfig};
 
 /// Default maximum number of simultaneously connected peers.
 pub const DEFAULT_MAX_PEERS: usize = 64;
+
+/// Default maximum accepted wire message size.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default timeout for socket reads and writes.
+pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+struct NodeLimits {
+    max_peers: usize,
+    max_message_size: usize,
+    socket_timeout: Duration,
+}
 
 /// Node configuration.
 #[derive(Debug, Clone)]
@@ -32,6 +47,12 @@ pub struct NodeConfig {
 
     /// Maximum number of simultaneously connected peers.
     pub max_peers: usize,
+
+    /// Maximum accepted wire message size.
+    pub max_message_size: usize,
+
+    /// Timeout for socket reads and writes.
+    pub socket_timeout: Duration,
 }
 
 impl NodeConfig {
@@ -42,6 +63,8 @@ impl NodeConfig {
             initial_peers: Vec::new(),
             tls: None,
             max_peers: DEFAULT_MAX_PEERS,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            socket_timeout: DEFAULT_SOCKET_TIMEOUT,
         }
     }
 
@@ -57,6 +80,16 @@ impl NodeConfig {
 
     pub fn with_max_peers(mut self, max_peers: usize) -> Self {
         self.max_peers = max_peers;
+        self
+    }
+
+    pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = max_message_size;
+        self
+    }
+
+    pub fn with_socket_timeout(mut self, socket_timeout: Duration) -> Self {
+        self.socket_timeout = socket_timeout;
         self
     }
 }
@@ -124,7 +157,11 @@ impl Node {
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
         let tls = self.config.tls.clone();
-        let max_peers = self.config.max_peers;
+        let limits = NodeLimits {
+            max_peers: self.config.max_peers,
+            max_message_size: self.config.max_message_size,
+            socket_timeout: self.config.socket_timeout,
+        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -144,7 +181,7 @@ impl Node {
                                 let node_id = node_id.clone();
                                 let event_tx = event_tx.clone();
                                 let tls = tls.clone();
-                                let max_peers = max_peers;
+                                let limits = limits;
 
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_incoming(
@@ -154,7 +191,7 @@ impl Node {
                                         node_id,
                                         peers,
                                         event_tx,
-                                        max_peers,
+                                        limits,
                                     )
                                     .await
                                     {
@@ -208,10 +245,15 @@ impl Node {
 
         // Send HELLO
         let hello = Message::hello(self.config.node_id.clone());
-        write_message(&mut writer, &hello).await?;
+        write_message(&mut writer, &hello, self.config.socket_timeout).await?;
 
         // Wait HELLO_ACK
-        let response = read_message(&mut reader).await?;
+        let response = read_message(
+            &mut reader,
+            self.config.max_message_size,
+            self.config.socket_timeout,
+        )
+        .await?;
         let peer_node_id = match response.kind {
             MessageKind::HelloAck { node_id, version } => {
                 if version != PROTOCOL_VERSION {
@@ -288,9 +330,19 @@ impl Node {
         let peers = Arc::clone(&self.peers);
         let event_tx = self.event_tx.clone();
         let addr_owned = addr.to_string();
+        let max_message_size = self.config.max_message_size;
+        let socket_timeout = self.config.socket_timeout;
 
         tokio::spawn(async move {
-            if let Err(e) = read_loop(reader, peer_node_id.clone(), event_tx.clone()).await {
+            if let Err(e) = read_loop(
+                reader,
+                peer_node_id.clone(),
+                event_tx.clone(),
+                max_message_size,
+                socket_timeout,
+            )
+            .await
+            {
                 debug!(peer = %peer_node_id, error = %e, "read loop ended");
             }
 
@@ -318,7 +370,7 @@ impl Node {
         for (addr, conn) in peers.iter_mut() {
             if conn.state == PeerState::Connected
                 && let Some(ref mut writer) = conn.writer
-                && let Err(e) = writer.write_all(&bytes).await
+                && let Err(e) = write_bytes(writer, &bytes, self.config.socket_timeout).await
             {
                 warn!(%addr, error = %e, "failed to send ops");
                 conn.state = PeerState::Failed;
@@ -357,7 +409,7 @@ async fn handle_incoming(
     our_node_id: NodeId,
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
-    max_peers: usize,
+    limits: NodeLimits,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
@@ -370,7 +422,7 @@ async fn handle_incoming(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Wait for HELLO
-    let msg = read_message(&mut reader).await?;
+    let msg = read_message(&mut reader, limits.max_message_size, limits.socket_timeout).await?;
     let peer_node_id = match msg.kind {
         MessageKind::Hello { node_id, version } => {
             if version != PROTOCOL_VERSION {
@@ -414,13 +466,17 @@ async fn handle_incoming(
         }
     }
 
-    // Send HELLO_ACK
+    {
+        let peers = peers.read().await;
+        ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
+    }
+
     let ack = Message::hello_ack(our_node_id);
-    write_message(&mut writer, &ack).await?;
+    write_message(&mut writer, &ack, limits.socket_timeout).await?;
 
     {
         let mut peers = peers.write().await;
-        ensure_peer_slot_available(&peers, max_peers, Some(&addr))?;
+        ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
         peers.insert(
             addr.clone(),
             PeerConnection {
@@ -441,7 +497,14 @@ async fn handle_incoming(
         .await;
 
     // Read Loop
-    read_loop(reader, peer_node_id.clone(), event_tx.clone()).await?;
+    read_loop(
+        reader,
+        peer_node_id.clone(),
+        event_tx.clone(),
+        limits.max_message_size,
+        limits.socket_timeout,
+    )
+    .await?;
 
     {
         let mut peers = peers.write().await;
@@ -486,9 +549,11 @@ async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
     peer_node_id: NodeId,
     event_tx: mpsc::Sender<NodeEvent>,
+    max_message_size: usize,
+    socket_timeout: Duration,
 ) -> NetResult<()> {
     loop {
-        let msg = match read_message(&mut reader).await {
+        let msg = match read_message(&mut reader, max_message_size, socket_timeout).await {
             Ok(m) => m,
             Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!(peer = %peer_node_id, "peer disconnected");
@@ -521,28 +586,56 @@ async fn read_loop(
 }
 
 /// Writes a message to a stream.
-async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Message) -> NetResult<()> {
+async fn write_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &Message,
+    socket_timeout: Duration,
+) -> NetResult<()> {
     let bytes = msg.to_bytes()?;
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
+    write_bytes(writer, &bytes, socket_timeout).await?;
+    Ok(())
+}
+
+async fn write_bytes<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    socket_timeout: Duration,
+) -> NetResult<()> {
+    timeout(socket_timeout, writer.write_all(bytes))
+        .await
+        .map_err(|_| NetError::Timeout)??;
+    timeout(socket_timeout, writer.flush())
+        .await
+        .map_err(|_| NetError::Timeout)??;
     Ok(())
 }
 
 /// Reads a message from a stream.
-async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> NetResult<Message> {
+async fn read_message<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    max_message_size: usize,
+    socket_timeout: Duration,
+) -> NetResult<Message> {
     // Read length (4 bytes)
     let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
+    timeout(socket_timeout, reader.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| NetError::Timeout)??;
     let len = u32::from_be_bytes(len_buf) as usize;
 
     // Sanity check
-    if len > 10 * 1024 * 1024 {
-        return Err(NetError::InvalidMessage("message too large".into()));
+    if len > max_message_size {
+        return Err(NetError::MessageTooLarge {
+            len,
+            limit: max_message_size,
+        });
     }
 
     // Read payload
     let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
+    timeout(socket_timeout, reader.read_exact(&mut buf))
+        .await
+        .map_err(|_| NetError::Timeout)??;
 
     Message::from_bytes(&buf).map_err(|e| e.into())
 }
@@ -559,6 +652,8 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:9000");
         assert_eq!(config.initial_peers.len(), 1);
         assert_eq!(config.max_peers, DEFAULT_MAX_PEERS);
+        assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(config.socket_timeout, DEFAULT_SOCKET_TIMEOUT);
     }
 
     #[test]
@@ -598,5 +693,70 @@ mod tests {
         );
 
         ensure_peer_slot_available(&peers, 1, Some("127.0.0.1:9001")).unwrap();
+    }
+
+    #[test]
+    fn node_config_allows_custom_wire_limits() {
+        let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000")
+            .with_max_message_size(1024)
+            .with_socket_timeout(Duration::from_secs(3));
+
+        assert_eq!(config.max_message_size, 1024);
+        assert_eq!(config.socket_timeout, Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_payload_over_configured_limit() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&8u32.to_be_bytes()).await.unwrap();
+
+        let err = read_message(&mut server, 4, DEFAULT_SOCKET_TIMEOUT)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetError::MessageTooLarge { len: 8, limit: 4 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_message_times_out_waiting_for_length() {
+        let (_client, mut server) = tokio::io::duplex(64);
+
+        let err = read_message(
+            &mut server,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, NetError::Timeout));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stress test: opens 1000 local TCP connections"]
+    async fn thousand_simultaneous_connections_do_not_crash() {
+        let config = NodeConfig::new(NodeId::new("stress-node"), "127.0.0.1:0")
+            .with_max_peers(DEFAULT_MAX_PEERS)
+            .with_socket_timeout(Duration::from_millis(100));
+        let node = Node::new(config);
+        let addr = node.start_listener().await.unwrap();
+
+        let mut tasks = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            tasks.push(tokio::spawn(async move { TcpStream::connect(addr).await }));
+        }
+
+        let mut connected = 0usize;
+        for task in tasks {
+            if task.await.unwrap().is_ok() {
+                connected += 1;
+            }
+        }
+
+        assert!(connected > 0, "stress test did not open any connection");
+        node.shutdown().await;
     }
 }

@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::{SyncConfig, TlsConfig};
+use serde::Deserialize;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -21,6 +22,10 @@ enum Cli {
         /// Datastore directory path (default: ./nx-data)
         #[arg(long, value_name = "PATH")]
         datastore_path: Option<PathBuf>,
+
+        /// Path to a Numax TOML configuration file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
 
         /// Enable sync and listen on this address (e.g., "0.0.0.0:9000")
         #[arg(long, value_name = "ADDR")]
@@ -91,6 +96,7 @@ async fn real_main() -> Result<()> {
         Cli::Run {
             module,
             datastore_path,
+            config,
             listen,
             peers,
             settle_for,
@@ -115,12 +121,15 @@ async fn real_main() -> Result<()> {
 
             // Validate TLS flag combinations
             validate_tls_flags(&tls_cert, &tls_key, &tls_ca, &allowed_peers, tls_insecure)?;
+            let file_config = load_run_config(config.as_ref())?;
 
             // Build TlsConfig (if any TLS-related flag was provided)
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
 
             // Build SyncConfig (if sync flags were provided)
-            let sync = build_sync_config(listen, peers, tls)?;
+            let sync = build_sync_config(listen, peers, tls)?
+                .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
+                .transpose()?;
             validate_settle_mode(&sync, settle_for)?;
             validate_wait_before_run(&sync, wait_before_run)?;
             validate_print_gcounter(&sync, &print_gcounter)?;
@@ -176,6 +185,87 @@ async fn real_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunFileConfig {
+    limits: Option<LimitsFileConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitsFileConfig {
+    max_peers: Option<usize>,
+    queued_ops_limit: Option<usize>,
+    max_message_size: Option<String>,
+    socket_timeout_secs: Option<u64>,
+}
+
+fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
+    let Some(path) = path else {
+        return Ok(RunFileConfig::default());
+    };
+
+    let text = fs::read_to_string(path)?;
+    toml::from_str(&text).map_err(Into::into)
+}
+
+fn apply_limit_config(
+    mut sync: SyncConfig,
+    limits: Option<&LimitsFileConfig>,
+) -> Result<SyncConfig> {
+    let Some(limits) = limits else {
+        return Ok(sync);
+    };
+
+    if let Some(max_peers) = limits.max_peers {
+        sync = sync.with_max_peers(max_peers);
+    }
+    if let Some(queued_ops_limit) = limits.queued_ops_limit {
+        if queued_ops_limit == 0 {
+            bail!("limits.queued_ops_limit must be greater than zero");
+        }
+        sync = sync.with_queued_ops_limit(queued_ops_limit);
+    }
+    if let Some(max_message_size) = &limits.max_message_size {
+        sync = sync.with_max_message_size(parse_byte_size(max_message_size)?);
+    }
+    if let Some(socket_timeout_secs) = limits.socket_timeout_secs {
+        if socket_timeout_secs == 0 {
+            bail!("limits.socket_timeout_secs must be greater than zero");
+        }
+        sync = sync.with_socket_timeout(Duration::from_secs(socket_timeout_secs));
+    }
+
+    Ok(sync)
+}
+
+fn parse_byte_size(input: &str) -> Result<usize> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("expected byte size like 16MiB");
+    }
+
+    let compact = input.replace(' ', "");
+    let (number, multiplier) = if let Some(n) = compact.strip_suffix("MiB") {
+        (n, 1024usize * 1024)
+    } else if let Some(n) = compact.strip_suffix("KiB") {
+        (n, 1024usize)
+    } else if let Some(n) = compact.strip_suffix('B') {
+        (n, 1usize)
+    } else {
+        (compact.as_str(), 1usize)
+    };
+
+    let amount = number
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("expected byte size like 16MiB"))?;
+    if amount == 0 {
+        bail!("byte size must be greater than zero");
+    }
+
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("byte size is too large"))
 }
 
 /// Validate that the TLS-related CLI flags form a coherent combination.
@@ -376,6 +466,83 @@ mod tests {
         #[test]
         fn rejects_zero_duration() {
             assert!(parse_duration("0s").is_err());
+        }
+    }
+
+    mod byte_size_parser {
+        use super::*;
+
+        #[test]
+        fn parses_mib() {
+            assert_eq!(parse_byte_size("16MiB").unwrap(), 16 * 1024 * 1024);
+        }
+
+        #[test]
+        fn parses_kib_with_space() {
+            assert_eq!(parse_byte_size("4 KiB").unwrap(), 4 * 1024);
+        }
+
+        #[test]
+        fn parses_plain_bytes() {
+            assert_eq!(parse_byte_size("128").unwrap(), 128);
+        }
+
+        #[test]
+        fn rejects_zero() {
+            assert!(parse_byte_size("0MiB").is_err());
+        }
+    }
+
+    mod file_config {
+        use super::*;
+
+        #[test]
+        fn parses_limits_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [limits]
+                max_peers = 64
+                queued_ops_limit = 10000
+                max_message_size = "16MiB"
+                socket_timeout_secs = 30
+                "#,
+            )
+            .unwrap();
+
+            let limits = cfg.limits.unwrap();
+            assert_eq!(limits.max_peers, Some(64));
+            assert_eq!(limits.queued_ops_limit, Some(10_000));
+            assert_eq!(limits.max_message_size.as_deref(), Some("16MiB"));
+            assert_eq!(limits.socket_timeout_secs, Some(30));
+        }
+
+        #[test]
+        fn applies_limits_to_sync_config() {
+            let limits = LimitsFileConfig {
+                max_peers: Some(8),
+                queued_ops_limit: Some(256),
+                max_message_size: Some("2MiB".into()),
+                socket_timeout_secs: Some(5),
+            };
+
+            let cfg = apply_limit_config(SyncConfig::new(), Some(&limits)).unwrap();
+
+            assert_eq!(cfg.max_peers, 8);
+            assert_eq!(cfg.queued_ops_limit, 256);
+            assert_eq!(cfg.max_message_size, 2 * 1024 * 1024);
+            assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn rejects_empty_queue_limit() {
+            let limits = LimitsFileConfig {
+                max_peers: None,
+                queued_ops_limit: Some(0),
+                max_message_size: None,
+                socket_timeout_secs: None,
+            };
+
+            assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());
         }
     }
 
@@ -686,6 +853,17 @@ mod tests {
             match cli {
                 Cli::Run { datastore_path, .. } => {
                     assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
+                }
+            }
+        }
+
+        #[test]
+        fn config_path_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--config", "numax.toml"]).unwrap();
+            match cli {
+                Cli::Run { config, .. } => {
+                    assert_eq!(config, Some(PathBuf::from("numax.toml")));
                 }
             }
         }

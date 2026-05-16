@@ -241,16 +241,16 @@ kill -TERM $PID  # Completes operations, exits with code 0
 
 - [x] Peer connection limit (default: 64)
 - [x] Queued ops limit (default: 10000)
-- [ ] Message size limit (default: 16 MiB)
-- [ ] Graceful rejection when overloaded
-- [ ] Socket read/write timeouts (default: 30s)
-- [ ] Test: 1000 simultaneous connections → no crash
+- [x] Message size limit (default: 16 MiB)
+- [x] Graceful rejection when overloaded
+- [x] Socket read/write timeouts (default: 30s)
+- [x] Test: 1000 simultaneous connections → no crash
 
 **Configuration**:
 ```toml
 [limits]
 max_peers = 64
-max_pending_ops = 10000
+queued_ops_limit = 10000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
 ```
