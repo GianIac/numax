@@ -120,6 +120,8 @@ numax is in alpha. It's the moment where feedback matters most.
 There's no community to pretend already exists. There's a project, an idea, and a door that's open.
 If you walk through it now, you're early. That's the best moment to leave a mark.
 
+ps: If you'd like to help, take a look at [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 - GianIac
 
 ---
