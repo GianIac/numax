@@ -19,6 +19,9 @@ pub const DEFAULT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500)
 /// Default maximum delay between reconnect attempts for a configured peer.
 pub const DEFAULT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
+/// Default number of consecutive failures after which a configured peer is considered dead.
+pub const DEFAULT_PEER_DEAD_AFTER_FAILURES: u32 = 3;
+
 /// Sync configuration for the runtime.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -48,6 +51,9 @@ pub struct SyncConfig {
 
     /// Maximum delay for automatic reconnect attempts.
     pub reconnect_max_delay: Duration,
+
+    /// Consecutive failures after which a configured peer is considered dead.
+    pub peer_dead_after_failures: u32,
 }
 
 impl Default for SyncConfig {
@@ -62,6 +68,7 @@ impl Default for SyncConfig {
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
             reconnect_initial_delay: DEFAULT_RECONNECT_INITIAL_DELAY,
             reconnect_max_delay: DEFAULT_RECONNECT_MAX_DELAY,
+            peer_dead_after_failures: DEFAULT_PEER_DEAD_AFTER_FAILURES,
         }
     }
 }
@@ -112,6 +119,11 @@ impl SyncConfig {
         self
     }
 
+    pub fn with_peer_dead_after_failures(mut self, failures: u32) -> Self {
+        self.peer_dead_after_failures = failures;
+        self
+    }
+
     /// Sync is enabled iff we have a bound listen address.
     pub fn is_enabled(&self) -> bool {
         self.listen_addr.is_some()
@@ -132,6 +144,10 @@ mod tests {
         assert_eq!(cfg.socket_timeout, DEFAULT_SOCKET_TIMEOUT);
         assert_eq!(cfg.reconnect_initial_delay, DEFAULT_RECONNECT_INITIAL_DELAY);
         assert_eq!(cfg.reconnect_max_delay, DEFAULT_RECONNECT_MAX_DELAY);
+        assert_eq!(
+            cfg.peer_dead_after_failures,
+            DEFAULT_PEER_DEAD_AFTER_FAILURES
+        );
 
         let cfg = SyncConfig::new().with_listen_addr("0.0.0.0:9000");
         assert!(cfg.is_enabled());
@@ -157,7 +173,8 @@ mod tests {
             .with_queued_ops_limit(256)
             .with_max_message_size(1024)
             .with_socket_timeout(Duration::from_secs(5))
-            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2));
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2))
+            .with_peer_dead_after_failures(5);
 
         assert_eq!(cfg.max_peers, 8);
         assert_eq!(cfg.queued_ops_limit, 256);
@@ -165,5 +182,6 @@ mod tests {
         assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
         assert_eq!(cfg.reconnect_initial_delay, Duration::from_millis(10));
         assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(2));
+        assert_eq!(cfg.peer_dead_after_failures, 5);
     }
 }

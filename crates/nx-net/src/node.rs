@@ -117,12 +117,14 @@ pub enum NodeEvent {
     /// Peer connected.
     PeerConnected {
         node_id: NodeId,
+        addr: String,
         peers_connected: usize,
     },
 
     /// Peer disconnected.
     PeerDisconnected {
         node_id: NodeId,
+        addr: String,
         peers_connected: usize,
     },
 }
@@ -370,6 +372,7 @@ impl Node {
             .event_tx
             .send(NodeEvent::PeerConnected {
                 node_id: peer_node_id.clone(),
+                addr: addr.to_string(),
                 peers_connected,
             })
             .await;
@@ -400,15 +403,21 @@ impl Node {
             let disconnected = {
                 let mut peers = peers.write().await;
                 peers.remove(&addr_owned).and_then(|removed| {
-                    (removed.state == PeerState::Connected)
-                        .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
+                    (removed.state == PeerState::Connected).then(|| {
+                        (
+                            peer_node_id.clone(),
+                            addr_owned.clone(),
+                            connected_peer_count(&peers),
+                        )
+                    })
                 })
             };
 
-            if let Some((node_id, peers_connected)) = disconnected {
+            if let Some((node_id, addr, peers_connected)) = disconnected {
                 let _ = event_tx
                     .send(NodeEvent::PeerDisconnected {
                         node_id,
+                        addr,
                         peers_connected,
                     })
                     .await;
@@ -451,6 +460,7 @@ impl Node {
                         .event_tx
                         .send(NodeEvent::PeerDisconnected {
                             node_id,
+                            addr: addr.clone(),
                             peers_connected,
                         })
                         .await;
@@ -627,6 +637,7 @@ async fn handle_incoming(
     let _ = event_tx
         .send(NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
+            addr: addr.clone(),
             peers_connected,
         })
         .await;
@@ -647,14 +658,20 @@ async fn handle_incoming(
         let Some(removed) = peers.remove(&addr) else {
             return read_result;
         };
-        (removed.state == PeerState::Connected)
-            .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
+        (removed.state == PeerState::Connected).then(|| {
+            (
+                peer_node_id.clone(),
+                addr.clone(),
+                connected_peer_count(&peers),
+            )
+        })
     };
 
-    if let Some((node_id, peers_connected)) = disconnected {
+    if let Some((node_id, addr, peers_connected)) = disconnected {
         let _ = event_tx
             .send(NodeEvent::PeerDisconnected {
                 node_id,
+                addr,
                 peers_connected,
             })
             .await;

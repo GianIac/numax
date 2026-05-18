@@ -328,7 +328,7 @@ HTTP endpoint over Tokio.
 **Goal**: Robust operation with an unstable network
 
 - [x] Automatic reconnect with exponential backoff
-- [ ] Peer health tracking (mark dead after N timeouts)
+- [x] Peer health tracking (mark dead after N timeouts)
 - [ ] Peer rotation (replace dead peers)
 - [ ] Periodic anti-entropy (pull every N seconds)
 - [ ] Op deduplication (bloom filter or set of OpIds)

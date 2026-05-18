@@ -16,6 +16,40 @@ use crate::sync_config::SyncConfig;
 const BROADCAST_BATCH_MAX: usize = 64;
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 
+/// Health state for a configured peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerHealthState {
+    Healthy,
+    Suspect,
+    Dead,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerHealth {
+    state: PeerHealthState,
+    consecutive_failures: u32,
+}
+
+impl Default for PeerHealth {
+    fn default() -> Self {
+        Self {
+            state: PeerHealthState::Suspect,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+struct ReconnectLoopContext {
+    node: Arc<Node>,
+    peers: Vec<String>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    peer_dead_after_failures: u32,
+    shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<RuntimeMetrics>,
+    peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+}
+
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
@@ -76,6 +110,9 @@ pub struct SyncManager {
     /// OpId
     seen_ops: Arc<RwLock<HashSet<String>>>,
 
+    /// Health state for configured peers, keyed by configured address.
+    peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+
     /// Channel to send Ops to broadcast.
     op_tx: mpsc::Sender<Op>,
 
@@ -106,6 +143,11 @@ impl SyncManager {
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
+        let peer_health = config
+            .peers
+            .iter()
+            .map(|peer| (peer.clone(), PeerHealth::default()))
+            .collect::<HashMap<_, _>>();
 
         if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
             warn!(error = %e, "failed to hydrate GCounter registry");
@@ -120,6 +162,7 @@ impl SyncManager {
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
+            peer_health: Arc::new(RwLock::new(peer_health)),
             op_tx,
             op_rx: Some(op_rx),
             shutdown_tx,
@@ -182,10 +225,18 @@ impl SyncManager {
         node.start_listener().await?;
 
         // Connect to initial peers.
+        let peer_dead_after_failures =
+            normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
         for peer_addr in &self.config.peers {
-            if let Err(e) = node.connect_to_peer(peer_addr).await {
-                self.metrics.record_sync_error();
-                warn!(peer = %peer_addr, error = %e, "failed to connect to peer");
+            match node.connect_to_peer(peer_addr).await {
+                Ok(()) => {
+                    mark_peer_success(&self.peer_health, peer_addr).await;
+                }
+                Err(e) => {
+                    self.metrics.record_sync_error();
+                    mark_peer_failure(&self.peer_health, peer_addr, peer_dead_after_failures).await;
+                    warn!(peer = %peer_addr, error = %e, "failed to connect to peer");
+                }
             }
         }
 
@@ -198,6 +249,9 @@ impl SyncManager {
         let seen_ops = Arc::clone(&self.seen_ops);
         let store = Arc::clone(&self.store);
         let metrics = Arc::clone(&self.metrics);
+        let peer_health = Arc::clone(&self.peer_health);
+        let peer_dead_after_failures =
+            normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.event_task = Some(tokio::spawn(async move {
             loop {
@@ -205,7 +259,15 @@ impl SyncManager {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             debug!("event loop shutdown requested");
-                            drain_node_events(&mut event_rx, &counters, &seen_ops, &store, &metrics).await;
+                            drain_node_events(
+                                &mut event_rx,
+                                &counters,
+                                &seen_ops,
+                                &store,
+                                &metrics,
+                                &peer_health,
+                                peer_dead_after_failures,
+                            ).await;
                             break;
                         }
                     }
@@ -213,7 +275,15 @@ impl SyncManager {
                         let Some(event) = event else {
                             break;
                         };
-                        handle_node_event(event, &counters, &seen_ops, &store, &metrics).await;
+                        handle_node_event(
+                            event,
+                            &counters,
+                            &seen_ops,
+                            &store,
+                            &metrics,
+                            &peer_health,
+                            peer_dead_after_failures,
+                        ).await;
                     }
                 }
             }
@@ -232,14 +302,16 @@ impl SyncManager {
             Arc::clone(&self.metrics),
         ));
 
-        self.reconnect_task = spawn_reconnect_loop(
-            Arc::clone(&node),
-            self.config.peers.clone(),
-            self.config.reconnect_initial_delay,
-            self.config.reconnect_max_delay,
-            self.shutdown_tx.subscribe(),
-            Arc::clone(&self.metrics),
-        );
+        self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
+            node: Arc::clone(&node),
+            peers: self.config.peers.clone(),
+            initial_delay: self.config.reconnect_initial_delay,
+            max_delay: self.config.reconnect_max_delay,
+            peer_dead_after_failures: self.config.peer_dead_after_failures,
+            shutdown_rx: self.shutdown_tx.subscribe(),
+            metrics: Arc::clone(&self.metrics),
+            peer_health: Arc::clone(&self.peer_health),
+        });
 
         Ok(())
     }
@@ -260,13 +332,28 @@ impl SyncManager {
         };
         for peer_addr in &self.config.peers {
             if node.is_connected_addr(peer_addr).await {
+                mark_peer_success(&self.peer_health, peer_addr).await;
                 continue;
             }
-            if let Err(e) = node.connect_to_peer(peer_addr).await {
-                self.metrics.record_sync_error();
-                debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
+            let peer_dead_after_failures =
+                normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
+            match node.connect_to_peer(peer_addr).await {
+                Ok(()) => {
+                    mark_peer_success(&self.peer_health, peer_addr).await;
+                }
+                Err(e) => {
+                    self.metrics.record_sync_error();
+                    mark_peer_failure(&self.peer_health, peer_addr, peer_dead_after_failures).await;
+                    debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
+                }
             }
         }
+    }
+
+    /// Returns the current health state of a configured peer.
+    pub async fn peer_health_state(&self, addr: &str) -> Option<PeerHealthState> {
+        let peer_health = self.peer_health.read().await;
+        peer_health.get(addr).map(|health| health.state)
     }
 
     /// Returns the number of connected peers, or zero before networking starts.
@@ -344,14 +431,18 @@ fn spawn_broadcast_loop(
     })
 }
 
-fn spawn_reconnect_loop(
-    node: Arc<Node>,
-    peers: Vec<String>,
-    initial_delay: Duration,
-    max_delay: Duration,
-    mut shutdown_rx: watch::Receiver<bool>,
-    metrics: Arc<RuntimeMetrics>,
-) -> Option<JoinHandle<()>> {
+fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
+    let ReconnectLoopContext {
+        node,
+        peers,
+        initial_delay,
+        max_delay,
+        peer_dead_after_failures,
+        mut shutdown_rx,
+        metrics,
+        peer_health,
+    } = context;
+
     if peers.is_empty() {
         return None;
     }
@@ -359,6 +450,7 @@ fn spawn_reconnect_loop(
     Some(tokio::spawn(async move {
         let initial_delay = normalize_reconnect_delay(initial_delay);
         let max_delay = max_delay.max(initial_delay);
+        let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
         let mut state = peers
             .into_iter()
             .map(|peer| (peer, initial_delay))
@@ -369,6 +461,7 @@ fn spawn_reconnect_loop(
 
             for (peer, delay) in state.iter_mut() {
                 if node.is_connected_addr(peer).await {
+                    mark_peer_success(&peer_health, peer).await;
                     *delay = initial_delay;
                     continue;
                 }
@@ -377,10 +470,12 @@ fn spawn_reconnect_loop(
                 match node.connect_to_peer(peer).await {
                     Ok(()) => {
                         info!(peer = %peer, "reconnected configured peer");
+                        mark_peer_success(&peer_health, peer).await;
                         *delay = initial_delay;
                     }
                     Err(e) => {
                         metrics.record_sync_error();
+                        mark_peer_failure(&peer_health, peer, peer_dead_after_failures).await;
                         debug!(peer = %peer, error = %e, delay = ?attempt_delay, "configured peer reconnect failed");
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
@@ -411,6 +506,66 @@ fn normalize_reconnect_delay(delay: Duration) -> Duration {
 
 fn next_reconnect_delay(current: Duration, max_delay: Duration) -> Duration {
     current.saturating_mul(2).min(max_delay.max(current))
+}
+
+fn normalize_peer_dead_after_failures(failures: u32) -> u32 {
+    failures.max(1)
+}
+
+fn record_peer_success(peer_health: &mut HashMap<String, PeerHealth>, peer: &str) {
+    let health = peer_health.entry(peer.to_string()).or_default();
+    health.state = PeerHealthState::Healthy;
+    health.consecutive_failures = 0;
+}
+
+fn record_peer_failure(
+    peer_health: &mut HashMap<String, PeerHealth>,
+    peer: &str,
+    dead_after_failures: u32,
+) {
+    let dead_after_failures = normalize_peer_dead_after_failures(dead_after_failures);
+    let health = peer_health.entry(peer.to_string()).or_default();
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.state = if health.consecutive_failures >= dead_after_failures {
+        PeerHealthState::Dead
+    } else {
+        PeerHealthState::Suspect
+    };
+}
+
+async fn mark_peer_success(peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>, peer: &str) {
+    let mut peer_health = peer_health.write().await;
+    record_peer_success(&mut peer_health, peer);
+}
+
+async fn mark_peer_failure(
+    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer: &str,
+    dead_after_failures: u32,
+) {
+    let mut peer_health = peer_health.write().await;
+    record_peer_failure(&mut peer_health, peer, dead_after_failures);
+}
+
+async fn mark_known_peer_success(
+    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer: &str,
+) {
+    let mut peer_health = peer_health.write().await;
+    if peer_health.contains_key(peer) {
+        record_peer_success(&mut peer_health, peer);
+    }
+}
+
+async fn mark_known_peer_failure(
+    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer: &str,
+    dead_after_failures: u32,
+) {
+    let mut peer_health = peer_health.write().await;
+    if peer_health.contains_key(peer) {
+        record_peer_failure(&mut peer_health, peer, dead_after_failures);
+    }
 }
 
 async fn broadcast_batch(
@@ -458,9 +613,20 @@ async fn drain_node_events(
     seen_ops: &Arc<RwLock<HashSet<String>>>,
     store: &Arc<NxStore>,
     metrics: &Arc<RuntimeMetrics>,
+    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer_dead_after_failures: u32,
 ) {
     while let Ok(event) = event_rx.try_recv() {
-        handle_node_event(event, counters, seen_ops, store, metrics).await;
+        handle_node_event(
+            event,
+            counters,
+            seen_ops,
+            store,
+            metrics,
+            peer_health,
+            peer_dead_after_failures,
+        )
+        .await;
     }
 }
 
@@ -470,6 +636,8 @@ async fn handle_node_event(
     seen_ops: &Arc<RwLock<HashSet<String>>>,
     store: &Arc<NxStore>,
     metrics: &Arc<RuntimeMetrics>,
+    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer_dead_after_failures: u32,
 ) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
@@ -483,19 +651,23 @@ async fn handle_node_event(
         }
         NodeEvent::PeerConnected {
             node_id,
+            addr,
             peers_connected,
         } => {
+            mark_known_peer_success(peer_health, &addr).await;
             metrics.record_peer_connect();
             metrics.set_peers_connected(peers_connected);
-            info!(peer = %node_id, "peer connected");
+            info!(peer = %node_id, addr = %addr, "peer connected");
         }
         NodeEvent::PeerDisconnected {
             node_id,
+            addr,
             peers_connected,
         } => {
+            mark_known_peer_failure(peer_health, &addr, peer_dead_after_failures).await;
             metrics.record_peer_disconnect();
             metrics.set_peers_connected(peers_connected);
-            info!(peer = %node_id, "peer disconnected");
+            info!(peer = %node_id, addr = %addr, "peer disconnected");
         }
     }
 }
@@ -672,6 +844,20 @@ mod tests {
         }
     }
 
+    async fn wait_for_peer_health(manager: &SyncManager, peer: &str, expected: PeerHealthState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.peer_health_state(peer).await == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peer {peer} did not reach health state {expected:?}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
         {
             let counters_arc = handle.counters();
@@ -733,6 +919,119 @@ mod tests {
             normalize_reconnect_delay(Duration::ZERO),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn peer_health_marks_suspect_then_dead_after_failures() {
+        let mut peer_health = HashMap::new();
+
+        record_peer_failure(&mut peer_health, "peer-a", 2);
+        let health = peer_health.get("peer-a").unwrap();
+        assert_eq!(health.state, PeerHealthState::Suspect);
+        assert_eq!(health.consecutive_failures, 1);
+
+        record_peer_failure(&mut peer_health, "peer-a", 2);
+        let health = peer_health.get("peer-a").unwrap();
+        assert_eq!(health.state, PeerHealthState::Dead);
+        assert_eq!(health.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn peer_health_resets_after_success() {
+        let mut peer_health = HashMap::new();
+
+        record_peer_failure(&mut peer_health, "peer-a", 1);
+        assert_eq!(
+            peer_health.get("peer-a").unwrap().state,
+            PeerHealthState::Dead
+        );
+
+        record_peer_success(&mut peer_health, "peer-a");
+        let health = peer_health.get("peer-a").unwrap();
+        assert_eq!(health.state, PeerHealthState::Healthy);
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn peer_dead_after_failures_is_never_zero() {
+        assert_eq!(normalize_peer_dead_after_failures(0), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_events_update_known_peer_health() {
+        let peer = "127.0.0.1:42000";
+        let peer_health = Arc::new(RwLock::new(HashMap::from([(
+            peer.to_string(),
+            PeerHealth::default(),
+        )])));
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let store = temp_store();
+        let metrics = metrics();
+        let node_id = NodeId::generate();
+
+        handle_node_event(
+            NodeEvent::PeerConnected {
+                node_id: node_id.clone(),
+                addr: peer.to_string(),
+                peers_connected: 1,
+            },
+            &counters,
+            &seen_ops,
+            &store,
+            &metrics,
+            &peer_health,
+            2,
+        )
+        .await;
+        assert_eq!(
+            peer_health.read().await.get(peer).unwrap().state,
+            PeerHealthState::Healthy
+        );
+
+        handle_node_event(
+            NodeEvent::PeerDisconnected {
+                node_id,
+                addr: peer.to_string(),
+                peers_connected: 0,
+            },
+            &counters,
+            &seen_ops,
+            &store,
+            &metrics,
+            &peer_health,
+            2,
+        )
+        .await;
+        let health = *peer_health.read().await.get(peer).unwrap();
+        assert_eq!(health.state, PeerHealthState::Suspect);
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn peer_events_ignore_unknown_peer_health() {
+        let peer_health = Arc::new(RwLock::new(HashMap::new()));
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let store = temp_store();
+        let metrics = metrics();
+
+        handle_node_event(
+            NodeEvent::PeerConnected {
+                node_id: NodeId::generate(),
+                addr: "127.0.0.1:42001".to_string(),
+                peers_connected: 1,
+            },
+            &counters,
+            &seen_ops,
+            &store,
+            &metrics,
+            &peer_health,
+            1,
+        )
+        .await;
+
+        assert!(peer_health.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -851,6 +1150,27 @@ mod tests {
 
         wait_for_counter(&manager_b, key, 1).await;
         assert_eq!(read_materialized(&store_b, key), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_health_marks_dead_then_healthy_when_peer_recovers() {
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a)
+            .with_peer(addr_b.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(20))
+            .with_peer_dead_after_failures(2);
+        let (manager_a, _handle_a, _store_a) = started_manager_with_config(config_a).await;
+
+        wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Dead).await;
+
+        let config_b = SyncConfig::new().with_listen_addr(addr_b.clone());
+        let (_manager_b, _handle_b, _store_b) = started_manager_with_config(config_b).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Healthy).await;
     }
 
     #[tokio::test]
