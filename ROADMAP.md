@@ -329,7 +329,7 @@ HTTP endpoint over Tokio.
 
 - [x] Automatic reconnect with exponential backoff
 - [x] Peer health tracking (mark dead after N timeouts)
-- [ ] Peer rotation (replace dead peers)
+- [x] Peer rotation (replace dead peers)
 - [ ] Periodic anti-entropy (pull every N seconds)
 - [ ] Op deduplication (bloom filter or set of OpIds)
 - [ ] Durable CRDT state or op log, so restart/reconnect can recover full

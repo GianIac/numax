@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nx_net::{Node, NodeConfig, NodeEvent};
+use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, NodeId, Op, OpKind};
 use tokio::sync::{RwLock, mpsc, watch};
@@ -42,12 +42,18 @@ impl Default for PeerHealth {
 struct ReconnectLoopContext {
     node: Arc<Node>,
     peers: Vec<String>,
+    max_peers: usize,
     initial_delay: Duration,
     max_delay: Duration,
     peer_dead_after_failures: u32,
     shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<RuntimeMetrics>,
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+}
+
+struct PeerReconnectState {
+    addr: String,
+    delay: Duration,
 }
 
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
@@ -228,9 +234,26 @@ impl SyncManager {
         let peer_dead_after_failures =
             normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
         for peer_addr in &self.config.peers {
+            if node.connected_peer_count().await >= self.config.max_peers {
+                debug!(
+                    peer = %peer_addr,
+                    limit = self.config.max_peers,
+                    "skipping initial peer connect: peer slot limit reached"
+                );
+                break;
+            }
+
             match node.connect_to_peer(peer_addr).await {
                 Ok(()) => {
                     mark_peer_success(&self.peer_health, peer_addr).await;
+                }
+                Err(NetError::PeerLimitReached(limit)) => {
+                    debug!(
+                        peer = %peer_addr,
+                        limit,
+                        "skipping initial peer connect: peer slot limit reached"
+                    );
+                    break;
                 }
                 Err(e) => {
                     self.metrics.record_sync_error();
@@ -305,6 +328,7 @@ impl SyncManager {
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
             node: Arc::clone(&node),
             peers: self.config.peers.clone(),
+            max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
             max_delay: self.config.reconnect_max_delay,
             peer_dead_after_failures: self.config.peer_dead_after_failures,
@@ -335,11 +359,27 @@ impl SyncManager {
                 mark_peer_success(&self.peer_health, peer_addr).await;
                 continue;
             }
+            if node.connected_peer_count().await >= self.config.max_peers {
+                debug!(
+                    peer = %peer_addr,
+                    limit = self.config.max_peers,
+                    "skipping configured peer reconnect: peer slot limit reached"
+                );
+                break;
+            }
             let peer_dead_after_failures =
                 normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
             match node.connect_to_peer(peer_addr).await {
                 Ok(()) => {
                     mark_peer_success(&self.peer_health, peer_addr).await;
+                }
+                Err(NetError::PeerLimitReached(limit)) => {
+                    debug!(
+                        peer = %peer_addr,
+                        limit,
+                        "skipping configured peer reconnect: peer slot limit reached"
+                    );
+                    break;
                 }
                 Err(e) => {
                     self.metrics.record_sync_error();
@@ -435,6 +475,7 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
     let ReconnectLoopContext {
         node,
         peers,
+        max_peers,
         initial_delay,
         max_delay,
         peer_dead_after_failures,
@@ -453,34 +494,56 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
         let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
         let mut state = peers
             .into_iter()
-            .map(|peer| (peer, initial_delay))
-            .collect::<HashMap<_, _>>();
+            .map(|addr| PeerReconnectState {
+                addr,
+                delay: initial_delay,
+            })
+            .collect::<Vec<_>>();
 
         loop {
             let mut sleep_for: Option<Duration> = None;
 
-            for (peer, delay) in state.iter_mut() {
-                if node.is_connected_addr(peer).await {
-                    mark_peer_success(&peer_health, peer).await;
-                    *delay = initial_delay;
+            for peer in state.iter_mut() {
+                let peer_addr = peer.addr.as_str();
+
+                if node.is_connected_addr(peer_addr).await {
+                    mark_peer_success(&peer_health, peer_addr).await;
+                    peer.delay = initial_delay;
                     continue;
                 }
 
-                let attempt_delay = *delay;
-                match node.connect_to_peer(peer).await {
+                if node.connected_peer_count().await >= max_peers {
+                    debug!(
+                        peer = %peer_addr,
+                        limit = max_peers,
+                        "skipping reconnect attempt: peer slot limit reached"
+                    );
+                    break;
+                }
+
+                let attempt_delay = peer.delay;
+                match node.connect_to_peer(peer_addr).await {
                     Ok(()) => {
-                        info!(peer = %peer, "reconnected configured peer");
-                        mark_peer_success(&peer_health, peer).await;
-                        *delay = initial_delay;
+                        info!(peer = %peer_addr, "reconnected configured peer");
+                        mark_peer_success(&peer_health, peer_addr).await;
+                        peer.delay = initial_delay;
+                    }
+                    Err(NetError::PeerLimitReached(limit)) => {
+                        debug!(
+                            peer = %peer_addr,
+                            limit,
+                            "skipping reconnect attempt: peer slot limit reached"
+                        );
+                        break;
                     }
                     Err(e) => {
                         metrics.record_sync_error();
-                        mark_peer_failure(&peer_health, peer, peer_dead_after_failures).await;
-                        debug!(peer = %peer, error = %e, delay = ?attempt_delay, "configured peer reconnect failed");
+                        mark_peer_failure(&peer_health, peer_addr, peer_dead_after_failures).await;
+                        debug!(peer = %peer_addr, error = %e, delay = ?attempt_delay, "configured peer reconnect failed");
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
                         );
-                        *delay = next_reconnect_delay(attempt_delay, max_delay);
+                        peer.delay = next_reconnect_delay(attempt_delay, max_delay);
                     }
                 }
             }
@@ -1171,6 +1234,39 @@ mod tests {
 
         wait_for_connected_peer(&manager_a).await;
         wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Healthy).await;
+    }
+
+    #[tokio::test]
+    async fn peer_rotation_replaces_dead_peer_with_available_configured_peer() {
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let addr_c = free_addr();
+
+        let (mut manager_b, _handle_b, _store_b) = started_manager(addr_b.clone()).await;
+        let (_manager_c, _handle_c, _store_c) = started_manager(addr_c.clone()).await;
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a)
+            .with_peer(addr_b.clone())
+            .with_peer(addr_c.clone())
+            .with_max_peers(1)
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(20))
+            .with_peer_dead_after_failures(1);
+        let (manager_a, _handle_a, _store_a) = started_manager_with_config(config_a).await;
+
+        wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Healthy).await;
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            manager_a.peer_health_state(&addr_c).await,
+            Some(PeerHealthState::Suspect),
+            "peer C should not be marked failed while peer slots are full"
+        );
+
+        manager_b.shutdown().await.unwrap();
+
+        wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Dead).await;
+        wait_for_peer_health(&manager_a, &addr_c, PeerHealthState::Healthy).await;
+        assert_eq!(manager_a.connected_peer_count().await, 1);
     }
 
     #[tokio::test]
