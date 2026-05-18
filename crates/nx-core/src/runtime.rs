@@ -18,6 +18,7 @@ use crate::sync_config::SyncConfig;
 use crate::sync_manager::{SyncHandle, SyncManager};
 
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const NODE_ID_STORE_KEY: &[u8] = b"__nx/runtime/node_id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownSignal {
@@ -113,7 +114,7 @@ impl Runtime {
 
         // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
         let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
-            let node_id = NodeId::generate();
+            let node_id = load_or_create_node_id(&store)?;
             let manager = SyncManager::new(
                 node_id,
                 sync_config.clone(),
@@ -339,6 +340,22 @@ impl Runtime {
     }
 }
 
+fn load_or_create_node_id(store: &NxStore) -> Result<NodeId> {
+    if let Some(bytes) = store.get(NODE_ID_STORE_KEY)? {
+        let id = String::from_utf8(bytes)
+            .map_err(|e| anyhow!("stored runtime node id is not valid UTF-8: {e}"))?;
+        if id.is_empty() {
+            return Err(anyhow!("stored runtime node id is empty"));
+        }
+        return Ok(NodeId::new(id));
+    }
+
+    let node_id = NodeId::generate();
+    store.set(NODE_ID_STORE_KEY, node_id.as_str().as_bytes())?;
+    store.flush()?;
+    Ok(node_id)
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> ShutdownSignal {
     use tokio::signal::unix::{SignalKind, signal};
@@ -520,5 +537,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(runtime.store.get(b"key").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn sync_runtime_reuses_persisted_node_id() {
+        let datastore_path = temp_datastore_path("numax-runtime-node-id-test");
+        let config = RuntimeConfig {
+            datastore_path: datastore_path.clone(),
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+
+        let first = Runtime::new(config).unwrap();
+        let first_node_id = first.sync_manager.as_ref().unwrap().node_id().clone();
+        drop(first);
+
+        let second = Runtime::new(RuntimeConfig {
+            datastore_path,
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            second.sync_manager.as_ref().unwrap().node_id(),
+            &first_node_id
+        );
     }
 }

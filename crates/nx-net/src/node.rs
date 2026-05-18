@@ -5,7 +5,8 @@ use std::time::Duration;
 use nx_sync::{NodeId, Op};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -119,6 +120,7 @@ struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
     writer: Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<crate::tls::NetStream>>>>,
+    _slot: OwnedSemaphorePermit,
 }
 
 /// node
@@ -128,6 +130,8 @@ pub struct Node {
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Option<mpsc::Receiver<NodeEvent>>,
     shutdown_tx: watch::Sender<bool>,
+    connection_slots: Arc<Semaphore>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Node {
@@ -135,6 +139,7 @@ impl Node {
     pub fn new(config: NodeConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let max_peers = config.max_peers;
 
         Self {
             config,
@@ -142,6 +147,8 @@ impl Node {
             event_tx,
             event_rx: Some(event_rx),
             shutdown_tx,
+            connection_slots: Arc::new(Semaphore::new(max_peers)),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -163,6 +170,8 @@ impl Node {
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
         let tls = self.config.tls.clone();
+        let connection_slots = Arc::clone(&self.connection_slots);
+        let tasks = Arc::clone(&self.tasks);
         let limits = NodeLimits {
             max_peers: self.config.max_peers,
             max_message_size: self.config.max_message_size,
@@ -170,7 +179,7 @@ impl Node {
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        let listener_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -183,13 +192,20 @@ impl Node {
                         match accepted {
                             Ok((stream, addr)) => {
                                 info!(%addr, "incoming connection");
+                                let slot = match Arc::clone(&connection_slots).try_acquire_owned() {
+                                    Ok(slot) => slot,
+                                    Err(_) => {
+                                        warn!(%addr, limit = limits.max_peers, "rejecting incoming connection: peer limit reached");
+                                        continue;
+                                    }
+                                };
                                 let peers = Arc::clone(&peers);
                                 let node_id = node_id.clone();
                                 let event_tx = event_tx.clone();
                                 let tls = tls.clone();
                                 let limits = limits;
 
-                                tokio::spawn(async move {
+                                let task = tokio::spawn(async move {
                                     if let Err(e) = handle_incoming(
                                         stream,
                                         addr.to_string(),
@@ -198,12 +214,14 @@ impl Node {
                                         peers,
                                         event_tx,
                                         limits,
+                                        slot,
                                     )
                                     .await
                                     {
                                         error!(%addr, error = %e, "connection error");
                                     }
                                 });
+                                tasks.lock().await.push(task);
                             }
                             Err(e) => {
                                 error!(error = %e, "accept error");
@@ -213,6 +231,7 @@ impl Node {
                 }
             }
         });
+        self.tasks.lock().await.push(listener_task);
 
         Ok(bound_addr)
     }
@@ -220,6 +239,9 @@ impl Node {
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
         self.ensure_peer_slot_available().await?;
+        let slot = Arc::clone(&self.connection_slots)
+            .try_acquire_owned()
+            .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
         let tcp = TcpStream::connect(addr)
             .await
@@ -320,6 +342,7 @@ impl Node {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     state: PeerState::Connected,
                     writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
+                    _slot: slot,
                 },
             );
             connected_peer_count(&peers)
@@ -341,7 +364,7 @@ impl Node {
         let max_message_size = self.config.max_message_size;
         let socket_timeout = self.config.socket_timeout;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(e) = read_loop(
                 reader,
                 peer_node_id.clone(),
@@ -372,6 +395,7 @@ impl Node {
                     .await;
             }
         });
+        self.tasks.lock().await.push(task);
 
         Ok(())
     }
@@ -446,9 +470,17 @@ impl Node {
     /// Close outbound peer connections by dropping their writers.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
-        let mut peers = self.peers.write().await;
-        let count = peers.len();
-        peers.clear();
+        let count = {
+            let mut peers = self.peers.write().await;
+            let count = peers.len();
+            peers.clear();
+            count
+        };
+        let mut tasks = self.tasks.lock().await;
+        for task in tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
         debug!(count, "node peer connections closed");
     }
 }
@@ -462,6 +494,7 @@ async fn handle_incoming(
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
     limits: NodeLimits,
+    slot: OwnedSemaphorePermit,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
@@ -535,6 +568,7 @@ async fn handle_incoming(
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 state: PeerState::Connected,
                 writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
+                _slot: slot,
             },
         );
         connected_peer_count(&peers)
@@ -705,6 +739,10 @@ async fn read_message<R: AsyncReadExt + Unpin>(
 mod tests {
     use super::*;
 
+    fn test_slot() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
+    }
+
     #[tokio::test]
     async fn test_node_config() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000")
@@ -733,6 +771,7 @@ mod tests {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 state: PeerState::Connected,
                 writer: None,
+                _slot: test_slot(),
             },
         );
 
@@ -750,6 +789,7 @@ mod tests {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 state: PeerState::Connected,
                 writer: None,
+                _slot: test_slot(),
             },
         );
 
@@ -767,6 +807,7 @@ mod tests {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     state: PeerState::Connected,
                     writer: None,
+                    _slot: test_slot(),
                 },
             );
             peers.insert(
@@ -775,6 +816,7 @@ mod tests {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     state: PeerState::Connected,
                     writer: None,
+                    _slot: test_slot(),
                 },
             );
         }
@@ -823,6 +865,31 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NetError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn incoming_idle_handshake_consumes_peer_slot() {
+        let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+            .with_max_peers(1)
+            .with_socket_timeout(Duration::from_secs(5));
+        let node = Node::new(config);
+        let addr = node.start_listener().await.unwrap();
+
+        let first = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.connected_peer_count().await, 0);
+
+        let second = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.connected_peer_count().await, 0);
+
+        drop(second);
+        drop(first);
+        node.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

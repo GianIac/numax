@@ -249,11 +249,6 @@ impl SyncManager {
         }
     }
 
-    /// Broadcast of pending operations, this method can be used for forced flush
-    pub async fn broadcast_pending(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     /// Returns the current value of a GCounter.
     pub async fn get_counter_value(&self, key: &str) -> u64 {
         let counters = self.counters.read().await;
