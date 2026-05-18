@@ -13,6 +13,12 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = nx_net::DEFAULT_MAX_MESSAGE_SIZE;
 /// Default timeout for socket reads and writes.
 pub const DEFAULT_SOCKET_TIMEOUT: Duration = nx_net::DEFAULT_SOCKET_TIMEOUT;
 
+/// Default first delay before retrying a failed configured peer connection.
+pub const DEFAULT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+
+/// Default maximum delay between reconnect attempts for a configured peer.
+pub const DEFAULT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+
 /// Sync configuration for the runtime.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -36,6 +42,12 @@ pub struct SyncConfig {
 
     /// Timeout for socket reads and writes.
     pub socket_timeout: Duration,
+
+    /// Initial delay for automatic reconnect attempts.
+    pub reconnect_initial_delay: Duration,
+
+    /// Maximum delay for automatic reconnect attempts.
+    pub reconnect_max_delay: Duration,
 }
 
 impl Default for SyncConfig {
@@ -48,6 +60,8 @@ impl Default for SyncConfig {
             queued_ops_limit: DEFAULT_QUEUED_OPS_LIMIT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
+            reconnect_initial_delay: DEFAULT_RECONNECT_INITIAL_DELAY,
+            reconnect_max_delay: DEFAULT_RECONNECT_MAX_DELAY,
         }
     }
 }
@@ -92,6 +106,12 @@ impl SyncConfig {
         self
     }
 
+    pub fn with_reconnect_backoff(mut self, initial_delay: Duration, max_delay: Duration) -> Self {
+        self.reconnect_initial_delay = initial_delay;
+        self.reconnect_max_delay = max_delay;
+        self
+    }
+
     /// Sync is enabled iff we have a bound listen address.
     pub fn is_enabled(&self) -> bool {
         self.listen_addr.is_some()
@@ -110,6 +130,8 @@ mod tests {
         assert_eq!(cfg.queued_ops_limit, DEFAULT_QUEUED_OPS_LIMIT);
         assert_eq!(cfg.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(cfg.socket_timeout, DEFAULT_SOCKET_TIMEOUT);
+        assert_eq!(cfg.reconnect_initial_delay, DEFAULT_RECONNECT_INITIAL_DELAY);
+        assert_eq!(cfg.reconnect_max_delay, DEFAULT_RECONNECT_MAX_DELAY);
 
         let cfg = SyncConfig::new().with_listen_addr("0.0.0.0:9000");
         assert!(cfg.is_enabled());
@@ -134,11 +156,14 @@ mod tests {
             .with_max_peers(8)
             .with_queued_ops_limit(256)
             .with_max_message_size(1024)
-            .with_socket_timeout(Duration::from_secs(5));
+            .with_socket_timeout(Duration::from_secs(5))
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2));
 
         assert_eq!(cfg.max_peers, 8);
         assert_eq!(cfg.queued_ops_limit, 256);
         assert_eq!(cfg.max_message_size, 1024);
         assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.reconnect_initial_delay, Duration::from_millis(10));
+        assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(2));
     }
 }

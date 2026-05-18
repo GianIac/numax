@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nx_net::{Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
@@ -89,6 +90,9 @@ pub struct SyncManager {
 
     /// Outbound broadcast drain task.
     broadcast_task: Option<JoinHandle<()>>,
+
+    /// Configured peer reconnect task.
+    reconnect_task: Option<JoinHandle<()>>,
 }
 
 impl SyncManager {
@@ -121,6 +125,7 @@ impl SyncManager {
             shutdown_tx,
             event_task: None,
             broadcast_task: None,
+            reconnect_task: None,
         }
     }
 
@@ -227,6 +232,15 @@ impl SyncManager {
             Arc::clone(&self.metrics),
         ));
 
+        self.reconnect_task = spawn_reconnect_loop(
+            Arc::clone(&node),
+            self.config.peers.clone(),
+            self.config.reconnect_initial_delay,
+            self.config.reconnect_max_delay,
+            self.shutdown_tx.subscribe(),
+            Arc::clone(&self.metrics),
+        );
+
         Ok(())
     }
 
@@ -241,12 +255,26 @@ impl SyncManager {
 
     /// Retry connecting to the peers configured at startup.
     pub async fn reconnect_configured_peers(&self) {
+        let Some(node) = self.node.as_ref() else {
+            return;
+        };
         for peer_addr in &self.config.peers {
-            if let Err(e) = self.connect_to_peer(peer_addr).await {
+            if node.is_connected_addr(peer_addr).await {
+                continue;
+            }
+            if let Err(e) = node.connect_to_peer(peer_addr).await {
                 self.metrics.record_sync_error();
                 debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
             }
         }
+    }
+
+    /// Returns the number of connected peers, or zero before networking starts.
+    pub async fn connected_peer_count(&self) -> usize {
+        let Some(node) = self.node.as_ref() else {
+            return 0;
+        };
+        node.connected_peer_count().await
     }
 
     /// Returns the current value of a GCounter.
@@ -263,6 +291,12 @@ impl SyncManager {
             && let Err(e) = task.await
         {
             warn!(error = %e, "broadcast task failed during shutdown");
+        }
+
+        if let Some(task) = self.reconnect_task.take()
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, "reconnect task failed during shutdown");
         }
 
         if let Some(node) = self.node.as_ref() {
@@ -308,6 +342,75 @@ fn spawn_broadcast_loop(
         }
         debug!("broadcast loop terminated");
     })
+}
+
+fn spawn_reconnect_loop(
+    node: Arc<Node>,
+    peers: Vec<String>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<RuntimeMetrics>,
+) -> Option<JoinHandle<()>> {
+    if peers.is_empty() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let initial_delay = normalize_reconnect_delay(initial_delay);
+        let max_delay = max_delay.max(initial_delay);
+        let mut state = peers
+            .into_iter()
+            .map(|peer| (peer, initial_delay))
+            .collect::<HashMap<_, _>>();
+
+        loop {
+            let mut sleep_for: Option<Duration> = None;
+
+            for (peer, delay) in state.iter_mut() {
+                if node.is_connected_addr(peer).await {
+                    *delay = initial_delay;
+                    continue;
+                }
+
+                let attempt_delay = *delay;
+                match node.connect_to_peer(peer).await {
+                    Ok(()) => {
+                        info!(peer = %peer, "reconnected configured peer");
+                        *delay = initial_delay;
+                    }
+                    Err(e) => {
+                        metrics.record_sync_error();
+                        debug!(peer = %peer, error = %e, delay = ?attempt_delay, "configured peer reconnect failed");
+                        sleep_for = Some(
+                            sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
+                        );
+                        *delay = next_reconnect_delay(attempt_delay, max_delay);
+                    }
+                }
+            }
+            let sleep_for = sleep_for.unwrap_or(initial_delay);
+
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!("reconnect loop shutdown requested");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+        }
+        debug!("reconnect loop terminated");
+    }))
+}
+
+fn normalize_reconnect_delay(delay: Duration) -> Duration {
+    delay.max(Duration::from_millis(1))
+}
+
+fn next_reconnect_delay(current: Duration, max_delay: Duration) -> Duration {
+    current.saturating_mul(2).min(max_delay.max(current))
 }
 
 async fn broadcast_batch(
@@ -558,6 +661,17 @@ mod tests {
         }
     }
 
+    async fn wait_for_connected_peer(manager: &SyncManager) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.connected_peer_count().await > 0 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "manager did not connect to peer");
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
         {
             let counters_arc = handle.counters();
@@ -582,6 +696,43 @@ mod tests {
         let handle = manager.handle();
         manager.start().await.unwrap();
         (manager, handle, store)
+    }
+
+    async fn started_manager_with_config(
+        config: SyncConfig,
+    ) -> (SyncManager, SyncHandle, Arc<NxStore>) {
+        let store = temp_store();
+        let mut manager =
+            SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
+        let handle = manager.handle();
+        manager.start().await.unwrap();
+        (manager, handle, store)
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_max() {
+        let max = Duration::from_secs(5);
+
+        assert_eq!(
+            next_reconnect_delay(Duration::from_millis(500), max),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(4), max),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(5), max),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_is_never_zero() {
+        assert_eq!(
+            normalize_reconnect_delay(Duration::ZERO),
+            Duration::from_millis(1)
+        );
     }
 
     #[tokio::test]
@@ -678,6 +829,28 @@ mod tests {
         wait_for_counter(&manager_b, key, 2).await;
         assert_eq!(read_materialized(&store_a, key), 2);
         assert_eq!(read_materialized(&store_b, key), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_loop_connects_configured_peer_that_starts_later() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a)
+            .with_peer(addr_b.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50));
+        let (manager_a, handle_a, _store_a) = started_manager_with_config(config_a).await;
+
+        let config_b = SyncConfig::new().with_listen_addr(addr_b);
+        let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        local_increment(&handle_a, key, 1).await;
+
+        wait_for_counter(&manager_b, key, 1).await;
+        assert_eq!(read_materialized(&store_b, key), 1);
     }
 
     #[tokio::test]

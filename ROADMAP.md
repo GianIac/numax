@@ -327,7 +327,7 @@ HTTP endpoint over Tokio.
 ### Phase 10: Network Resilience 🌐
 **Goal**: Robust operation with an unstable network
 
-- [ ] Automatic reconnect with exponential backoff
+- [x] Automatic reconnect with exponential backoff
 - [ ] Peer health tracking (mark dead after N timeouts)
 - [ ] Peer rotation (replace dead peers)
 - [ ] Periodic anti-entropy (pull every N seconds)

@@ -470,6 +470,14 @@ impl Node {
         connected_peer_count(&peers)
     }
 
+    /// Returns true when the configured peer address currently has an active connection.
+    pub async fn is_connected_addr(&self, addr: &str) -> bool {
+        let peers = self.peers.read().await;
+        peers
+            .get(addr)
+            .is_some_and(|conn| conn.state == PeerState::Connected)
+    }
+
     async fn ensure_peer_slot_available(&self) -> NetResult<()> {
         let peers = self.peers.read().await;
         ensure_peer_slot_available(&peers, self.config.max_peers, None)
@@ -877,6 +885,36 @@ mod tests {
 
         assert_eq!(node_id, NodeId::new("peer-a"));
         assert_eq!(connected, 1);
+    }
+
+    #[tokio::test]
+    async fn is_connected_addr_tracks_connected_state() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000"));
+        {
+            let mut peers = node.peers.write().await;
+            peers.insert(
+                "127.0.0.1:9001".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
+                    state: PeerState::Connected,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+            peers.insert(
+                "127.0.0.1:9002".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
+                    state: PeerState::Failed,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+        }
+
+        assert!(node.is_connected_addr("127.0.0.1:9001").await);
+        assert!(!node.is_connected_addr("127.0.0.1:9002").await);
+        assert!(!node.is_connected_addr("127.0.0.1:9003").await);
     }
 
     #[test]
