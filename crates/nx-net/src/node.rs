@@ -259,8 +259,9 @@ impl Node {
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
-        let tcp = TcpStream::connect(addr)
+        let tcp = timeout(self.config.socket_timeout, TcpStream::connect(addr))
             .await
+            .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
 
         let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
@@ -955,6 +956,26 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NetError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn connect_to_peer_times_out_during_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _addr) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_millis(10)),
+        );
+
+        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+
+        assert!(matches!(err, NetError::Timeout));
+        accept_task.await.unwrap();
     }
 
     #[tokio::test]
