@@ -1,6 +1,6 @@
 @echo off
 
-echo Building guest_c WASM module
+echo Building guest_cpp WASM module
 
 clang++ ^
   --target=wasm32-wasip1 ^
