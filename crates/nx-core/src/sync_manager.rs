@@ -566,7 +566,7 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
 
                 if node.is_connected_addr(peer_addr).await {
                     mark_peer_success(&peer_health, peer_addr).await;
-                    peer.reset(initial_delay, now);
+                    peer.reset(initial_delay, StdInstant::now());
                     continue;
                 }
 
@@ -580,16 +580,16 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
                 match try_connect_configured_peer(&connect_context, peer_addr).await {
                     ConfiguredPeerConnectOutcome::Connected => {
                         info!(peer = %peer_addr, "reconnected configured peer");
-                        peer.reset(initial_delay, now);
+                        peer.reset(initial_delay, StdInstant::now());
                     }
                     ConfiguredPeerConnectOutcome::AlreadyConnected => {
-                        peer.reset(initial_delay, now);
+                        peer.reset(initial_delay, StdInstant::now());
                     }
                     ConfiguredPeerConnectOutcome::SlotLimitReached => {
                         break;
                     }
                     ConfiguredPeerConnectOutcome::Failed => {
-                        let attempt_delay = peer.record_failure(max_delay, now);
+                        let attempt_delay = peer.record_failure(max_delay, StdInstant::now());
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
                         );
@@ -1047,6 +1047,21 @@ mod tests {
         state.reset(Duration::from_millis(500), now);
         assert_eq!(state.delay, Duration::from_millis(500));
         assert_eq!(state.next_attempt_at, now);
+    }
+
+    #[test]
+    fn peer_reconnect_state_schedules_backoff_from_failure_time() {
+        let started_at = StdInstant::now();
+        let failed_at = started_at + Duration::from_secs(3);
+        let mut state =
+            PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), started_at);
+
+        state.record_failure(Duration::from_secs(5), failed_at);
+
+        assert_eq!(
+            state.next_attempt_at,
+            failed_at + Duration::from_millis(500)
+        );
     }
 
     #[test]
