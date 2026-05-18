@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.2**, the current public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-alpha.3**, the current public technical preview of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.2` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-alpha.3` - technical preview, API and wire format may change before the stable v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -414,7 +414,7 @@ pub fn merge(&mut self, other: &GCounter) {
 - propagates operations to active peers through nx-net,
 - covered by end-to-end E2E tests.
 
-**Hydration** *(Planned, Phase 7)* - rebuilding the GCounter state from sled at node startup is not yet implemented. Today the state is rebuilt during execution through operations; the persistence of the materialized CRDT state is present but replay at startup is on the roadmap.
+**Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from the values materialized in sled. Durable full CRDT state/op-log recovery remains planned in Phase 10 for stronger restart/reconnect resilience.
 
 **Planned CRDTs (Phase 14):**
 
@@ -479,7 +479,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.2:**
+**Out of scope for v0.1.0-alpha.3:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -764,7 +764,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.2. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.3. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -830,7 +830,7 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.2 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-alpha.3 is a technical preview. We recognize its limits, explicitly:
 
 - **Anti-entropy is not implemented yet.** Nodes exchange live PushOps, but automatic recovery of missed deltas after long disconnections is Phase 10 work.
 - **K-fanout gossip and full network resilience are in progress.** The architecture is defined; reconnect with backoff, automatic anti-entropy and op dedup are in Phase 10.
@@ -857,11 +857,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.2 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, multi-OS CI, end-to-end examples.
+v0.1.0-alpha.3 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, lifecycle/backpressure hardening, opt-in observability, multi-OS CI, end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.2 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-alpha.3 is just the beginning.** But it is a beginning built on code, not on promises.
 
 In closing, I love software and I love numax.
 

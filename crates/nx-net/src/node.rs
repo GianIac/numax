@@ -34,6 +34,16 @@ struct NodeLimits {
     socket_timeout: Duration,
 }
 
+struct IncomingContext {
+    tls: Option<TlsConfig>,
+    our_node_id: NodeId,
+    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    event_tx: mpsc::Sender<NodeEvent>,
+    limits: NodeLimits,
+    slot: OwnedSemaphorePermit,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
 /// Node configuration.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -211,18 +221,18 @@ impl Node {
                                 let shutdown_rx = shutdown_tx.subscribe();
 
                                 let task = tokio::spawn(async move {
-                                    if let Err(e) = handle_incoming(
-                                        stream,
-                                        addr.to_string(),
+                                    let context = IncomingContext {
                                         tls,
-                                        node_id,
+                                        our_node_id: node_id,
                                         peers,
                                         event_tx,
                                         limits,
                                         slot,
                                         shutdown_rx,
-                                    )
-                                    .await
+                                    };
+
+                                    if let Err(e) =
+                                        handle_incoming(stream, addr.to_string(), context).await
                                     {
                                         error!(%addr, error = %e, "connection error");
                                     }
@@ -512,14 +522,18 @@ impl Node {
 async fn handle_incoming(
     stream: TcpStream,
     addr: String,
-    tls: Option<TlsConfig>,
-    our_node_id: NodeId,
-    peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
-    event_tx: mpsc::Sender<NodeEvent>,
-    limits: NodeLimits,
-    slot: OwnedSemaphorePermit,
-    shutdown_rx: watch::Receiver<bool>,
+    context: IncomingContext,
 ) -> NetResult<()> {
+    let IncomingContext {
+        tls,
+        our_node_id,
+        peers,
+        event_tx,
+        limits,
+        slot,
+        shutdown_rx,
+    } = context;
+
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
         None => NetStream::Plain(stream),

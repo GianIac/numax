@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.2` - developer preview.
+> **Current release**: `v0.1.0-alpha.3` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -29,6 +29,24 @@ Includes:
 Known limitations:
 - Full network resilience, serialization hardening and the extended host API are
   still open phases.
+- API and wire format may change before `v0.1.0`.
+
+### v0.1.0-alpha.3 ✅
+**Purpose**: hardening preview for lifecycle, backpressure and observability.
+
+Includes:
+- Everything in `v0.1.0-alpha.2`.
+- Phase 7 lifecycle hardening: stable runtime NodeId, startup hydration,
+  cooperative network read-loop shutdown, bounded task shutdown fallback and
+  final store flush.
+- Phase 8 backpressure and limits: peer limit during handshake, queued ops
+  limit, message size limit and socket read/write timeouts.
+- Phase 9 minimal observability: configurable logging, `/metrics`, `/health`
+  and `/ready`.
+
+Known limitations:
+- Durable full CRDT state/op-log recovery, automatic reconnect and anti-entropy
+  remain tracked in Phase 10.
 - API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
@@ -417,9 +435,9 @@ For each one: implementation, property tests, OpKind, docs, example.
 | 0-5 | Foundation | ✅ | - |
 | 6 | Transport Security | ✅ | **P0** |
 | 6.5 | End-to-End Sync Wiring | ✅* | **P0** |
-| 7 | Graceful Lifecycle | ⏳ | **P0** |
-| 8 | Backpressure | ⏳ | **P0** |
-| 9 | Observability | ⏳ | **P1** |
+| 7 | Graceful Lifecycle | ✅ | **P0** |
+| 8 | Backpressure | ✅ | **P0** |
+| 9 | Observability | ✅ | **P1** |
 | 10 | Network Resilience | ⏳ | **P1** |
 | 11 | Dual Serialization | ⏳ | **P1** |
 | 12 | Extended Host API | ⏳ | **P1** |
@@ -443,8 +461,8 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 6 (TLS) complete
 - [x] Phase 6.5 (End-to-End Sync) complete
 - [x] Phase 7 (Graceful shutdown) complete
-- [ ] Phase 8 (Backpressure) complete
-- [ ] Phase 9 (Observability) at least logging + health
+- [x] Phase 8 (Backpressure) complete
+- [x] Phase 9 (Observability) at least logging + health
 - [ ] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [ ] Phase 11 (Serialization) JSON + bincode working
 - [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
@@ -464,6 +482,17 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Base WASM examples present
 - [x] `cargo test` passes outside the sandbox
 - [x] `cargo clippy --all-targets --all-features -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
+
+---
+
+## v0.1.0-alpha.3 Release Criteria
+
+- [x] Phase 7 graceful lifecycle hardening complete
+- [x] Phase 8 backpressure complete
+- [x] Phase 9 minimal observability complete
+- [x] `cargo test` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [x] Known limitations documented in the roadmap
 
 ---
