@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
@@ -54,6 +54,44 @@ struct ReconnectLoopContext {
 struct PeerReconnectState {
     addr: String,
     delay: Duration,
+    next_attempt_at: StdInstant,
+}
+
+impl PeerReconnectState {
+    fn new(addr: String, initial_delay: Duration, now: StdInstant) -> Self {
+        Self {
+            addr,
+            delay: initial_delay,
+            next_attempt_at: now,
+        }
+    }
+
+    fn reset(&mut self, initial_delay: Duration, now: StdInstant) {
+        self.delay = initial_delay;
+        self.next_attempt_at = now;
+    }
+
+    fn record_failure(&mut self, max_delay: Duration, now: StdInstant) -> Duration {
+        let attempt_delay = self.delay;
+        self.next_attempt_at = now + attempt_delay;
+        self.delay = next_reconnect_delay(attempt_delay, max_delay);
+        attempt_delay
+    }
+}
+
+struct ConfiguredPeerConnectContext<'a> {
+    node: &'a Node,
+    max_peers: usize,
+    peer_dead_after_failures: u32,
+    metrics: &'a Arc<RuntimeMetrics>,
+    peer_health: &'a Arc<RwLock<HashMap<String, PeerHealth>>>,
+}
+
+enum ConfiguredPeerConnectOutcome {
+    Connected,
+    AlreadyConnected,
+    SlotLimitReached,
+    Failed,
 }
 
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
@@ -233,33 +271,19 @@ impl SyncManager {
         // Connect to initial peers.
         let peer_dead_after_failures =
             normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
+        let connect_context = ConfiguredPeerConnectContext {
+            node: &node,
+            max_peers: self.config.max_peers,
+            peer_dead_after_failures,
+            metrics: &self.metrics,
+            peer_health: &self.peer_health,
+        };
         for peer_addr in &self.config.peers {
-            if node.connected_peer_count().await >= self.config.max_peers {
-                debug!(
-                    peer = %peer_addr,
-                    limit = self.config.max_peers,
-                    "skipping initial peer connect: peer slot limit reached"
-                );
+            if matches!(
+                try_connect_configured_peer(&connect_context, peer_addr).await,
+                ConfiguredPeerConnectOutcome::SlotLimitReached
+            ) {
                 break;
-            }
-
-            match node.connect_to_peer(peer_addr).await {
-                Ok(()) => {
-                    mark_peer_success(&self.peer_health, peer_addr).await;
-                }
-                Err(NetError::PeerLimitReached(limit)) => {
-                    debug!(
-                        peer = %peer_addr,
-                        limit,
-                        "skipping initial peer connect: peer slot limit reached"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    self.metrics.record_sync_error();
-                    mark_peer_failure(&self.peer_health, peer_addr, peer_dead_after_failures).await;
-                    warn!(peer = %peer_addr, error = %e, "failed to connect to peer");
-                }
             }
         }
 
@@ -354,38 +378,21 @@ impl SyncManager {
         let Some(node) = self.node.as_ref() else {
             return;
         };
+        let peer_dead_after_failures =
+            normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
+        let connect_context = ConfiguredPeerConnectContext {
+            node,
+            max_peers: self.config.max_peers,
+            peer_dead_after_failures,
+            metrics: &self.metrics,
+            peer_health: &self.peer_health,
+        };
         for peer_addr in &self.config.peers {
-            if node.is_connected_addr(peer_addr).await {
-                mark_peer_success(&self.peer_health, peer_addr).await;
-                continue;
-            }
-            if node.connected_peer_count().await >= self.config.max_peers {
-                debug!(
-                    peer = %peer_addr,
-                    limit = self.config.max_peers,
-                    "skipping configured peer reconnect: peer slot limit reached"
-                );
+            if matches!(
+                try_connect_configured_peer(&connect_context, peer_addr).await,
+                ConfiguredPeerConnectOutcome::SlotLimitReached
+            ) {
                 break;
-            }
-            let peer_dead_after_failures =
-                normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
-            match node.connect_to_peer(peer_addr).await {
-                Ok(()) => {
-                    mark_peer_success(&self.peer_health, peer_addr).await;
-                }
-                Err(NetError::PeerLimitReached(limit)) => {
-                    debug!(
-                        peer = %peer_addr,
-                        limit,
-                        "skipping configured peer reconnect: peer slot limit reached"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    self.metrics.record_sync_error();
-                    mark_peer_failure(&self.peer_health, peer_addr, peer_dead_after_failures).await;
-                    debug!(peer = %peer_addr, error = %e, "configured peer reconnect failed");
-                }
             }
         }
     }
@@ -471,6 +478,51 @@ fn spawn_broadcast_loop(
     })
 }
 
+async fn try_connect_configured_peer(
+    context: &ConfiguredPeerConnectContext<'_>,
+    peer_addr: &str,
+) -> ConfiguredPeerConnectOutcome {
+    if context.node.is_connected_addr(peer_addr).await {
+        mark_peer_success(context.peer_health, peer_addr).await;
+        return ConfiguredPeerConnectOutcome::AlreadyConnected;
+    }
+
+    if context.node.connected_peer_count().await >= context.max_peers {
+        debug!(
+            peer = %peer_addr,
+            limit = context.max_peers,
+            "skipping configured peer connect: peer slot limit reached"
+        );
+        return ConfiguredPeerConnectOutcome::SlotLimitReached;
+    }
+
+    match context.node.connect_to_peer(peer_addr).await {
+        Ok(()) => {
+            mark_peer_success(context.peer_health, peer_addr).await;
+            ConfiguredPeerConnectOutcome::Connected
+        }
+        Err(NetError::PeerLimitReached(limit)) => {
+            debug!(
+                peer = %peer_addr,
+                limit,
+                "skipping configured peer connect: peer slot limit reached"
+            );
+            ConfiguredPeerConnectOutcome::SlotLimitReached
+        }
+        Err(e) => {
+            context.metrics.record_sync_error();
+            mark_peer_failure(
+                context.peer_health,
+                peer_addr,
+                context.peer_dead_after_failures,
+            )
+            .await;
+            debug!(peer = %peer_addr, error = %e, "configured peer connect failed");
+            ConfiguredPeerConnectOutcome::Failed
+        }
+    }
+}
+
 fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
     let ReconnectLoopContext {
         node,
@@ -492,58 +544,55 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
         let initial_delay = normalize_reconnect_delay(initial_delay);
         let max_delay = max_delay.max(initial_delay);
         let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
+        let now = StdInstant::now();
         let mut state = peers
             .into_iter()
-            .map(|addr| PeerReconnectState {
-                addr,
-                delay: initial_delay,
-            })
+            .map(|addr| PeerReconnectState::new(addr, initial_delay, now))
             .collect::<Vec<_>>();
 
         loop {
             let mut sleep_for: Option<Duration> = None;
+            let now = StdInstant::now();
+            let connect_context = ConfiguredPeerConnectContext {
+                node: node.as_ref(),
+                max_peers,
+                peer_dead_after_failures,
+                metrics: &metrics,
+                peer_health: &peer_health,
+            };
 
             for peer in state.iter_mut() {
                 let peer_addr = peer.addr.as_str();
 
                 if node.is_connected_addr(peer_addr).await {
                     mark_peer_success(&peer_health, peer_addr).await;
-                    peer.delay = initial_delay;
+                    peer.reset(initial_delay, now);
                     continue;
                 }
 
-                if node.connected_peer_count().await >= max_peers {
-                    debug!(
-                        peer = %peer_addr,
-                        limit = max_peers,
-                        "skipping reconnect attempt: peer slot limit reached"
-                    );
-                    break;
+                if let Some(wait) = peer.next_attempt_at.checked_duration_since(now)
+                    && !wait.is_zero()
+                {
+                    sleep_for = Some(sleep_for.map_or(wait, |current| current.min(wait)));
+                    continue;
                 }
 
-                let attempt_delay = peer.delay;
-                match node.connect_to_peer(peer_addr).await {
-                    Ok(()) => {
+                match try_connect_configured_peer(&connect_context, peer_addr).await {
+                    ConfiguredPeerConnectOutcome::Connected => {
                         info!(peer = %peer_addr, "reconnected configured peer");
-                        mark_peer_success(&peer_health, peer_addr).await;
-                        peer.delay = initial_delay;
+                        peer.reset(initial_delay, now);
                     }
-                    Err(NetError::PeerLimitReached(limit)) => {
-                        debug!(
-                            peer = %peer_addr,
-                            limit,
-                            "skipping reconnect attempt: peer slot limit reached"
-                        );
+                    ConfiguredPeerConnectOutcome::AlreadyConnected => {
+                        peer.reset(initial_delay, now);
+                    }
+                    ConfiguredPeerConnectOutcome::SlotLimitReached => {
                         break;
                     }
-                    Err(e) => {
-                        metrics.record_sync_error();
-                        mark_peer_failure(&peer_health, peer_addr, peer_dead_after_failures).await;
-                        debug!(peer = %peer_addr, error = %e, delay = ?attempt_delay, "configured peer reconnect failed");
+                    ConfiguredPeerConnectOutcome::Failed => {
+                        let attempt_delay = peer.record_failure(max_delay, now);
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
                         );
-                        peer.delay = next_reconnect_delay(attempt_delay, max_delay);
                     }
                 }
             }
@@ -982,6 +1031,22 @@ mod tests {
             normalize_reconnect_delay(Duration::ZERO),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn peer_reconnect_state_tracks_next_attempt_per_peer() {
+        let now = StdInstant::now();
+        let mut state =
+            PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
+
+        let first_delay = state.record_failure(Duration::from_secs(5), now);
+        assert_eq!(first_delay, Duration::from_millis(500));
+        assert_eq!(state.delay, Duration::from_secs(1));
+        assert_eq!(state.next_attempt_at, now + Duration::from_millis(500));
+
+        state.reset(Duration::from_millis(500), now);
+        assert_eq!(state.delay, Duration::from_millis(500));
+        assert_eq!(state.next_attempt_at, now);
     }
 
     #[test]
