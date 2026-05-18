@@ -51,8 +51,16 @@ In the guest_c directory
 
 From the repository root:
 
+### Run on Windows
+
 ```bash
 .\target\release\nx.exe run .\examples\guest_c\guest.wasm
+```
+
+### Run on MacOS/Linux
+
+```bash
+./target/release/nx run ./examples/guest_c/guest.wasm
 ```
 
 output:

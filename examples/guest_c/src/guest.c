@@ -25,13 +25,14 @@ extern int db_set(
  */
 __attribute__((export_name("run")))
 void run() {
-    const char* msg = "Hello from C guest!";
-    host_log_v2(msg, 21);
+    const char msg[] = "Hello from C guest!";
+    host_log_v2(msg, sizeof(msg) - 1);
 
     const char* key = "hello";
     const char* val = "numax";
 
     db_set(key, 5, val, 5);
 
-    host_log_v2("db_set ok", 9);
+    const char done[] = "db_set ok";
+    host_log_v2(done, sizeof(done) - 1);
 }

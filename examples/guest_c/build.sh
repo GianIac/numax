@@ -1,4 +1,13 @@
+#!/usr/bin/env bash
+
 set -e
+
+if ! command -v clang >/dev/null 2>&1; then
+    echo "[error] clang not found in PATH"
+    exit 1
+fi
+
+echo "Building guest_c WASM module"
 
 clang \
   --target=wasm32-wasip1 \
