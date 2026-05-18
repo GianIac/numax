@@ -226,14 +226,6 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 - [x] Test: kill -TERM → no data corruption
 - [x] Test: crash → restart → consistent state
 
-> These tasks complete the CLI criterion left open by Phase 6.5 and bring it
-> inside a general lifecycle: service loop, signal-aware shutdown, final flush
-> and orderly handling of connections.
->
-> Production hardening follow-up for `v0.1.0`: network read loops should exit
-> cooperatively on shutdown, emit the normal disconnect cleanup path and use
-> forced task abort only as a bounded fallback.
-
 **Remaining hardening:**
 - [x] Read loops listen to the runtime shutdown signal instead of relying only
       on socket close/timeout.
