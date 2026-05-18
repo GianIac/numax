@@ -229,6 +229,18 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 > These tasks complete the CLI criterion left open by Phase 6.5 and bring it
 > inside a general lifecycle: service loop, signal-aware shutdown, final flush
 > and orderly handling of connections.
+>
+> Production hardening follow-up for `v0.1.0`: network read loops should exit
+> cooperatively on shutdown, emit the normal disconnect cleanup path and use
+> forced task abort only as a bounded fallback.
+
+**Remaining hardening:**
+- [ ] Read loops listen to the runtime shutdown signal instead of relying only
+      on socket close/timeout.
+- [ ] Node shutdown waits a bounded time for network tasks to exit
+      cooperatively before aborting them.
+- [ ] Test: active peer connections shut down without waiting for the socket
+      read timeout.
 
 **Criteria**:
 ```bash
@@ -310,8 +322,14 @@ HTTP endpoint over Tokio.
 - [ ] Peer rotation (replace dead peers)
 - [ ] Periodic anti-entropy (pull every N seconds)
 - [ ] Op deduplication (bloom filter or set of OpIds)
+- [ ] Durable CRDT state or op log, so restart/reconnect can recover full
+      CRDT state rather than only materialized totals.
+- [ ] Startup hydration from durable CRDT state/op log.
+- [ ] Persist dedup metadata, or otherwise prevent duplicate remote ops after
+      restart.
 - [ ] Test: intermittent network (10% packet loss)
 - [ ] Test: node dies and comes back → converges
+- [ ] Test: duplicate op after restart does not double count
 
 ---
 
@@ -435,7 +453,7 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 7 (Graceful shutdown) complete
 - [ ] Phase 8 (Backpressure) complete
 - [ ] Phase 9 (Observability) at least logging + health
-- [ ] Phase 10 (Resilience) at least reconnect + dedup
+- [ ] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [ ] Phase 11 (Serialization) JSON + bincode working
 - [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
 - [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
