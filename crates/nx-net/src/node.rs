@@ -24,6 +24,9 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Default timeout for socket reads and writes.
 pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Time allowed for network tasks to finish cooperatively after shutdown.
+const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy)]
 struct NodeLimits {
     max_peers: usize,
@@ -178,6 +181,7 @@ impl Node {
             socket_timeout: self.config.socket_timeout,
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown_tx = self.shutdown_tx.clone();
 
         let listener_task = tokio::spawn(async move {
             loop {
@@ -204,6 +208,7 @@ impl Node {
                                 let event_tx = event_tx.clone();
                                 let tls = tls.clone();
                                 let limits = limits;
+                                let shutdown_rx = shutdown_tx.subscribe();
 
                                 let task = tokio::spawn(async move {
                                     if let Err(e) = handle_incoming(
@@ -215,6 +220,7 @@ impl Node {
                                         event_tx,
                                         limits,
                                         slot,
+                                        shutdown_rx,
                                     )
                                     .await
                                     {
@@ -363,6 +369,7 @@ impl Node {
         let addr_owned = addr.to_string();
         let max_message_size = self.config.max_message_size;
         let socket_timeout = self.config.socket_timeout;
+        let shutdown_rx = self.shutdown_tx.subscribe();
 
         let task = tokio::spawn(async move {
             if let Err(e) = read_loop(
@@ -371,6 +378,7 @@ impl Node {
                 event_tx.clone(),
                 max_message_size,
                 socket_timeout,
+                shutdown_rx,
             )
             .await
             {
@@ -470,17 +478,32 @@ impl Node {
     /// Close outbound peer connections by dropping their writers.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+
+        let mut tasks = {
+            let mut tasks = self.tasks.lock().await;
+            std::mem::take(&mut *tasks)
+        };
+
+        for mut task in tasks.drain(..) {
+            match timeout(TASK_SHUTDOWN_GRACE, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!(error = %e, "network task ended during shutdown");
+                }
+                Err(_) => {
+                    warn!("network task did not finish cooperatively; aborting");
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+
         let count = {
             let mut peers = self.peers.write().await;
             let count = peers.len();
             peers.clear();
             count
         };
-        let mut tasks = self.tasks.lock().await;
-        for task in tasks.drain(..) {
-            task.abort();
-            let _ = task.await;
-        }
         debug!(count, "node peer connections closed");
     }
 }
@@ -495,6 +518,7 @@ async fn handle_incoming(
     event_tx: mpsc::Sender<NodeEvent>,
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> NetResult<()> {
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
@@ -591,6 +615,7 @@ async fn handle_incoming(
         event_tx.clone(),
         limits.max_message_size,
         limits.socket_timeout,
+        shutdown_rx,
     )
     .await;
 
@@ -646,15 +671,28 @@ async fn read_loop(
     event_tx: mpsc::Sender<NodeEvent>,
     max_message_size: usize,
     socket_timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> NetResult<()> {
     loop {
-        let msg = match read_message(&mut reader, max_message_size, socket_timeout).await {
-            Ok(m) => m,
-            Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!(peer = %peer_node_id, "peer disconnected");
-                break;
+        let msg = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    debug!(peer = %peer_node_id, "read loop shutdown requested");
+                    break;
+                }
+                continue;
             }
-            Err(e) => return Err(e),
+
+            msg = read_message(&mut reader, max_message_size, socket_timeout) => {
+                match msg {
+                    Ok(m) => m,
+                    Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        debug!(peer = %peer_node_id, "peer disconnected");
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
 
         match msg.kind {
@@ -890,6 +928,55 @@ mod tests {
         drop(second);
         drop(first);
         node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn active_peer_shutdown_does_not_wait_for_socket_timeout() {
+        let node_a = Node::new(
+            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(5)),
+        );
+        let addr_a = node_a.start_listener().await.unwrap();
+
+        let mut node_b = Node::new(
+            NodeConfig::new(NodeId::new("node-b"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(5)),
+        );
+        let mut events_b = node_b.take_event_receiver().unwrap();
+        node_b.connect_to_peer(&addr_a.to_string()).await.unwrap();
+
+        let connected = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(NodeEvent::PeerConnected { .. }) = events_b.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(connected.is_ok(), "peer did not connect");
+
+        let started = std::time::Instant::now();
+        node_b.shutdown().await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown waited for socket timeout instead of cooperative signal"
+        );
+
+        let disconnected = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(NodeEvent::PeerDisconnected { .. }) = events_b.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            disconnected.is_ok(),
+            "peer disconnect event was not emitted"
+        );
+
+        node_a.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

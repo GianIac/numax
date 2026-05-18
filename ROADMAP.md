@@ -235,11 +235,11 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 > forced task abort only as a bounded fallback.
 
 **Remaining hardening:**
-- [ ] Read loops listen to the runtime shutdown signal instead of relying only
+- [x] Read loops listen to the runtime shutdown signal instead of relying only
       on socket close/timeout.
-- [ ] Node shutdown waits a bounded time for network tasks to exit
+- [x] Node shutdown waits a bounded time for network tasks to exit
       cooperatively before aborting them.
-- [ ] Test: active peer connections shut down without waiting for the socket
+- [x] Test: active peer connections shut down without waiting for the socket
       read timeout.
 
 **Criteria**:
