@@ -77,6 +77,16 @@ async fn crdt_gcounter_inc_impl(
         None => return ERR_SYNC_DISABLED,
     };
 
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_gcounter_inc: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
     // Apply locally and materialize the value before exposing the new state.
     {
         let counters_arc = handle.counters();
@@ -86,6 +96,7 @@ async fn crdt_gcounter_inc_impl(
         let total = counter.value();
 
         if let Err(e) = materialize_gcounter_value(&handle.store(), &key, total) {
+            handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_gcounter_inc: failed to materialize counter");
             return ERR_INTERNAL;
         }
@@ -93,12 +104,10 @@ async fn crdt_gcounter_inc_impl(
         counters.insert(key.clone(), counter);
     }
 
-    // Enqueue the Op for broadcast. Bounded-channel backpressure is
-
     let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
-    if let Err(e) = handle.op_sender().send(op).await {
-        tracing::warn!(error = %e, "crdt_gcounter_inc: broadcast channel closed");
-    }
+    tracing::debug!(op_id = %op.id, "queued local GCounter increment");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
 
     0
 }

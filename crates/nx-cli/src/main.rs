@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
-use nx_core::{SyncConfig, TlsConfig};
+use nx_core::{ObservabilityConfig, SyncConfig, TlsConfig};
+use serde::Deserialize;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -21,6 +22,10 @@ enum Cli {
         /// Datastore directory path (default: ./nx-data)
         #[arg(long, value_name = "PATH")]
         datastore_path: Option<PathBuf>,
+
+        /// Path to a Numax TOML configuration file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
 
         /// Enable sync and listen on this address (e.g., "0.0.0.0:9000")
         #[arg(long, value_name = "ADDR")]
@@ -49,6 +54,18 @@ enum Cli {
         /// Enable verbose logging
         #[arg(short, long)]
         verbose: bool,
+
+        /// Logging level (trace, debug, info, warn, error).
+        #[arg(long, value_name = "LEVEL")]
+        log_level: Option<String>,
+
+        /// Logging format.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        log_format: Option<LogFormat>,
+
+        /// Enable the observability HTTP endpoint (e.g. "127.0.0.1:9100").
+        #[arg(long, value_name = "ADDR")]
+        observability_listen: Option<String>,
 
         /// Path to this node's TLS certificate (PEM)
         #[arg(long, value_name = "PATH")]
@@ -91,6 +108,7 @@ async fn real_main() -> Result<()> {
         Cli::Run {
             module,
             datastore_path,
+            config,
             listen,
             peers,
             settle_for,
@@ -98,20 +116,22 @@ async fn real_main() -> Result<()> {
             print_gcounter,
             shutdown_timeout,
             verbose,
+            log_level,
+            log_format,
+            observability_listen,
             tls_cert,
             tls_key,
             tls_ca,
             allowed_peers,
             tls_insecure,
         } => {
+            let file_config = load_run_config(config.as_ref())?;
+
             // Setup logging
-            let log_level = if verbose { "debug" } else { "info" };
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-                )
-                .init();
+            let log_level =
+                resolve_log_level(verbose, log_level, file_config.observability.as_ref())?;
+            let log_format = resolve_log_format(log_format, file_config.observability.as_ref());
+            init_logging(&log_level, log_format);
 
             // Validate TLS flag combinations
             validate_tls_flags(&tls_cert, &tls_key, &tls_ca, &allowed_peers, tls_insecure)?;
@@ -120,10 +140,16 @@ async fn real_main() -> Result<()> {
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
 
             // Build SyncConfig (if sync flags were provided)
-            let sync = build_sync_config(listen, peers, tls)?;
+            let sync = build_sync_config(listen, peers, tls, file_config.limits.is_some())?
+                .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
+                .transpose()?;
             validate_settle_mode(&sync, settle_for)?;
             validate_wait_before_run(&sync, wait_before_run)?;
             validate_print_gcounter(&sync, &print_gcounter)?;
+            let observability = build_observability_config(
+                observability_listen,
+                file_config.observability.as_ref(),
+            )?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
@@ -142,9 +168,11 @@ async fn real_main() -> Result<()> {
                 );
                 cfg.sync = Some(s);
             }
+            cfg.observability = observability;
 
             let mut rt = Runtime::new(cfg)?;
             let run_result: Result<()> = async {
+                rt.start_observability().await?;
                 rt.start_sync().await?;
                 if let Some(duration) = wait_before_run {
                     rt.wait_before_run(duration).await?;
@@ -176,6 +204,171 @@ async fn real_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunFileConfig {
+    limits: Option<LimitsFileConfig>,
+    observability: Option<ObservabilityFileConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitsFileConfig {
+    max_peers: Option<usize>,
+    queued_ops_limit: Option<usize>,
+    max_message_size: Option<String>,
+    socket_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObservabilityFileConfig {
+    listen: Option<String>,
+    log_level: Option<String>,
+    log_format: Option<LogFormat>,
+    request_timeout_secs: Option<u64>,
+}
+
+fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
+    let Some(path) = path else {
+        return Ok(RunFileConfig::default());
+    };
+
+    let text = fs::read_to_string(path)?;
+    toml::from_str(&text).map_err(Into::into)
+}
+
+fn init_logging(log_level: &str, log_format: LogFormat) {
+    match log_format {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
+            .init(),
+    }
+}
+
+fn resolve_log_level(
+    verbose: bool,
+    cli_log_level: Option<String>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> Result<String> {
+    let level = cli_log_level
+        .or_else(|| observability.and_then(|cfg| cfg.log_level.clone()))
+        .unwrap_or_else(|| {
+            if verbose {
+                "debug".to_string()
+            } else {
+                "info".to_string()
+            }
+        });
+
+    match level.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => Ok(level),
+        _ => bail!("log level must be one of trace, debug, info, warn, error"),
+    }
+}
+
+fn resolve_log_format(
+    cli_log_format: Option<LogFormat>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> LogFormat {
+    cli_log_format
+        .or_else(|| observability.and_then(|cfg| cfg.log_format))
+        .unwrap_or(LogFormat::Text)
+}
+
+fn build_observability_config(
+    listen: Option<String>,
+    observability: Option<&ObservabilityFileConfig>,
+) -> Result<Option<ObservabilityConfig>> {
+    let Some(listen_addr) = listen.or_else(|| observability.and_then(|cfg| cfg.listen.clone()))
+    else {
+        return Ok(None);
+    };
+
+    let mut config = ObservabilityConfig::new(listen_addr);
+    if let Some(request_timeout_secs) = observability.and_then(|cfg| cfg.request_timeout_secs) {
+        if request_timeout_secs == 0 {
+            bail!("observability.request_timeout_secs must be greater than zero");
+        }
+        config = config.with_request_timeout(Duration::from_secs(request_timeout_secs));
+    }
+
+    Ok(Some(config))
+}
+
+fn apply_limit_config(
+    mut sync: SyncConfig,
+    limits: Option<&LimitsFileConfig>,
+) -> Result<SyncConfig> {
+    let Some(limits) = limits else {
+        return Ok(sync);
+    };
+
+    if let Some(max_peers) = limits.max_peers {
+        sync = sync.with_max_peers(max_peers);
+    }
+    if let Some(queued_ops_limit) = limits.queued_ops_limit {
+        if queued_ops_limit == 0 {
+            bail!("limits.queued_ops_limit must be greater than zero");
+        }
+        sync = sync.with_queued_ops_limit(queued_ops_limit);
+    }
+    if let Some(max_message_size) = &limits.max_message_size {
+        sync = sync.with_max_message_size(parse_byte_size(max_message_size)?);
+    }
+    if let Some(socket_timeout_secs) = limits.socket_timeout_secs {
+        if socket_timeout_secs == 0 {
+            bail!("limits.socket_timeout_secs must be greater than zero");
+        }
+        sync = sync.with_socket_timeout(Duration::from_secs(socket_timeout_secs));
+    }
+
+    Ok(sync)
+}
+
+fn parse_byte_size(input: &str) -> Result<usize> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("expected byte size like 16MiB");
+    }
+
+    let compact = input.replace(' ', "");
+    let (number, multiplier) = if let Some(n) = compact.strip_suffix("MiB") {
+        (n, 1024usize * 1024)
+    } else if let Some(n) = compact.strip_suffix("KiB") {
+        (n, 1024usize)
+    } else if let Some(n) = compact.strip_suffix('B') {
+        (n, 1usize)
+    } else {
+        (compact.as_str(), 1usize)
+    };
+
+    let amount = number
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("expected byte size like 16MiB"))?;
+    if amount == 0 {
+        bail!("byte size must be greater than zero");
+    }
+
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("byte size is too large"))
 }
 
 /// Validate that the TLS-related CLI flags form a coherent combination.
@@ -309,14 +502,15 @@ fn build_sync_config(
     listen: Option<String>,
     peers: Vec<String>,
     tls: Option<TlsConfig>,
+    force_enabled: bool,
 ) -> Result<Option<SyncConfig>> {
-    if listen.is_none() && peers.is_empty() {
+    if listen.is_none() && peers.is_empty() && !force_enabled {
         return Ok(None);
     }
 
     if listen.is_none() {
         bail!(
-            "--peer requires --listen: dialer-only mode is not yet supported. \
+            "sync configuration requires --listen: dialer-only mode is not yet supported. \
              Pass --listen <addr> to enable sync."
         );
     }
@@ -376,6 +570,171 @@ mod tests {
         #[test]
         fn rejects_zero_duration() {
             assert!(parse_duration("0s").is_err());
+        }
+    }
+
+    mod byte_size_parser {
+        use super::*;
+
+        #[test]
+        fn parses_mib() {
+            assert_eq!(parse_byte_size("16MiB").unwrap(), 16 * 1024 * 1024);
+        }
+
+        #[test]
+        fn parses_kib_with_space() {
+            assert_eq!(parse_byte_size("4 KiB").unwrap(), 4 * 1024);
+        }
+
+        #[test]
+        fn parses_plain_bytes() {
+            assert_eq!(parse_byte_size("128").unwrap(), 128);
+        }
+
+        #[test]
+        fn rejects_zero() {
+            assert!(parse_byte_size("0MiB").is_err());
+        }
+    }
+
+    mod file_config {
+        use super::*;
+
+        #[test]
+        fn parses_limits_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [limits]
+                max_peers = 64
+                queued_ops_limit = 10000
+                max_message_size = "16MiB"
+                socket_timeout_secs = 30
+                "#,
+            )
+            .unwrap();
+
+            let limits = cfg.limits.unwrap();
+            assert_eq!(limits.max_peers, Some(64));
+            assert_eq!(limits.queued_ops_limit, Some(10_000));
+            assert_eq!(limits.max_message_size.as_deref(), Some("16MiB"));
+            assert_eq!(limits.socket_timeout_secs, Some(30));
+        }
+
+        #[test]
+        fn parses_observability_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [observability]
+                listen = "127.0.0.1:9100"
+                log_level = "debug"
+                log_format = "json"
+                request_timeout_secs = 7
+                "#,
+            )
+            .unwrap();
+
+            let observability = cfg.observability.unwrap();
+            assert_eq!(observability.listen.as_deref(), Some("127.0.0.1:9100"));
+            assert_eq!(observability.log_level.as_deref(), Some("debug"));
+            assert_eq!(observability.log_format, Some(LogFormat::Json));
+            assert_eq!(observability.request_timeout_secs, Some(7));
+        }
+
+        #[test]
+        fn applies_limits_to_sync_config() {
+            let limits = LimitsFileConfig {
+                max_peers: Some(8),
+                queued_ops_limit: Some(256),
+                max_message_size: Some("2MiB".into()),
+                socket_timeout_secs: Some(5),
+            };
+
+            let cfg = apply_limit_config(SyncConfig::new(), Some(&limits)).unwrap();
+
+            assert_eq!(cfg.max_peers, 8);
+            assert_eq!(cfg.queued_ops_limit, 256);
+            assert_eq!(cfg.max_message_size, 2 * 1024 * 1024);
+            assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn rejects_empty_queue_limit() {
+            let limits = LimitsFileConfig {
+                max_peers: None,
+                queued_ops_limit: Some(0),
+                max_message_size: None,
+                socket_timeout_secs: None,
+            };
+
+            assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());
+        }
+
+        #[test]
+        fn builds_observability_from_file_config() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+                request_timeout_secs: Some(7),
+            };
+
+            let observability = build_observability_config(None, Some(&cfg))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(observability.listen_addr, "127.0.0.1:9100");
+            assert_eq!(observability.request_timeout, Duration::from_secs(7));
+        }
+
+        #[test]
+        fn cli_observability_listen_overrides_file_config() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+                request_timeout_secs: None,
+            };
+
+            let observability =
+                build_observability_config(Some("127.0.0.1:9200".into()), Some(&cfg))
+                    .unwrap()
+                    .unwrap();
+
+            assert_eq!(observability.listen_addr, "127.0.0.1:9200");
+        }
+
+        #[test]
+        fn rejects_empty_observability_timeout() {
+            let cfg = ObservabilityFileConfig {
+                listen: Some("127.0.0.1:9100".into()),
+                log_level: None,
+                log_format: None,
+                request_timeout_secs: Some(0),
+            };
+
+            assert!(build_observability_config(None, Some(&cfg)).is_err());
+        }
+
+        #[test]
+        fn resolves_log_level_from_cli_then_file_then_verbose() {
+            let cfg = ObservabilityFileConfig {
+                listen: None,
+                log_level: Some("warn".into()),
+                log_format: None,
+                request_timeout_secs: None,
+            };
+
+            assert_eq!(
+                resolve_log_level(false, Some("debug".into()), Some(&cfg)).unwrap(),
+                "debug"
+            );
+            assert_eq!(resolve_log_level(false, None, Some(&cfg)).unwrap(), "warn");
+            assert_eq!(resolve_log_level(true, None, None).unwrap(), "debug");
+        }
+
+        #[test]
+        fn rejects_invalid_log_level() {
+            assert!(resolve_log_level(false, Some("loud".into()), None).is_err());
         }
     }
 
@@ -559,13 +918,13 @@ mod tests {
 
         #[test]
         fn no_flags_is_none() {
-            let r = build_sync_config(None, vec![], None).unwrap();
+            let r = build_sync_config(None, vec![], None, false).unwrap();
             assert!(r.is_none());
         }
 
         #[test]
         fn listen_alone_is_some() {
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false)
                 .unwrap()
                 .expect("sync should be enabled with --listen alone");
             assert!(cfg.is_enabled());
@@ -575,10 +934,18 @@ mod tests {
 
         #[test]
         fn peer_without_listen_is_error() {
-            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None);
+            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false);
             assert!(r.is_err(), "peers without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
-            assert!(err.contains("--peer requires --listen"), "got: {err}");
+            assert!(err.contains("requires --listen"), "got: {err}");
+        }
+
+        #[test]
+        fn limits_config_without_listen_is_error() {
+            let r = build_sync_config(None, vec![], None, true);
+            assert!(r.is_err(), "limits without --listen must fail loudly");
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("requires --listen"), "got: {err}");
         }
 
         #[test]
@@ -587,6 +954,7 @@ mod tests {
                 Some("0.0.0.0:9000".into()),
                 vec!["a:1".into(), "b:2".into()],
                 None,
+                false,
             )
             .unwrap()
             .unwrap();
@@ -598,7 +966,7 @@ mod tests {
         #[test]
         fn tls_is_propagated() {
             let tls = Some(TlsConfig::insecure_dev());
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false)
                 .unwrap()
                 .unwrap();
             assert!(cfg.tls.is_some());
@@ -686,6 +1054,45 @@ mod tests {
             match cli {
                 Cli::Run { datastore_path, .. } => {
                     assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
+                }
+            }
+        }
+
+        #[test]
+        fn config_path_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "run", "x.wasm", "--config", "numax.toml"]).unwrap();
+            match cli {
+                Cli::Run { config, .. } => {
+                    assert_eq!(config, Some(PathBuf::from("numax.toml")));
+                }
+            }
+        }
+
+        #[test]
+        fn observability_flags_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "run",
+                "x.wasm",
+                "--observability-listen",
+                "127.0.0.1:9100",
+                "--log-level",
+                "debug",
+                "--log-format",
+                "json",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run {
+                    observability_listen,
+                    log_level,
+                    log_format,
+                    ..
+                } => {
+                    assert_eq!(observability_listen.as_deref(), Some("127.0.0.1:9100"));
+                    assert_eq!(log_level.as_deref(), Some("debug"));
+                    assert_eq!(log_format, Some(LogFormat::Json));
                 }
             }
         }

@@ -17,7 +17,7 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
-> **Status:** `v0.1.0-alpha.2` - public technical preview.
+> **Status:** `v0.1.0-alpha.3` - public technical preview.
 > It works, it's tested, it's honest about what's missing. See [`ROADMAP.md`](./ROADMAP.md).
 
 ---

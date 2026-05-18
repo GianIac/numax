@@ -159,6 +159,10 @@ vote:tally:yes = 3
 
 - mTLS is enabled by `--tls-cert`, `--tls-key`, and `--tls-ca`.
 - The allowlist admits only the three certificate-derived NodeIds.
+- `--config ./numax.toml` can provide the implemented `[limits]` and
+  `[observability]` sections.
+- `--log-format json` enables structured logs. `--observability-listen
+  127.0.0.1:9300` exposes `/metrics`, `/health` and `/ready` for one node.
 - The guest never writes votes through `nx_sdk::db::*`; replicated state goes
   through `nx_sdk::crdt::gcounter`.
 - `--wait-before-run` gives the three TLS handshakes time to complete before

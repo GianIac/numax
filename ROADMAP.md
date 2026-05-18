@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.2` - developer preview.
+> **Current release**: `v0.1.0-alpha.3` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -27,7 +27,26 @@ Includes:
 - Examples: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
 
 Known limitations:
-- Backpressure, observability and full network resilience are still open phases.
+- Full network resilience, serialization hardening and the extended host API are
+  still open phases.
+- API and wire format may change before `v0.1.0`.
+
+### v0.1.0-alpha.3 ✅
+**Purpose**: hardening preview for lifecycle, backpressure and observability.
+
+Includes:
+- Everything in `v0.1.0-alpha.2`.
+- Phase 7 lifecycle hardening: stable runtime NodeId, startup hydration,
+  cooperative network read-loop shutdown, bounded task shutdown fallback and
+  final store flush.
+- Phase 8 backpressure and limits: peer limit during handshake, queued ops
+  limit, message size limit and socket read/write timeouts.
+- Phase 9 minimal observability: configurable logging, `/metrics`, `/health`
+  and `/ready`.
+
+Known limitations:
+- Durable full CRDT state/op-log recovery, automatic reconnect and anti-entropy
+  remain tracked in Phase 10.
 - API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
@@ -225,9 +244,13 @@ nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
 - [x] Test: kill -TERM → no data corruption
 - [x] Test: crash → restart → consistent state
 
-> These tasks complete the CLI criterion left open by Phase 6.5 and bring it
-> inside a general lifecycle: service loop, signal-aware shutdown, final flush
-> and orderly handling of connections.
+**Remaining hardening:**
+- [x] Read loops listen to the runtime shutdown signal instead of relying only
+      on socket close/timeout.
+- [x] Node shutdown waits a bounded time for network tasks to exit
+      cooperatively before aborting them.
+- [x] Test: active peer connections shut down without waiting for the socket
+      read timeout.
 
 **Criteria**:
 ```bash
@@ -239,18 +262,18 @@ kill -TERM $PID  # Completes operations, exits with code 0
 ### Phase 8: Backpressure and Limits ⚡
 **Goal**: Stability under load
 
-- [ ] Peer connection limit (default: 64)
-- [ ] Queued ops limit (default: 10000)
-- [ ] Message size limit (default: 16 MiB)
-- [ ] Graceful rejection when overloaded
-- [ ] Socket read/write timeouts (default: 30s)
-- [ ] Test: 1000 simultaneous connections → no crash
+- [x] Peer connection limit (default: 64)
+- [x] Queued ops limit (default: 10000)
+- [x] Message size limit (default: 16 MiB)
+- [x] Graceful rejection when overloaded
+- [x] Socket read/write timeouts (default: 30s)
+- [x] Test: 1000 simultaneous connections → no crash
 
 **Configuration**:
 ```toml
 [limits]
 max_peers = 64
-max_pending_ops = 10000
+queued_ops_limit = 10000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
 ```
@@ -261,23 +284,43 @@ socket_timeout_secs = 30
 **Goal**: Visibility into what the runtime is doing
 
 **Structured logging**:
-- [ ] JSON format for logs
-- [ ] Configurable levels (trace/debug/info/warn/error)
-- [ ] Correlation ID to trace operations
+- [x] JSON format for logs
+- [x] Configurable levels (trace/debug/info/warn/error)
+- [x] Correlation ID to trace operations
 
 **Metrics**:
-- [ ] `numax_ops_total` - Operations processed
-- [ ] `numax_peers_connected` - Active peers
-- [ ] `numax_sync_latency_ms` - Sync latency
-- [ ] `numax_store_keys` - Keys in the store
-- [ ] `numax_store_bytes` - Bytes used
-- [ ] `/metrics` endpoint (Prometheus format)
+- [x] `numax_ops_total` - Operations processed
+- [x] `numax_peers_connected` - Active peers
+- [x] `numax_sync_latency_ms` - Sync latency
+- [x] `numax_store_keys` - Keys in the store
+- [x] `numax_store_bytes` - Bytes used
+- [x] `numax_sync_errors_total` - Sync errors
+- [x] `numax_observability_requests_total` - Observability requests
+- [x] `numax_observability_errors_total` - Observability request errors
+- [x] `numax_peer_connects_total` - Peer connections observed
+- [x] `numax_peer_disconnects_total` - Peer disconnections observed
+- [x] `numax_broadcast_batches_total` - Broadcast batches sent
+- [x] `numax_broadcast_ops_total` - Broadcast ops sent
+- [x] `/metrics` endpoint (Prometheus format)
 
 **Health check**:
-- [ ] `/health` endpoint (liveness)
-- [ ] `/ready` endpoint (readiness)
+- [x] `/health` endpoint (liveness)
+- [x] `/ready` endpoint (readiness)
+- [x] Test: `/ready` returns 503 before runtime readiness
+- [x] Test: unknown observability paths return 404
+- [x] Test: observability request timeout is bounded
 
-**Libraries**: `tracing`, `tracing-subscriber`, `metrics`, `metrics-exporter-prometheus`
+**Configuration**:
+```toml
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
+request_timeout_secs = 5
+```
+
+**Implementation**: `tracing`, `tracing-subscriber`, minimal Prometheus-compatible
+HTTP endpoint over Tokio.
 
 ---
 
@@ -289,8 +332,14 @@ socket_timeout_secs = 30
 - [ ] Peer rotation (replace dead peers)
 - [ ] Periodic anti-entropy (pull every N seconds)
 - [ ] Op deduplication (bloom filter or set of OpIds)
+- [ ] Durable CRDT state or op log, so restart/reconnect can recover full
+      CRDT state rather than only materialized totals.
+- [ ] Startup hydration from durable CRDT state/op log.
+- [ ] Persist dedup metadata, or otherwise prevent duplicate remote ops after
+      restart.
 - [ ] Test: intermittent network (10% packet loss)
 - [ ] Test: node dies and comes back → converges
+- [ ] Test: duplicate op after restart does not double count
 
 ---
 
@@ -386,9 +435,9 @@ For each one: implementation, property tests, OpKind, docs, example.
 | 0-5 | Foundation | ✅ | - |
 | 6 | Transport Security | ✅ | **P0** |
 | 6.5 | End-to-End Sync Wiring | ✅* | **P0** |
-| 7 | Graceful Lifecycle | ⏳ | **P0** |
-| 8 | Backpressure | ⏳ | **P0** |
-| 9 | Observability | ⏳ | **P1** |
+| 7 | Graceful Lifecycle | ✅ | **P0** |
+| 8 | Backpressure | ✅ | **P0** |
+| 9 | Observability | ✅ | **P1** |
 | 10 | Network Resilience | ⏳ | **P1** |
 | 11 | Dual Serialization | ⏳ | **P1** |
 | 12 | Extended Host API | ⏳ | **P1** |
@@ -412,9 +461,9 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 6 (TLS) complete
 - [x] Phase 6.5 (End-to-End Sync) complete
 - [x] Phase 7 (Graceful shutdown) complete
-- [ ] Phase 8 (Backpressure) complete
-- [ ] Phase 9 (Observability) at least logging + health
-- [ ] Phase 10 (Resilience) at least reconnect + dedup
+- [x] Phase 8 (Backpressure) complete
+- [x] Phase 9 (Observability) at least logging + health
+- [ ] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [ ] Phase 11 (Serialization) JSON + bincode working
 - [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
 - [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
@@ -433,6 +482,17 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Base WASM examples present
 - [x] `cargo test` passes outside the sandbox
 - [x] `cargo clippy --all-targets --all-features -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
+
+---
+
+## v0.1.0-alpha.3 Release Criteria
+
+- [x] Phase 7 graceful lifecycle hardening complete
+- [x] Phase 8 backpressure complete
+- [x] Phase 9 minimal observability complete
+- [x] `cargo test` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [x] Known limitations documented in the roadmap
 
 ---

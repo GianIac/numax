@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.2**, the current public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-alpha.3**, the current public technical preview of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.2` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-alpha.3` - technical preview, API and wire format may change before the stable v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -306,6 +306,10 @@ This convention allows the guest to handle errors deterministically, without exc
 | Key length | 1024 bytes |
 | Value length | 1 MB |
 | Output buffer | 10 MB |
+| Peer connections | 64 |
+| Queued CRDT ops | 10000 |
+| Wire message size | 16 MiB |
+| Socket read/write timeout | 30s |
 
 ### 5.2 Numax Store - Local datastore *(Implemented)*
 
@@ -410,7 +414,7 @@ pub fn merge(&mut self, other: &GCounter) {
 - propagates operations to active peers through nx-net,
 - covered by end-to-end E2E tests.
 
-**Hydration** *(Planned, Phase 7)* - rebuilding the GCounter state from sled at node startup is not yet implemented. Today the state is rebuilt during execution through operations; the persistence of the materialized CRDT state is present but replay at startup is on the roadmap.
+**Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from the values materialized in sled. Durable full CRDT state/op-log recovery remains planned in Phase 10 for stronger restart/reconnect resilience.
 
 **Planned CRDTs (Phase 14):**
 
@@ -455,9 +459,10 @@ Numax Net handles communication between nodes for state synchronization.
 
 - TCP + TLS 1.3 + mTLS channel *(Implemented)*;
 - handshake, push/pull and keepalive *(Implemented)*;
+- peer connection limit, queued-op limit, message-size limit and socket read/write timeouts *(Implemented)*;
 - peer-to-peer gossip with K-fanout: architecture defined, full integration in progress *(Prototype)*;
 - full network resilience (reconnect with exponential backoff, automatic anti-entropy, op dedup) *(Planned, Phase 10)*;
-- backpressure and connection limits *(Planned, Phase 8)*.
+- automatic anti-entropy after long disconnections *(Planned, Phase 10)*.
 
 ### 5.5 Channel security *(Implemented)*
 
@@ -474,7 +479,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.2:**
+**Out of scope for v0.1.0-alpha.3:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -526,6 +531,15 @@ nx run <module.wasm>
 # Runs with a custom data directory
 nx run <module.wasm> --datastore-path ./my-data
 
+# Runs with a TOML configuration file
+nx run <module.wasm> --config ./numax.toml
+
+# Runs with the observability endpoint enabled
+nx run <module.wasm> \
+    --observability-listen 127.0.0.1:9100 \
+    --log-level info \
+    --log-format json
+
 # Runs as a sync-enabled node
 nx run <module.wasm> \
     --listen 0.0.0.0:9000 \
@@ -555,6 +569,10 @@ nx run <module.wasm> \
 | Flag | Description |
 |------|-------------|
 | `--datastore-path` | Directory for persistent data |
+| `--config` | TOML configuration file |
+| `--observability-listen` | Enable `/metrics`, `/health` and `/ready` on the given address |
+| `--log-level` | Logging level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--log-format` | Logging format: `text` or `json` |
 | `--listen` | Address on which to accept peer connections and enable sync |
 | `--peer` | Initial peer address (repeatable) |
 | `--wait-before-run` | Bounded pre-run window for peer handshakes |
@@ -564,6 +582,39 @@ nx run <module.wasm> \
 | `--tls-cert` / `--tls-key` / `--tls-ca` | TLS material for mTLS |
 | `--allowed-peers` | Allowlist of accepted peer NodeIDs |
 | `--tls-insecure` | Disables TLS (local dev only) |
+
+The implemented `limits` section is intentionally small:
+
+```toml
+[limits]
+max_peers = 64
+queued_ops_limit = 10000
+max_message_size = "16MiB"
+socket_timeout_secs = 30
+
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
+request_timeout_secs = 5
+```
+
+The same limit values are the runtime defaults when no config file is provided.
+The observability endpoint is opt-in: without `--observability-listen` or
+`[observability].listen`, no HTTP endpoint is opened.
+
+The endpoint exposes:
+
+| Path | Meaning |
+|------|---------|
+| `/metrics` | Prometheus-compatible text metrics |
+| `/health` | Liveness |
+| `/ready` | Readiness |
+
+The first metric set is deliberately operational:
+operation counts, connected peers, last sync latency, sync errors,
+observability request/error counters, peer connect/disconnect counters,
+broadcast batch/op counters and local store size.
 
 ### 5.8 Topology: epidemic gossip *(Prototype)*
 
@@ -655,11 +706,20 @@ Increment operations are materialized on sled and propagated to peers through th
 | `env_get` | Filtered environment variable reading | *Planned* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
-### 6.3 Configuration and Deployment *(Planned - Phase 15)*
+### 6.3 Configuration and Deployment *(Prototype)*
 
-Deployment will consist in shipping a `.wasm` file and a minimal configuration. Example (format being defined):
+Deployment will consist in shipping a `.wasm` file and a minimal configuration.
+
+The `limits` section below is implemented today. The other deployment sections
+remain planned work.
 
 ```toml
+[limits]
+max_peers = 64
+queued_ops_limit = 10000
+max_message_size = "16MiB"
+socket_timeout_secs = 30
+
 [module]
 name = "cart_handler"
 path = "cart_handler.wasm"
@@ -704,7 +764,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.2. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.3. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -770,12 +830,12 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.2 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-alpha.3 is a technical preview. We recognize its limits, explicitly:
 
 - **Anti-entropy is not implemented yet.** Nodes exchange live PushOps, but automatic recovery of missed deltas after long disconnections is Phase 10 work.
 - **K-fanout gossip and full network resilience are in progress.** The architecture is defined; reconnect with backoff, automatic anti-entropy and op dedup are in Phase 10.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
-- **Minimal observability.** Advanced structured logging, Prometheus metrics and health checks are in Phase 9.
+- **Minimal observability.** Structured logs, Prometheus-compatible metrics and health checks are available as an opt-in endpoint; richer dashboards and alerting remain outside the current preview.
 - **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. Dual-mode JSON/bincode serialization is planned in Phase 11.
 - **Available CRDTs limited to GCounter.** PNCounter, LWW-Register, ORSet, LWW-Map and RGA will arrive with Phase 14.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
@@ -797,11 +857,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.2 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, multi-OS CI, end-to-end examples.
+v0.1.0-alpha.3 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, lifecycle/backpressure hardening, opt-in observability, multi-OS CI, end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.2 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-alpha.3 is just the beginning.** But it is a beginning built on code, not on promises.
 
 In closing, I love software and I love numax.
 

@@ -8,6 +8,12 @@ pub struct Store {
     db: sled::Db,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreStats {
+    pub keys: u64,
+    pub bytes: u64,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -47,6 +53,18 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.db.flush()?;
         Ok(())
+    }
+
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
+        let mut stats = StoreStats { keys: 0, bytes: 0 };
+
+        for item in self.db.iter() {
+            let (key, value) = item?;
+            stats.keys += 1;
+            stats.bytes += key.len() as u64 + value.len() as u64;
+        }
+
+        Ok(stats)
     }
 
     #[allow(clippy::type_complexity)]

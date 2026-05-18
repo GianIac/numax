@@ -7,9 +7,11 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 nx-core = { path = "../nx-core" }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "0.9"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [[bin]]
 name = "nx"

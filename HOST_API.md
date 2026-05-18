@@ -113,8 +113,8 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 CRDT functions operate on replicated data types. In the current implementation,
 GCounter state is held in the runtime sync manager's in-memory registry and
 the current total is materialized to sled after each local or remote update.
-Operations are broadcast to peers when sync is enabled. Startup hydration from
-the materialized sled value is planned but not complete yet.
+Operations are broadcast to peers when sync is enabled. On startup, the runtime
+hydrates the in-memory GCounter registry from the materialized sled values.
 
 #### `crdt_gcounter_inc`
 
@@ -295,7 +295,7 @@ pub extern "C" fn run() {
 - [x] `crdt_gcounter_inc` - Increment GCounter
 - [x] `crdt_gcounter_value` - Read GCounter value
 - [x] Durable GCounter materialization in sled
-- [ ] Startup hydration from materialized GCounter values
+- [x] Startup hydration from materialized GCounter values
 - [ ] `crdt_set_add` - Add element to ORSet
 - [ ] `crdt_set_remove` - Remove element from ORSet
 - [ ] `crdt_set_contains` - Check membership

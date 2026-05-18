@@ -19,6 +19,9 @@ pub enum NetError {
     #[error("invalid message: {0}")]
     InvalidMessage(String),
 
+    #[error("message too large: {len} > {limit}")]
+    MessageTooLarge { len: usize, limit: usize },
+
     #[error("timeout")]
     Timeout,
 
@@ -30,6 +33,9 @@ pub enum NetError {
 
     #[error("peer not allowed: {0}")]
     PeerNotAllowed(String),
+
+    #[error("peer connection limit reached: {0}")]
+    PeerLimitReached(usize),
 
     #[error("node ID mismatch: expected {expected}, got {got}")]
     NodeIdMismatch { expected: String, got: String },
