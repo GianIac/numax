@@ -331,7 +331,7 @@ HTTP endpoint over Tokio.
 - [x] Peer health tracking (mark dead after N timeouts)
 - [x] Peer rotation (replace dead peers)
 - [x] Periodic anti-entropy (pull every N seconds)
-- [ ] Op deduplication (bloom filter or set of OpIds)
+- [x] Op deduplication (bounded set of OpIds)
 - [ ] Durable CRDT state or op log, so restart/reconnect can recover full
       CRDT state rather than only materialized totals.
 - [ ] Startup hydration from durable CRDT state/op log.

@@ -10,6 +10,9 @@ pub const DEFAULT_QUEUED_OPS_LIMIT: usize = 10_000;
 /// Default maximum number of in-memory ops retained for anti-entropy.
 pub const DEFAULT_OP_LOG_LIMIT: usize = 10_000;
 
+/// Default maximum number of seen OpIds retained for deduplication.
+pub const DEFAULT_SEEN_OPS_LIMIT: usize = 100_000;
+
 /// Default maximum accepted wire message size.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = nx_net::DEFAULT_MAX_MESSAGE_SIZE;
 
@@ -49,6 +52,9 @@ pub struct SyncConfig {
     /// Maximum number of in-memory ops retained for anti-entropy.
     pub op_log_limit: usize,
 
+    /// Maximum number of seen OpIds retained for deduplication.
+    pub seen_ops_limit: usize,
+
     /// Maximum accepted wire message size.
     pub max_message_size: usize,
 
@@ -77,6 +83,7 @@ impl Default for SyncConfig {
             max_peers: DEFAULT_MAX_PEERS,
             queued_ops_limit: DEFAULT_QUEUED_OPS_LIMIT,
             op_log_limit: DEFAULT_OP_LOG_LIMIT,
+            seen_ops_limit: DEFAULT_SEEN_OPS_LIMIT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
             reconnect_initial_delay: DEFAULT_RECONNECT_INITIAL_DELAY,
@@ -119,6 +126,11 @@ impl SyncConfig {
 
     pub fn with_op_log_limit(mut self, op_log_limit: usize) -> Self {
         self.op_log_limit = op_log_limit;
+        self
+    }
+
+    pub fn with_seen_ops_limit(mut self, seen_ops_limit: usize) -> Self {
+        self.seen_ops_limit = seen_ops_limit;
         self
     }
 
@@ -165,6 +177,7 @@ mod tests {
         assert_eq!(cfg.max_peers, DEFAULT_MAX_PEERS);
         assert_eq!(cfg.queued_ops_limit, DEFAULT_QUEUED_OPS_LIMIT);
         assert_eq!(cfg.op_log_limit, DEFAULT_OP_LOG_LIMIT);
+        assert_eq!(cfg.seen_ops_limit, DEFAULT_SEEN_OPS_LIMIT);
         assert_eq!(cfg.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(cfg.socket_timeout, DEFAULT_SOCKET_TIMEOUT);
         assert_eq!(cfg.reconnect_initial_delay, DEFAULT_RECONNECT_INITIAL_DELAY);
@@ -198,6 +211,7 @@ mod tests {
             .with_max_peers(8)
             .with_queued_ops_limit(256)
             .with_op_log_limit(512)
+            .with_seen_ops_limit(2048)
             .with_max_message_size(1024)
             .with_socket_timeout(Duration::from_secs(5))
             .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2))
@@ -207,6 +221,7 @@ mod tests {
         assert_eq!(cfg.max_peers, 8);
         assert_eq!(cfg.queued_ops_limit, 256);
         assert_eq!(cfg.op_log_limit, 512);
+        assert_eq!(cfg.seen_ops_limit, 2048);
         assert_eq!(cfg.max_message_size, 1024);
         assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
         assert_eq!(cfg.reconnect_initial_delay, Duration::from_millis(10));

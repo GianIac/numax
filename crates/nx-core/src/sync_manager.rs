@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -39,6 +39,47 @@ impl Default for PeerHealth {
     }
 }
 
+#[derive(Debug)]
+struct SeenOps {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+impl SeenOps {
+    fn new(limit: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            limit: normalize_seen_ops_limit(limit),
+        }
+    }
+
+    fn contains(&self, op_id: &str) -> bool {
+        self.ids.contains(op_id)
+    }
+
+    fn insert(&mut self, op_id: impl Into<String>) -> bool {
+        let op_id = op_id.into();
+        if !self.ids.insert(op_id.clone()) {
+            return false;
+        }
+
+        self.order.push_back(op_id);
+        while self.order.len() > self.limit {
+            if let Some(evicted) = self.order.pop_front() {
+                self.ids.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 struct ReconnectLoopContext {
     node: Arc<Node>,
     peers: Vec<String>,
@@ -62,7 +103,7 @@ struct AntiEntropyLoopContext {
 #[derive(Clone)]
 struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
-    seen_ops: Arc<RwLock<HashSet<String>>>,
+    seen_ops: Arc<RwLock<SeenOps>>,
     op_log: Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     store: Arc<NxStore>,
@@ -173,7 +214,7 @@ pub struct SyncManager {
     metrics: Arc<RuntimeMetrics>,
 
     /// OpId
-    seen_ops: Arc<RwLock<HashSet<String>>>,
+    seen_ops: Arc<RwLock<SeenOps>>,
 
     /// In-memory operation log used to answer anti-entropy pull requests.
     op_log: Arc<RwLock<Vec<Op>>>,
@@ -213,6 +254,7 @@ impl SyncManager {
     ) -> Self {
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let op_log_limit = normalize_op_log_limit(config.op_log_limit);
+        let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
         let peer_health = config
@@ -233,7 +275,7 @@ impl SyncManager {
             counters,
             store,
             metrics,
-            seen_ops: Arc::new(RwLock::new(HashSet::new())),
+            seen_ops: Arc::new(RwLock::new(SeenOps::new(seen_ops_limit))),
             op_log: Arc::new(RwLock::new(Vec::with_capacity(op_log_limit.min(1024)))),
             peer_health: Arc::new(RwLock::new(peer_health)),
             op_tx,
@@ -490,7 +532,7 @@ impl SyncManager {
 fn spawn_broadcast_loop(
     node: Arc<Node>,
     mut op_rx: mpsc::Receiver<Op>,
-    seen_ops: Arc<RwLock<HashSet<String>>>,
+    seen_ops: Arc<RwLock<SeenOps>>,
     op_log: Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -722,6 +764,10 @@ fn normalize_op_log_limit(limit: usize) -> usize {
     limit.max(1)
 }
 
+fn normalize_seen_ops_limit(limit: usize) -> usize {
+    limit.max(1)
+}
+
 fn next_reconnect_delay(current: Duration, max_delay: Duration) -> Duration {
     current.saturating_mul(2).min(max_delay.max(current))
 }
@@ -790,7 +836,7 @@ async fn broadcast_batch(
     node: &Arc<Node>,
     op_rx: &mut mpsc::Receiver<Op>,
     first: Op,
-    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    seen_ops: &Arc<RwLock<SeenOps>>,
     op_log: &Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     metrics: &Arc<RuntimeMetrics>,
@@ -822,7 +868,7 @@ async fn broadcast_batch(
 async fn drain_broadcast_queue(
     node: &Arc<Node>,
     op_rx: &mut mpsc::Receiver<Op>,
-    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    seen_ops: &Arc<RwLock<SeenOps>>,
     op_log: &Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     metrics: &Arc<RuntimeMetrics>,
@@ -833,7 +879,7 @@ async fn drain_broadcast_queue(
 }
 
 async fn remember_ops(
-    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    seen_ops: &Arc<RwLock<SeenOps>>,
     op_log: &Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     ops: &[Op],
@@ -1011,7 +1057,7 @@ pub(crate) fn materialize_gcounter_value(
 async fn apply_remote_op(
     op: &Op,
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
-    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    seen_ops: &Arc<RwLock<SeenOps>>,
     op_log: &Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     store: &Arc<NxStore>,
@@ -1091,7 +1137,7 @@ mod tests {
 
     fn test_event_context(
         counters: Arc<RwLock<HashMap<String, GCounter>>>,
-        seen_ops: Arc<RwLock<HashSet<String>>>,
+        seen_ops: Arc<RwLock<SeenOps>>,
         op_log: Arc<RwLock<Vec<Op>>>,
         store: Arc<NxStore>,
         metrics: Arc<RuntimeMetrics>,
@@ -1265,7 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn remember_ops_prunes_op_log_to_configured_limit() {
-        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
         let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
@@ -1286,6 +1332,39 @@ mod tests {
     #[test]
     fn op_log_limit_is_never_zero() {
         assert_eq!(normalize_op_log_limit(0), 1);
+    }
+
+    #[test]
+    fn seen_ops_limit_is_never_zero() {
+        assert_eq!(normalize_seen_ops_limit(0), 1);
+    }
+
+    #[test]
+    fn seen_ops_eviction_keeps_recent_ids() {
+        let mut seen = SeenOps::new(2);
+
+        assert!(seen.insert("op-a"));
+        assert!(seen.insert("op-b"));
+        assert!(seen.insert("op-c"));
+
+        assert!(!seen.contains("op-a"));
+        assert!(seen.contains("op-b"));
+        assert!(seen.contains("op-c"));
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn seen_ops_duplicate_does_not_refresh_position() {
+        let mut seen = SeenOps::new(2);
+
+        assert!(seen.insert("op-a"));
+        assert!(seen.insert("op-b"));
+        assert!(!seen.insert("op-a"));
+        assert!(seen.insert("op-c"));
+
+        assert!(!seen.contains("op-a"));
+        assert!(seen.contains("op-b"));
+        assert!(seen.contains("op-c"));
     }
 
     #[test]
@@ -1332,7 +1411,7 @@ mod tests {
             PeerHealth::default(),
         )])));
         let counters = Arc::new(RwLock::new(HashMap::new()));
-        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let store = temp_store();
         let metrics = metrics();
@@ -1378,7 +1457,7 @@ mod tests {
     async fn peer_events_ignore_unknown_peer_health() {
         let peer_health = Arc::new(RwLock::new(HashMap::new()));
         let counters = Arc::new(RwLock::new(HashMap::new()));
-        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let store = temp_store();
         let metrics = metrics();
@@ -1408,7 +1487,7 @@ mod tests {
     async fn apply_remote_op_materializes_counter_value() {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
-        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
@@ -1429,7 +1508,7 @@ mod tests {
     async fn apply_remote_op_duplicate_does_not_double_materialize() {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
-        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
