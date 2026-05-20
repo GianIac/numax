@@ -15,6 +15,7 @@ use crate::sync_config::SyncConfig;
 /// Upper bound on how many ops we coalesce into a single PushOps message.
 const BROADCAST_BATCH_MAX: usize = 64;
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
+const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 
 /// Health state for a configured peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,19 +984,38 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
 }
 
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(GCOUNTER_STORE_PREFIX.len() + key.len());
-    out.extend_from_slice(GCOUNTER_STORE_PREFIX.as_bytes());
+    gcounter_store_key(GCOUNTER_STORE_PREFIX, key)
+}
+
+fn durable_gcounter_state_key(key: &str) -> Vec<u8> {
+    gcounter_store_key(GCOUNTER_STATE_STORE_PREFIX, key)
+}
+
+fn gcounter_store_key(prefix: &str, key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + key.len());
+    out.extend_from_slice(prefix.as_bytes());
     out.extend_from_slice(key.as_bytes());
     out
 }
 
 fn logical_gcounter_key(store_key: &[u8]) -> anyhow::Result<String> {
-    let key = store_key
-        .strip_prefix(GCOUNTER_STORE_PREFIX.as_bytes())
-        .ok_or_else(|| anyhow::anyhow!("invalid GCounter materialized key"))?;
+    logical_key_for_prefix(store_key, GCOUNTER_STORE_PREFIX, "materialized GCounter")
+}
 
-    String::from_utf8(key.to_vec())
-        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in GCounter materialized key: {e}"))
+fn logical_gcounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_key_for_prefix(
+        store_key,
+        GCOUNTER_STATE_STORE_PREFIX,
+        "durable GCounter state",
+    )
+}
+
+fn logical_key_for_prefix(store_key: &[u8], prefix: &str, kind: &str) -> anyhow::Result<String> {
+    let key = store_key
+        .strip_prefix(prefix.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("invalid {kind} key"))?;
+
+    String::from_utf8(key.to_vec()).map_err(|e| anyhow::anyhow!("invalid UTF-8 in {kind} key: {e}"))
 }
 
 fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -1010,6 +1030,54 @@ fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
 }
 
 fn hydrate_gcounter_registry(
+    store: &NxStore,
+    node_id: &NodeId,
+    counters: &mut HashMap<String, GCounter>,
+) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_gcounter_state(store, counters)?;
+    let materialized_count = hydrate_materialized_gcounter_values(store, node_id, counters)?;
+
+    debug!(
+        durable_count,
+        materialized_count,
+        total = counters.len(),
+        "hydrated GCounter registry from sled"
+    );
+    Ok(counters.len())
+}
+
+fn hydrate_durable_gcounter_state(
+    store: &NxStore,
+    counters: &mut HashMap<String, GCounter>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(GCOUNTER_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_gcounter_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable GCounter state key");
+                continue;
+            }
+        };
+        let counter = match parse_durable_gcounter_state(&value_bytes) {
+            Ok(counter) => counter,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable GCounter state");
+                continue;
+            }
+        };
+
+        materialize_gcounter_value(store, &key, counter.value())?;
+        counters.insert(key, counter);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
+fn hydrate_materialized_gcounter_values(
     store: &NxStore,
     node_id: &NodeId,
     counters: &mut HashMap<String, GCounter>,
@@ -1032,6 +1100,9 @@ fn hydrate_gcounter_registry(
                 continue;
             }
         };
+        if counters.contains_key(&key) {
+            continue;
+        }
 
         let mut counter = GCounter::new();
         counter.increment(node_id, value);
@@ -1039,7 +1110,6 @@ fn hydrate_gcounter_registry(
         hydrated += 1;
     }
 
-    debug!(count = hydrated, "hydrated GCounter registry from sled");
     Ok(hydrated)
 }
 
@@ -1050,6 +1120,24 @@ pub(crate) fn materialize_gcounter_value(
 ) -> anyhow::Result<()> {
     let store_key = materialized_gcounter_key(key);
     store.set(&store_key, &value.to_le_bytes())?;
+    Ok(())
+}
+
+fn parse_durable_gcounter_state(bytes: &[u8]) -> anyhow::Result<GCounter> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable GCounter state: {e}"))?;
+    GCounter::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable GCounter JSON: {e}"))
+}
+
+pub(crate) fn persist_gcounter_state(
+    store: &NxStore,
+    key: &str,
+    counter: &GCounter,
+) -> anyhow::Result<()> {
+    let store_key = durable_gcounter_state_key(key);
+    let state_json = counter.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_gcounter_value(store, key, counter.value())?;
     Ok(())
 }
 
@@ -1080,7 +1168,7 @@ async fn apply_remote_op(
             counter.increment(&op.origin, *increment);
             let total = counter.value();
 
-            materialize_gcounter_value(store, key, total)?;
+            persist_gcounter_state(store, key, &counter)?;
             counters.insert(key.clone(), counter);
 
             metrics.record_ops(1);
@@ -1133,6 +1221,12 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes);
         u64::from_le_bytes(buf)
+    }
+
+    fn read_durable_gcounter_state(store: &NxStore, key: &str) -> GCounter {
+        let key = durable_gcounter_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_gcounter_state(&bytes).unwrap()
     }
 
     fn test_event_context(
@@ -1204,9 +1298,8 @@ mod tests {
             let mut counters = counters_arc.write().await;
             let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
             counter.increment(handle.node_id(), delta);
-            let total = counter.value();
 
-            materialize_gcounter_value(&handle.store(), key, total).unwrap();
+            persist_gcounter_state(&handle.store(), key, &counter).unwrap();
             counters.insert(key.to_string(), counter);
         }
 
@@ -1502,6 +1595,8 @@ mod tests {
         buf.copy_from_slice(&bytes);
 
         assert_eq!(u64::from_le_bytes(buf), 3);
+        let state = read_durable_gcounter_state(&store, "counter:visits");
+        assert_eq!(state.value_for(&NodeId::new("remote-a")), 3);
     }
 
     #[tokio::test]
@@ -1542,6 +1637,55 @@ mod tests {
         let counters = manager.counters.read().await;
         let counter = counters.get("counter:visits").unwrap();
         assert_eq!(counter.value_for(&node_id), 42);
+    }
+
+    #[tokio::test]
+    async fn manager_hydrates_gcounter_registry_from_durable_state() {
+        let store = temp_store();
+        let node_a = NodeId::new("node-a");
+        let node_b = NodeId::new("node-b");
+        let mut counter = GCounter::new();
+        counter.increment(&node_a, 5);
+        counter.increment(&node_b, 7);
+
+        persist_gcounter_state(&store, "counter:visits", &counter).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(manager.get_counter_value("counter:visits").await, 12);
+
+        let counters = manager.counters.read().await;
+        let hydrated = counters.get("counter:visits").unwrap();
+        assert_eq!(hydrated.value_for(&node_a), 5);
+        assert_eq!(hydrated.value_for(&node_b), 7);
+    }
+
+    #[tokio::test]
+    async fn durable_gcounter_state_takes_precedence_over_materialized_total() {
+        let store = temp_store();
+        let node_a = NodeId::new("node-a");
+        let node_b = NodeId::new("node-b");
+        let mut counter = GCounter::new();
+        counter.increment(&node_a, 2);
+        counter.increment(&node_b, 3);
+
+        persist_gcounter_state(&store, "counter:visits", &counter).unwrap();
+        materialize_gcounter_value(&store, "counter:visits", 99).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(manager.get_counter_value("counter:visits").await, 5);
+        assert_eq!(read_materialized(&store, "counter:visits"), 5);
     }
 
     #[tokio::test]

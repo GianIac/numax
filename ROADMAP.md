@@ -332,9 +332,9 @@ HTTP endpoint over Tokio.
 - [x] Peer rotation (replace dead peers)
 - [x] Periodic anti-entropy (pull every N seconds)
 - [x] Op deduplication (bounded set of OpIds)
-- [ ] Durable CRDT state or op log, so restart/reconnect can recover full
+- [x] Durable CRDT state or op log, so restart/reconnect can recover full
       CRDT state rather than only materialized totals.
-- [ ] Startup hydration from durable CRDT state/op log.
+- [x] Startup hydration from durable CRDT state/op log.
 - [ ] Persist dedup metadata, or otherwise prevent duplicate remote ops after
       restart.
 - [ ] Test: intermittent network (10% packet loss)
