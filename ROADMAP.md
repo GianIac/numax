@@ -337,8 +337,8 @@ HTTP endpoint over Tokio.
 - [x] Startup hydration from durable CRDT state/op log.
 - [x] Persist dedup metadata, or otherwise prevent duplicate remote ops after
       restart.
-- [ ] Test: intermittent network (10% packet loss)
-- [ ] Test: node dies and comes back → converges
+- [x] Test: intermittent network (10% packet loss)
+- [x] Test: node dies and comes back → converges
 - [x] Test: duplicate op after restart does not double count
 
 ---

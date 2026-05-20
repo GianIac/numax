@@ -1511,6 +1511,30 @@ mod tests {
     }
 
     async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
+        let op = apply_local_increment(handle, key, delta).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn dropped_local_increment(
+        manager: &SyncManager,
+        handle: &SyncHandle,
+        key: &str,
+        delta: u64,
+    ) {
+        let op = apply_local_increment(handle, key, delta).await;
+        remember_ops(
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            manager.config.op_log_limit,
+            &manager.store,
+            &[op],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn apply_local_increment(handle: &SyncHandle, key: &str, delta: u64) -> Op {
         {
             let counters_arc = handle.counters();
             let mut counters = counters_arc.write().await;
@@ -1521,8 +1545,7 @@ mod tests {
             counters.insert(key.to_string(), counter);
         }
 
-        let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
-        handle.op_sender().send(op).await.unwrap();
+        Op::gcounter_increment(handle.node_id().clone(), key, delta)
     }
 
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -1533,6 +1556,17 @@ mod tests {
         let handle = manager.handle();
         manager.start().await.unwrap();
         (manager, handle, store)
+    }
+
+    async fn started_manager_with_store(
+        node_id: NodeId,
+        config: SyncConfig,
+        store: Arc<NxStore>,
+    ) -> (SyncManager, SyncHandle) {
+        let mut manager = SyncManager::new(node_id, config, store, metrics());
+        let handle = manager.handle();
+        manager.start().await.unwrap();
+        (manager, handle)
     }
 
     async fn started_manager_with_config(
@@ -2112,6 +2146,86 @@ mod tests {
         wait_for_counter(&manager_b, key, 1).await;
         assert_eq!(read_materialized(&store_b, key), 1);
         assert_eq!(manager_a.get_counter_value(key).await, 1);
+    }
+
+    #[tokio::test]
+    async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a.clone())
+            .with_peer(addr_b.clone())
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
+
+        let config_b = SyncConfig::new()
+            .with_listen_addr(addr_b)
+            .with_peer(addr_a)
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        wait_for_connected_peer(&manager_b).await;
+
+        for i in 0..100 {
+            if i % 10 == 0 {
+                dropped_local_increment(&manager_a, &handle_a, key, 1).await;
+            } else {
+                local_increment(&handle_a, key, 1).await;
+            }
+        }
+
+        wait_for_counter(&manager_b, key, 100).await;
+        assert_eq!(manager_a.get_counter_value(key).await, 100);
+        assert_eq!(read_materialized(&store_a, key), 100);
+        assert_eq!(read_materialized(&store_b, key), 100);
+    }
+
+    #[tokio::test]
+    async fn node_restart_reconnects_and_converges_from_durable_state() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let store_b = temp_store();
+        let node_b_id = NodeId::new("node-b");
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a.clone())
+            .with_peer(addr_b.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
+
+        let config_b = SyncConfig::new()
+            .with_listen_addr(addr_b.clone())
+            .with_peer(addr_a.clone())
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (mut manager_b, _handle_b) =
+            started_manager_with_store(node_b_id.clone(), config_b, Arc::clone(&store_b)).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        local_increment(&handle_a, key, 1).await;
+        wait_for_counter(&manager_b, key, 1).await;
+
+        manager_b.shutdown().await.unwrap();
+        local_increment(&handle_a, key, 1).await;
+
+        let config_b_restart = SyncConfig::new()
+            .with_listen_addr(addr_b)
+            .with_peer(addr_a)
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_b_restarted, _handle_b_restarted) =
+            started_manager_with_store(node_b_id, config_b_restart, Arc::clone(&store_b)).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        wait_for_connected_peer(&manager_b_restarted).await;
+        wait_for_counter(&manager_b_restarted, key, 2).await;
+
+        assert_eq!(manager_a.get_counter_value(key).await, 2);
+        assert_eq!(read_materialized(&store_a, key), 2);
+        assert_eq!(read_materialized(&store_b, key), 2);
     }
 
     #[tokio::test]
