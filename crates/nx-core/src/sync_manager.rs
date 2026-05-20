@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
@@ -16,6 +19,13 @@ use crate::sync_config::SyncConfig;
 const BROADCAST_BATCH_MAX: usize = 64;
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
+const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeenOpsInsert {
+    AlreadySeen,
+    Inserted { evicted: Vec<String> },
+}
 
 /// Health state for a configured peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,26 +66,30 @@ impl SeenOps {
         }
     }
 
+    #[cfg(test)]
     fn contains(&self, op_id: &str) -> bool {
         self.ids.contains(op_id)
     }
 
-    fn insert(&mut self, op_id: impl Into<String>) -> bool {
+    fn insert(&mut self, op_id: impl Into<String>) -> SeenOpsInsert {
         let op_id = op_id.into();
         if !self.ids.insert(op_id.clone()) {
-            return false;
+            return SeenOpsInsert::AlreadySeen;
         }
 
         self.order.push_back(op_id);
+        let mut evicted_ids = Vec::new();
         while self.order.len() > self.limit {
             if let Some(evicted) = self.order.pop_front() {
                 self.ids.remove(&evicted);
+                evicted_ids.push(evicted);
             }
         }
-        true
+        SeenOpsInsert::Inserted {
+            evicted: evicted_ids,
+        }
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.ids.len()
     }
@@ -101,10 +115,31 @@ struct AntiEntropyLoopContext {
     metrics: Arc<RuntimeMetrics>,
 }
 
+struct BroadcastLoopContext {
+    node: Arc<Node>,
+    seen_ops: Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: Arc<AtomicU64>,
+    op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
+    store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
+}
+
+struct RemoteOpApplyContext<'a> {
+    counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
+    seen_ops: &'a Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: &'a Arc<AtomicU64>,
+    op_log: &'a Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
+    store: &'a Arc<NxStore>,
+    metrics: &'a Arc<RuntimeMetrics>,
+}
+
 #[derive(Clone)]
 struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
     store: Arc<NxStore>,
@@ -217,6 +252,9 @@ pub struct SyncManager {
     /// OpId
     seen_ops: Arc<RwLock<SeenOps>>,
 
+    /// Monotonic sequence used to retain recent durable dedup metadata.
+    seen_ops_next_sequence: Arc<AtomicU64>,
+
     /// In-memory operation log used to answer anti-entropy pull requests.
     op_log: Arc<RwLock<Vec<Op>>>,
 
@@ -264,6 +302,14 @@ impl SyncManager {
             .map(|peer| (peer.clone(), PeerHealth::default()))
             .collect::<HashMap<_, _>>();
 
+        let (seen_ops, seen_ops_next_sequence) = match hydrate_seen_ops(&store, seen_ops_limit) {
+            Ok(hydrated) => hydrated,
+            Err(e) => {
+                warn!(error = %e, "failed to hydrate seen OpIds");
+                (SeenOps::new(seen_ops_limit), 0)
+            }
+        };
+
         if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
             warn!(error = %e, "failed to hydrate GCounter registry");
         }
@@ -276,7 +322,8 @@ impl SyncManager {
             counters,
             store,
             metrics,
-            seen_ops: Arc::new(RwLock::new(SeenOps::new(seen_ops_limit))),
+            seen_ops: Arc::new(RwLock::new(seen_ops)),
+            seen_ops_next_sequence: Arc::new(AtomicU64::new(seen_ops_next_sequence)),
             op_log: Arc::new(RwLock::new(Vec::with_capacity(op_log_limit.min(1024)))),
             peer_health: Arc::new(RwLock::new(peer_health)),
             op_tx,
@@ -368,6 +415,7 @@ impl SyncManager {
         let event_context = NodeEventContext {
             counters: Arc::clone(&self.counters),
             seen_ops: Arc::clone(&self.seen_ops),
+            seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
             op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
@@ -406,13 +454,17 @@ impl SyncManager {
             .take()
             .expect("op_rx already taken: SyncManager::start called twice?");
         self.broadcast_task = Some(spawn_broadcast_loop(
-            Arc::clone(&node),
+            BroadcastLoopContext {
+                node: Arc::clone(&node),
+                seen_ops: Arc::clone(&self.seen_ops),
+                seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
+                op_log: Arc::clone(&self.op_log),
+                op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
+                store: Arc::clone(&self.store),
+                metrics: Arc::clone(&self.metrics),
+            },
             op_rx,
-            Arc::clone(&self.seen_ops),
-            Arc::clone(&self.op_log),
-            normalize_op_log_limit(self.config.op_log_limit),
             self.shutdown_tx.subscribe(),
-            Arc::clone(&self.metrics),
         ));
 
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
@@ -531,13 +583,9 @@ impl SyncManager {
 
 /// Spawn the outbound broadcast drain loop.
 fn spawn_broadcast_loop(
-    node: Arc<Node>,
+    context: BroadcastLoopContext,
     mut op_rx: mpsc::Receiver<Op>,
-    seen_ops: Arc<RwLock<SeenOps>>,
-    op_log: Arc<RwLock<Vec<Op>>>,
-    op_log_limit: usize,
     mut shutdown_rx: watch::Receiver<bool>,
-    metrics: Arc<RuntimeMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -546,12 +594,8 @@ fn spawn_broadcast_loop(
                     if *shutdown_rx.borrow() {
                         debug!("broadcast loop shutdown requested");
                         drain_broadcast_queue(
-                            &node,
+                            &context,
                             &mut op_rx,
-                            &seen_ops,
-                            &op_log,
-                            op_log_limit,
-                            &metrics,
                         ).await;
                         break;
                     }
@@ -561,13 +605,9 @@ fn spawn_broadcast_loop(
                         break;
                     };
                     broadcast_batch(
-                        &node,
+                        &context,
                         &mut op_rx,
                         first,
-                        &seen_ops,
-                        &op_log,
-                        op_log_limit,
-                        &metrics,
                     ).await;
                 }
             }
@@ -834,13 +874,9 @@ async fn mark_known_peer_failure(
 }
 
 async fn broadcast_batch(
-    node: &Arc<Node>,
+    context: &BroadcastLoopContext,
     op_rx: &mut mpsc::Receiver<Op>,
     first: Op,
-    seen_ops: &Arc<RwLock<SeenOps>>,
-    op_log: &Arc<RwLock<Vec<Op>>>,
-    op_log_limit: usize,
-    metrics: &Arc<RuntimeMetrics>,
 ) {
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
@@ -854,45 +890,54 @@ async fn broadcast_batch(
     }
 
     let count = batch.len();
-    remember_ops(seen_ops, op_log, op_log_limit, &batch).await;
+    if let Err(e) = remember_ops(
+        &context.seen_ops,
+        &context.seen_ops_next_sequence,
+        &context.op_log,
+        context.op_log_limit,
+        &context.store,
+        &batch,
+    )
+    .await
+    {
+        context.metrics.record_sync_error();
+        warn!(error = %e, "failed to persist local op dedup metadata");
+    }
     let started = std::time::Instant::now();
-    if let Err(e) = node.broadcast_ops(batch).await {
-        metrics.record_sync_error();
+    if let Err(e) = context.node.broadcast_ops(batch).await {
+        context.metrics.record_sync_error();
         warn!(error = %e, count, "broadcast partially failed; ops dropped for failed peers");
     } else {
-        metrics.record_broadcast_batch(count);
-        metrics.record_sync_latency(started.elapsed());
+        context.metrics.record_broadcast_batch(count);
+        context.metrics.record_sync_latency(started.elapsed());
         debug!(count, "broadcast batch sent");
     }
 }
 
-async fn drain_broadcast_queue(
-    node: &Arc<Node>,
-    op_rx: &mut mpsc::Receiver<Op>,
-    seen_ops: &Arc<RwLock<SeenOps>>,
-    op_log: &Arc<RwLock<Vec<Op>>>,
-    op_log_limit: usize,
-    metrics: &Arc<RuntimeMetrics>,
-) {
+async fn drain_broadcast_queue(context: &BroadcastLoopContext, op_rx: &mut mpsc::Receiver<Op>) {
     while let Ok(first) = op_rx.try_recv() {
-        broadcast_batch(node, op_rx, first, seen_ops, op_log, op_log_limit, metrics).await;
+        broadcast_batch(context, op_rx, first).await;
     }
 }
 
 async fn remember_ops(
     seen_ops: &Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: &Arc<AtomicU64>,
     op_log: &Arc<RwLock<Vec<Op>>>,
     op_log_limit: usize,
+    store: &Arc<NxStore>,
     ops: &[Op],
-) {
+) -> anyhow::Result<()> {
     let mut seen = seen_ops.write().await;
     let mut log = op_log.write().await;
     for op in ops {
-        if seen.insert(op.id.as_str().to_string()) {
+        if let SeenOpsInsert::Inserted { evicted } = seen.insert(op.id.as_str().to_string()) {
+            persist_seen_op_insert(store, seen_ops_next_sequence, op.id.as_str(), &evicted)?;
             log.push(op.clone());
         }
     }
     prune_op_log(&mut log, op_log_limit);
+    Ok(())
 }
 
 fn prune_op_log(log: &mut Vec<Op>, limit: usize) {
@@ -925,17 +970,16 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
             for op in ops {
-                if let Err(e) = apply_remote_op(
-                    &op,
-                    &context.counters,
-                    &context.seen_ops,
-                    &context.op_log,
-                    context.op_log_limit,
-                    &context.store,
-                    &context.metrics,
-                )
-                .await
-                {
+                let apply_context = RemoteOpApplyContext {
+                    counters: &context.counters,
+                    seen_ops: &context.seen_ops,
+                    seen_ops_next_sequence: &context.seen_ops_next_sequence,
+                    op_log: &context.op_log,
+                    op_log_limit: context.op_log_limit,
+                    store: &context.store,
+                    metrics: &context.metrics,
+                };
+                if let Err(e) = apply_remote_op(&op, &apply_context).await {
                     context.metrics.record_sync_error();
                     error!(error = %e, "failed to apply remote op");
                 }
@@ -991,6 +1035,10 @@ fn durable_gcounter_state_key(key: &str) -> Vec<u8> {
     gcounter_store_key(GCOUNTER_STATE_STORE_PREFIX, key)
 }
 
+fn seen_op_store_key(op_id: &str) -> Vec<u8> {
+    gcounter_store_key(SEEN_OP_STORE_PREFIX, op_id)
+}
+
 fn gcounter_store_key(prefix: &str, key: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + key.len());
     out.extend_from_slice(prefix.as_bytes());
@@ -1010,12 +1058,27 @@ fn logical_gcounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     )
 }
 
+fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_key_for_prefix(store_key, SEEN_OP_STORE_PREFIX, "seen OpId")
+}
+
 fn logical_key_for_prefix(store_key: &[u8], prefix: &str, kind: &str) -> anyhow::Result<String> {
     let key = store_key
         .strip_prefix(prefix.as_bytes())
         .ok_or_else(|| anyhow::anyhow!("invalid {kind} key"))?;
 
     String::from_utf8(key.to_vec()).map_err(|e| anyhow::anyhow!("invalid UTF-8 in {kind} key: {e}"))
+}
+
+fn parse_seen_op_sequence(bytes: &[u8]) -> anyhow::Result<u64> {
+    let buf: [u8; 8] = bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid seen OpId sequence length: expected 8, got {}",
+            bytes.len()
+        )
+    })?;
+
+    Ok(u64::from_be_bytes(buf))
 }
 
 fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
@@ -1044,6 +1107,52 @@ fn hydrate_gcounter_registry(
         "hydrated GCounter registry from sled"
     );
     Ok(counters.len())
+}
+
+fn hydrate_seen_ops(store: &NxStore, limit: usize) -> anyhow::Result<(SeenOps, u64)> {
+    let limit = normalize_seen_ops_limit(limit);
+    let entries = store.scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())?;
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut next_sequence = 0;
+
+    for (store_key, value_bytes) in entries {
+        let op_id = match logical_seen_op_id(&store_key) {
+            Ok(op_id) => op_id,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid seen OpId key");
+                continue;
+            }
+        };
+        let sequence = match parse_seen_op_sequence(&value_bytes) {
+            Ok(sequence) => sequence,
+            Err(e) => {
+                warn!(op_id = %op_id, error = %e, "skipping invalid seen OpId metadata");
+                continue;
+            }
+        };
+
+        next_sequence = next_sequence.max(sequence.saturating_add(1));
+        ordered.push((sequence, op_id));
+    }
+
+    ordered.sort_by_key(|(sequence, _)| *sequence);
+    let mut seen = SeenOps::new(limit);
+    let mut evicted = Vec::new();
+    for (_, op_id) in ordered {
+        if let SeenOpsInsert::Inserted {
+            evicted: evicted_ids,
+        } = seen.insert(op_id)
+        {
+            evicted.extend(evicted_ids);
+        }
+    }
+    persist_seen_op_evictions(store, &evicted)?;
+
+    debug!(
+        count = seen.len(),
+        next_sequence, "hydrated seen OpId metadata from sled"
+    );
+    Ok((seen, next_sequence))
 }
 
 fn hydrate_durable_gcounter_state(
@@ -1141,49 +1250,132 @@ pub(crate) fn persist_gcounter_state(
     Ok(())
 }
 
-/// Apply an operation received from a remote peer.
-async fn apply_remote_op(
-    op: &Op,
-    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
-    seen_ops: &Arc<RwLock<SeenOps>>,
-    op_log: &Arc<RwLock<Vec<Op>>>,
-    op_log_limit: usize,
-    store: &Arc<NxStore>,
-    metrics: &Arc<RuntimeMetrics>,
+fn persist_seen_op_insert(
+    store: &NxStore,
+    next_sequence: &AtomicU64,
+    op_id: &str,
+    evicted: &[String],
 ) -> anyhow::Result<()> {
-    // Deduplication
-    {
-        let seen = seen_ops.read().await;
-        if seen.contains(op.id.as_str()) {
+    let sequence = next_sequence.fetch_add(1, Ordering::Relaxed);
+    persist_seen_op_batch(store, op_id, sequence, evicted)
+}
+
+fn persist_seen_op_batch(
+    store: &NxStore,
+    op_id: &str,
+    sequence: u64,
+    evicted: &[String],
+) -> anyhow::Result<()> {
+    let seen_key = seen_op_store_key(op_id);
+    let seen_value = sequence.to_be_bytes();
+    let delete_keys = evicted
+        .iter()
+        .map(|op_id| seen_op_store_key(op_id))
+        .collect::<Vec<_>>();
+    let delete_refs = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    store.apply_batch(
+        &[(seen_key.as_slice(), seen_value.as_slice())],
+        &delete_refs,
+    )?;
+    Ok(())
+}
+
+fn persist_seen_op_evictions(store: &NxStore, evicted: &[String]) -> anyhow::Result<()> {
+    if evicted.is_empty() {
+        return Ok(());
+    }
+
+    let delete_keys = evicted
+        .iter()
+        .map(|op_id| seen_op_store_key(op_id))
+        .collect::<Vec<_>>();
+    let delete_refs = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+    store.apply_batch(&[], &delete_refs)?;
+    Ok(())
+}
+
+fn persist_remote_gcounter_op(
+    store: &NxStore,
+    next_sequence: &AtomicU64,
+    key: &str,
+    counter: &GCounter,
+    op_id: &str,
+    evicted: &[String],
+) -> anyhow::Result<()> {
+    let sequence = next_sequence.fetch_add(1, Ordering::Relaxed);
+    let state_key = durable_gcounter_state_key(key);
+    let state_json = counter.to_json()?;
+    let materialized_key = materialized_gcounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    let seen_key = seen_op_store_key(op_id);
+    let seen_value = sequence.to_be_bytes();
+    let delete_keys = evicted
+        .iter()
+        .map(|op_id| seen_op_store_key(op_id))
+        .collect::<Vec<_>>();
+    let delete_refs = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_value.as_slice()),
+        ],
+        &delete_refs,
+    )?;
+    Ok(())
+}
+
+/// Apply an operation received from a remote peer.
+async fn apply_remote_op(op: &Op, context: &RemoteOpApplyContext<'_>) -> anyhow::Result<()> {
+    let seen_insert = {
+        let mut seen = context.seen_ops.write().await;
+        seen.insert(op.id.as_str().to_string())
+    };
+    let evicted = match seen_insert {
+        SeenOpsInsert::AlreadySeen => {
             debug!(op_id = %op.id, "skipping duplicate op");
             return Ok(());
         }
-    }
+        SeenOpsInsert::Inserted { evicted } => evicted,
+    };
 
     // Apply according to type
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
-            let mut counters = counters.write().await;
+            let mut counters = context.counters.write().await;
             let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
             counter.increment(&op.origin, *increment);
             let total = counter.value();
 
-            persist_gcounter_state(store, key, &counter)?;
+            persist_remote_gcounter_op(
+                context.store,
+                context.seen_ops_next_sequence,
+                key,
+                &counter,
+                op.id.as_str(),
+                &evicted,
+            )?;
             counters.insert(key.clone(), counter);
 
-            metrics.record_ops(1);
+            context.metrics.record_ops(1);
             debug!(op_id = %op.id, key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
         }
     }
 
-    {
-        let mut seen = seen_ops.write().await;
-        if seen.insert(op.id.as_str().to_string()) {
-            let mut log = op_log.write().await;
-            log.push(op.clone());
-            prune_op_log(&mut log, op_log_limit);
-        }
-    }
+    let mut log = context.op_log.write().await;
+    log.push(op.clone());
+    prune_op_log(&mut log, context.op_log_limit);
 
     Ok(())
 }
@@ -1229,6 +1421,10 @@ mod tests {
         parse_durable_gcounter_state(&bytes).unwrap()
     }
 
+    fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
+        store.get(&seen_op_store_key(op_id)).unwrap().is_some()
+    }
+
     fn test_event_context(
         counters: Arc<RwLock<HashMap<String, GCounter>>>,
         seen_ops: Arc<RwLock<SeenOps>>,
@@ -1240,6 +1436,7 @@ mod tests {
         NodeEventContext {
             counters,
             seen_ops,
+            seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
             op_log_limit: 1024,
             store,
@@ -1251,6 +1448,27 @@ mod tests {
             peer_health,
             peer_dead_after_failures: 2,
         }
+    }
+
+    async fn apply_remote_op_for_test(
+        op: &Op,
+        counters: &Arc<RwLock<HashMap<String, GCounter>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        store: &Arc<NxStore>,
+    ) {
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_op(op, &context).await.unwrap();
     }
 
     async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
@@ -1404,7 +1622,9 @@ mod tests {
 
     #[tokio::test]
     async fn remember_ops_prunes_op_log_to_configured_limit() {
+        let store = temp_store();
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
         let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
@@ -1412,11 +1632,14 @@ mod tests {
 
         remember_ops(
             &seen_ops,
+            &seen_ops_next_sequence,
             &op_log,
             2,
+            &store,
             &[op_a.clone(), op_b.clone(), op_c.clone()],
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(op_log.read().await.as_slice(), &[op_b, op_c]);
         assert!(seen_ops.read().await.contains(op_a.id.as_str()));
@@ -1436,9 +1659,20 @@ mod tests {
     fn seen_ops_eviction_keeps_recent_ids() {
         let mut seen = SeenOps::new(2);
 
-        assert!(seen.insert("op-a"));
-        assert!(seen.insert("op-b"));
-        assert!(seen.insert("op-c"));
+        assert!(matches!(
+            seen.insert("op-a"),
+            SeenOpsInsert::Inserted { .. }
+        ));
+        assert!(matches!(
+            seen.insert("op-b"),
+            SeenOpsInsert::Inserted { .. }
+        ));
+        assert_eq!(
+            seen.insert("op-c"),
+            SeenOpsInsert::Inserted {
+                evicted: vec!["op-a".to_string()]
+            }
+        );
 
         assert!(!seen.contains("op-a"));
         assert!(seen.contains("op-b"));
@@ -1450,14 +1684,59 @@ mod tests {
     fn seen_ops_duplicate_does_not_refresh_position() {
         let mut seen = SeenOps::new(2);
 
-        assert!(seen.insert("op-a"));
-        assert!(seen.insert("op-b"));
-        assert!(!seen.insert("op-a"));
-        assert!(seen.insert("op-c"));
+        assert!(matches!(
+            seen.insert("op-a"),
+            SeenOpsInsert::Inserted { .. }
+        ));
+        assert!(matches!(
+            seen.insert("op-b"),
+            SeenOpsInsert::Inserted { .. }
+        ));
+        assert_eq!(seen.insert("op-a"), SeenOpsInsert::AlreadySeen);
+        assert_eq!(
+            seen.insert("op-c"),
+            SeenOpsInsert::Inserted {
+                evicted: vec!["op-a".to_string()]
+            }
+        );
 
         assert!(!seen.contains("op-a"));
         assert!(seen.contains("op-b"));
         assert!(seen.contains("op-c"));
+    }
+
+    #[test]
+    fn hydrate_seen_ops_restores_recent_ids_and_next_sequence() {
+        let store = temp_store();
+
+        persist_seen_op_batch(&store, "op-a", 7, &[]).unwrap();
+        persist_seen_op_batch(&store, "op-b", 8, &[]).unwrap();
+
+        let (seen, next_sequence) = hydrate_seen_ops(&store, 10).unwrap();
+
+        assert!(seen.contains("op-a"));
+        assert!(seen.contains("op-b"));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(next_sequence, 9);
+    }
+
+    #[test]
+    fn hydrate_seen_ops_prunes_old_metadata_to_limit() {
+        let store = temp_store();
+
+        persist_seen_op_batch(&store, "op-a", 1, &[]).unwrap();
+        persist_seen_op_batch(&store, "op-b", 2, &[]).unwrap();
+        persist_seen_op_batch(&store, "op-c", 3, &[]).unwrap();
+
+        let (seen, next_sequence) = hydrate_seen_ops(&store, 2).unwrap();
+
+        assert!(!seen.contains("op-a"));
+        assert!(seen.contains("op-b"));
+        assert!(seen.contains("op-c"));
+        assert_eq!(next_sequence, 4);
+        assert!(!seen_op_exists(&store, "op-a"));
+        assert!(seen_op_exists(&store, "op-b"));
+        assert!(seen_op_exists(&store, "op-c"));
     }
 
     #[test]
@@ -1581,13 +1860,20 @@ mod tests {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
-            .await
-            .unwrap();
+        apply_remote_op_for_test(
+            &op,
+            &counters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &store,
+        )
+        .await;
 
         let key = materialized_gcounter_key("counter:visits");
         let bytes = store.get(&key).unwrap().unwrap();
@@ -1604,16 +1890,29 @@ mod tests {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
-            .await
-            .unwrap();
-        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
-            .await
-            .unwrap();
+        apply_remote_op_for_test(
+            &op,
+            &counters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &store,
+        )
+        .await;
+        apply_remote_op_for_test(
+            &op,
+            &counters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &store,
+        )
+        .await;
 
         let key = materialized_gcounter_key("counter:visits");
         let bytes = store.get(&key).unwrap().unwrap();
@@ -1621,6 +1920,51 @@ mod tests {
         buf.copy_from_slice(&bytes);
 
         assert_eq!(u64::from_le_bytes(buf), 3);
+    }
+
+    #[tokio::test]
+    async fn duplicate_remote_op_after_restart_does_not_double_count() {
+        let store = temp_store();
+        let origin = NodeId::new("remote-a");
+        let op = Op::gcounter_increment(origin, "counter:visits", 3);
+
+        let first_manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+        apply_remote_op_for_test(
+            &op,
+            &first_manager.counters,
+            &first_manager.seen_ops,
+            &first_manager.seen_ops_next_sequence,
+            &first_manager.op_log,
+            &store,
+        )
+        .await;
+
+        let restarted_manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+        apply_remote_op_for_test(
+            &op,
+            &restarted_manager.counters,
+            &restarted_manager.seen_ops,
+            &restarted_manager.seen_ops_next_sequence,
+            &restarted_manager.op_log,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            restarted_manager.get_counter_value("counter:visits").await,
+            3
+        );
+        assert_eq!(read_materialized(&store, "counter:visits"), 3);
     }
 
     #[tokio::test]

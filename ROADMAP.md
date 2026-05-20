@@ -335,11 +335,11 @@ HTTP endpoint over Tokio.
 - [x] Durable CRDT state or op log, so restart/reconnect can recover full
       CRDT state rather than only materialized totals.
 - [x] Startup hydration from durable CRDT state/op log.
-- [ ] Persist dedup metadata, or otherwise prevent duplicate remote ops after
+- [x] Persist dedup metadata, or otherwise prevent duplicate remote ops after
       restart.
 - [ ] Test: intermittent network (10% packet loss)
 - [ ] Test: node dies and comes back → converges
-- [ ] Test: duplicate op after restart does not double count
+- [x] Test: duplicate op after restart does not double count
 
 ---
 
