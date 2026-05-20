@@ -51,6 +51,27 @@ struct ReconnectLoopContext {
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 }
 
+struct AntiEntropyLoopContext {
+    node: Arc<Node>,
+    peers: Vec<String>,
+    interval: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<RuntimeMetrics>,
+}
+
+#[derive(Clone)]
+struct NodeEventContext {
+    counters: Arc<RwLock<HashMap<String, GCounter>>>,
+    seen_ops: Arc<RwLock<HashSet<String>>>,
+    op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
+    store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
+    node: Arc<Node>,
+    peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer_dead_after_failures: u32,
+}
+
 struct PeerReconnectState {
     addr: String,
     delay: Duration,
@@ -154,6 +175,9 @@ pub struct SyncManager {
     /// OpId
     seen_ops: Arc<RwLock<HashSet<String>>>,
 
+    /// In-memory operation log used to answer anti-entropy pull requests.
+    op_log: Arc<RwLock<Vec<Op>>>,
+
     /// Health state for configured peers, keyed by configured address.
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 
@@ -174,6 +198,9 @@ pub struct SyncManager {
 
     /// Configured peer reconnect task.
     reconnect_task: Option<JoinHandle<()>>,
+
+    /// Periodic anti-entropy pull task.
+    anti_entropy_task: Option<JoinHandle<()>>,
 }
 
 impl SyncManager {
@@ -185,6 +212,7 @@ impl SyncManager {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
+        let op_log_limit = normalize_op_log_limit(config.op_log_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
         let peer_health = config
@@ -206,6 +234,7 @@ impl SyncManager {
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(HashSet::new())),
+            op_log: Arc::new(RwLock::new(Vec::with_capacity(op_log_limit.min(1024)))),
             peer_health: Arc::new(RwLock::new(peer_health)),
             op_tx,
             op_rx: Some(op_rx),
@@ -213,6 +242,7 @@ impl SyncManager {
             event_task: None,
             broadcast_task: None,
             reconnect_task: None,
+            anti_entropy_task: None,
         }
     }
 
@@ -292,13 +322,19 @@ impl SyncManager {
         self.node = Some(Arc::clone(&node));
 
         // Inbound loop: apply remote ops into the counter registry.
-        let counters = Arc::clone(&self.counters);
-        let seen_ops = Arc::clone(&self.seen_ops);
-        let store = Arc::clone(&self.store);
-        let metrics = Arc::clone(&self.metrics);
-        let peer_health = Arc::clone(&self.peer_health);
-        let peer_dead_after_failures =
-            normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
+        let event_context = NodeEventContext {
+            counters: Arc::clone(&self.counters),
+            seen_ops: Arc::clone(&self.seen_ops),
+            op_log: Arc::clone(&self.op_log),
+            op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
+            store: Arc::clone(&self.store),
+            metrics: Arc::clone(&self.metrics),
+            node: Arc::clone(&node),
+            peer_health: Arc::clone(&self.peer_health),
+            peer_dead_after_failures: normalize_peer_dead_after_failures(
+                self.config.peer_dead_after_failures,
+            ),
+        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.event_task = Some(tokio::spawn(async move {
             loop {
@@ -306,15 +342,7 @@ impl SyncManager {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             debug!("event loop shutdown requested");
-                            drain_node_events(
-                                &mut event_rx,
-                                &counters,
-                                &seen_ops,
-                                &store,
-                                &metrics,
-                                &peer_health,
-                                peer_dead_after_failures,
-                            ).await;
+                            drain_node_events(&mut event_rx, &event_context).await;
                             break;
                         }
                     }
@@ -322,15 +350,7 @@ impl SyncManager {
                         let Some(event) = event else {
                             break;
                         };
-                        handle_node_event(
-                            event,
-                            &counters,
-                            &seen_ops,
-                            &store,
-                            &metrics,
-                            &peer_health,
-                            peer_dead_after_failures,
-                        ).await;
+                        handle_node_event(event, &event_context).await;
                     }
                 }
             }
@@ -345,6 +365,9 @@ impl SyncManager {
         self.broadcast_task = Some(spawn_broadcast_loop(
             Arc::clone(&node),
             op_rx,
+            Arc::clone(&self.seen_ops),
+            Arc::clone(&self.op_log),
+            normalize_op_log_limit(self.config.op_log_limit),
             self.shutdown_tx.subscribe(),
             Arc::clone(&self.metrics),
         ));
@@ -359,6 +382,14 @@ impl SyncManager {
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
             peer_health: Arc::clone(&self.peer_health),
+        });
+
+        self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            node: Arc::clone(&node),
+            peers: self.config.peers.clone(),
+            interval: self.config.anti_entropy_interval,
+            shutdown_rx: self.shutdown_tx.subscribe(),
+            metrics: Arc::clone(&self.metrics),
         });
 
         Ok(())
@@ -433,6 +464,12 @@ impl SyncManager {
             warn!(error = %e, "reconnect task failed during shutdown");
         }
 
+        if let Some(task) = self.anti_entropy_task.take()
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, "anti-entropy task failed during shutdown");
+        }
+
         if let Some(node) = self.node.as_ref() {
             node.shutdown().await;
         }
@@ -453,6 +490,9 @@ impl SyncManager {
 fn spawn_broadcast_loop(
     node: Arc<Node>,
     mut op_rx: mpsc::Receiver<Op>,
+    seen_ops: Arc<RwLock<HashSet<String>>>,
+    op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<RuntimeMetrics>,
 ) -> JoinHandle<()> {
@@ -462,7 +502,14 @@ fn spawn_broadcast_loop(
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!("broadcast loop shutdown requested");
-                        drain_broadcast_queue(&node, &mut op_rx, &metrics).await;
+                        drain_broadcast_queue(
+                            &node,
+                            &mut op_rx,
+                            &seen_ops,
+                            &op_log,
+                            op_log_limit,
+                            &metrics,
+                        ).await;
                         break;
                     }
                 }
@@ -470,7 +517,15 @@ fn spawn_broadcast_loop(
                     let Some(first) = op else {
                         break;
                     };
-                    broadcast_batch(&node, &mut op_rx, first, &metrics).await;
+                    broadcast_batch(
+                        &node,
+                        &mut op_rx,
+                        first,
+                        &seen_ops,
+                        &op_log,
+                        op_log_limit,
+                        &metrics,
+                    ).await;
                 }
             }
         }
@@ -612,8 +667,59 @@ fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>>
     }))
 }
 
+fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
+    let AntiEntropyLoopContext {
+        node,
+        peers,
+        interval,
+        mut shutdown_rx,
+        metrics,
+    } = context;
+
+    if peers.is_empty() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let interval = normalize_anti_entropy_interval(interval);
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!("anti-entropy loop shutdown requested");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {
+                    for peer in &peers {
+                        if !node.is_connected_addr(peer).await {
+                            continue;
+                        }
+
+                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
+                            metrics.record_sync_error();
+                            debug!(peer = %peer, error = %e, "anti-entropy pull failed");
+                        } else {
+                            debug!(peer = %peer, "anti-entropy pull requested");
+                        }
+                    }
+                }
+            }
+        }
+        debug!("anti-entropy loop terminated");
+    }))
+}
+
 fn normalize_reconnect_delay(delay: Duration) -> Duration {
     delay.max(Duration::from_millis(1))
+}
+
+fn normalize_anti_entropy_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(1))
+}
+
+fn normalize_op_log_limit(limit: usize) -> usize {
+    limit.max(1)
 }
 
 fn next_reconnect_delay(current: Duration, max_delay: Duration) -> Duration {
@@ -684,6 +790,9 @@ async fn broadcast_batch(
     node: &Arc<Node>,
     op_rx: &mut mpsc::Receiver<Op>,
     first: Op,
+    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    op_log: &Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
     metrics: &Arc<RuntimeMetrics>,
 ) {
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
@@ -698,6 +807,7 @@ async fn broadcast_batch(
     }
 
     let count = batch.len();
+    remember_ops(seen_ops, op_log, op_log_limit, &batch).await;
     let started = std::time::Instant::now();
     if let Err(e) = node.broadcast_ops(batch).await {
         metrics.record_sync_error();
@@ -712,53 +822,90 @@ async fn broadcast_batch(
 async fn drain_broadcast_queue(
     node: &Arc<Node>,
     op_rx: &mut mpsc::Receiver<Op>,
+    seen_ops: &Arc<RwLock<HashSet<String>>>,
+    op_log: &Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
     metrics: &Arc<RuntimeMetrics>,
 ) {
     while let Ok(first) = op_rx.try_recv() {
-        broadcast_batch(node, op_rx, first, metrics).await;
+        broadcast_batch(node, op_rx, first, seen_ops, op_log, op_log_limit, metrics).await;
     }
 }
 
-async fn drain_node_events(
-    event_rx: &mut mpsc::Receiver<NodeEvent>,
-    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
+async fn remember_ops(
     seen_ops: &Arc<RwLock<HashSet<String>>>,
-    store: &Arc<NxStore>,
-    metrics: &Arc<RuntimeMetrics>,
-    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
-    peer_dead_after_failures: u32,
+    op_log: &Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
+    ops: &[Op],
 ) {
+    let mut seen = seen_ops.write().await;
+    let mut log = op_log.write().await;
+    for op in ops {
+        if seen.insert(op.id.as_str().to_string()) {
+            log.push(op.clone());
+        }
+    }
+    prune_op_log(&mut log, op_log_limit);
+}
+
+fn prune_op_log(log: &mut Vec<Op>, limit: usize) {
+    let limit = normalize_op_log_limit(limit);
+    if log.len() > limit {
+        let remove_count = log.len() - limit;
+        log.drain(..remove_count);
+    }
+}
+
+async fn op_log_since(op_log: &Arc<RwLock<Vec<Op>>>, since_op_id: Option<&str>) -> Vec<Op> {
+    let log = op_log.read().await;
+    match since_op_id {
+        Some(op_id) => log
+            .iter()
+            .position(|op| op.id.as_str() == op_id)
+            .map_or_else(|| log.clone(), |index| log[index + 1..].to_vec()),
+        None => log.clone(),
+    }
+}
+
+async fn drain_node_events(event_rx: &mut mpsc::Receiver<NodeEvent>, context: &NodeEventContext) {
     while let Ok(event) = event_rx.try_recv() {
-        handle_node_event(
-            event,
-            counters,
-            seen_ops,
-            store,
-            metrics,
-            peer_health,
-            peer_dead_after_failures,
-        )
-        .await;
+        handle_node_event(event, context).await;
     }
 }
 
-async fn handle_node_event(
-    event: NodeEvent,
-    counters: &Arc<RwLock<HashMap<String, GCounter>>>,
-    seen_ops: &Arc<RwLock<HashSet<String>>>,
-    store: &Arc<NxStore>,
-    metrics: &Arc<RuntimeMetrics>,
-    peer_health: &Arc<RwLock<HashMap<String, PeerHealth>>>,
-    peer_dead_after_failures: u32,
-) {
+async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
             for op in ops {
-                if let Err(e) = apply_remote_op(&op, counters, seen_ops, store, metrics).await {
-                    metrics.record_sync_error();
+                if let Err(e) = apply_remote_op(
+                    &op,
+                    &context.counters,
+                    &context.seen_ops,
+                    &context.op_log,
+                    context.op_log_limit,
+                    &context.store,
+                    &context.metrics,
+                )
+                .await
+                {
+                    context.metrics.record_sync_error();
                     error!(error = %e, "failed to apply remote op");
                 }
+            }
+        }
+        NodeEvent::PullRequested {
+            from,
+            addr,
+            since_op_id,
+        } => {
+            let ops = op_log_since(&context.op_log, since_op_id.as_deref()).await;
+            let count = ops.len();
+            if let Err(e) = context.node.send_ops_to_addr(&addr, ops).await {
+                context.metrics.record_sync_error();
+                warn!(peer = %from, addr = %addr, error = %e, "failed to answer pull request");
+            } else {
+                debug!(peer = %from, addr = %addr, count, "answered pull request");
             }
         }
         NodeEvent::PeerConnected {
@@ -766,9 +913,9 @@ async fn handle_node_event(
             addr,
             peers_connected,
         } => {
-            mark_known_peer_success(peer_health, &addr).await;
-            metrics.record_peer_connect();
-            metrics.set_peers_connected(peers_connected);
+            mark_known_peer_success(&context.peer_health, &addr).await;
+            context.metrics.record_peer_connect();
+            context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer connected");
         }
         NodeEvent::PeerDisconnected {
@@ -776,9 +923,14 @@ async fn handle_node_event(
             addr,
             peers_connected,
         } => {
-            mark_known_peer_failure(peer_health, &addr, peer_dead_after_failures).await;
-            metrics.record_peer_disconnect();
-            metrics.set_peers_connected(peers_connected);
+            mark_known_peer_failure(
+                &context.peer_health,
+                &addr,
+                context.peer_dead_after_failures,
+            )
+            .await;
+            context.metrics.record_peer_disconnect();
+            context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer disconnected");
         }
     }
@@ -860,6 +1012,8 @@ async fn apply_remote_op(
     op: &Op,
     counters: &Arc<RwLock<HashMap<String, GCounter>>>,
     seen_ops: &Arc<RwLock<HashSet<String>>>,
+    op_log: &Arc<RwLock<Vec<Op>>>,
+    op_log_limit: usize,
     store: &Arc<NxStore>,
     metrics: &Arc<RuntimeMetrics>,
 ) -> anyhow::Result<()> {
@@ -890,7 +1044,11 @@ async fn apply_remote_op(
 
     {
         let mut seen = seen_ops.write().await;
-        seen.insert(op.id.as_str().to_string());
+        if seen.insert(op.id.as_str().to_string()) {
+            let mut log = op_log.write().await;
+            log.push(op.clone());
+            prune_op_log(&mut log, op_log_limit);
+        }
     }
 
     Ok(())
@@ -929,6 +1087,30 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes);
         u64::from_le_bytes(buf)
+    }
+
+    fn test_event_context(
+        counters: Arc<RwLock<HashMap<String, GCounter>>>,
+        seen_ops: Arc<RwLock<HashSet<String>>>,
+        op_log: Arc<RwLock<Vec<Op>>>,
+        store: Arc<NxStore>,
+        metrics: Arc<RuntimeMetrics>,
+        peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+    ) -> NodeEventContext {
+        NodeEventContext {
+            counters,
+            seen_ops,
+            op_log,
+            op_log_limit: 1024,
+            store,
+            metrics,
+            node: Arc::new(Node::new(NodeConfig::new(
+                NodeId::generate(),
+                "127.0.0.1:0",
+            ))),
+            peer_health,
+            peer_dead_after_failures: 2,
+        }
     }
 
     async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
@@ -1064,6 +1246,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn op_log_since_returns_ops_after_known_id() {
+        let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
+        let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
+        let op_c = Op::gcounter_increment(NodeId::new("node-c"), "counter:visits", 3);
+        let op_log = Arc::new(RwLock::new(vec![op_a.clone(), op_b.clone(), op_c.clone()]));
+
+        assert_eq!(
+            op_log_since(&op_log, None).await,
+            vec![op_a, op_b.clone(), op_c.clone()]
+        );
+        assert_eq!(
+            op_log_since(&op_log, Some(op_b.id.as_str())).await,
+            vec![op_c]
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_ops_prunes_op_log_to_configured_limit() {
+        let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
+        let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
+        let op_c = Op::gcounter_increment(NodeId::new("node-c"), "counter:visits", 3);
+
+        remember_ops(
+            &seen_ops,
+            &op_log,
+            2,
+            &[op_a.clone(), op_b.clone(), op_c.clone()],
+        )
+        .await;
+
+        assert_eq!(op_log.read().await.as_slice(), &[op_b, op_c]);
+        assert!(seen_ops.read().await.contains(op_a.id.as_str()));
+    }
+
+    #[test]
+    fn op_log_limit_is_never_zero() {
+        assert_eq!(normalize_op_log_limit(0), 1);
+    }
+
     #[test]
     fn peer_health_marks_suspect_then_dead_after_failures() {
         let mut peer_health = HashMap::new();
@@ -1109,8 +1333,17 @@ mod tests {
         )])));
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
         let store = temp_store();
         let metrics = metrics();
+        let context = test_event_context(
+            Arc::clone(&counters),
+            Arc::clone(&seen_ops),
+            Arc::clone(&op_log),
+            Arc::clone(&store),
+            Arc::clone(&metrics),
+            Arc::clone(&peer_health),
+        );
         let node_id = NodeId::generate();
 
         handle_node_event(
@@ -1119,12 +1352,7 @@ mod tests {
                 addr: peer.to_string(),
                 peers_connected: 1,
             },
-            &counters,
-            &seen_ops,
-            &store,
-            &metrics,
-            &peer_health,
-            2,
+            &context,
         )
         .await;
         assert_eq!(
@@ -1138,12 +1366,7 @@ mod tests {
                 addr: peer.to_string(),
                 peers_connected: 0,
             },
-            &counters,
-            &seen_ops,
-            &store,
-            &metrics,
-            &peer_health,
-            2,
+            &context,
         )
         .await;
         let health = *peer_health.read().await.get(peer).unwrap();
@@ -1156,8 +1379,17 @@ mod tests {
         let peer_health = Arc::new(RwLock::new(HashMap::new()));
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
         let store = temp_store();
         let metrics = metrics();
+        let context = test_event_context(
+            Arc::clone(&counters),
+            Arc::clone(&seen_ops),
+            Arc::clone(&op_log),
+            Arc::clone(&store),
+            Arc::clone(&metrics),
+            Arc::clone(&peer_health),
+        );
 
         handle_node_event(
             NodeEvent::PeerConnected {
@@ -1165,12 +1397,7 @@ mod tests {
                 addr: "127.0.0.1:42001".to_string(),
                 peers_connected: 1,
             },
-            &counters,
-            &seen_ops,
-            &store,
-            &metrics,
-            &peer_health,
-            1,
+            &context,
         )
         .await;
 
@@ -1182,10 +1409,11 @@ mod tests {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
+        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
             .await
             .unwrap();
 
@@ -1202,13 +1430,14 @@ mod tests {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(HashSet::new()));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
-        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
+        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
             .await
             .unwrap();
-        apply_remote_op(&op, &counters, &seen_ops, &store, &metrics())
+        apply_remote_op(&op, &counters, &seen_ops, &op_log, 1024, &store, &metrics())
             .await
             .unwrap();
 
@@ -1293,6 +1522,29 @@ mod tests {
 
         wait_for_counter(&manager_b, key, 1).await;
         assert_eq!(read_materialized(&store_b, key), 1);
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_pull_converges_peer_that_missed_broadcast() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+
+        let config_a = SyncConfig::new().with_listen_addr(addr_a.clone());
+        let (manager_a, handle_a, _store_a) = started_manager_with_config(config_a).await;
+
+        local_increment(&handle_a, key, 1).await;
+
+        let config_b = SyncConfig::new()
+            .with_listen_addr(addr_b)
+            .with_peer(addr_a)
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+
+        wait_for_connected_peer(&manager_b).await;
+        wait_for_counter(&manager_b, key, 1).await;
+        assert_eq!(read_materialized(&store_b, key), 1);
+        assert_eq!(manager_a.get_counter_value(key).await, 1);
     }
 
     #[tokio::test]

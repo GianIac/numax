@@ -114,6 +114,13 @@ pub enum NodeEvent {
     /// received new operations from a peer.
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
+    /// Peer requested operations from a known point.
+    PullRequested {
+        from: NodeId,
+        addr: String,
+        since_op_id: Option<String>,
+    },
+
     /// Peer connected.
     PeerConnected {
         node_id: NodeId,
@@ -389,6 +396,7 @@ impl Node {
             if let Err(e) = read_loop(
                 reader,
                 peer_node_id.clone(),
+                addr_owned.clone(),
                 event_tx.clone(),
                 max_message_size,
                 socket_timeout,
@@ -430,7 +438,26 @@ impl Node {
 
     /// Send ops to all connected peers.
     pub async fn broadcast_ops(&self, ops: Vec<Op>) -> NetResult<()> {
-        let msg = Message::push_ops(ops);
+        self.broadcast_message(Message::push_ops(ops)).await
+    }
+
+    /// Send ops to a specific connected peer.
+    pub async fn send_ops_to_addr(&self, addr: &str, ops: Vec<Op>) -> NetResult<()> {
+        self.send_message_to_addr(addr, Message::push_ops(ops))
+            .await
+    }
+
+    /// Request ops from a specific connected peer.
+    pub async fn send_pull_since_to_addr(
+        &self,
+        addr: &str,
+        since_op_id: Option<String>,
+    ) -> NetResult<()> {
+        self.send_message_to_addr(addr, Message::pull_since(since_op_id))
+            .await
+    }
+
+    async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
         let bytes = msg.to_bytes()?;
 
         let writers = {
@@ -470,6 +497,40 @@ impl Node {
 
         if !failed.is_empty() {
             return Err(NetError::PeerDisconnected(failed.join(",")));
+        }
+
+        Ok(())
+    }
+
+    async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
+        let bytes = msg.to_bytes()?;
+        let writer = {
+            let peers = self.peers.read().await;
+            peers.get(addr).and_then(|conn| {
+                (conn.state == PeerState::Connected)
+                    .then(|| conn.writer.as_ref().map(Arc::clone))
+                    .flatten()
+            })
+        };
+
+        let Some(writer) = writer else {
+            return Err(NetError::PeerDisconnected(addr.to_string()));
+        };
+
+        let mut writer = writer.lock().await;
+        if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
+            warn!(%addr, error = %e, "failed to send message to peer");
+            if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr).await {
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::PeerDisconnected {
+                        node_id,
+                        addr: addr.to_string(),
+                        peers_connected,
+                    })
+                    .await;
+            }
+            return Err(e);
         }
 
         Ok(())
@@ -646,6 +707,7 @@ async fn handle_incoming(
     let read_result = read_loop(
         reader,
         peer_node_id.clone(),
+        addr.clone(),
         event_tx.clone(),
         limits.max_message_size,
         limits.socket_timeout,
@@ -708,6 +770,7 @@ fn ensure_peer_slot_available(
 async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
     peer_node_id: NodeId,
+    addr: String,
     event_tx: mpsc::Sender<NodeEvent>,
     max_message_size: usize,
     socket_timeout: Duration,
@@ -742,6 +805,16 @@ async fn read_loop(
                     .send(NodeEvent::OpsReceived {
                         from: peer_node_id.clone(),
                         ops,
+                    })
+                    .await;
+            }
+            MessageKind::PullSince { since_op_id } => {
+                debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
+                let _ = event_tx
+                    .send(NodeEvent::PullRequested {
+                        from: peer_node_id.clone(),
+                        addr: addr.clone(),
+                        since_op_id,
                     })
                     .await;
             }
