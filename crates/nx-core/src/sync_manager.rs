@@ -20,6 +20,7 @@ const BROADCAST_BATCH_MAX: usize = 64;
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
+const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
 #[derive(Debug, PartialEq, Eq)]
 enum SeenOpsInsert {
@@ -50,7 +51,7 @@ impl Default for PeerHealth {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SeenOps {
     ids: HashSet<String>,
     order: VecDeque<String>,
@@ -113,6 +114,8 @@ struct AntiEntropyLoopContext {
     interval: Duration,
     shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<RuntimeMetrics>,
+    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+    anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 }
 
 struct BroadcastLoopContext {
@@ -120,6 +123,7 @@ struct BroadcastLoopContext {
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: Arc<AtomicU64>,
     op_log_limit: usize,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
@@ -130,9 +134,28 @@ struct RemoteOpApplyContext<'a> {
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
     op_log: &'a Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: &'a Arc<AtomicU64>,
     op_log_limit: usize,
     store: &'a Arc<NxStore>,
     metrics: &'a Arc<RuntimeMetrics>,
+}
+
+struct OpPersistencePlan {
+    op: Op,
+    seen_sequence: u64,
+    op_log_sequence: u64,
+    seen_evicted: Vec<String>,
+    op_log_evicted: Vec<Op>,
+}
+
+struct RemoteGCounterPersistence<'a> {
+    key: &'a str,
+    counter: &'a GCounter,
+    op: &'a Op,
+    seen_sequence: u64,
+    op_log_sequence: u64,
+    seen_evicted: &'a [String],
+    op_log_evicted: &'a [Op],
 }
 
 #[derive(Clone)]
@@ -141,11 +164,14 @@ struct NodeEventContext {
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: Arc<AtomicU64>,
     op_log_limit: usize,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     node: Arc<Node>,
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+    anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
     peer_dead_after_failures: u32,
 }
 
@@ -258,8 +284,17 @@ pub struct SyncManager {
     /// In-memory operation log used to answer anti-entropy pull requests.
     op_log: Arc<RwLock<Vec<Op>>>,
 
+    /// Monotonic sequence used to retain recent durable operation-log entries.
+    op_log_next_sequence: Arc<AtomicU64>,
+
     /// Health state for configured peers, keyed by configured address.
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+
+    /// Connected configured peer NodeIds, keyed by configured address.
+    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+
+    /// Last received OpId per peer NodeId, used for incremental anti-entropy pulls.
+    anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 
     /// Channel to send Ops to broadcast.
     op_tx: mpsc::Sender<Op>,
@@ -296,6 +331,13 @@ impl SyncManager {
         let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
+        let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
+            Ok(hydrated) => hydrated,
+            Err(e) => {
+                warn!(error = %e, "failed to hydrate operation log");
+                (Vec::with_capacity(op_log_limit.min(1024)), 0)
+            }
+        };
         let peer_health = config
             .peers
             .iter()
@@ -324,8 +366,11 @@ impl SyncManager {
             metrics,
             seen_ops: Arc::new(RwLock::new(seen_ops)),
             seen_ops_next_sequence: Arc::new(AtomicU64::new(seen_ops_next_sequence)),
-            op_log: Arc::new(RwLock::new(Vec::with_capacity(op_log_limit.min(1024)))),
+            op_log: Arc::new(RwLock::new(op_log)),
+            op_log_next_sequence: Arc::new(AtomicU64::new(op_log_next_sequence)),
             peer_health: Arc::new(RwLock::new(peer_health)),
+            peer_node_ids: Arc::new(RwLock::new(HashMap::new())),
+            anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
             op_tx,
             op_rx: Some(op_rx),
             shutdown_tx,
@@ -417,11 +462,14 @@ impl SyncManager {
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
+            op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
             op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             node: Arc::clone(&node),
             peer_health: Arc::clone(&self.peer_health),
+            peer_node_ids: Arc::clone(&self.peer_node_ids),
+            anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
             peer_dead_after_failures: normalize_peer_dead_after_failures(
                 self.config.peer_dead_after_failures,
             ),
@@ -459,6 +507,7 @@ impl SyncManager {
                 seen_ops: Arc::clone(&self.seen_ops),
                 seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
                 op_log: Arc::clone(&self.op_log),
+                op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
                 op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
                 store: Arc::clone(&self.store),
                 metrics: Arc::clone(&self.metrics),
@@ -485,6 +534,8 @@ impl SyncManager {
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
+            peer_node_ids: Arc::clone(&self.peer_node_ids),
+            anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
         });
 
         Ok(())
@@ -757,6 +808,8 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
         interval,
         mut shutdown_rx,
         metrics,
+        peer_node_ids,
+        anti_entropy_watermarks,
     } = context;
 
     if peers.is_empty() {
@@ -779,7 +832,15 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             continue;
                         }
 
-                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
+                        let since_op_id = {
+                            let peer_node_ids = peer_node_ids.read().await;
+                            let Some(node_id) = peer_node_ids.get(peer) else {
+                                continue;
+                            };
+                            anti_entropy_watermarks.read().await.get(node_id).cloned()
+                        };
+
+                        if let Err(e) = node.send_pull_since_to_addr(peer, since_op_id).await {
                             metrics.record_sync_error();
                             debug!(peer = %peer, error = %e, "anti-entropy pull failed");
                         } else {
@@ -894,6 +955,7 @@ async fn broadcast_batch(
         &context.seen_ops,
         &context.seen_ops_next_sequence,
         &context.op_log,
+        &context.op_log_next_sequence,
         context.op_log_limit,
         &context.store,
         &batch,
@@ -902,6 +964,7 @@ async fn broadcast_batch(
     {
         context.metrics.record_sync_error();
         warn!(error = %e, "failed to persist local op dedup metadata");
+        return;
     }
     let started = std::time::Instant::now();
     if let Err(e) = context.node.broadcast_ops(batch).await {
@@ -924,27 +987,49 @@ async fn remember_ops(
     seen_ops: &Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &Arc<AtomicU64>,
     op_log: &Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: &Arc<AtomicU64>,
     op_log_limit: usize,
     store: &Arc<NxStore>,
     ops: &[Op],
 ) -> anyhow::Result<()> {
     let mut seen = seen_ops.write().await;
     let mut log = op_log.write().await;
+    let mut next_seen_sequence = seen_ops_next_sequence.load(Ordering::Relaxed);
+    let mut next_op_log_sequence = op_log_next_sequence.load(Ordering::Relaxed);
+    let mut planned_seen = seen.clone();
+    let mut planned_log = log.clone();
+    let mut inserts = Vec::new();
     for op in ops {
-        if let SeenOpsInsert::Inserted { evicted } = seen.insert(op.id.as_str().to_string()) {
-            persist_seen_op_insert(store, seen_ops_next_sequence, op.id.as_str(), &evicted)?;
-            log.push(op.clone());
+        if let SeenOpsInsert::Inserted { evicted } = planned_seen.insert(op.id.as_str().to_string())
+        {
+            planned_log.push(op.clone());
+            let op_log_evicted = prune_op_log_and_return_evicted(&mut planned_log, op_log_limit);
+            inserts.push(OpPersistencePlan {
+                op: op.clone(),
+                seen_sequence: next_seen_sequence,
+                op_log_sequence: next_op_log_sequence,
+                seen_evicted: evicted,
+                op_log_evicted,
+            });
+            next_seen_sequence = next_seen_sequence.saturating_add(1);
+            next_op_log_sequence = next_op_log_sequence.saturating_add(1);
         }
     }
-    prune_op_log(&mut log, op_log_limit);
+    persist_local_ops_batch(store, &inserts)?;
+    *seen = planned_seen;
+    *log = planned_log;
+    seen_ops_next_sequence.store(next_seen_sequence, Ordering::Relaxed);
+    op_log_next_sequence.store(next_op_log_sequence, Ordering::Relaxed);
     Ok(())
 }
 
-fn prune_op_log(log: &mut Vec<Op>, limit: usize) {
+fn prune_op_log_and_return_evicted(log: &mut Vec<Op>, limit: usize) -> Vec<Op> {
     let limit = normalize_op_log_limit(limit);
     if log.len() > limit {
         let remove_count = log.len() - limit;
-        log.drain(..remove_count);
+        log.drain(..remove_count).collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -969,20 +1054,28 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
-            for op in ops {
+            for op in &ops {
                 let apply_context = RemoteOpApplyContext {
                     counters: &context.counters,
                     seen_ops: &context.seen_ops,
                     seen_ops_next_sequence: &context.seen_ops_next_sequence,
                     op_log: &context.op_log,
+                    op_log_next_sequence: &context.op_log_next_sequence,
                     op_log_limit: context.op_log_limit,
                     store: &context.store,
                     metrics: &context.metrics,
                 };
-                if let Err(e) = apply_remote_op(&op, &apply_context).await {
+                if let Err(e) = apply_remote_op(op, &apply_context).await {
                     context.metrics.record_sync_error();
                     error!(error = %e, "failed to apply remote op");
                 }
+            }
+            if let Some(last_op) = ops.last() {
+                context
+                    .anti_entropy_watermarks
+                    .write()
+                    .await
+                    .insert(from, last_op.id.as_str().to_string());
             }
         }
         NodeEvent::PullRequested {
@@ -1005,6 +1098,11 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
             peers_connected,
         } => {
             mark_known_peer_success(&context.peer_health, &addr).await;
+            context
+                .peer_node_ids
+                .write()
+                .await
+                .insert(addr.clone(), node_id.clone());
             context.metrics.record_peer_connect();
             context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer connected");
@@ -1020,6 +1118,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
                 context.peer_dead_after_failures,
             )
             .await;
+            context.peer_node_ids.write().await.remove(&addr);
             context.metrics.record_peer_disconnect();
             context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer disconnected");
@@ -1037,6 +1136,10 @@ fn durable_gcounter_state_key(key: &str) -> Vec<u8> {
 
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
     gcounter_store_key(SEEN_OP_STORE_PREFIX, op_id)
+}
+
+fn op_log_store_key(op_id: &str) -> Vec<u8> {
+    gcounter_store_key(OP_LOG_STORE_PREFIX, op_id)
 }
 
 fn gcounter_store_key(prefix: &str, key: &str) -> Vec<u8> {
@@ -1060,6 +1163,10 @@ fn logical_gcounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
     logical_key_for_prefix(store_key, SEEN_OP_STORE_PREFIX, "seen OpId")
+}
+
+fn logical_op_log_id(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_key_for_prefix(store_key, OP_LOG_STORE_PREFIX, "op log OpId")
 }
 
 fn logical_key_for_prefix(store_key: &[u8], prefix: &str, kind: &str) -> anyhow::Result<String> {
@@ -1090,6 +1197,28 @@ fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
     })?;
 
     Ok(u64::from_le_bytes(buf))
+}
+
+fn encode_durable_op_log_value(sequence: u64, op: &Op) -> anyhow::Result<Vec<u8>> {
+    let op_bytes = op.to_bytes()?;
+    let mut out = Vec::with_capacity(8 + op_bytes.len());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(&op_bytes);
+    Ok(out)
+}
+
+fn parse_durable_op_log_value(bytes: &[u8]) -> anyhow::Result<(u64, Op)> {
+    if bytes.len() < 8 {
+        anyhow::bail!(
+            "invalid op log value length: expected at least 8, got {}",
+            bytes.len()
+        );
+    }
+    let mut seq = [0u8; 8];
+    seq.copy_from_slice(&bytes[..8]);
+    let op = Op::from_bytes(&bytes[8..])
+        .map_err(|e| anyhow::anyhow!("invalid durable op log JSON: {e}"))?;
+    Ok((u64::from_be_bytes(seq), op))
 }
 
 fn hydrate_gcounter_registry(
@@ -1153,6 +1282,44 @@ fn hydrate_seen_ops(store: &NxStore, limit: usize) -> anyhow::Result<(SeenOps, u
         next_sequence, "hydrated seen OpId metadata from sled"
     );
     Ok((seen, next_sequence))
+}
+
+fn hydrate_op_log(store: &NxStore, limit: usize) -> anyhow::Result<(Vec<Op>, u64)> {
+    let limit = normalize_op_log_limit(limit);
+    let entries = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())?;
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut next_sequence = 0;
+
+    for (store_key, value_bytes) in entries {
+        let op_id = match logical_op_log_id(&store_key) {
+            Ok(op_id) => op_id,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable op log key");
+                continue;
+            }
+        };
+        let (sequence, op) = match parse_durable_op_log_value(&value_bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(op_id = %op_id, error = %e, "skipping invalid durable op log entry");
+                continue;
+            }
+        };
+
+        next_sequence = next_sequence.max(sequence.saturating_add(1));
+        ordered.push((sequence, op));
+    }
+
+    ordered.sort_by_key(|(sequence, _)| *sequence);
+    let mut op_log = ordered.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
+    let evicted = prune_op_log_and_return_evicted(&mut op_log, limit);
+    persist_op_log_evictions(store, &evicted)?;
+
+    debug!(
+        count = op_log.len(),
+        next_sequence, "hydrated durable op log from sled"
+    );
+    Ok((op_log, next_sequence))
 }
 
 fn hydrate_durable_gcounter_state(
@@ -1250,16 +1417,7 @@ pub(crate) fn persist_gcounter_state(
     Ok(())
 }
 
-fn persist_seen_op_insert(
-    store: &NxStore,
-    next_sequence: &AtomicU64,
-    op_id: &str,
-    evicted: &[String],
-) -> anyhow::Result<()> {
-    let sequence = next_sequence.fetch_add(1, Ordering::Relaxed);
-    persist_seen_op_batch(store, op_id, sequence, evicted)
-}
-
+#[cfg(test)]
 fn persist_seen_op_batch(
     store: &NxStore,
     op_id: &str,
@@ -1284,6 +1442,20 @@ fn persist_seen_op_batch(
     Ok(())
 }
 
+fn collect_seen_delete_keys(evicted: &[String]) -> Vec<Vec<u8>> {
+    evicted
+        .iter()
+        .map(|op_id| seen_op_store_key(op_id))
+        .collect()
+}
+
+fn collect_op_log_delete_keys(evicted: &[Op]) -> Vec<Vec<u8>> {
+    evicted
+        .iter()
+        .map(|op| op_log_store_key(op.id.as_str()))
+        .collect()
+}
+
 fn persist_seen_op_evictions(store: &NxStore, evicted: &[String]) -> anyhow::Result<()> {
     if evicted.is_empty() {
         return Ok(());
@@ -1301,25 +1473,66 @@ fn persist_seen_op_evictions(store: &NxStore, evicted: &[String]) -> anyhow::Res
     Ok(())
 }
 
+fn persist_op_log_evictions(store: &NxStore, evicted: &[Op]) -> anyhow::Result<()> {
+    if evicted.is_empty() {
+        return Ok(());
+    }
+
+    let delete_keys = collect_op_log_delete_keys(evicted);
+    let delete_refs = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+    store.apply_batch(&[], &delete_refs)?;
+    Ok(())
+}
+
+fn persist_local_ops_batch(store: &NxStore, plans: &[OpPersistencePlan]) -> anyhow::Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let mut set_keys = Vec::new();
+    let mut set_values = Vec::new();
+    let mut delete_keys = Vec::new();
+
+    for plan in plans {
+        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
+        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
+        set_keys.push(op_log_store_key(plan.op.id.as_str()));
+        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
+        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
+        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    }
+
+    let sets = set_keys
+        .iter()
+        .zip(set_values.iter())
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    store.apply_batch(&sets, &deletes)?;
+    Ok(())
+}
+
 fn persist_remote_gcounter_op(
     store: &NxStore,
-    next_sequence: &AtomicU64,
-    key: &str,
-    counter: &GCounter,
-    op_id: &str,
-    evicted: &[String],
+    change: RemoteGCounterPersistence<'_>,
 ) -> anyhow::Result<()> {
-    let sequence = next_sequence.fetch_add(1, Ordering::Relaxed);
-    let state_key = durable_gcounter_state_key(key);
-    let state_json = counter.to_json()?;
-    let materialized_key = materialized_gcounter_key(key);
-    let materialized_value = counter.value().to_le_bytes();
-    let seen_key = seen_op_store_key(op_id);
-    let seen_value = sequence.to_be_bytes();
-    let delete_keys = evicted
-        .iter()
-        .map(|op_id| seen_op_store_key(op_id))
-        .collect::<Vec<_>>();
+    let state_key = durable_gcounter_state_key(change.key);
+    let state_json = change.counter.to_json()?;
+    let materialized_key = materialized_gcounter_key(change.key);
+    let materialized_value = change.counter.value().to_le_bytes();
+    let seen_key = seen_op_store_key(change.op.id.as_str());
+    let seen_value = change.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(change.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(change.op_log_sequence, change.op)?;
+    let mut delete_keys = collect_seen_delete_keys(change.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(change.op_log_evicted));
     let delete_refs = delete_keys
         .iter()
         .map(|key| key.as_slice())
@@ -1330,6 +1543,7 @@ fn persist_remote_gcounter_op(
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
             (seen_key.as_slice(), seen_value.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &delete_refs,
     )?;
@@ -1338,11 +1552,9 @@ fn persist_remote_gcounter_op(
 
 /// Apply an operation received from a remote peer.
 async fn apply_remote_op(op: &Op, context: &RemoteOpApplyContext<'_>) -> anyhow::Result<()> {
-    let seen_insert = {
-        let mut seen = context.seen_ops.write().await;
-        seen.insert(op.id.as_str().to_string())
-    };
-    let evicted = match seen_insert {
+    let mut seen = context.seen_ops.write().await;
+    let mut planned_seen = seen.clone();
+    let seen_evicted = match planned_seen.insert(op.id.as_str().to_string()) {
         SeenOpsInsert::AlreadySeen => {
             debug!(op_id = %op.id, "skipping duplicate op");
             return Ok(());
@@ -1350,7 +1562,13 @@ async fn apply_remote_op(op: &Op, context: &RemoteOpApplyContext<'_>) -> anyhow:
         SeenOpsInsert::Inserted { evicted } => evicted,
     };
 
-    // Apply according to type
+    let mut log = context.op_log.write().await;
+    let mut planned_log = log.clone();
+    planned_log.push(op.clone());
+    let op_log_evicted = prune_op_log_and_return_evicted(&mut planned_log, context.op_log_limit);
+    let seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
+    let op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
+
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
             let mut counters = context.counters.write().await;
@@ -1360,22 +1578,30 @@ async fn apply_remote_op(op: &Op, context: &RemoteOpApplyContext<'_>) -> anyhow:
 
             persist_remote_gcounter_op(
                 context.store,
-                context.seen_ops_next_sequence,
-                key,
-                &counter,
-                op.id.as_str(),
-                &evicted,
+                RemoteGCounterPersistence {
+                    key,
+                    counter: &counter,
+                    op,
+                    seen_sequence,
+                    op_log_sequence,
+                    seen_evicted: &seen_evicted,
+                    op_log_evicted: &op_log_evicted,
+                },
             )?;
             counters.insert(key.clone(), counter);
+            *seen = planned_seen;
+            *log = planned_log;
+            context
+                .seen_ops_next_sequence
+                .store(seen_sequence.saturating_add(1), Ordering::Relaxed);
+            context
+                .op_log_next_sequence
+                .store(op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
             context.metrics.record_ops(1);
             debug!(op_id = %op.id, key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
         }
     }
-
-    let mut log = context.op_log.write().await;
-    log.push(op.clone());
-    prune_op_log(&mut log, context.op_log_limit);
 
     Ok(())
 }
@@ -1438,6 +1664,7 @@ mod tests {
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
+            op_log_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log_limit: 1024,
             store,
             metrics,
@@ -1446,6 +1673,8 @@ mod tests {
                 "127.0.0.1:0",
             ))),
             peer_health,
+            peer_node_ids: Arc::new(RwLock::new(HashMap::new())),
+            anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
             peer_dead_after_failures: 2,
         }
     }
@@ -1456,6 +1685,7 @@ mod tests {
         seen_ops: &Arc<RwLock<SeenOps>>,
         seen_ops_next_sequence: &Arc<AtomicU64>,
         op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
         store: &Arc<NxStore>,
     ) {
         let metrics = metrics();
@@ -1464,6 +1694,7 @@ mod tests {
             seen_ops,
             seen_ops_next_sequence,
             op_log,
+            op_log_next_sequence,
             op_log_limit: 1024,
             store,
             metrics: &metrics,
@@ -1526,6 +1757,7 @@ mod tests {
             &manager.seen_ops,
             &manager.seen_ops_next_sequence,
             &manager.op_log,
+            &manager.op_log_next_sequence,
             manager.config.op_log_limit,
             &manager.store,
             &[op],
@@ -1659,6 +1891,7 @@ mod tests {
         let store = temp_store();
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
         let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
         let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
@@ -1668,6 +1901,7 @@ mod tests {
             &seen_ops,
             &seen_ops_next_sequence,
             &op_log,
+            &op_log_next_sequence,
             2,
             &store,
             &[op_a.clone(), op_b.clone(), op_c.clone()],
@@ -1890,12 +2124,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ops_received_updates_anti_entropy_watermark() {
+        let peer = NodeId::new("peer-a");
+        let peer_health = Arc::new(RwLock::new(HashMap::new()));
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let store = temp_store();
+        let metrics = metrics();
+        let context = test_event_context(
+            Arc::clone(&counters),
+            Arc::clone(&seen_ops),
+            Arc::clone(&op_log),
+            Arc::clone(&store),
+            Arc::clone(&metrics),
+            Arc::clone(&peer_health),
+        );
+        let op_a = Op::gcounter_increment(peer.clone(), "counter:visits", 1);
+        let op_b = Op::gcounter_increment(peer.clone(), "counter:visits", 1);
+        let expected = op_b.id.as_str().to_string();
+
+        handle_node_event(
+            NodeEvent::OpsReceived {
+                from: peer.clone(),
+                ops: vec![op_a, op_b],
+            },
+            &context,
+        )
+        .await;
+
+        assert_eq!(
+            context
+                .anti_entropy_watermarks
+                .read()
+                .await
+                .get(&peer)
+                .cloned(),
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
     async fn apply_remote_op_materializes_counter_value() {
         let store = temp_store();
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
@@ -1905,6 +2181,7 @@ mod tests {
             &seen_ops,
             &seen_ops_next_sequence,
             &op_log,
+            &op_log_next_sequence,
             &store,
         )
         .await;
@@ -1926,6 +2203,7 @@ mod tests {
         let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
         let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
         let origin = NodeId::new("remote-a");
         let op = Op::gcounter_increment(origin, "counter:visits", 3);
 
@@ -1935,6 +2213,7 @@ mod tests {
             &seen_ops,
             &seen_ops_next_sequence,
             &op_log,
+            &op_log_next_sequence,
             &store,
         )
         .await;
@@ -1944,6 +2223,7 @@ mod tests {
             &seen_ops,
             &seen_ops_next_sequence,
             &op_log,
+            &op_log_next_sequence,
             &store,
         )
         .await;
@@ -1974,6 +2254,7 @@ mod tests {
             &first_manager.seen_ops,
             &first_manager.seen_ops_next_sequence,
             &first_manager.op_log,
+            &first_manager.op_log_next_sequence,
             &store,
         )
         .await;
@@ -1990,6 +2271,7 @@ mod tests {
             &restarted_manager.seen_ops,
             &restarted_manager.seen_ops_next_sequence,
             &restarted_manager.op_log,
+            &restarted_manager.op_log_next_sequence,
             &store,
         )
         .await;
@@ -2226,6 +2508,51 @@ mod tests {
         assert_eq!(manager_a.get_counter_value(key).await, 2);
         assert_eq!(read_materialized(&store_a, key), 2);
         assert_eq!(read_materialized(&store_b, key), 2);
+    }
+
+    #[tokio::test]
+    async fn source_restart_before_anti_entropy_still_serves_missed_ops() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let store_a = temp_store();
+        let node_a_id = NodeId::new("node-a");
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a.clone())
+            .with_peer(addr_b.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (mut manager_a, handle_a) =
+            started_manager_with_store(node_a_id.clone(), config_a, Arc::clone(&store_a)).await;
+
+        let config_b = SyncConfig::new()
+            .with_listen_addr(addr_b)
+            .with_peer(addr_a.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+
+        wait_for_connected_peer(&manager_a).await;
+        wait_for_connected_peer(&manager_b).await;
+
+        dropped_local_increment(&manager_a, &handle_a, key, 1).await;
+        manager_a.shutdown().await.unwrap();
+
+        let config_a_restart = SyncConfig::new()
+            .with_listen_addr(addr_a)
+            .with_peer(manager_b.config.listen_addr.clone().unwrap())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_a_restarted, _handle_a_restarted) =
+            started_manager_with_store(node_a_id, config_a_restart, Arc::clone(&store_a)).await;
+
+        wait_for_connected_peer(&manager_a_restarted).await;
+        wait_for_connected_peer(&manager_b).await;
+        wait_for_counter(&manager_b, key, 1).await;
+
+        assert_eq!(read_materialized(&store_a, key), 1);
+        assert_eq!(read_materialized(&store_b, key), 1);
     }
 
     #[tokio::test]
