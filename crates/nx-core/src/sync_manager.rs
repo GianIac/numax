@@ -1054,6 +1054,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
+            let mut last_applied_op_id = None;
             for op in &ops {
                 let apply_context = RemoteOpApplyContext {
                     counters: &context.counters,
@@ -1068,14 +1069,16 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
                 if let Err(e) = apply_remote_op(op, &apply_context).await {
                     context.metrics.record_sync_error();
                     error!(error = %e, "failed to apply remote op");
+                    break;
                 }
+                last_applied_op_id = Some(op.id.as_str().to_string());
             }
-            if let Some(last_op) = ops.last() {
+            if let Some(op_id) = last_applied_op_id {
                 context
                     .anti_entropy_watermarks
                     .write()
                     .await
-                    .insert(from, last_op.id.as_str().to_string());
+                    .insert(from, op_id);
             }
         }
         NodeEvent::PullRequested {
@@ -1305,6 +1308,14 @@ fn hydrate_op_log(store: &NxStore, limit: usize) -> anyhow::Result<(Vec<Op>, u64
                 continue;
             }
         };
+        if op.id.as_str() != op_id {
+            warn!(
+                key_op_id = %op_id,
+                value_op_id = %op.id,
+                "skipping durable op log entry with mismatched OpId"
+            );
+            continue;
+        }
 
         next_sequence = next_sequence.max(sequence.saturating_add(1));
         ordered.push((sequence, op));
@@ -1649,6 +1660,12 @@ mod tests {
 
     fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
         store.get(&seen_op_store_key(op_id)).unwrap().is_some()
+    }
+
+    fn write_durable_op_log_entry(store: &NxStore, key_op_id: &str, sequence: u64, op: &Op) {
+        let key = op_log_store_key(key_op_id);
+        let value = encode_durable_op_log_value(sequence, op).unwrap();
+        store.set(&key, &value).unwrap();
     }
 
     fn test_event_context(
@@ -2005,6 +2022,21 @@ mod tests {
         assert!(!seen_op_exists(&store, "op-a"));
         assert!(seen_op_exists(&store, "op-b"));
         assert!(seen_op_exists(&store, "op-c"));
+    }
+
+    #[test]
+    fn hydrate_op_log_skips_key_value_op_id_mismatch() {
+        let store = temp_store();
+        let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
+        let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 1);
+
+        write_durable_op_log_entry(&store, op_a.id.as_str(), 1, &op_a);
+        write_durable_op_log_entry(&store, "different-op-id", 2, &op_b);
+
+        let (op_log, next_sequence) = hydrate_op_log(&store, 10).unwrap();
+
+        assert_eq!(op_log, vec![op_a]);
+        assert_eq!(next_sequence, 2);
     }
 
     #[test]
