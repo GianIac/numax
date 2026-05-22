@@ -383,20 +383,36 @@ HTTP endpoint over Tokio.
 ### Phase 12: Extended Host API 🔌
 **Goal**: Complete API for WASM modules
 
+> ⚠️ **WIP** - this phase is actively being shaped. The items below reflect the current agreed minimum for `v0.1.0`.
+> See [#57](https://github.com/GianIac/numax/issues/57) for the ongoing discussion on formalizing this API surface in WIT + Component Model.
+
 **Database**:
-- [ ] `db_scan`, `db_exists`, `db_keys`
+- [ ] `db_scan` — prefix scan with iterator / paginated results
+- [ ] `db_exists` — check key existence without reading the value
+- [ ] `db_keys` — list keys matching a prefix
 
 **Time**:
-- [ ] `time_now`, `time_monotonic`
+- [ ] `time_now` — current Unix timestamp (ms)
+- [ ] `time_monotonic` — monotonic clock for measurements
 
 **Crypto**:
-- [ ] `random_bytes`, `hash_sha256`, `hash_blake3`
+- [ ] `random_bytes` — cryptographically secure random bytes
+- [ ] `hash_sha256` — SHA-256 hash
+- [ ] `hash_blake3` — BLAKE3 hash (faster)
 
 **System**:
-- [ ] `env_get`, `module_id`, `abort`
+- [ ] `env_get` — read an environment variable
+- [ ] `module_id` — get current module identifier
+- [ ] `abort` — terminate execution with an error message
 
-**Network**:
-- [ ] `net_node_id`, `net_peers`
+**Network** *(query-only, no send)*:
+- [ ] `net_node_id` — get own NodeId
+- [ ] `net_peers` — list currently connected peers
+
+**Under evaluation** *(not committed to `v0.1.0`)*:
+- [ ] `host_capabilities` — query which host APIs are available at runtime
+- [ ] `event_emit` — emit a named event to the runtime (foundation for callbacks)
+- [ ] `db_scan` cursor/pagination variant — safe iteration over large key spaces
 
 **Libraries**: `sha2`, `blake3`, `getrandom`
 
