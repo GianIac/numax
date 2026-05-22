@@ -6,6 +6,10 @@ pub extern "C" fn run() {
 
     db::set("hello", b"world").unwrap();
     nx_log!("kv_sdk_roundtrip: exists = {}", db::exists("hello").unwrap());
+    nx_log!(
+        "kv_sdk_roundtrip: scan count = {}",
+        db::scan("hel").unwrap().len()
+    );
 
     let v = db::get("hello").unwrap().unwrap();
     nx_log!("kv_sdk_roundtrip: got {}", core::str::from_utf8(&v).unwrap());

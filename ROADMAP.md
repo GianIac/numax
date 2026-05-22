@@ -387,7 +387,7 @@ HTTP endpoint over Tokio.
 > See [#57](https://github.com/GianIac/numax/issues/57) for the ongoing discussion on formalizing this API surface in WIT + Component Model.
 
 **Database**:
-- [ ] `db_scan` — prefix scan with iterator / paginated results
+- [x] `db_scan` — prefix scan with iterator / paginated results
 - [x] `db_exists` — check key existence without reading the value
 - [ ] `db_keys` — list keys matching a prefix
 

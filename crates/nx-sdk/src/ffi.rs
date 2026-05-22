@@ -4,6 +4,14 @@ unsafe extern "C" {
     pub fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn db_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32;
     pub fn db_exists(key_ptr: u32, key_len: u32) -> i32;
+    pub fn db_scan(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        cursor: u64,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
     pub fn db_delete(key_ptr: u32, key_len: u32) -> i32;
 
     // CRDT (namespace "nx")
