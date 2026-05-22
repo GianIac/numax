@@ -1,23 +1,65 @@
+use crate::{NetError, NetResult};
 use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+const FORMAT_JSON: u8 = 0x01;
+const FORMAT_BINCODE: u8 = 0x02;
+
+/// Wire payload serialization format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerializationFormat {
+    Json,
+    Bincode,
+}
+
+impl SerializationFormat {
+    fn to_wire_byte(self) -> u8 {
+        match self {
+            Self::Json => FORMAT_JSON,
+            Self::Bincode => FORMAT_BINCODE,
+        }
+    }
+
+    fn from_wire_byte(byte: u8) -> NetResult<Self> {
+        match byte {
+            FORMAT_JSON => Ok(Self::Json),
+            FORMAT_BINCODE => Ok(Self::Bincode),
+            other => Err(NetError::InvalidMessage(format!(
+                "unknown serialization format byte: {other}"
+            ))),
+        }
+    }
+}
+
+pub const DEFAULT_SUPPORTED_FORMATS: &[SerializationFormat] =
+    &[SerializationFormat::Bincode, SerializationFormat::Json];
 
 /// Message type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     /// Initial handshake.
-    Hello { node_id: NodeId, version: u32 },
+    Hello {
+        node_id: NodeId,
+        version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+    },
 
     /// Response to Hello.
-    HelloAck { node_id: NodeId, version: u32 },
+    HelloAck {
+        node_id: NodeId,
+        version: u32,
+        selected_format: SerializationFormat,
+    },
 
     /// Send CRDT operations.
     PushOps { ops: Vec<Op> },
 
     /// Acknowledge ops reception.
-    PushOpsAck { received_count: usize },
+    PushOpsAck { received_count: u64 },
 
     /// Request operations from a certain point.
     /// `since_op_id` is the last known op_id (None = I want everything).
@@ -31,26 +73,45 @@ pub enum MessageKind {
 }
 
 /// Complete message with metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub kind: MessageKind,
 }
 
 impl Message {
     pub fn hello(node_id: NodeId) -> Self {
+        Self::hello_with_formats(
+            node_id,
+            DEFAULT_SUPPORTED_FORMATS.to_vec(),
+            SerializationFormat::Bincode,
+        )
+    }
+
+    pub fn hello_with_formats(
+        node_id: NodeId,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+    ) -> Self {
         Self {
             kind: MessageKind::Hello {
                 node_id,
                 version: PROTOCOL_VERSION,
+                supported_formats,
+                preferred_format,
             },
         }
     }
 
     pub fn hello_ack(node_id: NodeId) -> Self {
+        Self::hello_ack_with_format(node_id, SerializationFormat::Bincode)
+    }
+
+    pub fn hello_ack_with_format(node_id: NodeId, selected_format: SerializationFormat) -> Self {
         Self {
             kind: MessageKind::HelloAck {
                 node_id,
                 version: PROTOCOL_VERSION,
+                selected_format,
             },
         }
     }
@@ -63,7 +124,9 @@ impl Message {
 
     pub fn push_ops_ack(received_count: usize) -> Self {
         Self {
-            kind: MessageKind::PushOpsAck { received_count },
+            kind: MessageKind::PushOpsAck {
+                received_count: received_count as u64,
+            },
         }
     }
 
@@ -85,19 +148,55 @@ impl Message {
         }
     }
 
-    /// Serialize to bytes (length-prefixed JSON).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let json = serde_json::to_vec(self)?;
-        let len = (json.len() as u32).to_be_bytes();
-        let mut buf = Vec::with_capacity(4 + json.len());
+    /// Serialize to bytes using the default production wire format.
+    pub fn to_bytes(&self) -> NetResult<Vec<u8>> {
+        self.to_bytes_with_format(SerializationFormat::Bincode)
+    }
+
+    /// Serialize to bytes using the JSON debug wire format.
+    pub fn to_json_bytes(&self) -> NetResult<Vec<u8>> {
+        self.to_bytes_with_format(SerializationFormat::Json)
+    }
+
+    /// Serialize to bytes (length-prefixed format byte + payload).
+    pub fn to_bytes_with_format(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
+        let payload = match format {
+            SerializationFormat::Json => serde_json::to_vec(self)?,
+            SerializationFormat::Bincode => bincode::serialize(self)?,
+        };
+        let len = payload
+            .len()
+            .checked_add(1)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| NetError::InvalidMessage("message payload exceeds u32".to_string()))?;
+        let len = len.to_be_bytes();
+        let mut buf = Vec::with_capacity(4 + 1 + payload.len());
         buf.extend_from_slice(&len);
-        buf.extend_from_slice(&json);
+        buf.push(format.to_wire_byte());
+        buf.extend_from_slice(&payload);
         Ok(buf)
     }
 
-    /// Deserialize from JSON bytes (without length prefix).
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    /// Deserialize from bytes without the length prefix.
+    pub fn from_bytes(bytes: &[u8]) -> NetResult<Self> {
+        let (_, msg) = Self::from_bytes_with_format(bytes)?;
+        Ok(msg)
+    }
+
+    /// Deserialize from bytes without the length prefix, returning the detected format.
+    pub fn from_bytes_with_format(bytes: &[u8]) -> NetResult<(SerializationFormat, Self)> {
+        let Some((&format_byte, payload)) = bytes.split_first() else {
+            return Err(NetError::InvalidMessage(
+                "message payload is missing serialization format byte".to_string(),
+            ));
+        };
+
+        let format = SerializationFormat::from_wire_byte(format_byte)?;
+        let msg = match format {
+            SerializationFormat::Json => serde_json::from_slice(payload)?,
+            SerializationFormat::Bincode => bincode::deserialize(payload)?,
+        };
+        Ok((format, msg))
     }
 }
 
@@ -114,30 +213,54 @@ mod tests {
             MessageKind::Hello {
                 node_id: id,
                 version,
+                supported_formats,
+                preferred_format,
             } => {
                 assert_eq!(id, &node_id);
                 assert_eq!(*version, PROTOCOL_VERSION);
+                assert_eq!(supported_formats, DEFAULT_SUPPORTED_FORMATS);
+                assert_eq!(*preferred_format, SerializationFormat::Bincode);
             }
             _ => panic!("wrong message kind"),
         }
     }
 
     #[test]
-    fn test_message_roundtrip() {
+    fn test_message_roundtrip_json() {
         let node_id = NodeId::new("node-1");
         let msg = Message::hello(node_id);
 
-        let bytes = msg.to_bytes().unwrap();
+        let bytes = msg.to_bytes_with_format(SerializationFormat::Json).unwrap();
 
         // Skip 4-byte length prefix
-        let parsed = Message::from_bytes(&bytes[4..]).unwrap();
+        let (format, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
 
-        match (&msg.kind, &parsed.kind) {
-            (MessageKind::Hello { node_id: id1, .. }, MessageKind::Hello { node_id: id2, .. }) => {
-                assert_eq!(id1, id2);
-            }
-            _ => panic!("mismatch"),
-        }
+        assert_eq!(format, SerializationFormat::Json);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_message_roundtrip_bincode() {
+        let node = NodeId::new("node-1");
+        let op = Op::gcounter_increment(node, "counter:test", 5);
+        let msg = Message::push_ops(vec![op]);
+
+        let bytes = msg
+            .to_bytes_with_format(SerializationFormat::Bincode)
+            .unwrap();
+
+        // Skip 4-byte length prefix
+        let (format, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
+
+        assert_eq!(format, SerializationFormat::Bincode);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn rejects_unknown_serialization_format() {
+        let err = Message::from_bytes(&[0xff, b'{', b'}']).unwrap_err();
+
+        assert!(matches!(err, NetError::InvalidMessage(_)));
     }
 
     #[test]

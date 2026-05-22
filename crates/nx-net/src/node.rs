@@ -11,7 +11,9 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NetError, NetResult};
-use crate::message::{Message, MessageKind, PROTOCOL_VERSION};
+use crate::message::{
+    DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
+};
 use crate::peer::{PeerInfo, PeerState};
 use crate::tls::{NetStream, TlsConfig};
 
@@ -32,6 +34,7 @@ struct NodeLimits {
     max_peers: usize,
     max_message_size: usize,
     socket_timeout: Duration,
+    serialization_format: SerializationFormat,
 }
 
 struct IncomingContext {
@@ -67,6 +70,9 @@ pub struct NodeConfig {
 
     /// Timeout for socket reads and writes.
     pub socket_timeout: Duration,
+
+    /// Serialization format used for outgoing messages.
+    pub serialization_format: SerializationFormat,
 }
 
 impl NodeConfig {
@@ -79,6 +85,7 @@ impl NodeConfig {
             max_peers: DEFAULT_MAX_PEERS,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
+            serialization_format: SerializationFormat::Bincode,
         }
     }
 
@@ -106,6 +113,11 @@ impl NodeConfig {
         self.socket_timeout = socket_timeout;
         self
     }
+
+    pub fn with_serialization_format(mut self, serialization_format: SerializationFormat) -> Self {
+        self.serialization_format = serialization_format;
+        self
+    }
 }
 
 /// Node exit event (for runtime).
@@ -114,15 +126,24 @@ pub enum NodeEvent {
     /// received new operations from a peer.
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
+    /// Peer requested operations from a known point.
+    PullRequested {
+        from: NodeId,
+        addr: String,
+        since_op_id: Option<String>,
+    },
+
     /// Peer connected.
     PeerConnected {
         node_id: NodeId,
+        addr: String,
         peers_connected: usize,
     },
 
     /// Peer disconnected.
     PeerDisconnected {
         node_id: NodeId,
+        addr: String,
         peers_connected: usize,
     },
 }
@@ -132,6 +153,7 @@ pub enum NodeEvent {
 struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
+    serialization_format: SerializationFormat,
     writer: Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<crate::tls::NetStream>>>>,
     _slot: OwnedSemaphorePermit,
 }
@@ -189,6 +211,7 @@ impl Node {
             max_peers: self.config.max_peers,
             max_message_size: self.config.max_message_size,
             socket_timeout: self.config.socket_timeout,
+            serialization_format: self.config.serialization_format,
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -259,8 +282,9 @@ impl Node {
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
-        let tcp = TcpStream::connect(addr)
+        let tcp = timeout(self.config.socket_timeout, TcpStream::connect(addr))
             .await
+            .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
 
         let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
@@ -288,8 +312,19 @@ impl Node {
         let (mut reader, mut writer) = tokio::io::split(stream);
 
         // Send HELLO
-        let hello = Message::hello(self.config.node_id.clone());
-        write_message(&mut writer, &hello, self.config.socket_timeout).await?;
+        let supported_formats = supported_formats_for(self.config.serialization_format);
+        let hello = Message::hello_with_formats(
+            self.config.node_id.clone(),
+            supported_formats,
+            self.config.serialization_format,
+        );
+        write_message(
+            &mut writer,
+            &hello,
+            self.config.serialization_format,
+            self.config.socket_timeout,
+        )
+        .await?;
 
         // Wait HELLO_ACK
         let response = read_message(
@@ -298,17 +333,24 @@ impl Node {
             self.config.socket_timeout,
         )
         .await?;
-        let peer_node_id = match response.kind {
-            MessageKind::HelloAck { node_id, version } => {
+        let (peer_node_id, negotiated_format) = match response.kind {
+            MessageKind::HelloAck {
+                node_id,
+                version,
+                selected_format,
+            } => {
                 if version != PROTOCOL_VERSION {
-                    warn!(
-                        their_version = version,
-                        our_version = PROTOCOL_VERSION,
-                        "protocol version mismatch"
-                    );
+                    return Err(protocol_version_mismatch(version));
                 }
-                info!(peer = %node_id, "handshake complete");
-                node_id
+                if !supported_formats_for(self.config.serialization_format)
+                    .contains(&selected_format)
+                {
+                    return Err(NetError::InvalidMessage(format!(
+                        "peer selected unsupported serialization format: {selected_format:?}"
+                    )));
+                }
+                info!(peer = %node_id, serialization_format = ?selected_format, "handshake complete");
+                (node_id, selected_format)
             }
             _ => {
                 return Err(NetError::InvalidMessage("expected HelloAck".into()));
@@ -357,6 +399,7 @@ impl Node {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     state: PeerState::Connected,
+                    serialization_format: negotiated_format,
                     writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
                     _slot: slot,
                 },
@@ -369,6 +412,7 @@ impl Node {
             .event_tx
             .send(NodeEvent::PeerConnected {
                 node_id: peer_node_id.clone(),
+                addr: addr.to_string(),
                 peers_connected,
             })
             .await;
@@ -385,6 +429,7 @@ impl Node {
             if let Err(e) = read_loop(
                 reader,
                 peer_node_id.clone(),
+                addr_owned.clone(),
                 event_tx.clone(),
                 max_message_size,
                 socket_timeout,
@@ -399,15 +444,21 @@ impl Node {
             let disconnected = {
                 let mut peers = peers.write().await;
                 peers.remove(&addr_owned).and_then(|removed| {
-                    (removed.state == PeerState::Connected)
-                        .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
+                    (removed.state == PeerState::Connected).then(|| {
+                        (
+                            peer_node_id.clone(),
+                            addr_owned.clone(),
+                            connected_peer_count(&peers),
+                        )
+                    })
                 })
             };
 
-            if let Some((node_id, peers_connected)) = disconnected {
+            if let Some((node_id, addr, peers_connected)) = disconnected {
                 let _ = event_tx
                     .send(NodeEvent::PeerDisconnected {
                         node_id,
+                        addr,
                         peers_connected,
                     })
                     .await;
@@ -420,9 +471,26 @@ impl Node {
 
     /// Send ops to all connected peers.
     pub async fn broadcast_ops(&self, ops: Vec<Op>) -> NetResult<()> {
-        let msg = Message::push_ops(ops);
-        let bytes = msg.to_bytes()?;
+        self.broadcast_message(Message::push_ops(ops)).await
+    }
 
+    /// Send ops to a specific connected peer.
+    pub async fn send_ops_to_addr(&self, addr: &str, ops: Vec<Op>) -> NetResult<()> {
+        self.send_message_to_addr(addr, Message::push_ops(ops))
+            .await
+    }
+
+    /// Request ops from a specific connected peer.
+    pub async fn send_pull_since_to_addr(
+        &self,
+        addr: &str,
+        since_op_id: Option<String>,
+    ) -> NetResult<()> {
+        self.send_message_to_addr(addr, Message::pull_since(since_op_id))
+            .await
+    }
+
+    async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
         let writers = {
             let peers = self.peers.read().await;
             peers
@@ -430,9 +498,9 @@ impl Node {
                 .filter_map(|(addr, conn)| {
                     (conn.state == PeerState::Connected)
                         .then(|| {
-                            conn.writer
-                                .as_ref()
-                                .map(|writer| (addr.clone(), Arc::clone(writer)))
+                            conn.writer.as_ref().map(|writer| {
+                                (addr.clone(), Arc::clone(writer), conn.serialization_format)
+                            })
                         })
                         .flatten()
                 })
@@ -440,7 +508,8 @@ impl Node {
         };
 
         let mut failed = Vec::new();
-        for (addr, writer) in writers {
+        for (addr, writer, serialization_format) in writers {
+            let bytes = msg.to_bytes_with_format(serialization_format)?;
             let mut writer = writer.lock().await;
             if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
                 warn!(%addr, error = %e, "failed to send ops");
@@ -450,6 +519,7 @@ impl Node {
                         .event_tx
                         .send(NodeEvent::PeerDisconnected {
                             node_id,
+                            addr: addr.clone(),
                             peers_connected,
                         })
                         .await;
@@ -464,10 +534,56 @@ impl Node {
         Ok(())
     }
 
+    async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
+        let peer_writer = {
+            let peers = self.peers.read().await;
+            peers.get(addr).and_then(|conn| {
+                (conn.state == PeerState::Connected)
+                    .then(|| {
+                        conn.writer
+                            .as_ref()
+                            .map(|writer| (Arc::clone(writer), conn.serialization_format))
+                    })
+                    .flatten()
+            })
+        };
+
+        let Some((writer, serialization_format)) = peer_writer else {
+            return Err(NetError::PeerDisconnected(addr.to_string()));
+        };
+
+        let bytes = msg.to_bytes_with_format(serialization_format)?;
+        let mut writer = writer.lock().await;
+        if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
+            warn!(%addr, error = %e, "failed to send message to peer");
+            if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr).await {
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::PeerDisconnected {
+                        node_id,
+                        addr: addr.to_string(),
+                        peers_connected,
+                    })
+                    .await;
+            }
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
     /// Returns the number of currently connected peers.
     pub async fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
         connected_peer_count(&peers)
+    }
+
+    /// Returns true when the configured peer address currently has an active connection.
+    pub async fn is_connected_addr(&self, addr: &str) -> bool {
+        let peers = self.peers.read().await;
+        peers
+            .get(addr)
+            .is_some_and(|conn| conn.state == PeerState::Connected)
     }
 
     async fn ensure_peer_slot_available(&self) -> NetResult<()> {
@@ -546,12 +662,32 @@ async fn handle_incoming(
 
     // Wait for HELLO
     let msg = read_message(&mut reader, limits.max_message_size, limits.socket_timeout).await?;
-    let peer_node_id = match msg.kind {
-        MessageKind::Hello { node_id, version } => {
+    let (peer_node_id, negotiated_format) = match msg.kind {
+        MessageKind::Hello {
+            node_id,
+            version,
+            supported_formats,
+            preferred_format,
+        } => {
             if version != PROTOCOL_VERSION {
-                warn!(their_version = version, "protocol mismatch");
+                return Err(protocol_version_mismatch(version));
             }
-            node_id
+            let negotiated_format =
+                negotiate_serialization_format(limits.serialization_format, &supported_formats)
+                    .ok_or_else(|| {
+                        NetError::InvalidMessage(
+                            "no mutually supported serialization format".to_string(),
+                        )
+                    })?;
+            if negotiated_format != preferred_format {
+                debug!(
+                    peer = %node_id,
+                    peer_preferred_format = ?preferred_format,
+                    selected_format = ?negotiated_format,
+                    "selected alternate serialization format"
+                );
+            }
+            (node_id, negotiated_format)
         }
         _ => {
             return Err(NetError::InvalidMessage("expected Hello".into()));
@@ -594,8 +730,8 @@ async fn handle_incoming(
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
     }
 
-    let ack = Message::hello_ack(our_node_id);
-    write_message(&mut writer, &ack, limits.socket_timeout).await?;
+    let ack = Message::hello_ack_with_format(our_node_id, negotiated_format);
+    write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
     let peers_connected = {
         let mut peers = peers.write().await;
@@ -605,6 +741,7 @@ async fn handle_incoming(
             PeerConnection {
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 state: PeerState::Connected,
+                serialization_format: negotiated_format,
                 writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
                 _slot: slot,
             },
@@ -612,12 +749,13 @@ async fn handle_incoming(
         connected_peer_count(&peers)
     };
 
-    info!(peer = %peer_node_id, "incoming peer connected");
+    info!(peer = %peer_node_id, serialization_format = ?negotiated_format, "incoming peer connected");
 
     // Notify Event
     let _ = event_tx
         .send(NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
+            addr: addr.clone(),
             peers_connected,
         })
         .await;
@@ -626,6 +764,7 @@ async fn handle_incoming(
     let read_result = read_loop(
         reader,
         peer_node_id.clone(),
+        addr.clone(),
         event_tx.clone(),
         limits.max_message_size,
         limits.socket_timeout,
@@ -638,14 +777,20 @@ async fn handle_incoming(
         let Some(removed) = peers.remove(&addr) else {
             return read_result;
         };
-        (removed.state == PeerState::Connected)
-            .then(|| (peer_node_id.clone(), connected_peer_count(&peers)))
+        (removed.state == PeerState::Connected).then(|| {
+            (
+                peer_node_id.clone(),
+                addr.clone(),
+                connected_peer_count(&peers),
+            )
+        })
     };
 
-    if let Some((node_id, peers_connected)) = disconnected {
+    if let Some((node_id, addr, peers_connected)) = disconnected {
         let _ = event_tx
             .send(NodeEvent::PeerDisconnected {
                 node_id,
+                addr,
                 peers_connected,
             })
             .await;
@@ -678,10 +823,37 @@ fn ensure_peer_slot_available(
     Ok(())
 }
 
+fn supported_formats_for(preferred: SerializationFormat) -> Vec<SerializationFormat> {
+    match preferred {
+        SerializationFormat::Json => vec![SerializationFormat::Json],
+        SerializationFormat::Bincode => DEFAULT_SUPPORTED_FORMATS.to_vec(),
+    }
+}
+
+fn negotiate_serialization_format(
+    preferred: SerializationFormat,
+    peer_supported: &[SerializationFormat],
+) -> Option<SerializationFormat> {
+    let local_supported = supported_formats_for(preferred);
+    if peer_supported.contains(&preferred) && local_supported.contains(&preferred) {
+        return Some(preferred);
+    }
+    local_supported
+        .into_iter()
+        .find(|format| peer_supported.contains(format))
+}
+
+fn protocol_version_mismatch(their_version: u32) -> NetError {
+    NetError::InvalidMessage(format!(
+        "protocol version mismatch: expected {PROTOCOL_VERSION}, got {their_version}"
+    ))
+}
+
 /// Loop for reading messages from a peer until disconnection
 async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
     peer_node_id: NodeId,
+    addr: String,
     event_tx: mpsc::Sender<NodeEvent>,
     max_message_size: usize,
     socket_timeout: Duration,
@@ -719,6 +891,16 @@ async fn read_loop(
                     })
                     .await;
             }
+            MessageKind::PullSince { since_op_id } => {
+                debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
+                let _ = event_tx
+                    .send(NodeEvent::PullRequested {
+                        from: peer_node_id.clone(),
+                        addr: addr.clone(),
+                        since_op_id,
+                    })
+                    .await;
+            }
             MessageKind::Ping => {
                 debug!(peer = %peer_node_id, "received ping");
                 // TODO: send Pong (serve writer)
@@ -736,9 +918,10 @@ async fn read_loop(
 async fn write_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &Message,
+    serialization_format: SerializationFormat,
     socket_timeout: Duration,
 ) -> NetResult<()> {
-    let bytes = msg.to_bytes()?;
+    let bytes = msg.to_bytes_with_format(serialization_format)?;
     write_bytes(writer, &bytes, socket_timeout).await?;
     Ok(())
 }
@@ -784,7 +967,7 @@ async fn read_message<R: AsyncReadExt + Unpin>(
         .await
         .map_err(|_| NetError::Timeout)??;
 
-    Message::from_bytes(&buf).map_err(|e| e.into())
+    Message::from_bytes(&buf)
 }
 
 #[cfg(test)]
@@ -815,6 +998,33 @@ mod tests {
     }
 
     #[test]
+    fn negotiation_prefers_local_format_when_peer_supports_it() {
+        let selected = negotiate_serialization_format(
+            SerializationFormat::Bincode,
+            &[SerializationFormat::Json, SerializationFormat::Bincode],
+        );
+
+        assert_eq!(selected, Some(SerializationFormat::Bincode));
+    }
+
+    #[test]
+    fn negotiation_falls_back_to_json_for_debug_peer() {
+        let selected = negotiate_serialization_format(
+            SerializationFormat::Bincode,
+            &[SerializationFormat::Json],
+        );
+
+        assert_eq!(selected, Some(SerializationFormat::Json));
+    }
+
+    #[test]
+    fn negotiation_rejects_empty_peer_formats() {
+        let selected = negotiate_serialization_format(SerializationFormat::Bincode, &[]);
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
     fn peer_slot_limit_rejects_new_peer_when_full() {
         let mut peers = HashMap::new();
         peers.insert(
@@ -822,6 +1032,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 state: PeerState::Connected,
+                serialization_format: SerializationFormat::Bincode,
                 writer: None,
                 _slot: test_slot(),
             },
@@ -840,6 +1051,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 state: PeerState::Connected,
+                serialization_format: SerializationFormat::Bincode,
                 writer: None,
                 _slot: test_slot(),
             },
@@ -858,6 +1070,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     state: PeerState::Connected,
+                    serialization_format: SerializationFormat::Bincode,
                     writer: None,
                     _slot: test_slot(),
                 },
@@ -867,6 +1080,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     state: PeerState::Connected,
+                    serialization_format: SerializationFormat::Bincode,
                     writer: None,
                     _slot: test_slot(),
                 },
@@ -877,6 +1091,38 @@ mod tests {
 
         assert_eq!(node_id, NodeId::new("peer-a"));
         assert_eq!(connected, 1);
+    }
+
+    #[tokio::test]
+    async fn is_connected_addr_tracks_connected_state() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000"));
+        {
+            let mut peers = node.peers.write().await;
+            peers.insert(
+                "127.0.0.1:9001".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
+                    state: PeerState::Connected,
+                    serialization_format: SerializationFormat::Bincode,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+            peers.insert(
+                "127.0.0.1:9002".to_string(),
+                PeerConnection {
+                    info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
+                    state: PeerState::Failed,
+                    serialization_format: SerializationFormat::Bincode,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+        }
+
+        assert!(node.is_connected_addr("127.0.0.1:9001").await);
+        assert!(!node.is_connected_addr("127.0.0.1:9002").await);
+        assert!(!node.is_connected_addr("127.0.0.1:9003").await);
     }
 
     #[test]
@@ -917,6 +1163,93 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NetError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn connect_to_peer_times_out_during_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _addr) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_millis(10)),
+        );
+
+        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+
+        assert!(matches!(err, NetError::Timeout));
+        accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_to_peer_rejects_protocol_version_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = NetStream::Plain(stream);
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+
+            let ack = Message {
+                kind: MessageKind::HelloAck {
+                    node_id: NodeId::new("old-peer"),
+                    version: PROTOCOL_VERSION - 1,
+                    selected_format: SerializationFormat::Bincode,
+                },
+            };
+            let bytes = ack.to_bytes().unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+
+        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+
+        assert!(
+            matches!(err, NetError::InvalidMessage(msg) if msg.contains("protocol version mismatch"))
+        );
+        accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incoming_rejects_protocol_version_mismatch() {
+        let mut node = Node::new(
+            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+        let mut events = node.take_event_receiver().unwrap();
+        let addr = node.start_listener().await.unwrap();
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let hello = Message {
+            kind: MessageKind::Hello {
+                node_id: NodeId::new("old-peer"),
+                version: PROTOCOL_VERSION - 1,
+                supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
+                preferred_format: SerializationFormat::Bincode,
+            },
+        };
+        let bytes = hello.to_bytes().unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let event = timeout(Duration::from_millis(200), events.recv()).await;
+        assert!(event.is_err(), "old protocol peer must not connect");
+
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -991,6 +1324,39 @@ mod tests {
         );
 
         node_a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bincode_node_negotiates_json_with_debug_peer() {
+        let node_a = Node::new(NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0"));
+        node_a.start_listener().await.unwrap();
+
+        let mut node_b = Node::new(
+            NodeConfig::new(NodeId::new("node-b"), "127.0.0.1:0")
+                .with_serialization_format(SerializationFormat::Json),
+        );
+        let mut events_b = node_b.take_event_receiver().unwrap();
+        let addr_b = node_b.start_listener().await.unwrap();
+
+        node_a.connect_to_peer(&addr_b.to_string()).await.unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(events_b.recv().await, Some(NodeEvent::PeerConnected { .. })) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let peers = node_a.peers.read().await;
+        let peer = peers.get(&addr_b.to_string()).expect("connected peer");
+        assert_eq!(peer.serialization_format, SerializationFormat::Json);
+
+        drop(peers);
+        node_a.shutdown().await;
+        node_b.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

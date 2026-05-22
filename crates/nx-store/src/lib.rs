@@ -68,6 +68,23 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_batch_sets_and_deletes_atomically() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.set(b"old", b"value").unwrap();
+        store
+            .apply_batch(
+                &[(b"new".as_slice(), b"value".as_slice())],
+                &[b"old".as_slice()],
+            )
+            .unwrap();
+
+        assert_eq!(store.get(b"new").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.get(b"old").unwrap(), None);
+    }
+
+    #[test]
     fn test_stats_counts_keys_and_bytes() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

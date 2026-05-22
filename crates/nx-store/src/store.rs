@@ -45,6 +45,22 @@ impl Store {
         Ok(())
     }
 
+    pub fn apply_batch(
+        &self,
+        sets: &[(&[u8], &[u8])],
+        deletes: &[&[u8]],
+    ) -> Result<(), StoreError> {
+        let mut batch = sled::Batch::default();
+        for (key, value) in sets {
+            batch.insert(*key, *value);
+        }
+        for key in deletes {
+            batch.remove(*key);
+        }
+        self.db.apply_batch(batch)?;
+        Ok(())
+    }
+
     pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
         self.db.remove(key)?;
         Ok(())

@@ -3,7 +3,7 @@ use nx_sync::{GCounter, Op};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::materialize_gcounter_value;
+use crate::sync_manager::persist_gcounter_state;
 
 // error codes
 const ERR_BUF_TOO_SMALL: i32 = -2;
@@ -87,17 +87,15 @@ async fn crdt_gcounter_inc_impl(
         }
     };
 
-    // Apply locally and materialize the value before exposing the new state.
+    // Apply locally and persist the CRDT state before exposing the new value.
     {
         let counters_arc = handle.counters();
         let mut counters = counters_arc.write().await;
         let mut counter = counters.get(&key).cloned().unwrap_or_else(GCounter::new);
         counter.increment(handle.node_id(), delta);
-        let total = counter.value();
-
-        if let Err(e) = materialize_gcounter_value(&handle.store(), &key, total) {
+        if let Err(e) = persist_gcounter_state(&handle.store(), &key, &counter) {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to materialize counter");
+            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to persist counter");
             return ERR_INTERNAL;
         }
 

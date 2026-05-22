@@ -43,6 +43,8 @@ Each invocation runs the guest once, waits for the configured settle window,
 prints the final materialized GCounter value, flushes the local store and exits:
 - each run performs one local increment (`crdt::gcounter::inc(key, 1)`)
 - the increment is broadcast to peers asynchronously
+- missed pushes can be recovered by periodic anti-entropy while peers remain
+  configured and reconnect
 - `--wait-before-run` gives both processes time to connect before the guest
   emits its increment
 - `--settle-for` gives PushOps and remote apply time to complete before exit
@@ -68,10 +70,13 @@ counter:visits = 2
   will log a message and exit, since `crdt::*` APIs require replication
   to be enabled on the runtime.
 - Each node has its own datastore (`./data-a`, `./data-b`). Counter totals are
-  materialized to sled after local and remote updates, flushed on shutdown and
-  hydrated back into the in-memory registry on startup.
+  materialized to sled after local and remote updates. Durable CRDT state/op-log
+  metadata and bounded dedup metadata are also persisted, then hydrated back
+  into the in-memory registry on startup.
 - Without `--settle-for`, a sync-enabled runtime stays alive until it receives
   SIGINT/SIGTERM/SIGHUP.
 - The `-v` flag enables verbose logs to observe lifecycle, broadcast and apply
   paths. Use `--log-format json` for structured logs, and
   `--observability-listen 127.0.0.1:9300` to expose the local metrics endpoint.
+- The production sync wire format is bincode. Add `--debug-protocol` to use
+  JSON for local wire inspection.

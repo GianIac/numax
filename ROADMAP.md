@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.3` - developer preview.
+> **Current release**: `v0.1.0-alpha.4` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -45,8 +45,26 @@ Includes:
   and `/ready`.
 
 Known limitations:
-- Durable full CRDT state/op-log recovery, automatic reconnect and anti-entropy
-  remain tracked in Phase 10.
+- Durable full CRDT state/op-log recovery, automatic reconnect, anti-entropy
+  and dual-mode wire serialization remain tracked in later phases.
+- API and wire format may change before `v0.1.0`.
+
+### v0.1.0-alpha.4 ✅
+**Purpose**: network resilience and dual-mode serialization preview.
+
+Includes:
+- Everything in `v0.1.0-alpha.3`.
+- Phase 10 network resilience: automatic reconnect with exponential backoff,
+  peer health tracking and rotation, periodic anti-entropy, bounded op
+  deduplication, durable CRDT state/op-log hydration and duplicate protection
+  across restart.
+- Phase 11 dual-mode wire serialization: bincode for production, JSON for
+  `--debug-protocol`, format negotiation in `Hello`/`HelloAck`, protocol
+  version `2`, and serialization benchmark coverage.
+
+Known limitations:
+- K-fanout gossip remains intentionally minimal; peers are still configured
+  explicitly.
 - API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
@@ -327,19 +345,19 @@ HTTP endpoint over Tokio.
 ### Phase 10: Network Resilience 🌐
 **Goal**: Robust operation with an unstable network
 
-- [ ] Automatic reconnect with exponential backoff
-- [ ] Peer health tracking (mark dead after N timeouts)
-- [ ] Peer rotation (replace dead peers)
-- [ ] Periodic anti-entropy (pull every N seconds)
-- [ ] Op deduplication (bloom filter or set of OpIds)
-- [ ] Durable CRDT state or op log, so restart/reconnect can recover full
+- [x] Automatic reconnect with exponential backoff
+- [x] Peer health tracking (mark dead after N timeouts)
+- [x] Peer rotation (replace dead peers)
+- [x] Periodic anti-entropy (pull every N seconds)
+- [x] Op deduplication (bounded set of OpIds)
+- [x] Durable CRDT state or op log, so restart/reconnect can recover full
       CRDT state rather than only materialized totals.
-- [ ] Startup hydration from durable CRDT state/op log.
-- [ ] Persist dedup metadata, or otherwise prevent duplicate remote ops after
+- [x] Startup hydration from durable CRDT state/op log.
+- [x] Persist dedup metadata, or otherwise prevent duplicate remote ops after
       restart.
-- [ ] Test: intermittent network (10% packet loss)
-- [ ] Test: node dies and comes back → converges
-- [ ] Test: duplicate op after restart does not double count
+- [x] Test: intermittent network (10% packet loss)
+- [x] Test: node dies and comes back → converges
+- [x] Test: duplicate op after restart does not double count
 
 ---
 
@@ -351,12 +369,12 @@ HTTP endpoint over Tokio.
 - bincode: compact (~50% size), fast (~10x faster parse)
 
 **Tasks**:
-- [ ] Add `bincode` to dependencies
-- [ ] `SerializationFormat` enum with a 1-byte header on the wire
-- [ ] CLI flag `--debug-protocol`
-- [ ] Format negotiation in Hello/HelloAck
-- [ ] Test: roundtrip for both formats
-- [ ] Benchmark: JSON vs bincode (size, speed)
+- [x] Add `bincode` to dependencies
+- [x] `SerializationFormat` enum with a 1-byte header on the wire
+- [x] CLI flag `--debug-protocol`
+- [x] Format negotiation in Hello/HelloAck
+- [x] Test: roundtrip for both formats
+- [x] Benchmark: JSON vs bincode (size, speed)
 
 **Libraries**: `bincode`, `serde` (already present)
 
@@ -463,8 +481,8 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 7 (Graceful shutdown) complete
 - [x] Phase 8 (Backpressure) complete
 - [x] Phase 9 (Observability) at least logging + health
-- [ ] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
-- [ ] Phase 11 (Serialization) JSON + bincode working
+- [x] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
+- [x] Phase 11 (Serialization) JSON + bincode working
 - [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
 - [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
 - [ ] All tests pass
@@ -491,6 +509,16 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 7 graceful lifecycle hardening complete
 - [x] Phase 8 backpressure complete
 - [x] Phase 9 minimal observability complete
+- [x] `cargo test` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
+
+---
+
+## v0.1.0-alpha.4 Release Criteria
+
+- [x] Phase 10 network resilience complete
+- [x] Phase 11 dual-mode serialization complete
 - [x] `cargo test` passes
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [x] Known limitations documented in the roadmap

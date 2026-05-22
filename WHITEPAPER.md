@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.3**, the current public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-alpha.4**, the current public technical preview of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.3` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-alpha.4` - technical preview, API and wire format may change before the stable v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -189,7 +189,7 @@ CI today verifies compilation and test execution on:
 - **State**: each node maintains a persistent local key/value store based on sled. *(Implemented)*
 - **Sync**: a portion of the state can be replicated between nodes via CRDT + gossip. *(Prototype)*
 - **Consistency**: the system aims for eventual consistency; in the absence of new writes and with sufficient connectivity, all nodes converge on the same state. *(Prototype)*
-- **Fallible network**: disconnections and reconnections are normal conditions; the roadmap includes explicit mechanisms to recover missing deltas (anti-entropy). *(Planned, Phase 10)*
+- **Fallible network**: disconnections and reconnections are normal conditions; automatic reconnect, peer health tracking, peer rotation and anti-entropy are implemented for configured peers. *(Prototype)*
 
 ### 4.4 Security model & threat model
 
@@ -374,7 +374,7 @@ pub struct Op {
 }
 ```
 
-Operations are serializable for transport over the network (today JSON length-prefixed; dual-mode JSON/bincode planned in Phase 11).
+Operations are serializable for transport over the network. The current wire protocol is length-prefixed and format-tagged: bincode is the default production format, while JSON remains available through `--debug-protocol`.
 
 **GCounter (Grow-only Counter)** *(Implemented)* - the first implemented CRDT, a distributed counter that only supports increments. Each node owns its own "slot" and can only increment that one.
 
@@ -414,7 +414,7 @@ pub fn merge(&mut self, other: &GCounter) {
 - propagates operations to active peers through nx-net,
 - covered by end-to-end E2E tests.
 
-**Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from the values materialized in sled. Durable full CRDT state/op-log recovery remains planned in Phase 10 for stronger restart/reconnect resilience.
+**Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from durable CRDT state/op-log data, with materialized sled totals retained as a fallback. Dedup metadata is also persisted so recent duplicate remote operations after restart do not double count.
 
 **Planned CRDTs (Phase 14):**
 
@@ -432,37 +432,42 @@ Numax Net handles communication between nodes for state synchronization.
 
 **Architecture:** peer-to-peer. Each node can communicate directly with other nodes without a central server. TCP transport, **TLS 1.3 with mTLS** available and recommended.
 
-**Message protocol:** length-prefixed JSON (4 big-endian bytes for length, JSON payload):
+**Message protocol:** length-prefixed, dual-mode serialization. The first four
+bytes are a big-endian payload length. The payload starts with a one-byte
+serialization format tag, followed by either JSON or bincode encoded message
+data. Bincode is the default production format; JSON is selected with
+`--debug-protocol` for inspectability.
 
 ```
-┌──────────────┬─────────────────────────────┐
-│ Length (4B)  │     JSON Payload            │
-│ big-endian   │                             │
-└──────────────┴─────────────────────────────┘
+┌──────────────┬──────────────┬─────────────────────────────┐
+│ Length (4B)  │ Format (1B)  │ JSON or bincode payload      │
+│ big-endian   │              │                             │
+└──────────────┴──────────────┴─────────────────────────────┘
 ```
 
 **Implemented message types:**
 
 | Message | Direction | Description |
 |---------|-----------|-------------|
-| `Hello` | Client → Server | Initial handshake with NodeId and protocol version |
-| `HelloAck` | Server → Client | Handshake confirmation |
+| `Hello` | Client → Server | Initial handshake with NodeId, protocol version, supported formats and preferred format |
+| `HelloAck` | Server → Client | Handshake confirmation with selected serialization format |
 | `PushOps` | Bidirectional | Sends a batch of CRDT operations |
 | `PushOpsAck` | Bidirectional | Confirms reception of operations |
 | `PullSince` | Client → Server | Requests operations after a given OpId |
 | `Ping` | Bidirectional | Keepalive |
 | `Pong` | Bidirectional | Response to Ping |
 
-**Protocol versioning:** version number (`PROTOCOL_VERSION = 1`) exchanged during the handshake. Allows backward-compatible evolution and incompatibility detection.
+**Protocol versioning:** version number (`PROTOCOL_VERSION = 2`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity.
 
 **Current status:**
 
 - TCP + TLS 1.3 + mTLS channel *(Implemented)*;
-- handshake, push/pull and keepalive *(Implemented)*;
+- handshake, push/pull, anti-entropy pull requests and keepalive *(Implemented)*;
 - peer connection limit, queued-op limit, message-size limit and socket read/write timeouts *(Implemented)*;
-- peer-to-peer gossip with K-fanout: architecture defined, full integration in progress *(Prototype)*;
-- full network resilience (reconnect with exponential backoff, automatic anti-entropy, op dedup) *(Planned, Phase 10)*;
-- automatic anti-entropy after long disconnections *(Planned, Phase 10)*.
+- automatic reconnect with exponential backoff, peer health tracking and peer rotation *(Prototype)*;
+- periodic anti-entropy after missed pushes/reconnects *(Prototype)*;
+- bounded OpId deduplication and persisted dedup metadata *(Prototype)*;
+- peer-to-peer gossip with K-fanout: architecture defined, full dynamic discovery/fanout remains future work *(Prototype)*.
 
 ### 5.5 Channel security *(Implemented)*
 
@@ -479,7 +484,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.3:**
+**Out of scope for v0.1.0-alpha.4:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -547,6 +552,12 @@ nx run <module.wasm> \
     --peer 192.168.1.11:9000 \
     --datastore-path ./node-data
 
+# Uses JSON instead of bincode for the sync wire protocol
+nx run <module.wasm> \
+    --listen 0.0.0.0:9000 \
+    --peer 192.168.1.10:9000 \
+    --debug-protocol
+
 # Runs a bounded sync demo and prints a final GCounter value
 nx run <module.wasm> \
     --listen 0.0.0.0:9000 \
@@ -575,6 +586,7 @@ nx run <module.wasm> \
 | `--log-format` | Logging format: `text` or `json` |
 | `--listen` | Address on which to accept peer connections and enable sync |
 | `--peer` | Initial peer address (repeatable) |
+| `--debug-protocol` | Use JSON for the sync wire protocol instead of production bincode |
 | `--wait-before-run` | Bounded pre-run window for peer handshakes |
 | `--settle-for` | Bounded post-run window for PushOps and remote apply |
 | `--print-gcounter` | Print a final host-side GCounter value |
@@ -628,20 +640,24 @@ The model is **peer-to-peer with gossip**:
 
 The approach scales better than full-mesh and remains resilient in the presence of temporary disconnections. Full integration of dynamic fanout is in progress.
 
-### 5.9 Resilience: node down, intermittent network, reconnection *(Planned - Phase 10)*
+### 5.9 Resilience: node down, intermittent network, reconnection *(Prototype - Phase 10)*
 
-The network is considered fallible by nature. The designed countermeasures:
+The network is considered fallible by nature. The implemented countermeasures
+for configured peers are:
 
 When a peer becomes unreachable:
 
 - timeout and retry with **exponential backoff**;
-- marking the peer as down and removing it from the active set;
-- selection of a new peer from discovery to maintain the **K** fanout.
+- peer health tracking with suspect/dead state after repeated failures;
+- peer rotation across configured peers when slots are available.
 
 When a node comes back:
 
 - re-establishment of connections with known peers;
 - **anti-entropy** mechanism (`PullSince`) to recover missing updates;
+- durable CRDT state/op-log hydration on restart;
+- persisted bounded dedup metadata to avoid recent duplicate remote operations
+  after restart;
 - convergence to the same state thanks to CRDT properties.
 
 ---
@@ -694,7 +710,7 @@ Log levels: 0 = trace, 1 = debug, 2 = info, 3 = warn, 4 = error.
 | `crdt_gcounter_inc` | `(key_ptr: u32, key_len: u32, delta: u64) -> i32` | *Implemented* |
 | `crdt_gcounter_value` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 
-Increment operations are materialized on sled and propagated to peers through the SyncManager. In the absence of sync enabled, the functions return `ERR_SYNC_DISABLED` (-5).
+Increment operations are persisted as CRDT state/op-log metadata, materialized on sled and propagated to peers through the SyncManager. In the absence of sync enabled, the functions return `ERR_SYNC_DISABLED` (-5).
 
 **Extended Host API** - *(Planned, Phase 12)*
 
@@ -710,8 +726,8 @@ Increment operations are materialized on sled and propagated to peers through th
 
 Deployment will consist in shipping a `.wasm` file and a minimal configuration.
 
-The `limits` section below is implemented today. The other deployment sections
-remain planned work.
+The `limits` section below is implemented today. Observability can also be
+configured from file. The other deployment sections remain planned work.
 
 ```toml
 [limits]
@@ -764,7 +780,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.3. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.4. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -830,13 +846,13 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.3 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-alpha.4 is a technical preview. We recognize its limits, explicitly:
 
-- **Anti-entropy is not implemented yet.** Nodes exchange live PushOps, but automatic recovery of missed deltas after long disconnections is Phase 10 work.
-- **K-fanout gossip and full network resilience are in progress.** The architecture is defined; reconnect with backoff, automatic anti-entropy and op dedup are in Phase 10.
+- **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
+- **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Minimal observability.** Structured logs, Prometheus-compatible metrics and health checks are available as an opt-in endpoint; richer dashboards and alerting remain outside the current preview.
-- **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. Dual-mode JSON/bincode serialization is planned in Phase 11.
+- **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. The current wire protocol is versioned (`PROTOCOL_VERSION = 2`) and supports bincode by default with JSON debug mode.
 - **Available CRDTs limited to GCounter.** PNCounter, LWW-Register, ORSet, LWW-Map and RGA will arrive with Phase 14.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
 - **Not optimized for CPU-bound workloads.** The focus is I/O and coordination, not intensive computation.
@@ -857,11 +873,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.3 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, lifecycle/backpressure hardening, opt-in observability, multi-OS CI, end-to-end examples.
+v0.1.0-alpha.4 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, multi-OS CI, end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.3 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-alpha.4 is just the beginning.** But it is a beginning built on code, not on promises.
 
 In closing, I love software and I love numax.
 
