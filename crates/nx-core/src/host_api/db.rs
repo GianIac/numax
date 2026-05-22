@@ -38,6 +38,33 @@ fn read_bytes(
     Ok(buf)
 }
 
+fn read_validated_key(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    key_ptr: u32,
+    key_len: u32,
+    api_name: &str,
+) -> std::result::Result<Vec<u8>, i32> {
+    if key_len > MAX_KEY_LEN {
+        eprintln!("[nx-core] {api_name}: invalid key length: {key_len} (max {MAX_KEY_LEN})");
+        return Err(ERR_INTERNAL);
+    }
+
+    let key = match read_bytes(caller, memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[nx-core] {api_name}: failed to read key: {e}");
+            return Err(ERR_INTERNAL);
+        }
+    };
+
+    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
+        return Err(ERR_RESERVED_KEY);
+    }
+
+    Ok(key)
+}
+
 fn db_get_impl(
     mut caller: Caller<'_, HostState>,
     key_ptr: u32,
@@ -53,27 +80,15 @@ fn db_get_impl(
         }
     };
 
-    if key_len > MAX_KEY_LEN {
-        eprintln!("[nx-core] db_get: invalid key length: {key_len} (max {MAX_KEY_LEN})");
-        return ERR_INTERNAL;
-    }
-
     if out_cap > MAX_OUT_CAP {
         eprintln!("[nx-core] db_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})");
         return ERR_INTERNAL;
     }
 
-    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len, "db_get") {
         Ok(k) => k,
-        Err(e) => {
-            eprintln!("[nx-core] db_get: failed to read key: {e}");
-            return ERR_INTERNAL;
-        }
+        Err(code) => return code,
     };
-
-    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
-        return ERR_RESERVED_KEY;
-    }
 
     let value = match caller.data().store.get(&key) {
         Ok(v) => v,
@@ -114,26 +129,15 @@ fn db_set_impl(
         }
     };
 
-    if key_len > MAX_KEY_LEN {
-        eprintln!("[nx-core] db_set: invalid key length: {key_len} (max {MAX_KEY_LEN})");
-        return ERR_INTERNAL;
-    }
     if val_len > MAX_VALUE_LEN {
         eprintln!("[nx-core] db_set: invalid value length: {val_len} (max {MAX_VALUE_LEN})");
         return ERR_INTERNAL;
     }
 
-    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len, "db_set") {
         Ok(k) => k,
-        Err(e) => {
-            eprintln!("[nx-core] db_set: failed to read key: {e}");
-            return ERR_INTERNAL;
-        }
+        Err(code) => return code,
     };
-
-    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
-        return ERR_RESERVED_KEY;
-    }
 
     let val = match read_bytes(&mut caller, &memory, val_ptr, val_len) {
         Ok(v) => v,
@@ -160,22 +164,10 @@ fn db_delete_impl(mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32)
         }
     };
 
-    if key_len > MAX_KEY_LEN {
-        eprintln!("[nx-core] db_delete: invalid key length: {key_len} (max {MAX_KEY_LEN})");
-        return ERR_INTERNAL;
-    }
-
-    let key = match read_bytes(&mut caller, &memory, key_ptr, key_len) {
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len, "db_delete") {
         Ok(k) => k,
-        Err(e) => {
-            eprintln!("[nx-core] db_delete: failed to read key: {e}");
-            return ERR_INTERNAL;
-        }
+        Err(code) => return code,
     };
-
-    if key.starts_with(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()) {
-        return ERR_RESERVED_KEY;
-    }
 
     if let Err(e) = caller.data().store.delete(&key) {
         eprintln!("[nx-core] db_delete: store error: {e}");
@@ -183,6 +175,30 @@ fn db_delete_impl(mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32)
     }
 
     0
+}
+
+fn db_exists_impl(mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] db_exists: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len, "db_exists") {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    match caller.data().store.exists(&key) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            eprintln!("[nx-core] db_exists: store error: {e}");
+            ERR_INTERNAL
+        }
+    }
 }
 
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
@@ -207,6 +223,14 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
          val_ptr: u32,
          val_len: u32|
          -> i32 { db_set_impl(caller, key_ptr, key_len, val_ptr, val_len) },
+    )?;
+
+    linker.func_wrap(
+        "nx",
+        "db_exists",
+        |caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> i32 {
+            db_exists_impl(caller, key_ptr, key_len)
+        },
     )?;
 
     linker.func_wrap(

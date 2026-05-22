@@ -38,6 +38,10 @@ impl Store {
         Ok(v.map(|ivec| ivec.to_vec()))
     }
 
+    pub fn exists(&self, key: &[u8]) -> Result<bool, StoreError> {
+        Ok(self.db.contains_key(key)?)
+    }
+
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.db.insert(key, value)?;
         // For now, there's no explicit flush; sled is safe. I expect a stronger "durability":

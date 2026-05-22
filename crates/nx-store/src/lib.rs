@@ -30,6 +30,20 @@ mod tests {
     }
 
     #[test]
+    fn test_exists() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        assert!(!store.exists(b"key1").unwrap());
+
+        store.set(b"key1", b"value1").unwrap();
+        assert!(store.exists(b"key1").unwrap());
+
+        store.delete(b"key1").unwrap();
+        assert!(!store.exists(b"key1").unwrap());
+    }
+
+    #[test]
     fn test_overwrite() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

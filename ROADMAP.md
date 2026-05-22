@@ -388,7 +388,7 @@ HTTP endpoint over Tokio.
 
 **Database**:
 - [ ] `db_scan` — prefix scan with iterator / paginated results
-- [ ] `db_exists` — check key existence without reading the value
+- [x] `db_exists` — check key existence without reading the value
 - [ ] `db_keys` — list keys matching a prefix
 
 **Time**:

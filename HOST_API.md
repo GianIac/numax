@@ -39,6 +39,7 @@ fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
 | `-1` | Key not found |
 | `-2` | Buffer too small (retry with larger buffer) |
 | `-3` | Internal error |
+| `-4` | Reserved key |
 
 **Example (Rust with nx-sdk):**
 
@@ -46,6 +47,42 @@ fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
 use nx_sdk::db;
 
 let value = db::get("my_key")?;
+```
+
+---
+
+#### `db_exists`
+
+Checks whether a key exists without reading the value.
+
+```text
+fn db_exists(key_ptr: u32, key_len: u32) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key_ptr` | `u32` | Pointer to the key in WASM memory |
+| `key_len` | `u32` | Length of the key in bytes |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `1` | Key exists |
+| `0` | Key does not exist |
+| `-3` | Internal error |
+| `-4` | Reserved key |
+
+**Example:**
+
+```rust
+use nx_sdk::db;
+
+if db::exists("my_key")? {
+    // Key is present.
+}
 ```
 
 ---
@@ -73,6 +110,7 @@ fn db_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32
 |-------|---------|
 | `0` | Success |
 | `-3` | Internal error |
+| `-4` | Reserved key |
 
 **Example:**
 
@@ -105,6 +143,7 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 |-------|---------|
 | `0` | Success (even if key did not exist) |
 | `-3` | Internal error |
+| `-4` | Reserved key |
 
 ---
 
@@ -275,7 +314,7 @@ pub extern "C" fn run() {
 
 ### Database
 - [ ] `db_scan` - Scan by prefix
-- [ ] `db_exists` - Check key existence (without reading the value)
+- [x] `db_exists` - Check key existence (without reading the value)
 - [ ] `db_keys` - List all keys with prefix
 
 ### Network

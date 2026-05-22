@@ -38,6 +38,19 @@ pub fn delete(key: &str) -> Result<()> {
     map_rc_unit(rc)
 }
 
+/// exists(key) -> Result<bool, NxError>
+pub fn exists(key: &str) -> Result<bool> {
+    let rc = unsafe { ffi::db_exists(key.as_ptr() as u32, key.len() as u32) };
+    match rc {
+        0 => Ok(false),
+        1 => Ok(true),
+        ERR_INTERNAL => Err(NxError::Internal),
+        ERR_RESERVED_KEY => Err(NxError::ReservedKey),
+        c if c < 0 => Err(NxError::UnknownCode(c)),
+        _ => Err(NxError::UnknownCode(rc)),
+    }
+}
+
 // get(key) -> Result<Option<Vec<u8>>, NxError>
 pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 64;
