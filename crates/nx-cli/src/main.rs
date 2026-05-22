@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
-use nx_core::{ObservabilityConfig, SyncConfig, TlsConfig};
+use nx_core::{ObservabilityConfig, SerializationFormat, SyncConfig, TlsConfig};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -86,6 +86,10 @@ enum Cli {
         /// Skip TLS certificate verification (DEVELOPMENT ONLY).
         #[arg(long)]
         tls_insecure: bool,
+
+        /// Use JSON for the sync wire protocol instead of bincode.
+        #[arg(long)]
+        debug_protocol: bool,
     },
 }
 
@@ -124,6 +128,7 @@ async fn real_main() -> Result<()> {
             tls_ca,
             allowed_peers,
             tls_insecure,
+            debug_protocol,
         } => {
             let file_config = load_run_config(config.as_ref())?;
 
@@ -140,9 +145,15 @@ async fn real_main() -> Result<()> {
             let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
 
             // Build SyncConfig (if sync flags were provided)
-            let sync = build_sync_config(listen, peers, tls, file_config.limits.is_some())?
-                .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
-                .transpose()?;
+            let sync = build_sync_config(
+                listen,
+                peers,
+                tls,
+                file_config.limits.is_some(),
+                debug_protocol,
+            )?
+            .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
+            .transpose()?;
             validate_settle_mode(&sync, settle_for)?;
             validate_wait_before_run(&sync, wait_before_run)?;
             validate_print_gcounter(&sync, &print_gcounter)?;
@@ -164,6 +175,7 @@ async fn real_main() -> Result<()> {
                     listen = ?s.listen_addr,
                     peers = ?s.peers,
                     tls = s.tls.is_some(),
+                    serialization_format = ?s.serialization_format,
                     "sync enabled"
                 );
                 cfg.sync = Some(s);
@@ -503,8 +515,9 @@ fn build_sync_config(
     peers: Vec<String>,
     tls: Option<TlsConfig>,
     force_enabled: bool,
+    debug_protocol: bool,
 ) -> Result<Option<SyncConfig>> {
-    if listen.is_none() && peers.is_empty() && !force_enabled {
+    if listen.is_none() && peers.is_empty() && !force_enabled && !debug_protocol {
         return Ok(None);
     }
 
@@ -524,6 +537,9 @@ fn build_sync_config(
     }
     if let Some(t) = tls {
         cfg = cfg.with_tls(t);
+    }
+    if debug_protocol {
+        cfg = cfg.with_serialization_format(SerializationFormat::Json);
     }
 
     debug_assert!(cfg.is_enabled());
@@ -918,23 +934,24 @@ mod tests {
 
         #[test]
         fn no_flags_is_none() {
-            let r = build_sync_config(None, vec![], None, false).unwrap();
+            let r = build_sync_config(None, vec![], None, false, false).unwrap();
             assert!(r.is_none());
         }
 
         #[test]
         fn listen_alone_is_some() {
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false, false)
                 .unwrap()
                 .expect("sync should be enabled with --listen alone");
             assert!(cfg.is_enabled());
             assert!(cfg.peers.is_empty());
             assert_eq!(cfg.listen_addr.as_deref(), Some("0.0.0.0:9000"));
+            assert_eq!(cfg.serialization_format, SerializationFormat::Bincode);
         }
 
         #[test]
         fn peer_without_listen_is_error() {
-            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false);
+            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false, false);
             assert!(r.is_err(), "peers without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
             assert!(err.contains("requires --listen"), "got: {err}");
@@ -942,10 +959,29 @@ mod tests {
 
         #[test]
         fn limits_config_without_listen_is_error() {
-            let r = build_sync_config(None, vec![], None, true);
+            let r = build_sync_config(None, vec![], None, true, false);
             assert!(r.is_err(), "limits without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
             assert!(err.contains("requires --listen"), "got: {err}");
+        }
+
+        #[test]
+        fn debug_protocol_without_listen_is_error() {
+            let r = build_sync_config(None, vec![], None, false, true);
+            assert!(
+                r.is_err(),
+                "--debug-protocol without --listen must fail loudly"
+            );
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("requires --listen"), "got: {err}");
+        }
+
+        #[test]
+        fn debug_protocol_uses_json_wire_format() {
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cfg.serialization_format, SerializationFormat::Json);
         }
 
         #[test]
@@ -954,6 +990,7 @@ mod tests {
                 Some("0.0.0.0:9000".into()),
                 vec!["a:1".into(), "b:2".into()],
                 None,
+                false,
                 false,
             )
             .unwrap()
@@ -966,7 +1003,7 @@ mod tests {
         #[test]
         fn tls_is_propagated() {
             let tls = Some(TlsConfig::insecure_dev());
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false, false)
                 .unwrap()
                 .unwrap();
             assert!(cfg.tls.is_some());
@@ -1105,6 +1142,14 @@ mod tests {
                 Cli::Run { listen, .. } => {
                     assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
                 }
+            }
+        }
+
+        #[test]
+        fn debug_protocol_parsed() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--debug-protocol"]).unwrap();
+            match cli {
+                Cli::Run { debug_protocol, .. } => assert!(debug_protocol),
             }
         }
 

@@ -1,4 +1,4 @@
-use nx_net::TlsConfig;
+use nx_net::{SerializationFormat, TlsConfig};
 use std::time::Duration;
 
 /// Default maximum number of simultaneously connected peers.
@@ -72,6 +72,9 @@ pub struct SyncConfig {
 
     /// Interval between periodic anti-entropy pull requests.
     pub anti_entropy_interval: Duration,
+
+    /// Serialization format used for outgoing network messages.
+    pub serialization_format: SerializationFormat,
 }
 
 impl Default for SyncConfig {
@@ -90,6 +93,7 @@ impl Default for SyncConfig {
             reconnect_max_delay: DEFAULT_RECONNECT_MAX_DELAY,
             peer_dead_after_failures: DEFAULT_PEER_DEAD_AFTER_FAILURES,
             anti_entropy_interval: DEFAULT_ANTI_ENTROPY_INTERVAL,
+            serialization_format: SerializationFormat::Bincode,
         }
     }
 }
@@ -160,6 +164,11 @@ impl SyncConfig {
         self
     }
 
+    pub fn with_serialization_format(mut self, serialization_format: SerializationFormat) -> Self {
+        self.serialization_format = serialization_format;
+        self
+    }
+
     /// Sync is enabled iff we have a bound listen address.
     pub fn is_enabled(&self) -> bool {
         self.listen_addr.is_some()
@@ -187,6 +196,7 @@ mod tests {
             DEFAULT_PEER_DEAD_AFTER_FAILURES
         );
         assert_eq!(cfg.anti_entropy_interval, DEFAULT_ANTI_ENTROPY_INTERVAL);
+        assert_eq!(cfg.serialization_format, SerializationFormat::Bincode);
 
         let cfg = SyncConfig::new().with_listen_addr("0.0.0.0:9000");
         assert!(cfg.is_enabled());
@@ -216,7 +226,8 @@ mod tests {
             .with_socket_timeout(Duration::from_secs(5))
             .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2))
             .with_peer_dead_after_failures(5)
-            .with_anti_entropy_interval(Duration::from_secs(3));
+            .with_anti_entropy_interval(Duration::from_secs(3))
+            .with_serialization_format(SerializationFormat::Json);
 
         assert_eq!(cfg.max_peers, 8);
         assert_eq!(cfg.queued_ops_limit, 256);
@@ -228,5 +239,6 @@ mod tests {
         assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(2));
         assert_eq!(cfg.peer_dead_after_failures, 5);
         assert_eq!(cfg.anti_entropy_interval, Duration::from_secs(3));
+        assert_eq!(cfg.serialization_format, SerializationFormat::Json);
     }
 }

@@ -5,7 +5,7 @@ mod peer;
 mod tls;
 
 pub use error::{NetError, NetResult};
-pub use message::{Message, MessageKind};
+pub use message::{Message, MessageKind, SerializationFormat};
 pub use node::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS, DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig,
     NodeEvent,

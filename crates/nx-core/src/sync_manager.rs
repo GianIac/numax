@@ -422,7 +422,8 @@ impl SyncManager {
             .with_peers(self.config.peers.clone())
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
-            .with_socket_timeout(self.config.socket_timeout);
+            .with_socket_timeout(self.config.socket_timeout)
+            .with_serialization_format(self.config.serialization_format);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);

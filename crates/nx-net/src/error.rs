@@ -10,6 +10,9 @@ pub enum NetError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("bincode serialization error: {0}")]
+    BincodeSerialization(#[from] Box<bincode::ErrorKind>),
+
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 

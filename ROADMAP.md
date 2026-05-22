@@ -351,12 +351,12 @@ HTTP endpoint over Tokio.
 - bincode: compact (~50% size), fast (~10x faster parse)
 
 **Tasks**:
-- [ ] Add `bincode` to dependencies
-- [ ] `SerializationFormat` enum with a 1-byte header on the wire
-- [ ] CLI flag `--debug-protocol`
-- [ ] Format negotiation in Hello/HelloAck
-- [ ] Test: roundtrip for both formats
-- [ ] Benchmark: JSON vs bincode (size, speed)
+- [x] Add `bincode` to dependencies
+- [x] `SerializationFormat` enum with a 1-byte header on the wire
+- [x] CLI flag `--debug-protocol`
+- [x] Format negotiation in Hello/HelloAck
+- [x] Test: roundtrip for both formats
+- [x] Benchmark: JSON vs bincode (size, speed)
 
 **Libraries**: `bincode`, `serde` (already present)
 
