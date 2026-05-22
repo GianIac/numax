@@ -3,7 +3,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -148,8 +148,13 @@ impl Message {
         }
     }
 
-    /// Serialize to bytes using the default wire format.
+    /// Serialize to bytes using the default production wire format.
     pub fn to_bytes(&self) -> NetResult<Vec<u8>> {
+        self.to_bytes_with_format(SerializationFormat::Bincode)
+    }
+
+    /// Serialize to bytes using the JSON debug wire format.
+    pub fn to_json_bytes(&self) -> NetResult<Vec<u8>> {
         self.to_bytes_with_format(SerializationFormat::Json)
     }
 

@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use nx_net::{Message, MessageKind, Node, NodeConfig, SerializationFormat, TestPki};
+use nx_net::{
+    Message, MessageKind, Node, NodeConfig, PROTOCOL_VERSION, SerializationFormat, TestPki,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -40,7 +42,7 @@ async fn node_id_mismatch_disconnects_immediately() {
         let hello = Message {
             kind: MessageKind::Hello {
                 node_id: forged,
-                version: 1,
+                version: PROTOCOL_VERSION,
                 supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
                 preferred_format: SerializationFormat::Bincode,
             },

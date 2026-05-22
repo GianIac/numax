@@ -340,11 +340,7 @@ impl Node {
                 selected_format,
             } => {
                 if version != PROTOCOL_VERSION {
-                    warn!(
-                        their_version = version,
-                        our_version = PROTOCOL_VERSION,
-                        "protocol version mismatch"
-                    );
+                    return Err(protocol_version_mismatch(version));
                 }
                 if !supported_formats_for(self.config.serialization_format)
                     .contains(&selected_format)
@@ -674,7 +670,7 @@ async fn handle_incoming(
             preferred_format,
         } => {
             if version != PROTOCOL_VERSION {
-                warn!(their_version = version, "protocol mismatch");
+                return Err(protocol_version_mismatch(version));
             }
             let negotiated_format =
                 negotiate_serialization_format(limits.serialization_format, &supported_formats)
@@ -845,6 +841,12 @@ fn negotiate_serialization_format(
     local_supported
         .into_iter()
         .find(|format| peer_supported.contains(format))
+}
+
+fn protocol_version_mismatch(their_version: u32) -> NetError {
+    NetError::InvalidMessage(format!(
+        "protocol version mismatch: expected {PROTOCOL_VERSION}, got {their_version}"
+    ))
 }
 
 /// Loop for reading messages from a peer until disconnection
@@ -1181,6 +1183,73 @@ mod tests {
 
         assert!(matches!(err, NetError::Timeout));
         accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_to_peer_rejects_protocol_version_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = NetStream::Plain(stream);
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+
+            let ack = Message {
+                kind: MessageKind::HelloAck {
+                    node_id: NodeId::new("old-peer"),
+                    version: PROTOCOL_VERSION - 1,
+                    selected_format: SerializationFormat::Bincode,
+                },
+            };
+            let bytes = ack.to_bytes().unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+
+        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+
+        assert!(
+            matches!(err, NetError::InvalidMessage(msg) if msg.contains("protocol version mismatch"))
+        );
+        accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incoming_rejects_protocol_version_mismatch() {
+        let mut node = Node::new(
+            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+        let mut events = node.take_event_receiver().unwrap();
+        let addr = node.start_listener().await.unwrap();
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let hello = Message {
+            kind: MessageKind::Hello {
+                node_id: NodeId::new("old-peer"),
+                version: PROTOCOL_VERSION - 1,
+                supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
+                preferred_format: SerializationFormat::Bincode,
+            },
+        };
+        let bytes = hello.to_bytes().unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let event = timeout(Duration::from_millis(200), events.recv()).await;
+        assert!(event.is_err(), "old protocol peer must not connect");
+
+        node.shutdown().await;
     }
 
     #[tokio::test]
