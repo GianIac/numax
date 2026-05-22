@@ -180,6 +180,53 @@ let rows = db::scan("user:")?;
 
 ---
 
+#### `db_keys`
+
+Lists keys matching a prefix and returns a bounded page.
+
+```text
+fn db_keys(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    cursor: u64,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+**Parameters:** same as `db_scan`.
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Buffer too small (retry with larger buffer) |
+| `-3` | Internal error |
+| `-4` | Reserved prefix |
+
+**Output encoding:**
+
+```text
+u32 key_count
+repeat key_count times:
+  u32 key_len
+  u8[key_len] key
+```
+
+All integer fields are little-endian. Runtime-reserved keys under `__nx/` are never returned.
+
+**Example:**
+
+```rust
+use nx_sdk::db;
+
+let keys = db::keys("user:")?;
+```
+
+---
+
 #### `db_delete`
 
 Deletes a key from the database.
@@ -373,7 +420,7 @@ pub extern "C" fn run() {
 ### Database
 - [x] `db_scan` - Scan by prefix
 - [x] `db_exists` - Check key existence (without reading the value)
-- [ ] `db_keys` - List all keys with prefix
+- [x] `db_keys` - List all keys with prefix
 
 ### Network
 - [ ] `net_send` - Send message to specific peer

@@ -97,6 +97,29 @@ fn parse_scan_rows(buf: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(rows)
 }
 
+fn parse_keys(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut offset = 0usize;
+    let count = read_u32_le(buf, &mut offset)? as usize;
+    let mut keys = Vec::new();
+
+    for _ in 0..count {
+        let key_len = read_u32_le(buf, &mut offset)? as usize;
+        let key_end = offset.saturating_add(key_len);
+        if key_end > buf.len() {
+            return Err(NxError::Internal);
+        }
+
+        keys.push(buf[offset..key_end].to_vec());
+        offset = key_end;
+    }
+
+    if offset != buf.len() {
+        return Err(NxError::Internal);
+    }
+
+    Ok(keys)
+}
+
 /// scan_page(prefix, cursor, limit) -> Result<Vec<(key, value)>, NxError>
 pub fn scan_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut cap: usize = 256;
@@ -133,6 +156,42 @@ pub fn scan_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<(Vec<u8>, 
     }
 }
 
+/// keys_page(prefix, cursor, limit) -> Result<Vec<key>, NxError>
+pub fn keys_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<Vec<u8>>> {
+    let mut cap: usize = 256;
+
+    loop {
+        let mut out = vec![0u8; cap];
+        let n = unsafe {
+            ffi::db_keys(
+                prefix.as_ptr() as u32,
+                prefix.len() as u32,
+                cursor,
+                limit,
+                out.as_mut_ptr() as u32,
+                out.len() as u32,
+            )
+        };
+
+        match n {
+            ERR_INTERNAL => return Err(NxError::Internal),
+            ERR_RESERVED_KEY => return Err(NxError::ReservedKey),
+            ERR_BUF_TOO_SMALL => {
+                cap = cap.saturating_mul(2);
+                if cap > MAX_SCAN_BUFFER {
+                    return Err(NxError::BufferTooSmall);
+                }
+                continue;
+            }
+            c if c < 0 => return Err(NxError::UnknownCode(c)),
+            n => {
+                out.truncate(n as usize);
+                return parse_keys(&out);
+            }
+        }
+    }
+}
+
 /// scan(prefix) -> Result<Vec<(key, value)>, NxError>
 pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut cursor = 0u64;
@@ -140,6 +199,27 @@ pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 
     loop {
         let page = scan_page(prefix, cursor, DEFAULT_SCAN_LIMIT)?;
+        if page.is_empty() {
+            return Ok(out);
+        }
+
+        cursor = cursor.saturating_add(page.len() as u64);
+        let is_last = page.len() < DEFAULT_SCAN_LIMIT as usize;
+        out.extend(page);
+
+        if is_last {
+            return Ok(out);
+        }
+    }
+}
+
+/// keys(prefix) -> Result<Vec<key>, NxError>
+pub fn keys(prefix: &str) -> Result<Vec<Vec<u8>>> {
+    let mut cursor = 0u64;
+    let mut out = Vec::new();
+
+    loop {
+        let page = keys_page(prefix, cursor, DEFAULT_SCAN_LIMIT)?;
         if page.is_empty() {
             return Ok(out);
         }

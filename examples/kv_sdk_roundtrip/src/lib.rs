@@ -10,6 +10,10 @@ pub extern "C" fn run() {
         "kv_sdk_roundtrip: scan count = {}",
         db::scan("hel").unwrap().len()
     );
+    nx_log!(
+        "kv_sdk_roundtrip: keys count = {}",
+        db::keys("hel").unwrap().len()
+    );
 
     let v = db::get("hello").unwrap().unwrap();
     nx_log!("kv_sdk_roundtrip: got {}", core::str::from_utf8(&v).unwrap());

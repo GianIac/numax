@@ -12,6 +12,14 @@ unsafe extern "C" {
         out_ptr: u32,
         out_cap: u32,
     ) -> i32;
+    pub fn db_keys(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        cursor: u64,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
     pub fn db_delete(key_ptr: u32, key_len: u32) -> i32;
 
     // CRDT (namespace "nx")

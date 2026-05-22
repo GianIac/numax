@@ -126,4 +126,33 @@ impl Store {
 
         Ok(out)
     }
+
+    pub fn keys_prefix_page(
+        &self,
+        prefix: &[u8],
+        cursor: u64,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut out = Vec::new();
+        let mut skipped = 0u64;
+        let limit = limit as usize;
+
+        for item in self.db.scan_prefix(prefix) {
+            let (k, _) = item?;
+            if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                continue;
+            }
+            if skipped < cursor {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            out.push(k.to_vec());
+        }
+
+        Ok(out)
+    }
 }

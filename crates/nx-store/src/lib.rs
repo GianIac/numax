@@ -134,6 +134,35 @@ mod tests {
     }
 
     #[test]
+    fn test_keys_prefix_page_paginates_visible_keys() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.set(b"app:a", b"1").unwrap();
+        store.set(b"app:b", b"2").unwrap();
+        store.set(b"app:c", b"3").unwrap();
+        store.set(b"other:a", b"4").unwrap();
+
+        let first = store.keys_prefix_page(b"app:", 0, 2, None).unwrap();
+        assert_eq!(first, vec![b"app:a".to_vec(), b"app:b".to_vec()]);
+
+        let second = store.keys_prefix_page(b"app:", 2, 2, None).unwrap();
+        assert_eq!(second, vec![b"app:c".to_vec()]);
+    }
+
+    #[test]
+    fn test_keys_prefix_page_excludes_reserved_prefix() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.set(b"app:a", b"1").unwrap();
+        store.set(b"__nx/internal", b"secret").unwrap();
+
+        let keys = store.keys_prefix_page(b"", 0, 10, Some(b"__nx/")).unwrap();
+        assert_eq!(keys, vec![b"app:a".to_vec()]);
+    }
+
+    #[test]
     fn test_stats_counts_keys_and_bytes() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

@@ -389,7 +389,7 @@ HTTP endpoint over Tokio.
 **Database**:
 - [x] `db_scan` — prefix scan with iterator / paginated results
 - [x] `db_exists` — check key existence without reading the value
-- [ ] `db_keys` — list keys matching a prefix
+- [x] `db_keys` — list keys matching a prefix
 
 **Time**:
 - [ ] `time_now` — current Unix timestamp (ms)

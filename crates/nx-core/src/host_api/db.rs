@@ -83,6 +83,33 @@ fn encode_scan_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> std::result::Result<Vec<u8>,
     Ok(out)
 }
 
+fn encode_keys(keys: &[Vec<u8>]) -> std::result::Result<Vec<u8>, i32> {
+    let key_count = u32::try_from(keys.len()).map_err(|_| ERR_INTERNAL)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&key_count.to_le_bytes());
+
+    for key in keys {
+        let key_len = u32::try_from(key.len()).map_err(|_| ERR_INTERNAL)?;
+        out.extend_from_slice(&key_len.to_le_bytes());
+        out.extend_from_slice(key);
+    }
+
+    Ok(out)
+}
+
+fn validate_page_request(api_name: &str, limit: u32, out_cap: u32) -> std::result::Result<(), i32> {
+    if limit == 0 || limit > MAX_SCAN_LIMIT {
+        eprintln!("[nx-core] {api_name}: invalid limit: {limit} (max {MAX_SCAN_LIMIT})");
+        return Err(ERR_INTERNAL);
+    }
+    if out_cap > MAX_OUT_CAP {
+        eprintln!("[nx-core] {api_name}: output capacity too large: {out_cap} (max {MAX_OUT_CAP})");
+        return Err(ERR_INTERNAL);
+    }
+
+    Ok(())
+}
+
 fn db_get_impl(
     mut caller: Caller<'_, HostState>,
     key_ptr: u32,
@@ -236,13 +263,8 @@ fn db_scan_impl(
         }
     };
 
-    if limit == 0 || limit > MAX_SCAN_LIMIT {
-        eprintln!("[nx-core] db_scan: invalid limit: {limit} (max {MAX_SCAN_LIMIT})");
-        return ERR_INTERNAL;
-    }
-    if out_cap > MAX_OUT_CAP {
-        eprintln!("[nx-core] db_scan: output capacity too large: {out_cap} (max {MAX_OUT_CAP})");
-        return ERR_INTERNAL;
+    if let Err(code) = validate_page_request("db_scan", limit, out_cap) {
+        return code;
     }
 
     let prefix = match read_validated_key(&mut caller, &memory, prefix_ptr, prefix_len, "db_scan") {
@@ -274,6 +296,62 @@ fn db_scan_impl(
 
     if let Err(e) = memory.write(&mut caller, out_ptr as usize, &encoded) {
         eprintln!("[nx-core] db_scan: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    encoded.len() as i32
+}
+
+fn db_keys_impl(
+    mut caller: Caller<'_, HostState>,
+    prefix_ptr: u32,
+    prefix_len: u32,
+    cursor: u64,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] db_keys: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if let Err(code) = validate_page_request("db_keys", limit, out_cap) {
+        return code;
+    }
+
+    let prefix = match read_validated_key(&mut caller, &memory, prefix_ptr, prefix_len, "db_keys") {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let keys = match caller.data().store.keys_prefix_page(
+        &prefix,
+        cursor,
+        limit,
+        Some(crate::host_api::crdt::RESERVED_PREFIX.as_bytes()),
+    ) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("[nx-core] db_keys: store error: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let encoded = match encode_keys(&keys) {
+        Ok(encoded) => encoded,
+        Err(code) => return code,
+    };
+
+    if encoded.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &encoded) {
+        eprintln!("[nx-core] db_keys: failed to write output: {e}");
         return ERR_INTERNAL;
     }
 
@@ -324,6 +402,23 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
          out_cap: u32|
          -> i32 {
             db_scan_impl(
+                caller, prefix_ptr, prefix_len, cursor, limit, out_ptr, out_cap,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        "nx",
+        "db_keys",
+        |caller: Caller<'_, HostState>,
+         prefix_ptr: u32,
+         prefix_len: u32,
+         cursor: u64,
+         limit: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            db_keys_impl(
                 caller, prefix_ptr, prefix_len, cursor, limit, out_ptr, out_cap,
             )
         },
