@@ -8,47 +8,6 @@
 
 ## Release Status
 
-### v0.1.0-alpha.2 ✅
-**Purpose**: second technical preview, focused on making sync usable from the CLI.
-
-Includes:
-- Wasmtime runtime + WASI preview1.
-- Local KV host API (`db_get`, `db_set`, `db_delete`) and logging.
-- Embedded sled store.
-- GCounter CRDT with JSON serialization.
-- Base networking with Hello/PushOps/PullSince/Ping.
-- TLS/mTLS, NodeID derived from certificate and allowlist.
-- End-to-end internal wiring between guest CRDT API, SyncManager and datastore.
-- Sled materialization of the GCounter total on local/remote update.
-- Runtime lifecycle for sync-enabled nodes: long-running mode, settle mode,
-  signal-aware shutdown and final store flush.
-- Startup hydration of materialized GCounter values.
-- `SyncManager` E2E tests for handshake, PushOps, convergence and idempotency.
-- Examples: `distributed_counter`, `distributed_chat` local-only, `vote_tally_tls`.
-
-Known limitations:
-- Full network resilience, serialization hardening and the extended host API are
-  still open phases.
-- API and wire format may change before `v0.1.0`.
-
-### v0.1.0-alpha.3 ✅
-**Purpose**: hardening preview for lifecycle, backpressure and observability.
-
-Includes:
-- Everything in `v0.1.0-alpha.2`.
-- Phase 7 lifecycle hardening: stable runtime NodeId, startup hydration,
-  cooperative network read-loop shutdown, bounded task shutdown fallback and
-  final store flush.
-- Phase 8 backpressure and limits: peer limit during handshake, queued ops
-  limit, message size limit and socket read/write timeouts.
-- Phase 9 minimal observability: configurable logging, `/metrics`, `/health`
-  and `/ready`.
-
-Known limitations:
-- Durable full CRDT state/op-log recovery, automatic reconnect, anti-entropy
-  and dual-mode wire serialization remain tracked in later phases.
-- API and wire format may change before `v0.1.0`.
-
 ### v0.1.0-alpha.4 ✅
 **Purpose**: network resilience and dual-mode serialization preview.
 
