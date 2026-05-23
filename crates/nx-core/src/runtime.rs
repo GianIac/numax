@@ -92,6 +92,9 @@ impl Runtime {
         // host_db (namespace "nx", func "db_get", "db_set" etc.)
         host_api::db::add_to_linker(&mut linker)?;
 
+        // host_time (namespace "nx", func "time_now", "time_monotonic")
+        host_api::time::add_to_linker(&mut linker)?;
+
         // host_crdt (namespace "nx", func "crdt_gcounter_inc", "crdt_gcounter_value")
         host_api::crdt::add_to_linker(&mut linker)?;
 

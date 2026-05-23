@@ -392,8 +392,8 @@ HTTP endpoint over Tokio.
 - [x] `db_keys` — list keys matching a prefix
 
 **Time**:
-- [ ] `time_now` — current Unix timestamp (ms)
-- [ ] `time_monotonic` — monotonic clock for measurements
+- [x] `time_now` — current Unix timestamp (ms)
+- [x] `time_monotonic` — monotonic clock for measurements
 
 **Crypto**:
 - [ ] `random_bytes` — cryptographically secure random bytes

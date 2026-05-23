@@ -718,7 +718,8 @@ Increment operations are persisted as CRDT state/op-log metadata, materialized o
 
 | Function | Description | Status |
 |----------|-------------|--------|
-| `time_now` | Monotonic/UTC timestamp | *Planned* |
+| `time_now` | Current Unix timestamp in milliseconds | *Implemented (Phase 12)* |
+| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented (Phase 12)* |
 | `random_bytes` | Controlled source of entropy | *Planned* |
 | `hash_*` | Family of hashing functions | *Planned* |
 | `env_get` | Filtered environment variable reading | *Planned* |

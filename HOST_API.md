@@ -252,6 +252,54 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 
 ---
 
+### Time
+
+Time functions expose host-managed clocks to WASM modules.
+
+#### `time_now`
+
+Returns the current Unix timestamp in milliseconds.
+
+```text
+fn time_now() -> u64
+```
+
+**Return:** milliseconds since `1970-01-01T00:00:00Z`.
+
+**Example:**
+
+```rust
+use nx_sdk::time;
+
+let now_ms = time::now();
+```
+
+---
+
+#### `time_monotonic`
+
+Returns monotonic milliseconds since the runtime process initialized its
+monotonic clock. Use this for measuring elapsed durations, not for persisted
+timestamps.
+
+```text
+fn time_monotonic() -> u64
+```
+
+**Return:** monotonic milliseconds relative to the runtime process.
+
+**Example:**
+
+```rust
+use nx_sdk::time;
+
+let start = time::monotonic();
+// work
+let elapsed_ms = time::monotonic() - start;
+```
+
+---
+
 ### CRDT
 
 CRDT functions operate on replicated data types. In the current implementation,
@@ -429,8 +477,8 @@ pub extern "C" fn run() {
 - [ ] `net_node_id` - Get own NodeId
 
 ### Time
-- [ ] `time_now` - Current Unix timestamp (ms)
-- [ ] `time_monotonic` - Monotonic clock for measurements
+- [x] `time_now` - Current Unix timestamp (ms)
+- [x] `time_monotonic` - Monotonic clock for measurements
 
 ### Crypto
 - [ ] `random_bytes` - Secure random number generation

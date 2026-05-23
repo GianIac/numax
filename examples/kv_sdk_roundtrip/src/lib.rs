@@ -1,4 +1,4 @@
-use nx_sdk::{db, nx_log};
+use nx_sdk::{db, nx_log, time};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
@@ -13,6 +13,11 @@ pub extern "C" fn run() {
     nx_log!(
         "kv_sdk_roundtrip: keys count = {}",
         db::keys("hel").unwrap().len()
+    );
+    nx_log!("kv_sdk_roundtrip: time_now = {}", time::now());
+    nx_log!(
+        "kv_sdk_roundtrip: time_monotonic = {}",
+        time::monotonic()
     );
 
     let v = db::get("hello").unwrap().unwrap();
