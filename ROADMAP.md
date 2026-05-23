@@ -406,8 +406,8 @@ HTTP endpoint over Tokio.
 - [x] `abort` — terminate execution with an error message
 
 **Network**:
-- [ ] `net_node_id` — get own NodeId
-- [ ] `net_peers` — list currently connected peers
+- [x] `net_node_id` — get own NodeId
+- [x] `net_peers` — list currently connected peers
 
 **Under evaluation**:
 - [ ] `host_capabilities` — query which host APIs are available at runtime

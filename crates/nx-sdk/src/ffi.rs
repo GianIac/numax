@@ -40,6 +40,10 @@ unsafe extern "C" {
     pub fn module_id(out_ptr: u32, out_cap: u32) -> i32;
     pub fn abort(msg_ptr: u32, msg_len: u32);
 
+    // Network (namespace "nx")
+    pub fn net_node_id(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn net_peers(out_ptr: u32, out_cap: u32) -> i32;
+
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
     #[expect(dead_code, reason = "legacy guest import kept for compatibility")]
     pub fn host_log(msg_ptr: u32, msg_len: u32);

@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod log;
+pub mod net;
 pub mod system;
 pub mod time;
 

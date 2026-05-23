@@ -226,6 +226,7 @@ pub struct SyncHandle {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
+    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
 }
 
 impl SyncHandle {
@@ -252,6 +253,17 @@ impl SyncHandle {
     /// Shared runtime metrics.
     pub fn metrics(&self) -> Arc<RuntimeMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Connected peers known to the sync manager, as `(addr, node_id)` pairs.
+    pub async fn connected_peers(&self) -> Vec<(String, NodeId)> {
+        let peers = self.peer_node_ids.read().await;
+        let mut peers = peers
+            .iter()
+            .map(|(addr, node_id)| (addr.clone(), node_id.clone()))
+            .collect::<Vec<_>>();
+        peers.sort_by(|(addr_a, _), (addr_b, _)| addr_a.cmp(addr_b));
+        peers
     }
 }
 
@@ -404,6 +416,7 @@ impl SyncManager {
             counters: Arc::clone(&self.counters),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
+            peer_node_ids: Arc::clone(&self.peer_node_ids),
         }
     }
 

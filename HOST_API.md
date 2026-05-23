@@ -463,6 +463,71 @@ system::abort("invalid module state");
 
 ---
 
+### Network
+
+Network functions expose sync runtime introspection to WASM modules. They require
+sync to be enabled; otherwise they return `-5` (`ERR_SYNC_DISABLED`).
+
+#### `net_node_id`
+
+Returns the local sync `NodeId`.
+
+```text
+fn net_node_id(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+| `-5` | Sync is disabled |
+
+**Example:**
+
+```rust
+use nx_sdk::net;
+
+let node_id = net::node_id()?;
+```
+
+---
+
+#### `net_peers`
+
+Returns currently connected sync peers.
+
+```text
+fn net_peers(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:** same as `net_node_id`.
+
+**Output encoding:**
+
+```text
+u32 peer_count
+repeat peer_count times:
+  u32 addr_len
+  u32 node_id_len
+  u8[addr_len] addr
+  u8[node_id_len] node_id
+```
+
+All integer fields are little-endian.
+
+**Example:**
+
+```rust
+use nx_sdk::net;
+
+let peers = net::peers()?;
+```
+
+---
+
 ### CRDT
 
 CRDT functions operate on replicated data types. In the current implementation,
@@ -636,8 +701,8 @@ pub extern "C" fn run() {
 ### Network
 - [ ] `net_send` - Send message to specific peer
 - [ ] `net_broadcast` - Broadcast to all peers
-- [ ] `net_peers` - List connected peers
-- [ ] `net_node_id` - Get own NodeId
+- [x] `net_peers` - List connected peers
+- [x] `net_node_id` - Get own NodeId
 
 ### Time
 - [x] `time_now` - Current Unix timestamp (ms)

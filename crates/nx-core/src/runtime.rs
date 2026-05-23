@@ -106,6 +106,9 @@ impl Runtime {
         // host_system (namespace "nx", func "env_get", "module_id", "abort")
         host_api::system::add_to_linker(&mut linker)?;
 
+        // host_net (namespace "nx", func "net_node_id", "net_peers")
+        host_api::net::add_to_linker(&mut linker)?;
+
         // host_crdt (namespace "nx", func "crdt_gcounter_inc", "crdt_gcounter_value")
         host_api::crdt::add_to_linker(&mut linker)?;
 
