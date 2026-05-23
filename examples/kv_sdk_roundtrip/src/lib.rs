@@ -33,6 +33,11 @@ pub extern "C" fn run() {
     );
     nx_log!("kv_sdk_roundtrip: module_id = {}", system::module_id().unwrap());
     nx_log!(
+        "kv_sdk_roundtrip: capabilities = {}",
+        system::host_capabilities().unwrap().len()
+    );
+    system::event_emit("kv_sdk_roundtrip.completed_db_setup", b"hello").unwrap();
+    nx_log!(
         "kv_sdk_roundtrip: env present = {}",
         system::env_get("NX_EXAMPLE").unwrap().is_some()
     );

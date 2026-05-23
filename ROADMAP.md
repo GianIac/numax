@@ -376,8 +376,6 @@ HTTP endpoint over Tokio.
 - [x] Test: roundtrip for both formats
 - [x] Benchmark: JSON vs bincode (size, speed)
 
-**Libraries**: `bincode`, `serde` (already present)
-
 ---
 
 ### Phase 12: Extended Host API 🔌
@@ -410,11 +408,9 @@ HTTP endpoint over Tokio.
 - [x] `net_peers` — list currently connected peers
 
 **Under evaluation**:
-- [ ] `host_capabilities` — query which host APIs are available at runtime
-- [ ] `event_emit` — emit a named event to the runtime (foundation for callbacks)
-- [ ] `db_scan` cursor/pagination variant — safe iteration over large key spaces
-
-**Libraries**: `sha2`, `blake3`, `getrandom`
+- [x] `host_capabilities` — query which host APIs are available at runtime
+- [x] `event_emit` — emit a named event to the runtime (foundation for callbacks)
+- [x] `db_scan` cursor/pagination variant — safe iteration over large key spaces
 
 ---
 

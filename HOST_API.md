@@ -442,6 +442,63 @@ let id = system::module_id()?;
 
 ---
 
+#### `host_capabilities`
+
+Returns the host API capabilities exposed by the current runtime.
+
+```text
+fn host_capabilities(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Output encoding:** UTF-8 capability names separated by `\n`.
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let capabilities = system::host_capabilities()?;
+```
+
+---
+
+#### `event_emit`
+
+Emits a named event to the runtime. This is a foundation for future callback and
+event routing work; today the runtime records the event through tracing.
+
+```text
+fn event_emit(name_ptr: u32, name_len: u32, payload_ptr: u32, payload_len: u32) -> i32
+```
+
+Event names must be non-empty ASCII names using letters, digits, `_`, `-`, `.`
+or `:`. Payloads are bounded.
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `0` | Success |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+system::event_emit("user.created", b"{\"id\":1}")?;
+```
+
+---
+
 #### `abort`
 
 Terminates guest execution with a host-visible error message.
@@ -728,6 +785,8 @@ pub extern "C" fn run() {
 - [x] `env_get` - Read environment variable
 - [x] `module_id` - Get current module ID
 - [x] `abort` - Terminate execution with error
+- [x] `host_capabilities` - Query available host APIs
+- [x] `event_emit` - Emit a named event to the runtime
 
 ### Events (Callbacks)
 - [ ] `on_peer_connect` - Callback when a peer connects

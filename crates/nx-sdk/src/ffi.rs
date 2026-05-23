@@ -38,6 +38,8 @@ unsafe extern "C" {
     // System (namespace "nx")
     pub fn env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn module_id(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn host_capabilities(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn event_emit(name_ptr: u32, name_len: u32, payload_ptr: u32, payload_len: u32) -> i32;
     pub fn abort(msg_ptr: u32, msg_len: u32);
 
     // Network (namespace "nx")

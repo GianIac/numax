@@ -10,8 +10,35 @@ const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
 
 const MAX_ENV_KEY_LEN: u32 = 128;
+const MAX_EVENT_NAME_LEN: u32 = 128;
+const MAX_EVENT_PAYLOAD_LEN: u32 = 64 * 1024;
 const MAX_ABORT_MSG_LEN: u32 = 8 * 1024;
 const MAX_OUT_CAP: u32 = 1024 * 1024;
+
+const HOST_CAPABILITIES: &[&str] = &[
+    "abort",
+    "crdt_gcounter_inc",
+    "crdt_gcounter_value",
+    "db_delete",
+    "db_exists",
+    "db_get",
+    "db_keys",
+    "db_scan",
+    "db_set",
+    "env_get",
+    "event_emit",
+    "hash_blake3",
+    "hash_sha256",
+    "host_capabilities",
+    "host_log",
+    "host_log_v2",
+    "module_id",
+    "net_node_id",
+    "net_peers",
+    "random_bytes",
+    "time_monotonic",
+    "time_now",
+];
 
 fn get_memory(caller: &mut Caller<'_, HostState>) -> Option<Memory> {
     match caller.get_export("memory") {
@@ -73,6 +100,19 @@ fn is_allowed_env_key(key: &str) -> bool {
     key.starts_with("NX_") || key.starts_with("NUMAX_")
 }
 
+fn is_valid_event_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_EVENT_NAME_LEN as usize {
+        return false;
+    }
+
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+fn encoded_host_capabilities() -> Vec<u8> {
+    HOST_CAPABILITIES.join("\n").into_bytes()
+}
+
 fn env_get_impl(
     mut caller: Caller<'_, HostState>,
     key_ptr: u32,
@@ -126,6 +166,26 @@ fn env_get_impl(
     )
 }
 
+fn host_capabilities_impl(mut caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] host_capabilities: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+    let capabilities = encoded_host_capabilities();
+
+    write_bytes(
+        &mut caller,
+        &memory,
+        out_ptr,
+        out_cap,
+        &capabilities,
+        "host_capabilities",
+    )
+}
+
 fn module_id_impl(mut caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
@@ -144,6 +204,66 @@ fn module_id_impl(mut caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32)
         module_id.as_bytes(),
         "module_id",
     )
+}
+
+fn event_emit_impl(
+    mut caller: Caller<'_, HostState>,
+    name_ptr: u32,
+    name_len: u32,
+    payload_ptr: u32,
+    payload_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] event_emit: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let name = match read_bytes(&mut caller, &memory, name_ptr, name_len, MAX_EVENT_NAME_LEN) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[nx-core] event_emit: failed to read event name: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+    let name = match std::str::from_utf8(&name) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("[nx-core] event_emit: event name is not UTF-8: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+    if !is_valid_event_name(name) {
+        eprintln!("[nx-core] event_emit: invalid event name: {name:?}");
+        return ERR_INTERNAL;
+    }
+
+    let payload = match read_bytes(
+        &mut caller,
+        &memory,
+        payload_ptr,
+        payload_len,
+        MAX_EVENT_PAYLOAD_LEN,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[nx-core] event_emit: failed to read payload: {e}");
+            return ERR_INTERNAL;
+        }
+    };
+    let module_id = caller.data().module_id.clone();
+
+    tracing::info!(
+        target: "nx_event",
+        module_id = %module_id,
+        event = %name,
+        payload_len = payload.len(),
+        "guest event emitted"
+    );
+
+    0
 }
 
 fn abort_impl(
@@ -184,6 +304,25 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
 
     linker.func_wrap(
         "nx",
+        "host_capabilities",
+        |caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32| -> i32 {
+            host_capabilities_impl(caller, out_ptr, out_cap)
+        },
+    )?;
+
+    linker.func_wrap(
+        "nx",
+        "event_emit",
+        |caller: Caller<'_, HostState>,
+         name_ptr: u32,
+         name_len: u32,
+         payload_ptr: u32,
+         payload_len: u32|
+         -> i32 { event_emit_impl(caller, name_ptr, name_len, payload_ptr, payload_len) },
+    )?;
+
+    linker.func_wrap(
+        "nx",
         "abort",
         |caller: Caller<'_, HostState>,
          msg_ptr: u32,
@@ -205,5 +344,25 @@ mod tests {
         assert!(!is_allowed_env_key("PATH"));
         assert!(!is_allowed_env_key("NX_lower"));
         assert!(!is_allowed_env_key(""));
+    }
+
+    #[test]
+    fn event_name_policy_accepts_simple_namespaced_names() {
+        assert!(is_valid_event_name("module.started"));
+        assert!(is_valid_event_name("user:created"));
+        assert!(is_valid_event_name("job_1-done"));
+        assert!(!is_valid_event_name(""));
+        assert!(!is_valid_event_name("bad name"));
+        assert!(!is_valid_event_name("bad/slash"));
+    }
+
+    #[test]
+    fn capabilities_include_phase_12_apis() {
+        let capabilities = String::from_utf8(encoded_host_capabilities()).unwrap();
+
+        assert!(capabilities.contains("host_capabilities"));
+        assert!(capabilities.contains("event_emit"));
+        assert!(capabilities.contains("net_peers"));
+        assert!(capabilities.contains("db_scan"));
     }
 }

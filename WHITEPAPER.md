@@ -726,6 +726,8 @@ Increment operations are persisted as CRDT state/op-log metadata, materialized o
 | `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented (Phase 12)* |
 | `module_id` | Current module identifier | *Implemented (Phase 12)* |
 | `abort` | Terminate guest execution with an error message | *Implemented (Phase 12)* |
+| `host_capabilities` | Query exposed host APIs | *Implemented (Phase 12)* |
+| `event_emit` | Emit a named runtime event | *Implemented (Phase 12)* |
 | `net_node_id` | Local sync NodeId | *Implemented (Phase 12)* |
 | `net_peers` | Connected sync peers | *Implemented (Phase 12)* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
