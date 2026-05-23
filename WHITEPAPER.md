@@ -723,7 +723,9 @@ Increment operations are persisted as CRDT state/op-log metadata, materialized o
 | `random_bytes` | Cryptographically secure random bytes | *Implemented (Phase 12)* |
 | `hash_sha256` | SHA-256 digest | *Implemented (Phase 12)* |
 | `hash_blake3` | BLAKE3 digest | *Implemented (Phase 12)* |
-| `env_get` | Filtered environment variable reading | *Planned* |
+| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented (Phase 12)* |
+| `module_id` | Current module identifier | *Implemented (Phase 12)* |
+| `abort` | Terminate guest execution with an error message | *Implemented (Phase 12)* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
 ### 6.3 Configuration and Deployment *(Prototype)*

@@ -401,15 +401,15 @@ HTTP endpoint over Tokio.
 - [x] `hash_blake3` — BLAKE3 hash (faster)
 
 **System**:
-- [ ] `env_get` — read an environment variable
-- [ ] `module_id` — get current module identifier
-- [ ] `abort` — terminate execution with an error message
+- [x] `env_get` — read an environment variable
+- [x] `module_id` — get current module identifier
+- [x] `abort` — terminate execution with an error message
 
-**Network** *(query-only, no send)*:
+**Network**:
 - [ ] `net_node_id` — get own NodeId
 - [ ] `net_peers` — list currently connected peers
 
-**Under evaluation** *(not committed to `v0.1.0`)*:
+**Under evaluation**:
 - [ ] `host_capabilities` — query which host APIs are available at runtime
 - [ ] `event_emit` — emit a named event to the runtime (foundation for callbacks)
 - [ ] `db_scan` cursor/pagination variant — safe iteration over large key spaces

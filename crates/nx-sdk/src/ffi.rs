@@ -35,6 +35,11 @@ unsafe extern "C" {
     pub fn hash_sha256(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn hash_blake3(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
 
+    // System (namespace "nx")
+    pub fn env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn module_id(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn abort(msg_ptr: u32, msg_len: u32);
+
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
     #[expect(dead_code, reason = "legacy guest import kept for compatibility")]
     pub fn host_log(msg_ptr: u32, msg_len: u32);

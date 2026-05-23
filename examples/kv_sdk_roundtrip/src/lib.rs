@@ -1,4 +1,4 @@
-use nx_sdk::{crypto, db, nx_log, time};
+use nx_sdk::{crypto, db, nx_log, system, time};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
@@ -30,6 +30,11 @@ pub extern "C" fn run() {
     nx_log!(
         "kv_sdk_roundtrip: blake3 bytes = {}",
         crypto::hash_blake3(b"hello").unwrap().len()
+    );
+    nx_log!("kv_sdk_roundtrip: module_id = {}", system::module_id().unwrap());
+    nx_log!(
+        "kv_sdk_roundtrip: env present = {}",
+        system::env_get("NX_EXAMPLE").unwrap().is_some()
     );
 
     let v = db::get("hello").unwrap().unwrap();

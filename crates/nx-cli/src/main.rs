@@ -170,6 +170,7 @@ async fn real_main() -> Result<()> {
             if let Some(p) = datastore_path {
                 cfg.datastore_path = p;
             }
+            cfg.module_id = module.to_string_lossy().into_owned();
             if let Some(s) = sync {
                 info!(
                     listen = ?s.listen_addr,

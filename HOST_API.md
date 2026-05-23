@@ -383,6 +383,86 @@ let digest = crypto::hash_blake3(b"payload")?;
 
 ---
 
+### System
+
+System functions expose a small, controlled runtime surface to WASM modules.
+
+#### `env_get`
+
+Reads an allowed host environment variable. To avoid accidental secret leakage,
+the current policy exposes only uppercase variables whose names start with
+`NX_` or `NUMAX_`.
+
+```text
+fn env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-1` | Variable not present or not allowed |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let value = system::env_get("NX_FEATURE_FLAG")?;
+```
+
+---
+
+#### `module_id`
+
+Returns the current module identifier provided by the runtime.
+
+```text
+fn module_id(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let id = system::module_id()?;
+```
+
+---
+
+#### `abort`
+
+Terminates guest execution with a host-visible error message.
+
+```text
+fn abort(msg_ptr: u32, msg_len: u32)
+```
+
+The host turns this call into a Wasmtime trap. The SDK exposes it as
+`system::abort(message) -> !`.
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+system::abort("invalid module state");
+```
+
+---
+
 ### CRDT
 
 CRDT functions operate on replicated data types. In the current implementation,
@@ -580,9 +660,9 @@ pub extern "C" fn run() {
 - [ ] `crdt_set_contains` - Check membership
 
 ### System
-- [ ] `env_get` - Read environment variable
-- [ ] `module_id` - Get current module ID
-- [ ] `abort` - Terminate execution with error
+- [x] `env_get` - Read environment variable
+- [x] `module_id` - Get current module ID
+- [x] `abort` - Terminate execution with error
 
 ### Events (Callbacks)
 - [ ] `on_peer_connect` - Callback when a peer connects
