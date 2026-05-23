@@ -300,6 +300,89 @@ let elapsed_ms = time::monotonic() - start;
 
 ---
 
+### Crypto
+
+Crypto functions expose host-provided randomness and hashing primitives to WASM
+modules. All crypto functions are bounded to protect host memory.
+
+#### `random_bytes`
+
+Fills a guest buffer with cryptographically secure random bytes from the host.
+
+```text
+fn random_bytes(out_ptr: u32, out_len: u32) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `out_ptr` | `u32` | Pointer to output buffer |
+| `out_len` | `u32` | Number of random bytes to write |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let nonce = crypto::random_bytes(16)?;
+```
+
+---
+
+#### `hash_sha256`
+
+Computes a 32-byte SHA-256 digest.
+
+```text
+fn hash_sha256(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `32` | Success; digest written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let digest = crypto::hash_sha256(b"payload")?;
+```
+
+---
+
+#### `hash_blake3`
+
+Computes a 32-byte BLAKE3 digest.
+
+```text
+fn hash_blake3(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:** same as `hash_sha256`.
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let digest = crypto::hash_blake3(b"payload")?;
+```
+
+---
+
 ### CRDT
 
 CRDT functions operate on replicated data types. In the current implementation,
@@ -481,9 +564,9 @@ pub extern "C" fn run() {
 - [x] `time_monotonic` - Monotonic clock for measurements
 
 ### Crypto
-- [ ] `random_bytes` - Secure random number generation
-- [ ] `hash_sha256` - SHA-256 hash
-- [ ] `hash_blake3` - BLAKE3 hash (faster)
+- [x] `random_bytes` - Secure random number generation
+- [x] `hash_sha256` - SHA-256 hash
+- [x] `hash_blake3` - BLAKE3 hash (faster)
 
 ### CRDT
 - [x] `crdt_gcounter_inc` - Increment GCounter

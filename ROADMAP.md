@@ -396,9 +396,9 @@ HTTP endpoint over Tokio.
 - [x] `time_monotonic` — monotonic clock for measurements
 
 **Crypto**:
-- [ ] `random_bytes` — cryptographically secure random bytes
-- [ ] `hash_sha256` — SHA-256 hash
-- [ ] `hash_blake3` — BLAKE3 hash (faster)
+- [x] `random_bytes` — cryptographically secure random bytes
+- [x] `hash_sha256` — SHA-256 hash
+- [x] `hash_blake3` — BLAKE3 hash (faster)
 
 **System**:
 - [ ] `env_get` — read an environment variable

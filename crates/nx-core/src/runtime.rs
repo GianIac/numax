@@ -95,6 +95,9 @@ impl Runtime {
         // host_time (namespace "nx", func "time_now", "time_monotonic")
         host_api::time::add_to_linker(&mut linker)?;
 
+        // host_crypto (namespace "nx", func "random_bytes", "hash_sha256", "hash_blake3")
+        host_api::crypto::add_to_linker(&mut linker)?;
+
         // host_crdt (namespace "nx", func "crdt_gcounter_inc", "crdt_gcounter_value")
         host_api::crdt::add_to_linker(&mut linker)?;
 

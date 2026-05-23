@@ -1,4 +1,4 @@
-use nx_sdk::{db, nx_log, time};
+use nx_sdk::{crypto, db, nx_log, time};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
@@ -18,6 +18,18 @@ pub extern "C" fn run() {
     nx_log!(
         "kv_sdk_roundtrip: time_monotonic = {}",
         time::monotonic()
+    );
+    nx_log!(
+        "kv_sdk_roundtrip: random bytes = {}",
+        crypto::random_bytes(8).unwrap().len()
+    );
+    nx_log!(
+        "kv_sdk_roundtrip: sha256 bytes = {}",
+        crypto::hash_sha256(b"hello").unwrap().len()
+    );
+    nx_log!(
+        "kv_sdk_roundtrip: blake3 bytes = {}",
+        crypto::hash_blake3(b"hello").unwrap().len()
     );
 
     let v = db::get("hello").unwrap().unwrap();

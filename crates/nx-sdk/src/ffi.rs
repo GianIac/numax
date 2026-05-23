@@ -30,6 +30,11 @@ unsafe extern "C" {
     pub fn time_now() -> u64;
     pub fn time_monotonic() -> u64;
 
+    // Crypto (namespace "nx")
+    pub fn random_bytes(out_ptr: u32, out_len: u32) -> i32;
+    pub fn hash_sha256(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn hash_blake3(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
     #[expect(dead_code, reason = "legacy guest import kept for compatibility")]
     pub fn host_log(msg_ptr: u32, msg_len: u32);

@@ -3,6 +3,7 @@
 pub extern crate alloc as __alloc;
 
 pub mod crdt;
+pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod log;
