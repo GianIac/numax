@@ -23,7 +23,9 @@ const HOST_CAPABILITIES: &[&str] = &[
     "db_exists",
     "db_get",
     "db_keys",
+    "db_keys_after",
     "db_scan",
+    "db_scan_after",
     "db_set",
     "env_get",
     "event_emit",
@@ -364,5 +366,7 @@ mod tests {
         assert!(capabilities.contains("event_emit"));
         assert!(capabilities.contains("net_peers"));
         assert!(capabilities.contains("db_scan"));
+        assert!(capabilities.contains("db_scan_after"));
+        assert!(capabilities.contains("db_keys_after"));
     }
 }

@@ -169,6 +169,27 @@ repeat row_count times:
 ```
 
 All integer fields are little-endian. Runtime-reserved keys under `__nx/` are never returned.
+`db_scan` keeps the legacy offset cursor ABI for compatibility. New modules should prefer
+`db_scan_after`, which uses the last returned key as a stable cursor for large key spaces.
+
+#### `db_scan_after`
+
+Scans key/value pairs matching a prefix after a specific key cursor.
+
+```text
+fn db_scan_after(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    start_after_ptr: u32,
+    start_after_len: u32,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+`start_after_len = 0` starts at the first visible key. Otherwise, the cursor must be a key
+under the requested prefix. The output encoding and return codes are the same as `db_scan`.
 
 **Example:**
 
@@ -196,6 +217,8 @@ fn db_keys(
 ```
 
 **Parameters:** same as `db_scan`.
+`db_keys` keeps the legacy offset cursor ABI for compatibility. New modules should prefer
+`db_keys_after`, which uses the last returned key as a stable cursor.
 
 **Return:**
 
@@ -216,6 +239,25 @@ repeat key_count times:
 ```
 
 All integer fields are little-endian. Runtime-reserved keys under `__nx/` are never returned.
+
+#### `db_keys_after`
+
+Lists keys matching a prefix after a specific key cursor.
+
+```text
+fn db_keys_after(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    start_after_ptr: u32,
+    start_after_len: u32,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+`start_after_len = 0` starts at the first visible key. Otherwise, the cursor must be a key
+under the requested prefix. The output encoding and return codes are the same as `db_keys`.
 
 **Example:**
 
@@ -308,6 +350,8 @@ modules. All crypto functions are bounded to protect host memory.
 #### `random_bytes`
 
 Fills a guest buffer with cryptographically secure random bytes from the host.
+The SDK rejects requests above 1 MiB before allocating the guest buffer; the
+host enforces the same 1 MiB maximum.
 
 ```text
 fn random_bytes(out_ptr: u32, out_len: u32) -> i32

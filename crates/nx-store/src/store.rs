@@ -127,6 +127,53 @@ impl Store {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn scan_prefix_page_after(
+        &self,
+        prefix: &[u8],
+        start_after_key: Option<&[u8]>,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let mut out = Vec::new();
+        let limit = limit as usize;
+
+        match start_after_key {
+            Some(start_after) => {
+                for item in self.db.range(start_after.to_vec()..) {
+                    let (k, v) = item?;
+                    if k.as_ref() <= start_after {
+                        continue;
+                    }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+            None => {
+                for item in self.db.scan_prefix(prefix) {
+                    let (k, v) = item?;
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn keys_prefix_page(
         &self,
         prefix: &[u8],
@@ -154,5 +201,16 @@ impl Store {
         }
 
         Ok(out)
+    }
+
+    pub fn keys_prefix_page_after(
+        &self,
+        prefix: &[u8],
+        start_after_key: Option<&[u8]>,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let rows = self.scan_prefix_page_after(prefix, start_after_key, limit, excluded_prefix)?;
+        Ok(rows.into_iter().map(|(key, _)| key).collect())
     }
 }

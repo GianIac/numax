@@ -695,7 +695,9 @@ pub extern "C" fn run() {
 | `db_delete` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
 | `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented (Phase 12)* |
 | `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
 | `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
 
 **Logging** - *(Implemented)*
 

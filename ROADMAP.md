@@ -410,7 +410,7 @@ HTTP endpoint over Tokio.
 **Under evaluation**:
 - [x] `host_capabilities` — query which host APIs are available at runtime
 - [x] `event_emit` — emit a named event to the runtime (foundation for callbacks)
-- [x] `db_scan` cursor/pagination variant — safe iteration over large key spaces
+- [x] `db_scan_after` / `db_keys_after` — key-cursor pagination for safer large key-space iteration
 
 ---
 

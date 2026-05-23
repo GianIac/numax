@@ -156,6 +156,48 @@ pub fn scan_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<(Vec<u8>, 
     }
 }
 
+/// scan_page_after(prefix, start_after_key, limit) -> Result<Vec<(key, value)>, NxError>
+pub fn scan_page_after(
+    prefix: &str,
+    start_after_key: Option<&[u8]>,
+    limit: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut cap: usize = 256;
+    let start_after = start_after_key.unwrap_or_default();
+
+    loop {
+        let mut out = vec![0u8; cap];
+        let n = unsafe {
+            ffi::db_scan_after(
+                prefix.as_ptr() as u32,
+                prefix.len() as u32,
+                start_after.as_ptr() as u32,
+                start_after.len() as u32,
+                limit,
+                out.as_mut_ptr() as u32,
+                out.len() as u32,
+            )
+        };
+
+        match n {
+            ERR_INTERNAL => return Err(NxError::Internal),
+            ERR_RESERVED_KEY => return Err(NxError::ReservedKey),
+            ERR_BUF_TOO_SMALL => {
+                cap = cap.saturating_mul(2);
+                if cap > MAX_SCAN_BUFFER {
+                    return Err(NxError::BufferTooSmall);
+                }
+                continue;
+            }
+            c if c < 0 => return Err(NxError::UnknownCode(c)),
+            n => {
+                out.truncate(n as usize);
+                return parse_scan_rows(&out);
+            }
+        }
+    }
+}
+
 /// keys_page(prefix, cursor, limit) -> Result<Vec<key>, NxError>
 pub fn keys_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<Vec<u8>>> {
     let mut cap: usize = 256;
@@ -192,19 +234,61 @@ pub fn keys_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<Vec<u8>>> 
     }
 }
 
+/// keys_page_after(prefix, start_after_key, limit) -> Result<Vec<key>, NxError>
+pub fn keys_page_after(
+    prefix: &str,
+    start_after_key: Option<&[u8]>,
+    limit: u32,
+) -> Result<Vec<Vec<u8>>> {
+    let mut cap: usize = 256;
+    let start_after = start_after_key.unwrap_or_default();
+
+    loop {
+        let mut out = vec![0u8; cap];
+        let n = unsafe {
+            ffi::db_keys_after(
+                prefix.as_ptr() as u32,
+                prefix.len() as u32,
+                start_after.as_ptr() as u32,
+                start_after.len() as u32,
+                limit,
+                out.as_mut_ptr() as u32,
+                out.len() as u32,
+            )
+        };
+
+        match n {
+            ERR_INTERNAL => return Err(NxError::Internal),
+            ERR_RESERVED_KEY => return Err(NxError::ReservedKey),
+            ERR_BUF_TOO_SMALL => {
+                cap = cap.saturating_mul(2);
+                if cap > MAX_SCAN_BUFFER {
+                    return Err(NxError::BufferTooSmall);
+                }
+                continue;
+            }
+            c if c < 0 => return Err(NxError::UnknownCode(c)),
+            n => {
+                out.truncate(n as usize);
+                return parse_keys(&out);
+            }
+        }
+    }
+}
+
 /// scan(prefix) -> Result<Vec<(key, value)>, NxError>
 pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut cursor = 0u64;
+    let mut last_key: Option<Vec<u8>> = None;
     let mut out = Vec::new();
 
     loop {
-        let page = scan_page(prefix, cursor, DEFAULT_SCAN_LIMIT)?;
+        let page = scan_page_after(prefix, last_key.as_deref(), DEFAULT_SCAN_LIMIT)?;
         if page.is_empty() {
             return Ok(out);
         }
 
-        cursor = cursor.saturating_add(page.len() as u64);
         let is_last = page.len() < DEFAULT_SCAN_LIMIT as usize;
+        last_key = page.last().map(|(key, _)| key.clone());
         out.extend(page);
 
         if is_last {
@@ -215,17 +299,17 @@ pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 
 /// keys(prefix) -> Result<Vec<key>, NxError>
 pub fn keys(prefix: &str) -> Result<Vec<Vec<u8>>> {
-    let mut cursor = 0u64;
+    let mut last_key: Option<Vec<u8>> = None;
     let mut out = Vec::new();
 
     loop {
-        let page = keys_page(prefix, cursor, DEFAULT_SCAN_LIMIT)?;
+        let page = keys_page_after(prefix, last_key.as_deref(), DEFAULT_SCAN_LIMIT)?;
         if page.is_empty() {
             return Ok(out);
         }
 
-        cursor = cursor.saturating_add(page.len() as u64);
         let is_last = page.len() < DEFAULT_SCAN_LIMIT as usize;
+        last_key = page.last().cloned();
         out.extend(page);
 
         if is_last {
