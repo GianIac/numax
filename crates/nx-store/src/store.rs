@@ -210,7 +210,42 @@ impl Store {
         limit: u32,
         excluded_prefix: Option<&[u8]>,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        let rows = self.scan_prefix_page_after(prefix, start_after_key, limit, excluded_prefix)?;
-        Ok(rows.into_iter().map(|(key, _)| key).collect())
+        let mut out = Vec::new();
+        let limit = limit as usize;
+
+        match start_after_key {
+            Some(start_after) => {
+                for item in self.db.range(start_after.to_vec()..) {
+                    let (k, _) = item?;
+                    if k.as_ref() <= start_after {
+                        continue;
+                    }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(k.to_vec());
+                }
+            }
+            None => {
+                for item in self.db.scan_prefix(prefix) {
+                    let (k, _) = item?;
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(k.to_vec());
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
