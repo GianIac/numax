@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "nx")]
+#[command(version)]
 #[command(about = "Numax CLI - distributed WASM runtime", long_about = None)]
 enum Cli {
     /// Execute a WebAssembly module
@@ -1013,6 +1014,7 @@ mod tests {
     // clap parsing
     mod clap_parsing {
         use super::*;
+        use clap::CommandFactory;
 
         #[test]
         fn minimal_args() {
@@ -1055,6 +1057,36 @@ mod tests {
         #[test]
         fn no_subcommand_fails() {
             assert!(Cli::try_parse_from(["nx"]).is_err());
+        }
+
+        #[test]
+        fn version_flag_prints_crate_version() {
+            let err = Cli::try_parse_from(["nx", "--version"]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            let output = err.to_string();
+            assert!(output.contains("nx"), "version output: {output}");
+            assert!(
+                output.contains(env!("CARGO_PKG_VERSION")),
+                "version output: {output}"
+            );
+        }
+
+        #[test]
+        fn version_short_flag_prints_crate_version() {
+            let err = Cli::try_parse_from(["nx", "-V"]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            let output = err.to_string();
+            assert!(output.contains("nx"), "version output: {output}");
+            assert!(
+                output.contains(env!("CARGO_PKG_VERSION")),
+                "version output: {output}"
+            );
+        }
+
+        #[test]
+        fn help_includes_version_flag() {
+            let help = Cli::command().render_long_help().to_string();
+            assert!(help.contains("--version"), "help output: {help}");
         }
 
         #[test]
