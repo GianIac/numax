@@ -418,10 +418,15 @@ HTTP endpoint over Tokio.
 **Goal**: Verify behavior under stress
 
 **Scenarios**:
-- [ ] Single node: 10k ops/sec for 1 hour
-- [ ] 3 nodes: 1k ops/sec each, continuous sync
+- [ ] Single node: 10k ops/sec for 1 hour (`cargo bench -p nx-store --bench single_node_load -- --duration-secs 3600 --target-ops-sec 10000`)
+- [ ] 3 nodes: 1k ops/sec each, continuous sync (`cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 300 --target-ops-sec-per-node 1000`)
 - [ ] 10 nodes: full mesh, 100 ops/sec each
-- [ ] Chaos: kill a random node every 60s
+- [ ] Ignored chaos test: node restart loop converges
+
+**Benchmarks**:
+- [x] Single-node store throughput benchmark
+- [x] Multi-node sync throughput benchmark
+- [ ] Chaos/load runner with metrics output
 
 **Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
 

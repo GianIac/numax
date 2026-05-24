@@ -1,0 +1,18 @@
+{
+  "scenario": "single-node-store-write",
+  "duration_secs": 3600.000,
+  "target_ops_sec": 10000,
+  "ops_total": 36000000,
+  "ops_sec_avg": 10000.00,
+  "errors_total": 0,
+  "value_size": 256,
+  "key_space": 1000000,
+  "data_dir": "/tmp/.tmp6wIEmc",
+  "latency_ms": {
+    "p50": 0.001,
+    "p95": 0.004,
+    "p99": 0.010,
+    "max": 1.014,
+    "avg": 0.002
+  }
+}

@@ -1527,6 +1527,7 @@ dependencies = [
  "nx-store",
  "nx-sync",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tracing",
  "wasmtime",

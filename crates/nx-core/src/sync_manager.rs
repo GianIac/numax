@@ -16,7 +16,7 @@ use crate::observability::RuntimeMetrics;
 use crate::sync_config::SyncConfig;
 
 /// Upper bound on how many ops we coalesce into a single PushOps message.
-const BROADCAST_BATCH_MAX: usize = 64;
+const BROADCAST_BATCH_MAX: usize = 1024;
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
@@ -146,16 +146,6 @@ struct OpPersistencePlan {
     op_log_sequence: u64,
     seen_evicted: Vec<String>,
     op_log_evicted: Vec<Op>,
-}
-
-struct RemoteGCounterPersistence<'a> {
-    key: &'a str,
-    counter: &'a GCounter,
-    op: &'a Op,
-    seen_sequence: u64,
-    op_log_sequence: u64,
-    seen_evicted: &'a [String],
-    op_log_evicted: &'a [Op],
 }
 
 #[derive(Clone)]
@@ -846,7 +836,7 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             continue;
                         }
 
-                        let since_op_id = {
+                        let _last_seen_op_id = {
                             let peer_node_ids = peer_node_ids.read().await;
                             let Some(node_id) = peer_node_ids.get(peer) else {
                                 continue;
@@ -854,7 +844,7 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             anti_entropy_watermarks.read().await.get(node_id).cloned()
                         };
 
-                        if let Err(e) = node.send_pull_since_to_addr(peer, since_op_id).await {
+                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
                             metrics.record_sync_error();
                             debug!(peer = %peer, error = %e, "anti-entropy pull failed");
                         } else {
@@ -1010,31 +1000,90 @@ async fn remember_ops(
     let mut log = op_log.write().await;
     let mut next_seen_sequence = seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = op_log_next_sequence.load(Ordering::Relaxed);
-    let mut planned_seen = seen.clone();
-    let mut planned_log = log.clone();
+    let mut inserted_ops = Vec::new();
+    let mut inserted_ids = Vec::new();
     let mut inserts = Vec::new();
     for op in ops {
-        if let SeenOpsInsert::Inserted { evicted } = planned_seen.insert(op.id.as_str().to_string())
-        {
-            planned_log.push(op.clone());
-            let op_log_evicted = prune_op_log_and_return_evicted(&mut planned_log, op_log_limit);
-            inserts.push(OpPersistencePlan {
-                op: op.clone(),
-                seen_sequence: next_seen_sequence,
-                op_log_sequence: next_op_log_sequence,
-                seen_evicted: evicted,
-                op_log_evicted,
-            });
-            next_seen_sequence = next_seen_sequence.saturating_add(1);
-            next_op_log_sequence = next_op_log_sequence.saturating_add(1);
+        let op_id = op.id.as_str();
+        if !seen.ids.contains(op_id) && !inserted_ids.iter().any(|id| id == op_id) {
+            inserted_ids.push(op_id.to_string());
+            inserted_ops.push(op.clone());
         }
     }
+
+    let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
+    let op_log_evicted = plan_op_log_evictions(&log, inserted_ops.len(), op_log_limit);
+    let last_insert_index = inserted_ops.len().saturating_sub(1);
+
+    for (index, op) in inserted_ops.iter().enumerate() {
+        inserts.push(OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: next_seen_sequence,
+            op_log_sequence: next_op_log_sequence,
+            seen_evicted: if index == last_insert_index {
+                seen_evicted.clone()
+            } else {
+                Vec::new()
+            },
+            op_log_evicted: if index == last_insert_index {
+                op_log_evicted.clone()
+            } else {
+                Vec::new()
+            },
+        });
+        next_seen_sequence = next_seen_sequence.saturating_add(1);
+        next_op_log_sequence = next_op_log_sequence.saturating_add(1);
+    }
+
     persist_local_ops_batch(store, &inserts)?;
-    *seen = planned_seen;
-    *log = planned_log;
+    apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
+    log.extend(inserted_ops);
+    prune_op_log_and_return_evicted(&mut log, op_log_limit);
     seen_ops_next_sequence.store(next_seen_sequence, Ordering::Relaxed);
     op_log_next_sequence.store(next_op_log_sequence, Ordering::Relaxed);
     Ok(())
+}
+
+fn plan_seen_evictions(seen: &SeenOps, inserted_ids: &[String]) -> Vec<String> {
+    let total_len = seen.order.len().saturating_add(inserted_ids.len());
+    let remove_count = total_len.saturating_sub(seen.limit);
+    if remove_count == 0 {
+        return Vec::new();
+    }
+
+    let mut evicted = seen
+        .order
+        .iter()
+        .take(remove_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    if remove_count > seen.order.len() {
+        evicted.extend(
+            inserted_ids
+                .iter()
+                .take(remove_count - seen.order.len())
+                .cloned(),
+        );
+    }
+    evicted
+}
+
+fn apply_seen_insertions(seen: &mut SeenOps, inserted_ids: &[String], evicted: &[String]) {
+    for op_id in inserted_ids {
+        seen.ids.insert(op_id.clone());
+        seen.order.push_back(op_id.clone());
+    }
+    for op_id in evicted {
+        seen.ids.remove(op_id);
+        let _ = seen.order.pop_front();
+    }
+}
+
+fn plan_op_log_evictions(log: &[Op], inserted_count: usize, limit: usize) -> Vec<Op> {
+    let limit = normalize_op_log_limit(limit);
+    let total_len = log.len().saturating_add(inserted_count);
+    let remove_count = total_len.saturating_sub(limit);
+    log.iter().take(remove_count).cloned().collect()
 }
 
 fn prune_op_log_and_return_evicted(log: &mut Vec<Op>, limit: usize) -> Vec<Op> {
@@ -1068,26 +1117,23 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
     match event {
         NodeEvent::OpsReceived { from, ops } => {
             debug!(from = %from, count = ops.len(), "received ops from peer");
-            let mut last_applied_op_id = None;
-            for op in &ops {
-                let apply_context = RemoteOpApplyContext {
-                    counters: &context.counters,
-                    seen_ops: &context.seen_ops,
-                    seen_ops_next_sequence: &context.seen_ops_next_sequence,
-                    op_log: &context.op_log,
-                    op_log_next_sequence: &context.op_log_next_sequence,
-                    op_log_limit: context.op_log_limit,
-                    store: &context.store,
-                    metrics: &context.metrics,
-                };
-                if let Err(e) = apply_remote_op(op, &apply_context).await {
-                    context.metrics.record_sync_error();
-                    error!(error = %e, "failed to apply remote op");
-                    break;
-                }
-                last_applied_op_id = Some(op.id.as_str().to_string());
+            let last_received_op_id = ops.last().map(|op| op.id.as_str().to_string());
+            let apply_context = RemoteOpApplyContext {
+                counters: &context.counters,
+                seen_ops: &context.seen_ops,
+                seen_ops_next_sequence: &context.seen_ops_next_sequence,
+                op_log: &context.op_log,
+                op_log_next_sequence: &context.op_log_next_sequence,
+                op_log_limit: context.op_log_limit,
+                store: &context.store,
+                metrics: &context.metrics,
+            };
+            if let Err(e) = apply_remote_ops(&ops, &apply_context).await {
+                context.metrics.record_sync_error();
+                error!(error = %e, "failed to apply remote ops batch");
+                return;
             }
-            if let Some(op_id) = last_applied_op_id {
+            if let Some(op_id) = last_received_op_id {
                 context
                     .anti_entropy_watermarks
                     .write()
@@ -1544,88 +1590,133 @@ fn persist_local_ops_batch(store: &NxStore, plans: &[OpPersistencePlan]) -> anyh
     Ok(())
 }
 
-fn persist_remote_gcounter_op(
+fn persist_remote_ops_batch(
     store: &NxStore,
-    change: RemoteGCounterPersistence<'_>,
+    plans: &[OpPersistencePlan],
+    counter_updates: &HashMap<String, GCounter>,
 ) -> anyhow::Result<()> {
-    let state_key = durable_gcounter_state_key(change.key);
-    let state_json = change.counter.to_json()?;
-    let materialized_key = materialized_gcounter_key(change.key);
-    let materialized_value = change.counter.value().to_le_bytes();
-    let seen_key = seen_op_store_key(change.op.id.as_str());
-    let seen_value = change.seen_sequence.to_be_bytes();
-    let op_log_key = op_log_store_key(change.op.id.as_str());
-    let op_log_value = encode_durable_op_log_value(change.op_log_sequence, change.op)?;
-    let mut delete_keys = collect_seen_delete_keys(change.seen_evicted);
-    delete_keys.extend(collect_op_log_delete_keys(change.op_log_evicted));
-    let delete_refs = delete_keys
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let mut set_keys = Vec::new();
+    let mut set_values = Vec::new();
+    let mut delete_keys = Vec::new();
+    let mut changed_counter_keys = counter_updates.keys().collect::<Vec<_>>();
+    changed_counter_keys.sort();
+
+    for key in changed_counter_keys {
+        let Some(counter) = counter_updates.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_gcounter_state_key(key));
+        set_values.push(counter.to_json()?.into_bytes());
+        set_keys.push(materialized_gcounter_key(key));
+        set_values.push(counter.value().to_le_bytes().to_vec());
+    }
+
+    for plan in plans {
+        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
+        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
+        set_keys.push(op_log_store_key(plan.op.id.as_str()));
+        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
+        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
+        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    }
+
+    let sets = set_keys
+        .iter()
+        .zip(set_values.iter())
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    let deletes = delete_keys
         .iter()
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    store.apply_batch(
-        &[
-            (state_key.as_slice(), state_json.as_bytes()),
-            (materialized_key.as_slice(), materialized_value.as_slice()),
-            (seen_key.as_slice(), seen_value.as_slice()),
-            (op_log_key.as_slice(), op_log_value.as_slice()),
-        ],
-        &delete_refs,
-    )?;
+    store.apply_batch(&sets, &deletes)?;
     Ok(())
 }
 
-/// Apply an operation received from a remote peer.
-async fn apply_remote_op(op: &Op, context: &RemoteOpApplyContext<'_>) -> anyhow::Result<()> {
+/// Apply operations received from a remote peer as a single commit-aware batch.
+async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> anyhow::Result<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+
     let mut seen = context.seen_ops.write().await;
-    let mut planned_seen = seen.clone();
-    let seen_evicted = match planned_seen.insert(op.id.as_str().to_string()) {
-        SeenOpsInsert::AlreadySeen => {
-            debug!(op_id = %op.id, "skipping duplicate op");
-            return Ok(());
-        }
-        SeenOpsInsert::Inserted { evicted } => evicted,
-    };
-
     let mut log = context.op_log.write().await;
-    let mut planned_log = log.clone();
-    planned_log.push(op.clone());
-    let op_log_evicted = prune_op_log_and_return_evicted(&mut planned_log, context.op_log_limit);
-    let seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
-    let op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
+    let mut counters = context.counters.write().await;
+    let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
+    let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
+    let mut inserted_ids = Vec::new();
+    let mut inserted_ops = Vec::new();
+    let mut plans = Vec::new();
+    let mut counter_updates = HashMap::new();
 
-    match &op.kind {
-        OpKind::GCounterIncrement { key, increment } => {
-            let mut counters = context.counters.write().await;
-            let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
-            counter.increment(&op.origin, *increment);
-            let total = counter.value();
-
-            persist_remote_gcounter_op(
-                context.store,
-                RemoteGCounterPersistence {
-                    key,
-                    counter: &counter,
-                    op,
-                    seen_sequence,
-                    op_log_sequence,
-                    seen_evicted: &seen_evicted,
-                    op_log_evicted: &op_log_evicted,
-                },
-            )?;
-            counters.insert(key.clone(), counter);
-            *seen = planned_seen;
-            *log = planned_log;
-            context
-                .seen_ops_next_sequence
-                .store(seen_sequence.saturating_add(1), Ordering::Relaxed);
-            context
-                .op_log_next_sequence
-                .store(op_log_sequence.saturating_add(1), Ordering::Relaxed);
-
-            context.metrics.record_ops(1);
-            debug!(op_id = %op.id, key = %key, from = %op.origin, increment = %increment, total, "applied remote increment");
+    for op in ops {
+        let op_id = op.id.as_str();
+        if seen.ids.contains(op_id) || inserted_ids.iter().any(|id| id == op_id) {
+            debug!(op_id = %op.id, "skipping duplicate op");
+            continue;
         }
+
+        match &op.kind {
+            OpKind::GCounterIncrement { key, increment } => {
+                let counter = counter_updates
+                    .entry(key.clone())
+                    .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(GCounter::new));
+                counter.increment(&op.origin, *increment);
+            }
+        }
+
+        inserted_ids.push(op_id.to_string());
+        inserted_ops.push(op.clone());
+    }
+
+    let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
+    let op_log_evicted = plan_op_log_evictions(&log, inserted_ops.len(), context.op_log_limit);
+    let last_insert_index = inserted_ops.len().saturating_sub(1);
+
+    for (index, op) in inserted_ops.iter().enumerate() {
+        plans.push(OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: next_seen_sequence,
+            op_log_sequence: next_op_log_sequence,
+            seen_evicted: if index == last_insert_index {
+                seen_evicted.clone()
+            } else {
+                Vec::new()
+            },
+            op_log_evicted: if index == last_insert_index {
+                op_log_evicted.clone()
+            } else {
+                Vec::new()
+            },
+        });
+        next_seen_sequence = next_seen_sequence.saturating_add(1);
+        next_op_log_sequence = next_op_log_sequence.saturating_add(1);
+    }
+
+    persist_remote_ops_batch(context.store, &plans, &counter_updates)?;
+
+    let applied_count = plans.len() as u64;
+    apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
+    log.extend(inserted_ops);
+    prune_op_log_and_return_evicted(&mut log, context.op_log_limit);
+    for (key, counter) in counter_updates {
+        counters.insert(key, counter);
+    }
+    context
+        .seen_ops_next_sequence
+        .store(next_seen_sequence, Ordering::Relaxed);
+    context
+        .op_log_next_sequence
+        .store(next_op_log_sequence, Ordering::Relaxed);
+
+    if applied_count > 0 {
+        context.metrics.record_ops(applied_count);
+        debug!(count = applied_count, "applied remote ops batch");
     }
 
     Ok(())
@@ -1730,7 +1821,9 @@ mod tests {
             store,
             metrics: &metrics,
         };
-        apply_remote_op(op, &context).await.unwrap();
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
     }
 
     async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
