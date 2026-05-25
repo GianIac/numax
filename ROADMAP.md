@@ -445,9 +445,6 @@ For each one: implementation, property tests, OpKind, docs, example.
 - **P1**: Required for safe production
 - **P2**: Required for adoption
 
-`✅*`: closed for internal wiring and `SyncManager` E2E tests; the literal CLI
-criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
-
 ---
 
 ## Final v0.1.0 Release Criteria
