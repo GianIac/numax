@@ -765,9 +765,9 @@ keys = ["cart:", "user:"]
 
 ## 7. Test Suite
 
-The project includes an automated test suite that covers runtime, store, CRDT, networking and end-to-end flows.
+The project includes an automated test suite that covers runtime, store, CRDT, networking, host APIs, serialization and end-to-end sync flows.
 
-**Current coverage:** more than **38 tests** across unit, integration and end-to-end, distributed across the workspace crates (nx-core, nx-store, nx-sync, nx-net) and the SyncManager E2E flows.
+**Current coverage:** more than **220 test cases** across unit, integration and end-to-end flows, distributed across the workspace crates (`nx-core`, `nx-store`, `nx-sync`, `nx-net`, `nx-cli`) and the SyncManager E2E flows. Long-running smoke/load scenarios are kept behind ignored tests or Cargo bench runners so the default suite remains fast.
 
 **Specific CRDT tests** - explicitly verify the mathematical properties:
 
@@ -786,7 +786,17 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 4. `test` - full test suite execution
 5. `build-wasm` - compilation of WASM examples
 
-**Load testing** - *Planned, Phase 13*.
+**Load testing** - Phase 13 added reproducible load gates with JSON reports:
+
+- single-node store throughput: 10k ops/sec for 1 hour
+- 3-node continuous sync: 1k ops/sec per node
+- 10-node full mesh sync: 100 ops/sec per node
+- chaos restart runner: continuous load with follower restart every 60s
+
+The reports capture throughput, p50/p95/p99 latency, convergence time and
+restart count for chaos runs. RAM/CPU profiling is intentionally left as a
+future hardening extension rather than mixed into the current correctness/load
+gates.
 
 ---
 

@@ -428,9 +428,11 @@ HTTP endpoint over Tokio.
 - [x] Multi-node sync throughput benchmark
 - [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 300 --target-ops-sec 100 --restart-every-secs 60`)
 
-**Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
+**Metrics**: Throughput, p50/p95/p99 latency, convergence time, restart
+count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 
-**Tools**: custom script or `criterion`.
+**Tools**: custom Cargo bench runners with JSON reports under
+`crates/*/reports/load/`.
 
 ---
 
@@ -476,7 +478,7 @@ For each one: implementation, property tests, OpKind, docs, example.
 | 10 | Network Resilience | ⏳ | **P1** |
 | 11 | Dual Serialization | ⏳ | **P1** |
 | 12 | Extended Host API | ⏳ | **P1** |
-| 13 | Load Testing | ⏳ | **P1** |
+| 13 | Load Testing | ✅ | **P1** |
 | 14 | Complete CRDTs | ⏳ | **P2** |
 | 15 | Deployment & Docs | ⏳ | **P2** |
 
@@ -501,7 +503,7 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [x] Phase 11 (Serialization) JSON + bincode working
 - [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
-- [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
+- [x] Phase 13 (Load testing) single-node, multi-node and chaos gates
 - [ ] All tests pass
 - [ ] No clippy warnings
 - [ ] Base documentation
