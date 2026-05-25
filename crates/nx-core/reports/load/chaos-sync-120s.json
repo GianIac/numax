@@ -1,0 +1,25 @@
+{
+  "scenario": "chaos-sync-restart-gcounter",
+  "nodes": 3,
+  "load_duration_secs": 120.001,
+  "total_duration_secs": 120.103,
+  "target_ops_sec": 100,
+  "ops_total": 12000,
+  "ops_sec_avg": 100.00,
+  "errors_total": 0,
+  "restarts_total": 1,
+  "queued_ops_limit": 112000,
+  "op_log_limit": 112000,
+  "seen_ops_limit": 336000,
+  "expected_counter": 12000,
+  "observed_counters": [12000, 12000, 12000],
+  "converged": true,
+  "convergence_wait_secs": 0.101,
+  "latency_ms": {
+    "p50": 0.003,
+    "p95": 0.035,
+    "p99": 0.043,
+    "max": 0.720,
+    "avg": 0.006
+  }
+}

@@ -421,12 +421,12 @@ HTTP endpoint over Tokio.
 - [x] Single node: 10k ops/sec for 1 hour (`cargo bench -p nx-store --bench single_node_load -- --duration-secs 3600 --target-ops-sec 10000`)
 - [x] 3 nodes: 1k ops/sec each, continuous sync (`cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 300 --target-ops-sec-per-node 1000`)
 - [x] 10 nodes: full mesh, 100 ops/sec each (`cargo bench -p nx-core --bench three_node_sync_load -- --nodes 10 --duration-secs 300 --target-ops-sec-per-node 100`)
-- [ ] Ignored chaos test: node restart loop converges
+- [x] Ignored chaos test: node restart loop converges (`cargo test -p nx-core chaos_node_restart_loop_converges -- --ignored`)
 
 **Benchmarks**:
 - [x] Single-node store throughput benchmark
 - [x] Multi-node sync throughput benchmark
-- [ ] Chaos/load runner with metrics output
+- [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 120 --target-ops-sec 100 --restart-every-secs 60`)
 
 **Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
 

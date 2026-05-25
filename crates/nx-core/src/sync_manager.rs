@@ -2654,6 +2654,74 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "chaos smoke: repeatedly restarts a node and uses local TCP timing"]
+    async fn chaos_node_restart_loop_converges() {
+        let key = "visits";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let addr_c = free_addr();
+        let store_b = temp_store();
+        let node_b_id = NodeId::new("node-b");
+
+        let config_a = SyncConfig::new()
+            .with_listen_addr(addr_a.clone())
+            .with_peer(addr_b.clone())
+            .with_peer(addr_c.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
+
+        let config_b = SyncConfig::new()
+            .with_listen_addr(addr_b.clone())
+            .with_peer(addr_a.clone())
+            .with_peer(addr_c.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (mut manager_b, _handle_b) =
+            started_manager_with_store(node_b_id.clone(), config_b.clone(), Arc::clone(&store_b))
+                .await;
+
+        let config_c = SyncConfig::new()
+            .with_listen_addr(addr_c)
+            .with_peer(addr_a.clone())
+            .with_peer(addr_b.clone())
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50))
+            .with_anti_entropy_interval(Duration::from_millis(10));
+        let (manager_c, handle_c, store_c) = started_manager_with_config(config_c).await;
+
+        let mut expected = 0;
+        for _ in 0..3 {
+            local_increment(&handle_a, key, 1).await;
+            local_increment(&handle_c, key, 1).await;
+            expected += 2;
+            wait_for_counter(&manager_b, key, expected).await;
+
+            manager_b.shutdown().await.unwrap();
+
+            local_increment(&handle_a, key, 1).await;
+            local_increment(&handle_c, key, 1).await;
+            expected += 2;
+
+            let restarted = started_manager_with_store(
+                node_b_id.clone(),
+                config_b.clone(),
+                Arc::clone(&store_b),
+            )
+            .await;
+            manager_b = restarted.0;
+
+            wait_for_connected_peer(&manager_b).await;
+            wait_for_counter(&manager_b, key, expected).await;
+        }
+
+        wait_for_counter(&manager_a, key, expected).await;
+        wait_for_counter(&manager_c, key, expected).await;
+        assert_eq!(read_materialized(&store_a, key), expected);
+        assert_eq!(read_materialized(&store_b, key), expected);
+        assert_eq!(read_materialized(&store_c, key), expected);
+    }
+
+    #[tokio::test]
     async fn source_restart_before_anti_entropy_still_serves_missed_ops() {
         let key = "visits";
         let addr_a = free_addr();
