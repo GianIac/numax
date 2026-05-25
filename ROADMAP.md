@@ -426,7 +426,7 @@ HTTP endpoint over Tokio.
 **Benchmarks**:
 - [x] Single-node store throughput benchmark
 - [x] Multi-node sync throughput benchmark
-- [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 120 --target-ops-sec 100 --restart-every-secs 60`)
+- [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 300 --target-ops-sec 100 --restart-every-secs 60`)
 
 **Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
 
