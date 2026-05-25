@@ -8,24 +8,6 @@
 
 ## Release Status
 
-### v0.1.0-alpha.4 ✅
-**Purpose**: network resilience and dual-mode serialization preview.
-
-Includes:
-- Everything in `v0.1.0-alpha.3`.
-- Phase 10 network resilience: automatic reconnect with exponential backoff,
-  peer health tracking and rotation, periodic anti-entropy, bounded op
-  deduplication, durable CRDT state/op-log hydration and duplicate protection
-  across restart.
-- Phase 11 dual-mode wire serialization: bincode for production, JSON for
-  `--debug-protocol`, format negotiation in `Hello`/`HelloAck`, protocol
-  version `2`, and serialization benchmark coverage.
-
-Known limitations:
-- K-fanout gossip remains intentionally minimal; peers are still configured
-  explicitly.
-- API and wire format may change before `v0.1.0`.
-
 ### v0.1.0-alpha.5 ✅
 **Purpose**: extended host API and load-testing preview.
 
