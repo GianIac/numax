@@ -43,6 +43,9 @@ unsafe extern "C" {
     // CRDT (namespace "nx")
     pub fn crdt_gcounter_inc(key_ptr: u32, key_len: u32, delta: u64) -> i32;
     pub fn crdt_gcounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn crdt_pncounter_inc(key_ptr: u32, key_len: u32, delta: u64) -> i32;
+    pub fn crdt_pncounter_dec(key_ptr: u32, key_len: u32, delta: u64) -> i32;
+    pub fn crdt_pncounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
 
     // Time (namespace "nx")
     pub fn time_now() -> u64;

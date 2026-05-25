@@ -305,7 +305,7 @@ A CRDT host API is considered complete only when it has:
 | CRDT | Functions | Status |
 |------|-----------|--------|
 | GCounter | `crdt_gcounter_inc`, `crdt_gcounter_value` | Implemented |
-| PNCounter | `crdt_pncounter_inc`, `crdt_pncounter_dec`, `crdt_pncounter_value` | Planned, Phase 14 |
+| PNCounter | `crdt_pncounter_inc`, `crdt_pncounter_dec`, `crdt_pncounter_value` | Implemented |
 | LWW-Register | TBD | Planned, Phase 14 |
 | ORSet | TBD | Planned, Phase 14 |
 | LWW-Map | TBD | Planned, Phase 14 |
@@ -355,7 +355,7 @@ use nx_sdk::crdt::gcounter;
 let visits = gcounter::value("counter:visits")?;
 ```
 
-### PNCounter Planned Shape
+### PNCounter
 
 A positive/negative counter. It supports increments and decrements while still
 converging without coordination. Internally it is expected to behave like two
@@ -364,23 +364,56 @@ grow-only counters: one for positive slots and one for negative slots.
 Use it for stock, balances, votes with up/down movement, or any value that must
 move both directions while tolerating eventual consistency.
 
-Planned raw ABI:
+#### `crdt_pncounter_inc`
 
 ```text
 fn crdt_pncounter_inc(key_ptr: u32, key_len: u32, delta: u64) -> i32
-fn crdt_pncounter_dec(key_ptr: u32, key_len: u32, delta: u64) -> i32
-fn crdt_pncounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
 ```
 
-Expected value encoding: signed 8-byte little-endian `i64`.
+Returns `0` on success.
 
-Planned SDK:
+SDK:
 
 ```rust
 use nx_sdk::crdt::pncounter;
 
 pncounter::inc("inventory:sku-1", 10)?;
+```
+
+#### `crdt_pncounter_dec`
+
+```text
+fn crdt_pncounter_dec(key_ptr: u32, key_len: u32, delta: u64) -> i32
+```
+
+Returns `0` on success.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::pncounter;
+
 pncounter::dec("inventory:sku-1", 3)?;
+```
+
+#### `crdt_pncounter_value`
+
+```text
+fn crdt_pncounter_value(
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes a signed 8-byte little-endian `i64`. Returns `8` on success.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::pncounter;
+
 let available = pncounter::value("inventory:sku-1")?;
 ```
 
@@ -625,7 +658,8 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
 
 - Database: `db_get`, `db_set`, `db_delete`, `db_exists`, `db_scan`,
   `db_scan_after`, `db_keys`, `db_keys_after`
-- CRDT: `crdt_gcounter_inc`, `crdt_gcounter_value`
+- CRDT: `crdt_gcounter_inc`, `crdt_gcounter_value`, `crdt_pncounter_inc`,
+  `crdt_pncounter_dec`, `crdt_pncounter_value`
 - Time: `time_now`, `time_monotonic`
 - Crypto: `random_bytes`, `hash_sha256`, `hash_blake3`
 - System: `env_get`, `module_id`, `abort`, `host_capabilities`, `event_emit`

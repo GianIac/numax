@@ -1,9 +1,9 @@
 use anyhow::Result;
-use nx_sync::{GCounter, Op};
+use nx_sync::{GCounter, Op, PNCounter};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::persist_gcounter_state;
+use crate::sync_manager::{persist_gcounter_state, persist_pncounter_state};
 
 // error codes
 const ERR_BUF_TOO_SMALL: i32 = -2;
@@ -14,6 +14,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 // limits
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
 const U64_LEN: u32 = 8;
+const I64_LEN: u32 = 8;
 
 /// Runtime-reserved key prefix. Any guest-facing host API (db_*, crdt_*)
 pub(crate) const RESERVED_PREFIX: &str = "__nx/";
@@ -154,6 +155,157 @@ async fn crdt_gcounter_value_impl(
     U64_LEN as i32
 }
 
+async fn crdt_pncounter_inc_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    delta: u64,
+) -> i32 {
+    crdt_pncounter_change_impl(
+        &mut caller,
+        key_ptr,
+        key_len,
+        delta,
+        PNCounterChange::Increment,
+    )
+    .await
+}
+
+async fn crdt_pncounter_dec_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    delta: u64,
+) -> i32 {
+    crdt_pncounter_change_impl(
+        &mut caller,
+        key_ptr,
+        key_len,
+        delta,
+        PNCounterChange::Decrement,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PNCounterChange {
+    Increment,
+    Decrement,
+}
+
+async fn crdt_pncounter_change_impl(
+    caller: &mut Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    delta: u64,
+    change: PNCounterChange,
+) -> i32 {
+    let api_name = match change {
+        PNCounterChange::Increment => "crdt_pncounter_inc",
+        PNCounterChange::Decrement => "crdt_pncounter_dec",
+    };
+
+    let memory = match get_memory(caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] {api_name}: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "{api_name}: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    {
+        let counters_arc = handle.pncounters();
+        let mut counters = counters_arc.write().await;
+        let mut counter = counters.get(&key).cloned().unwrap_or_else(PNCounter::new);
+        match change {
+            PNCounterChange::Increment => counter.increment(handle.node_id(), delta),
+            PNCounterChange::Decrement => counter.decrement(handle.node_id(), delta),
+        }
+
+        if let Err(e) = persist_pncounter_state(&handle.store(), &key, &counter) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "{api_name}: failed to persist counter");
+            return ERR_INTERNAL;
+        }
+
+        counters.insert(key.clone(), counter);
+    }
+
+    let op = match change {
+        PNCounterChange::Increment => Op::pncounter_increment(handle.node_id().clone(), key, delta),
+        PNCounterChange::Decrement => Op::pncounter_decrement(handle.node_id().clone(), key, delta),
+    };
+    tracing::debug!(op_id = %op.id, api = api_name, "queued local PNCounter op");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_pncounter_value_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_pncounter_value: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap < I64_LEN {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let value: i64 = {
+        let counters_arc = handle.pncounters();
+        let counters = counters_arc.read().await;
+        counters.get(&key).map(|c| c.value()).unwrap_or(0)
+    };
+
+    let bytes = value.to_le_bytes();
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &bytes) {
+        eprintln!("[nx-core] crdt_pncounter_value: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    I64_LEN as i32
+}
+
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap_async(
         "nx",
@@ -169,6 +321,33 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>,
          (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(crdt_gcounter_value_impl(
+                caller, key_ptr, key_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_pncounter_inc",
+        |caller: Caller<'_, HostState>, (key_ptr, key_len, delta): (u32, u32, u64)| {
+            Box::new(crdt_pncounter_inc_impl(caller, key_ptr, key_len, delta))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_pncounter_dec",
+        |caller: Caller<'_, HostState>, (key_ptr, key_len, delta): (u32, u32, u64)| {
+            Box::new(crdt_pncounter_dec_impl(caller, key_ptr, key_len, delta))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_pncounter_value",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+            Box::new(crdt_pncounter_value_impl(
                 caller, key_ptr, key_len, out_ptr, out_cap,
             ))
         },

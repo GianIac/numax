@@ -7,7 +7,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, NodeId, Op, OpKind};
+use nx_sync::{GCounter, NodeId, Op, OpKind, PNCounter};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -20,6 +20,8 @@ const BROADCAST_BATCH_MAX: usize = 1024;
 const BROADCAST_COALESCE_DELAY: Duration = Duration::from_millis(1);
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
+const PNCOUNTER_STORE_PREFIX: &str = "__nx/crdt/pncounter/";
+const PNCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/pncounter/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
 const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
@@ -32,12 +34,14 @@ enum CrdtStoreNamespace {
 #[derive(Debug, Clone, Copy)]
 enum CrdtKind {
     GCounter,
+    PNCounter,
 }
 
 impl CrdtKind {
     fn label(self) -> &'static str {
         match self {
             Self::GCounter => "GCounter",
+            Self::PNCounter => "PNCounter",
         }
     }
 
@@ -45,6 +49,8 @@ impl CrdtKind {
         match (self, namespace) {
             (Self::GCounter, CrdtStoreNamespace::Materialized) => GCOUNTER_STORE_PREFIX,
             (Self::GCounter, CrdtStoreNamespace::State) => GCOUNTER_STATE_STORE_PREFIX,
+            (Self::PNCounter, CrdtStoreNamespace::Materialized) => PNCOUNTER_STORE_PREFIX,
+            (Self::PNCounter, CrdtStoreNamespace::State) => PNCOUNTER_STATE_STORE_PREFIX,
         }
     }
 }
@@ -158,6 +164,7 @@ struct BroadcastLoopContext {
 
 struct RemoteOpApplyContext<'a> {
     counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
+    pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
     op_log: &'a Arc<RwLock<Vec<Op>>>,
@@ -178,6 +185,7 @@ struct OpPersistencePlan {
 #[derive(Clone)]
 struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
+    pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
@@ -241,6 +249,7 @@ pub struct SyncHandle {
     node_id: NodeId,
     op_tx: mpsc::Sender<Op>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
+    pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
@@ -260,6 +269,11 @@ impl SyncHandle {
     /// Read-side handle over the counter registry.
     pub fn counters(&self) -> Arc<RwLock<HashMap<String, GCounter>>> {
         Arc::clone(&self.counters)
+    }
+
+    /// Read-side handle over the PNCounter registry.
+    pub fn pncounters(&self) -> Arc<RwLock<HashMap<String, PNCounter>>> {
+        Arc::clone(&self.pncounters)
     }
 
     /// Shared datastore used to materialize CRDT values.
@@ -297,6 +311,9 @@ pub struct SyncManager {
 
     /// GCounter
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
+
+    /// PNCounter
+    pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
 
     /// Store used to materialize replicated values.
     store: Arc<NxStore>,
@@ -360,6 +377,7 @@ impl SyncManager {
         let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
+        let mut pncounters = HashMap::new();
         let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
             Ok(hydrated) => hydrated,
             Err(e) => {
@@ -384,13 +402,18 @@ impl SyncManager {
         if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
             warn!(error = %e, "failed to hydrate GCounter registry");
         }
+        if let Err(e) = hydrate_pncounter_registry(&store, &node_id, &mut pncounters) {
+            warn!(error = %e, "failed to hydrate PNCounter registry");
+        }
         let counters = Arc::new(RwLock::new(counters));
+        let pncounters = Arc::new(RwLock::new(pncounters));
 
         Self {
             node_id,
             config,
             node: None,
             counters,
+            pncounters,
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(seen_ops)),
@@ -431,6 +454,7 @@ impl SyncManager {
             node_id: self.node_id.clone(),
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
+            pncounters: Arc::clone(&self.pncounters),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             peer_node_ids: Arc::clone(&self.peer_node_ids),
@@ -490,6 +514,7 @@ impl SyncManager {
         // Inbound loop: apply remote ops into the counter registry.
         let event_context = NodeEventContext {
             counters: Arc::clone(&self.counters),
+            pncounters: Arc::clone(&self.pncounters),
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
@@ -623,6 +648,12 @@ impl SyncManager {
     pub async fn get_counter_value(&self, key: &str) -> u64 {
         let counters = self.counters.read().await;
         counters.get(key).map(|c| c.value()).unwrap_or(0)
+    }
+
+    /// Returns the current value of a PNCounter.
+    pub async fn get_pncounter_value(&self, key: &str) -> i64 {
+        let pncounters = self.pncounters.read().await;
+        pncounters.get(key).map(|c| c.value()).unwrap_or(0)
     }
 
     /// Gracefully stop sync tasks and close network connections.
@@ -1150,6 +1181,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
             let last_received_op_id = ops.last().map(|op| op.id.as_str().to_string());
             let apply_context = RemoteOpApplyContext {
                 counters: &context.counters,
+                pncounters: &context.pncounters,
                 seen_ops: &context.seen_ops,
                 seen_ops_next_sequence: &context.seen_ops_next_sequence,
                 op_log: &context.op_log,
@@ -1227,6 +1259,14 @@ fn durable_gcounter_state_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::State, key)
 }
 
+pub(crate) fn materialized_pncounter_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::PNCounter, CrdtStoreNamespace::Materialized, key)
+}
+
+fn durable_pncounter_state_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::PNCounter, CrdtStoreNamespace::State, key)
+}
+
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
     prefixed_store_key(SEEN_OP_STORE_PREFIX, op_id)
 }
@@ -1256,6 +1296,18 @@ fn logical_gcounter_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_gcounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     logical_crdt_key(store_key, CrdtKind::GCounter, CrdtStoreNamespace::State)
+}
+
+fn logical_pncounter_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(
+        store_key,
+        CrdtKind::PNCounter,
+        CrdtStoreNamespace::Materialized,
+    )
+}
+
+fn logical_pncounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(store_key, CrdtKind::PNCounter, CrdtStoreNamespace::State)
 }
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1312,6 +1364,17 @@ fn parse_materialized_gcounter_value(bytes: &[u8]) -> anyhow::Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+fn parse_materialized_pncounter_value(bytes: &[u8]) -> anyhow::Result<i64> {
+    let buf: [u8; 8] = bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid materialized PNCounter value length: expected 8, got {}",
+            bytes.len()
+        )
+    })?;
+
+    Ok(i64::from_le_bytes(buf))
+}
+
 fn encode_durable_op_log_value(sequence: u64, op: &Op) -> anyhow::Result<Vec<u8>> {
     let op_bytes = op.to_bytes()?;
     let mut out = Vec::with_capacity(8 + op_bytes.len());
@@ -1347,6 +1410,23 @@ fn hydrate_gcounter_registry(
         materialized_count,
         total = counters.len(),
         "hydrated GCounter registry from sled"
+    );
+    Ok(counters.len())
+}
+
+fn hydrate_pncounter_registry(
+    store: &NxStore,
+    node_id: &NodeId,
+    counters: &mut HashMap<String, PNCounter>,
+) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_pncounter_state(store, counters)?;
+    let materialized_count = hydrate_materialized_pncounter_values(store, node_id, counters)?;
+
+    debug!(
+        durable_count,
+        materialized_count,
+        total = counters.len(),
+        "hydrated PNCounter registry from sled"
     );
     Ok(counters.len())
 }
@@ -1474,6 +1554,37 @@ fn hydrate_durable_gcounter_state(
     Ok(hydrated)
 }
 
+fn hydrate_durable_pncounter_state(
+    store: &NxStore,
+    counters: &mut HashMap<String, PNCounter>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(PNCOUNTER_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_pncounter_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable PNCounter state key");
+                continue;
+            }
+        };
+        let counter = match parse_durable_pncounter_state(&value_bytes) {
+            Ok(counter) => counter,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable PNCounter state");
+                continue;
+            }
+        };
+
+        materialize_pncounter_value(store, &key, counter.value())?;
+        counters.insert(key, counter);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 fn hydrate_materialized_gcounter_values(
     store: &NxStore,
     node_id: &NodeId,
@@ -1510,6 +1621,46 @@ fn hydrate_materialized_gcounter_values(
     Ok(hydrated)
 }
 
+fn hydrate_materialized_pncounter_values(
+    store: &NxStore,
+    node_id: &NodeId,
+    counters: &mut HashMap<String, PNCounter>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(PNCOUNTER_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_pncounter_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid materialized PNCounter key");
+                continue;
+            }
+        };
+        let value = match parse_materialized_pncounter_value(&value_bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid materialized PNCounter value");
+                continue;
+            }
+        };
+        if counters.contains_key(&key) {
+            continue;
+        }
+
+        let mut counter = PNCounter::new();
+        if value >= 0 {
+            counter.increment(node_id, value as u64);
+        } else {
+            counter.decrement(node_id, value.unsigned_abs());
+        }
+        counters.insert(key, counter);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 pub(crate) fn materialize_gcounter_value(
     store: &NxStore,
     key: &str,
@@ -1520,10 +1671,26 @@ pub(crate) fn materialize_gcounter_value(
     Ok(())
 }
 
+pub(crate) fn materialize_pncounter_value(
+    store: &NxStore,
+    key: &str,
+    value: i64,
+) -> anyhow::Result<()> {
+    let store_key = materialized_pncounter_key(key);
+    store.set(&store_key, &value.to_le_bytes())?;
+    Ok(())
+}
+
 fn parse_durable_gcounter_state(bytes: &[u8]) -> anyhow::Result<GCounter> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable GCounter state: {e}"))?;
     GCounter::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable GCounter JSON: {e}"))
+}
+
+fn parse_durable_pncounter_state(bytes: &[u8]) -> anyhow::Result<PNCounter> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable PNCounter state: {e}"))?;
+    PNCounter::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable PNCounter JSON: {e}"))
 }
 
 pub(crate) fn persist_gcounter_state(
@@ -1535,6 +1702,18 @@ pub(crate) fn persist_gcounter_state(
     let state_json = counter.to_json()?;
     store.set(&store_key, state_json.as_bytes())?;
     materialize_gcounter_value(store, key, counter.value())?;
+    Ok(())
+}
+
+pub(crate) fn persist_pncounter_state(
+    store: &NxStore,
+    key: &str,
+    counter: &PNCounter,
+) -> anyhow::Result<()> {
+    let store_key = durable_pncounter_state_key(key);
+    let state_json = counter.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_pncounter_value(store, key, counter.value())?;
     Ok(())
 }
 
@@ -1644,6 +1823,7 @@ fn persist_remote_ops_batch(
     store: &NxStore,
     plans: &[OpPersistencePlan],
     counter_updates: &HashMap<String, GCounter>,
+    pncounter_updates: &HashMap<String, PNCounter>,
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1662,6 +1842,19 @@ fn persist_remote_ops_batch(
         set_keys.push(durable_gcounter_state_key(key));
         set_values.push(counter.to_json()?.into_bytes());
         set_keys.push(materialized_gcounter_key(key));
+        set_values.push(counter.value().to_le_bytes().to_vec());
+    }
+
+    let mut changed_pncounter_keys = pncounter_updates.keys().collect::<Vec<_>>();
+    changed_pncounter_keys.sort();
+
+    for key in changed_pncounter_keys {
+        let Some(counter) = pncounter_updates.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_pncounter_state_key(key));
+        set_values.push(counter.to_json()?.into_bytes());
+        set_keys.push(materialized_pncounter_key(key));
         set_values.push(counter.value().to_le_bytes().to_vec());
     }
 
@@ -1697,12 +1890,14 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut seen = context.seen_ops.write().await;
     let mut log = context.op_log.write().await;
     let mut counters = context.counters.write().await;
+    let mut pncounters = context.pncounters.write().await;
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
     let mut inserted_ids = Vec::new();
     let mut inserted_ops = Vec::new();
     let mut plans = Vec::new();
     let mut counter_updates = HashMap::new();
+    let mut pncounter_updates = HashMap::new();
 
     for op in ops {
         let op_id = op.id.as_str();
@@ -1711,7 +1906,13 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             continue;
         }
 
-        apply_remote_op_to_counter_updates(op, &counters, &mut counter_updates);
+        apply_remote_op_to_counter_updates(
+            op,
+            &counters,
+            &mut counter_updates,
+            &pncounters,
+            &mut pncounter_updates,
+        );
 
         inserted_ids.push(op_id.to_string());
         inserted_ops.push(op.clone());
@@ -1741,7 +1942,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
         next_op_log_sequence = next_op_log_sequence.saturating_add(1);
     }
 
-    persist_remote_ops_batch(context.store, &plans, &counter_updates)?;
+    persist_remote_ops_batch(context.store, &plans, &counter_updates, &pncounter_updates)?;
 
     let applied_count = plans.len() as u64;
     apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
@@ -1749,6 +1950,9 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     prune_op_log_and_return_evicted(&mut log, context.op_log_limit);
     for (key, counter) in counter_updates {
         counters.insert(key, counter);
+    }
+    for (key, counter) in pncounter_updates {
+        pncounters.insert(key, counter);
     }
     context
         .seen_ops_next_sequence
@@ -1769,12 +1973,16 @@ fn apply_remote_op_to_counter_updates(
     op: &Op,
     counters: &HashMap<String, GCounter>,
     counter_updates: &mut HashMap<String, GCounter>,
+    pncounters: &HashMap<String, PNCounter>,
+    pncounter_updates: &mut HashMap<String, PNCounter>,
 ) {
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
             apply_remote_gcounter_increment(op, key, *increment, counters, counter_updates);
         }
-        OpKind::PNCounterIncrement { .. } | OpKind::PNCounterDecrement { .. } => {}
+        OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
+            apply_remote_pncounter_op(op, key, pncounters, pncounter_updates);
+        }
     }
 }
 
@@ -1789,6 +1997,18 @@ fn apply_remote_gcounter_increment(
         .entry(key.to_string())
         .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(GCounter::new));
     counter.increment(&op.origin, increment);
+}
+
+fn apply_remote_pncounter_op(
+    op: &Op,
+    key: &str,
+    counters: &HashMap<String, PNCounter>,
+    counter_updates: &mut HashMap<String, PNCounter>,
+) {
+    let counter = counter_updates
+        .entry(key.to_string())
+        .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(PNCounter::new));
+    let _ = counter.apply_op(op);
 }
 
 #[cfg(test)]
@@ -1826,10 +2046,24 @@ mod tests {
         u64::from_le_bytes(buf)
     }
 
+    fn read_materialized_pncounter(store: &NxStore, key: &str) -> i64 {
+        let key = materialized_pncounter_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        i64::from_le_bytes(buf)
+    }
+
     fn read_durable_gcounter_state(store: &NxStore, key: &str) -> GCounter {
         let key = durable_gcounter_state_key(key);
         let bytes = store.get(&key).unwrap().unwrap();
         parse_durable_gcounter_state(&bytes).unwrap()
+    }
+
+    fn read_durable_pncounter_state(store: &NxStore, key: &str) -> PNCounter {
+        let key = durable_pncounter_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_pncounter_state(&bytes).unwrap()
     }
 
     fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
@@ -1852,6 +2086,7 @@ mod tests {
     ) -> NodeEventContext {
         NodeEventContext {
             counters,
+            pncounters: Arc::new(RwLock::new(HashMap::new())),
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
@@ -1879,9 +2114,38 @@ mod tests {
         op_log_next_sequence: &Arc<AtomicU64>,
         store: &Arc<NxStore>,
     ) {
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters,
+            pncounters: &pncounters,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_next_sequence,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_remote_pncounter_op_for_test(
+        op: &Op,
+        pncounters: &Arc<RwLock<HashMap<String, PNCounter>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
+        store: &Arc<NxStore>,
+    ) {
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters: &counters,
+            pncounters,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -1904,6 +2168,20 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "counter {key} did not reach {expected}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_pncounter(manager: &SyncManager, key: &str, expected: i64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_pncounter_value(key).await == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pncounter {key} did not reach {expected}"
             );
             sleep(Duration::from_millis(25)).await;
         }
@@ -1939,6 +2217,16 @@ mod tests {
         handle.op_sender().send(op).await.unwrap();
     }
 
+    async fn local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) {
+        let op = apply_local_pncounter_inc(handle, key, delta).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) {
+        let op = apply_local_pncounter_dec(handle, key, delta).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
     async fn dropped_local_increment(
         manager: &SyncManager,
         handle: &SyncHandle,
@@ -1971,6 +2259,49 @@ mod tests {
         }
 
         Op::gcounter_increment(handle.node_id().clone(), key, delta)
+    }
+
+    async fn apply_local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) -> Op {
+        apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Increment).await
+    }
+
+    async fn apply_local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) -> Op {
+        apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Decrement).await
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PNCounterChangeForTest {
+        Increment,
+        Decrement,
+    }
+
+    async fn apply_local_pncounter_change(
+        handle: &SyncHandle,
+        key: &str,
+        delta: u64,
+        change: PNCounterChangeForTest,
+    ) -> Op {
+        {
+            let counters_arc = handle.pncounters();
+            let mut counters = counters_arc.write().await;
+            let mut counter = counters.get(key).cloned().unwrap_or_else(PNCounter::new);
+            match change {
+                PNCounterChangeForTest::Increment => counter.increment(handle.node_id(), delta),
+                PNCounterChangeForTest::Decrement => counter.decrement(handle.node_id(), delta),
+            }
+
+            persist_pncounter_state(&handle.store(), key, &counter).unwrap();
+            counters.insert(key.to_string(), counter);
+        }
+
+        match change {
+            PNCounterChangeForTest::Increment => {
+                Op::pncounter_increment(handle.node_id().clone(), key, delta)
+            }
+            PNCounterChangeForTest::Decrement => {
+                Op::pncounter_decrement(handle.node_id().clone(), key, delta)
+            }
+        }
     }
 
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -2037,6 +2368,38 @@ mod tests {
             )
             .unwrap(),
             "counter:visits"
+        );
+
+        let pn_materialized = crdt_store_key(
+            CrdtKind::PNCounter,
+            CrdtStoreNamespace::Materialized,
+            "stock:sku-1",
+        );
+        let pn_durable_state = crdt_store_key(
+            CrdtKind::PNCounter,
+            CrdtStoreNamespace::State,
+            "stock:sku-1",
+        );
+
+        assert_eq!(pn_materialized, materialized_pncounter_key("stock:sku-1"));
+        assert_eq!(pn_durable_state, durable_pncounter_state_key("stock:sku-1"));
+        assert_eq!(
+            logical_crdt_key(
+                &pn_materialized,
+                CrdtKind::PNCounter,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "stock:sku-1"
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &pn_durable_state,
+                CrdtKind::PNCounter,
+                CrdtStoreNamespace::State
+            )
+            .unwrap(),
+            "stock:sku-1"
         );
     }
 
@@ -2480,6 +2843,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_remote_pncounter_ops_materialize_signed_value() {
+        let store = temp_store();
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let origin = NodeId::new("remote-a");
+        let increment = Op::pncounter_increment(origin.clone(), "stock:sku-1", 10);
+        let decrement = Op::pncounter_decrement(origin.clone(), "stock:sku-1", 3);
+
+        apply_remote_pncounter_op_for_test(
+            &increment,
+            &pncounters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_pncounter_op_for_test(
+            &decrement,
+            &pncounters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 7);
+        let state = read_durable_pncounter_state(&store, "stock:sku-1");
+        assert_eq!(state.positive_for(&origin), 10);
+        assert_eq!(state.negative_for(&origin), 3);
+        assert_eq!(state.value(), 7);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_pncounter_duplicate_does_not_double_materialize() {
+        let store = temp_store();
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::pncounter_decrement(NodeId::new("remote-a"), "stock:sku-1", 3);
+
+        apply_remote_pncounter_op_for_test(
+            &op,
+            &pncounters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_pncounter_op_for_test(
+            &op,
+            &pncounters,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    }
+
+    #[tokio::test]
     async fn duplicate_remote_op_after_restart_does_not_double_count() {
         let store = temp_store();
         let origin = NodeId::new("remote-a");
@@ -2569,6 +3006,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_hydrates_pncounter_registry_from_durable_state() {
+        let store = temp_store();
+        let node_a = NodeId::new("node-a");
+        let node_b = NodeId::new("node-b");
+        let mut counter = PNCounter::new();
+        counter.increment(&node_a, 8);
+        counter.decrement(&node_b, 11);
+
+        persist_pncounter_state(&store, "stock:sku-1", &counter).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -3);
+
+        let pncounters = manager.pncounters.read().await;
+        let hydrated = pncounters.get("stock:sku-1").unwrap();
+        assert_eq!(hydrated.positive_for(&node_a), 8);
+        assert_eq!(hydrated.negative_for(&node_b), 11);
+    }
+
+    #[tokio::test]
+    async fn durable_pncounter_state_takes_precedence_over_materialized_total() {
+        let store = temp_store();
+        let node_a = NodeId::new("node-a");
+        let node_b = NodeId::new("node-b");
+        let mut counter = PNCounter::new();
+        counter.increment(&node_a, 5);
+        counter.decrement(&node_b, 2);
+
+        persist_pncounter_state(&store, "stock:sku-1", &counter).unwrap();
+        materialize_pncounter_value(&store, "stock:sku-1", -99).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 3);
+        assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 3);
+    }
+
+    #[tokio::test]
     async fn durable_gcounter_state_takes_precedence_over_materialized_total() {
         let store = temp_store();
         let node_a = NodeId::new("node-a");
@@ -2626,6 +3112,28 @@ mod tests {
         wait_for_counter(&manager_b, key, 2).await;
         assert_eq!(read_materialized(&store_a, key), 2);
         assert_eq!(read_materialized(&store_b, key), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_pncounter_inc_dec_converge() {
+        let key = "inventory:sku-1";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        tokio::join!(
+            local_pncounter_inc(&handle_a, key, 10),
+            local_pncounter_dec(&handle_b, key, 4),
+        );
+
+        wait_for_pncounter(&manager_a, key, 6).await;
+        wait_for_pncounter(&manager_b, key, 6).await;
+        assert_eq!(read_materialized_pncounter(&store_a, key), 6);
+        assert_eq!(read_materialized_pncounter(&store_b, key), 6);
     }
 
     #[tokio::test]
