@@ -12,24 +12,26 @@ use nx_core::sync_manager::{SyncHandle, SyncManager};
 use nx_store::Store;
 use nx_sync::{GCounter, NodeId, Op};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
 const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_TARGET_OPS_SEC_PER_NODE: u64 = 1_000;
 const DEFAULT_SETTLE_SECS: u64 = 10;
+const DEFAULT_NODE_COUNT: usize = 3;
 const TICK: Duration = Duration::from_millis(100);
 const HISTOGRAM_MAX_MICROS: usize = 1_000_000;
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const NODE_COUNT: u64 = 3;
 const LOAD_LIMIT_HEADROOM_OPS: u64 = 100_000;
 const LOAD_TEST_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Config {
+    nodes: usize,
     duration: Duration,
     target_ops_sec_per_node: u64,
     settle: Duration,
+    anti_entropy_interval: Duration,
     report: Option<PathBuf>,
 }
 
@@ -44,10 +46,12 @@ struct Report {
     ops_total: u64,
     ops_sec_avg: f64,
     errors_total: u64,
+    queued_ops_limit: usize,
     op_log_limit: usize,
     seen_ops_limit: usize,
+    anti_entropy_interval_secs: u64,
     expected_counter: u64,
-    observed_counters: [u64; 3],
+    observed_counters: Vec<u64>,
     converged: bool,
     convergence_wait_secs: f64,
     latency: LatencySnapshot,
@@ -155,9 +159,9 @@ fn run() -> Result<(), String> {
 
 async fn run_async(config: Config) -> Result<(), String> {
     let key = "load:counter";
-    let addrs = [free_addr()?, free_addr()?, free_addr()?];
+    let addrs = reserve_addrs(config.nodes)?;
     let limits = LoadLimits::for_config(&config);
-    let mut nodes = start_full_mesh(&addrs, limits).await?;
+    let mut nodes = start_full_mesh(&addrs, limits, config.anti_entropy_interval).await?;
     wait_for_full_mesh(&nodes).await?;
 
     let started = Instant::now();
@@ -188,14 +192,10 @@ async fn run_async(config: Config) -> Result<(), String> {
     let expected_counter = ops_total - errors_total;
     let convergence_started = Instant::now();
     let converged = wait_for_convergence(&nodes, key, expected_counter, config.settle).await;
-    let observed_counters = [
-        nodes[0].manager.get_counter_value(key).await,
-        nodes[1].manager.get_counter_value(key).await,
-        nodes[2].manager.get_counter_value(key).await,
-    ];
+    let observed_counters = observed_counters(&nodes, key).await;
 
     let report = Report {
-        scenario: "three-node-sync-gcounter",
+        scenario: "multi-node-sync-gcounter",
         nodes: nodes.len(),
         load_duration_secs: load_elapsed.as_secs_f64(),
         total_duration_secs: started.elapsed().as_secs_f64(),
@@ -204,8 +204,10 @@ async fn run_async(config: Config) -> Result<(), String> {
         ops_total,
         ops_sec_avg: ops_total as f64 / load_elapsed.as_secs_f64(),
         errors_total,
+        queued_ops_limit: limits.queued_ops_limit,
         op_log_limit: limits.op_log_limit,
         seen_ops_limit: limits.seen_ops_limit,
+        anti_entropy_interval_secs: config.anti_entropy_interval.as_secs(),
         expected_counter,
         observed_counters,
         converged,
@@ -260,6 +262,7 @@ async fn run_async(config: Config) -> Result<(), String> {
 
 #[derive(Debug, Clone, Copy)]
 struct LoadLimits {
+    queued_ops_limit: usize,
     op_log_limit: usize,
     seen_ops_limit: usize,
     max_message_size: usize,
@@ -271,9 +274,10 @@ impl LoadLimits {
             .target_ops_sec_per_node
             .saturating_mul(config.duration.as_secs())
             .saturating_add(LOAD_LIMIT_HEADROOM_OPS);
-        let total_expected = per_node_expected.saturating_mul(NODE_COUNT);
+        let total_expected = per_node_expected.saturating_mul(config.nodes as u64);
 
         Self {
+            queued_ops_limit: per_node_expected.min(usize::MAX as u64) as usize,
             op_log_limit: per_node_expected.min(usize::MAX as u64) as usize,
             seen_ops_limit: total_expected.min(usize::MAX as u64) as usize,
             max_message_size: LOAD_TEST_MAX_MESSAGE_SIZE,
@@ -282,44 +286,26 @@ impl LoadLimits {
 }
 
 async fn start_full_mesh(
-    addrs: &[String; 3],
+    addrs: &[String],
     limits: LoadLimits,
+    anti_entropy_interval: Duration,
 ) -> Result<Vec<BenchNode>, String> {
-    let configs = [
-        SyncConfig::new()
-            .with_listen_addr(addrs[0].clone())
-            .with_peer(addrs[1].clone())
-            .with_peer(addrs[2].clone())
-            .with_queued_ops_limit(100_000)
-            .with_op_log_limit(limits.op_log_limit)
-            .with_seen_ops_limit(limits.seen_ops_limit)
-            .with_max_message_size(limits.max_message_size)
-            .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
-            .with_anti_entropy_interval(Duration::from_secs(60)),
-        SyncConfig::new()
-            .with_listen_addr(addrs[1].clone())
-            .with_peer(addrs[0].clone())
-            .with_peer(addrs[2].clone())
-            .with_queued_ops_limit(100_000)
-            .with_op_log_limit(limits.op_log_limit)
-            .with_seen_ops_limit(limits.seen_ops_limit)
-            .with_max_message_size(limits.max_message_size)
-            .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
-            .with_anti_entropy_interval(Duration::from_secs(60)),
-        SyncConfig::new()
-            .with_listen_addr(addrs[2].clone())
-            .with_peer(addrs[0].clone())
-            .with_peer(addrs[1].clone())
-            .with_queued_ops_limit(100_000)
-            .with_op_log_limit(limits.op_log_limit)
-            .with_seen_ops_limit(limits.seen_ops_limit)
-            .with_max_message_size(limits.max_message_size)
-            .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
-            .with_anti_entropy_interval(Duration::from_secs(60)),
-    ];
-
     let mut nodes = Vec::new();
-    for config in configs {
+    for (index, listen_addr) in addrs.iter().enumerate() {
+        let mut config = SyncConfig::new()
+            .with_listen_addr(listen_addr.clone())
+            .with_queued_ops_limit(limits.queued_ops_limit)
+            .with_op_log_limit(limits.op_log_limit)
+            .with_seen_ops_limit(limits.seen_ops_limit)
+            .with_max_message_size(limits.max_message_size)
+            .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
+            .with_anti_entropy_interval(anti_entropy_interval);
+        for (peer_index, peer_addr) in addrs.iter().enumerate() {
+            if peer_index != index {
+                config = config.with_peer(peer_addr.clone());
+            }
+        }
+
         let store_dir = tempfile::tempdir().map_err(|e| format!("create temp store dir: {e}"))?;
         let store =
             Arc::new(Store::open(store_dir.path()).map_err(|e| format!("open store: {e}"))?);
@@ -352,21 +338,26 @@ fn spawn_producer(
 ) -> JoinHandle<ProducerResult> {
     tokio::spawn(async move {
         let started = Instant::now();
-        let deadline = started + duration;
-        let ops_per_tick = (target_ops_sec / ticks_per_second()).max(1);
-        let mut next_tick = started;
+        let target_ops = target_ops_sec.saturating_mul(duration.as_secs());
+        let mut ticker = interval(TICK);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
         let mut result = ProducerResult {
             ops_total: 0,
             errors_total: 0,
             latencies: LatencyHistogram::new(),
         };
 
-        while Instant::now() < deadline {
-            for _ in 0..ops_per_tick {
-                if Instant::now() >= deadline {
-                    break;
-                }
+        while result.ops_total + result.errors_total < target_ops {
+            ticker.tick().await;
+            let elapsed = started.elapsed().min(duration);
+            let expected_by_now = target_ops.min(
+                (elapsed.as_nanos().saturating_mul(target_ops_sec as u128)
+                    / Duration::from_secs(1).as_nanos()) as u64,
+            );
+            let produced = result.ops_total + result.errors_total;
+            let due_ops = expected_by_now.saturating_sub(produced);
 
+            for _ in 0..due_ops {
                 let op_started = Instant::now();
                 match local_increment(&handle, &key).await {
                     Ok(()) => {
@@ -375,14 +366,6 @@ fn spawn_producer(
                     }
                     Err(_) => result.errors_total += 1,
                 }
-            }
-
-            next_tick += TICK;
-            let now = Instant::now();
-            if next_tick > now {
-                sleep(next_tick - now).await;
-            } else {
-                next_tick = now;
             }
         }
 
@@ -416,9 +399,10 @@ async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), ()> {
 
 async fn wait_for_full_mesh(nodes: &[BenchNode]) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let expected_peers = nodes.len().saturating_sub(1);
     loop {
         let counts = futures_counts(nodes).await;
-        if counts.iter().all(|count| *count >= 2) {
+        if counts.iter().all(|count| *count >= expected_peers) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -436,11 +420,7 @@ async fn wait_for_convergence(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        let values = [
-            nodes[0].manager.get_counter_value(key).await,
-            nodes[1].manager.get_counter_value(key).await,
-            nodes[2].manager.get_counter_value(key).await,
-        ];
+        let values = observed_counters(nodes, key).await;
         if values.iter().all(|value| *value == expected) {
             return true;
         }
@@ -449,6 +429,14 @@ async fn wait_for_convergence(
         }
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn observed_counters(nodes: &[BenchNode], key: &str) -> Vec<u64> {
+    let mut values = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        values.push(node.manager.get_counter_value(key).await);
+    }
+    values
 }
 
 async fn futures_counts(nodes: &[BenchNode]) -> Vec<usize> {
@@ -462,15 +450,20 @@ async fn futures_counts(nodes: &[BenchNode]) -> Vec<usize> {
 impl Config {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut config = Self {
+            nodes: DEFAULT_NODE_COUNT,
             duration: Duration::from_secs(DEFAULT_DURATION_SECS),
             target_ops_sec_per_node: DEFAULT_TARGET_OPS_SEC_PER_NODE,
             settle: Duration::from_secs(DEFAULT_SETTLE_SECS),
+            anti_entropy_interval: Duration::ZERO,
             report: None,
         };
 
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--nodes" => {
+                    config.nodes = parse_next(&mut args, &arg)?;
+                }
                 "--duration-secs" => {
                     config.duration = Duration::from_secs(parse_next(&mut args, &arg)?);
                 }
@@ -479,6 +472,10 @@ impl Config {
                 }
                 "--settle-secs" => {
                     config.settle = Duration::from_secs(parse_next(&mut args, &arg)?);
+                }
+                "--anti-entropy-secs" => {
+                    config.anti_entropy_interval =
+                        Duration::from_secs(parse_next(&mut args, &arg)?);
                 }
                 "--report" => {
                     config.report = Some(PathBuf::from(next_value(&mut args, &arg)?));
@@ -492,11 +489,20 @@ impl Config {
             }
         }
 
+        if config.nodes < 2 {
+            return Err("--nodes must be at least 2".to_string());
+        }
         if config.duration.is_zero() {
             return Err("--duration-secs must be greater than zero".to_string());
         }
         if config.target_ops_sec_per_node == 0 {
             return Err("--target-ops-sec-per-node must be greater than zero".to_string());
+        }
+        if config.anti_entropy_interval.is_zero() {
+            config.anti_entropy_interval = config
+                .duration
+                .saturating_add(config.settle)
+                .saturating_add(Duration::from_secs(60));
         }
         Ok(config)
     }
@@ -516,10 +522,12 @@ impl Report {
                 "  \"ops_total\": {},\n",
                 "  \"ops_sec_avg\": {:.2},\n",
                 "  \"errors_total\": {},\n",
+                "  \"queued_ops_limit\": {},\n",
                 "  \"op_log_limit\": {},\n",
                 "  \"seen_ops_limit\": {},\n",
+                "  \"anti_entropy_interval_secs\": {},\n",
                 "  \"expected_counter\": {},\n",
-                "  \"observed_counters\": [{}, {}, {}],\n",
+                "  \"observed_counters\": [{}],\n",
                 "  \"converged\": {},\n",
                 "  \"convergence_wait_secs\": {:.3},\n",
                 "  \"latency_ms\": {{\n",
@@ -540,12 +548,12 @@ impl Report {
             self.ops_total,
             self.ops_sec_avg,
             self.errors_total,
+            self.queued_ops_limit,
             self.op_log_limit,
             self.seen_ops_limit,
+            self.anti_entropy_interval_secs,
             self.expected_counter,
-            self.observed_counters[0],
-            self.observed_counters[1],
-            self.observed_counters[2],
+            join_u64s(&self.observed_counters),
             self.converged,
             self.convergence_wait_secs,
             self.latency.p50_ms,
@@ -557,6 +565,14 @@ impl Report {
     }
 }
 
+fn reserve_addrs(count: usize) -> Result<Vec<String>, String> {
+    let mut addrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        addrs.push(free_addr()?);
+    }
+    Ok(addrs)
+}
+
 fn free_addr() -> Result<String, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind temp addr: {e}"))?;
     let addr = listener
@@ -565,8 +581,12 @@ fn free_addr() -> Result<String, String> {
     Ok(addr.to_string())
 }
 
-fn ticks_per_second() -> u64 {
-    Duration::from_secs(1).as_millis() as u64 / TICK.as_millis() as u64
+fn join_u64s(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_next<T: std::str::FromStr>(
@@ -591,12 +611,14 @@ fn micros_to_ms(micros: u64) -> f64 {
 fn print_help() {
     println!(
         "\
-Three-node continuous sync benchmark
+Multi-node continuous sync benchmark
 
 Options:
+  --nodes N                         Number of nodes in full mesh (default: {DEFAULT_NODE_COUNT})
   --duration-secs N                 Duration in seconds (default: {DEFAULT_DURATION_SECS})
   --target-ops-sec-per-node N       Target increment ops/sec per node (default: {DEFAULT_TARGET_OPS_SEC_PER_NODE})
   --settle-secs N                   Time allowed for final convergence (default: {DEFAULT_SETTLE_SECS})
+  --anti-entropy-secs N             Periodic pull interval; default keeps repair traffic outside the run window
   --report PATH                     Write JSON report to PATH
 
 Smoke example:

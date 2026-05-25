@@ -17,6 +17,7 @@ use crate::sync_config::SyncConfig;
 
 /// Upper bound on how many ops we coalesce into a single PushOps message.
 const BROADCAST_BATCH_MAX: usize = 1024;
+const BROADCAST_COALESCE_DELAY: Duration = Duration::from_millis(1);
 const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
@@ -946,7 +947,10 @@ async fn broadcast_batch(
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
 
-    // Coalesce any ops already queued, without yielding.
+    // Give producers a tiny window to fill the channel so sustained load is
+    // sent in larger PushOps messages instead of many tiny network writes.
+    tokio::time::sleep(BROADCAST_COALESCE_DELAY).await;
+
     while batch.len() < BROADCAST_BATCH_MAX {
         match op_rx.try_recv() {
             Ok(op) => batch.push(op),
