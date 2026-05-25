@@ -411,6 +411,14 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 | **LWW-Map** | Key→value map with LWW | Medium |
 | **RGA** | Replicated Growable Array (ordered lists) | Low |
 
+**PNCounter progress**:
+- [x] CRDT implementation in `nx-sync` with merge/property-style unit tests
+- [x] `OpKind` variants and operation constructors
+- [ ] durable state/op-log integration in `nx-core`
+- [ ] host API + SDK wrapper
+- [ ] SyncManager E2E coverage
+- [ ] distributed example with README
+
 Completion rule for each CRDT:
 - implementation in `nx-sync`
 - `OpKind` and wire serialization support

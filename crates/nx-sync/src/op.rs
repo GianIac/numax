@@ -32,6 +32,10 @@ impl fmt::Display for OpId {
 pub enum OpKind {
     /// GCounter increment.
     GCounterIncrement { key: String, increment: u64 },
+    /// PNCounter positive-side increment.
+    PNCounterIncrement { key: String, increment: u64 },
+    /// PNCounter negative-side increment.
+    PNCounterDecrement { key: String, decrement: u64 },
 }
 
 /// A complete CRDT operation, ready to be sent/received.
@@ -56,6 +60,30 @@ impl Op {
             kind: OpKind::GCounterIncrement {
                 key: key.into(),
                 increment,
+            },
+        }
+    }
+
+    /// Creates a new PNCounterIncrement operation.
+    pub fn pncounter_increment(origin: NodeId, key: impl Into<String>, increment: u64) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::PNCounterIncrement {
+                key: key.into(),
+                increment,
+            },
+        }
+    }
+
+    /// Creates a new PNCounterDecrement operation.
+    pub fn pncounter_decrement(origin: NodeId, key: impl Into<String>, decrement: u64) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::PNCounterDecrement {
+                key: key.into(),
+                decrement,
             },
         }
     }
@@ -107,6 +135,37 @@ mod tests {
                 assert_eq!(key, "counter:visits");
                 assert_eq!(*increment, 5);
             }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_pncounter_increment() {
+        let node = NodeId::new("node-1");
+        let op = Op::pncounter_increment(node.clone(), "stock:sku-1", 5);
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::PNCounterIncrement { key, increment } => {
+                assert_eq!(key, "stock:sku-1");
+                assert_eq!(*increment, 5);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_pncounter_decrement() {
+        let node = NodeId::new("node-1");
+        let op = Op::pncounter_decrement(node.clone(), "stock:sku-1", 3);
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::PNCounterDecrement { key, decrement } => {
+                assert_eq!(key, "stock:sku-1");
+                assert_eq!(*decrement, 3);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
         }
     }
 
@@ -128,6 +187,28 @@ mod tests {
     fn test_op_bytes_roundtrip() {
         let node = NodeId::new("test-node");
         let op = Op::gcounter_increment(node, "key", 100);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_pncounter_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::pncounter_decrement(node, "stock:sku-1", 7);
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_pncounter_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::pncounter_increment(node, "stock:sku-1", 11);
 
         let bytes = op.to_bytes().unwrap();
         let parsed = Op::from_bytes(&bytes).unwrap();

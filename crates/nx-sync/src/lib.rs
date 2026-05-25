@@ -8,3 +8,4 @@ pub use node_id::NodeId;
 pub use op::{Op, OpId, OpKind};
 
 pub use crdt::gcounter::GCounter;
+pub use crdt::pncounter::PNCounter;

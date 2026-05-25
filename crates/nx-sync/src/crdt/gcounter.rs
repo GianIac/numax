@@ -49,6 +49,7 @@ impl GCounter {
                     Ok(false)
                 }
             }
+            OpKind::PNCounterIncrement { .. } | OpKind::PNCounterDecrement { .. } => Ok(false),
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
                 assert_eq!(key, "counter:visits");
                 assert_eq!(increment, 1);
             }
+            other => panic!("unexpected op kind: {other:?}"),
         }
     }
 }

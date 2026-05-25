@@ -1774,6 +1774,7 @@ fn apply_remote_op_to_counter_updates(
         OpKind::GCounterIncrement { key, increment } => {
             apply_remote_gcounter_increment(op, key, *increment, counters, counter_updates);
         }
+        OpKind::PNCounterIncrement { .. } | OpKind::PNCounterDecrement { .. } => {}
     }
 }
 
