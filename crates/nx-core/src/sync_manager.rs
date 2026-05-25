@@ -23,6 +23,32 @@ const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
 const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
+#[derive(Debug, Clone, Copy)]
+enum CrdtStoreNamespace {
+    Materialized,
+    State,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CrdtKind {
+    GCounter,
+}
+
+impl CrdtKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GCounter => "GCounter",
+        }
+    }
+
+    fn prefix(self, namespace: CrdtStoreNamespace) -> &'static str {
+        match (self, namespace) {
+            (Self::GCounter, CrdtStoreNamespace::Materialized) => GCOUNTER_STORE_PREFIX,
+            (Self::GCounter, CrdtStoreNamespace::State) => GCOUNTER_STATE_STORE_PREFIX,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SeenOpsInsert {
     AlreadySeen,
@@ -1194,22 +1220,26 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
 }
 
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
-    gcounter_store_key(GCOUNTER_STORE_PREFIX, key)
+    crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::Materialized, key)
 }
 
 fn durable_gcounter_state_key(key: &str) -> Vec<u8> {
-    gcounter_store_key(GCOUNTER_STATE_STORE_PREFIX, key)
+    crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::State, key)
 }
 
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
-    gcounter_store_key(SEEN_OP_STORE_PREFIX, op_id)
+    prefixed_store_key(SEEN_OP_STORE_PREFIX, op_id)
 }
 
 fn op_log_store_key(op_id: &str) -> Vec<u8> {
-    gcounter_store_key(OP_LOG_STORE_PREFIX, op_id)
+    prefixed_store_key(OP_LOG_STORE_PREFIX, op_id)
 }
 
-fn gcounter_store_key(prefix: &str, key: &str) -> Vec<u8> {
+fn crdt_store_key(kind: CrdtKind, namespace: CrdtStoreNamespace, key: &str) -> Vec<u8> {
+    prefixed_store_key(kind.prefix(namespace), key)
+}
+
+fn prefixed_store_key(prefix: &str, key: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + key.len());
     out.extend_from_slice(prefix.as_bytes());
     out.extend_from_slice(key.as_bytes());
@@ -1217,15 +1247,15 @@ fn gcounter_store_key(prefix: &str, key: &str) -> Vec<u8> {
 }
 
 fn logical_gcounter_key(store_key: &[u8]) -> anyhow::Result<String> {
-    logical_key_for_prefix(store_key, GCOUNTER_STORE_PREFIX, "materialized GCounter")
+    logical_crdt_key(
+        store_key,
+        CrdtKind::GCounter,
+        CrdtStoreNamespace::Materialized,
+    )
 }
 
 fn logical_gcounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
-    logical_key_for_prefix(
-        store_key,
-        GCOUNTER_STATE_STORE_PREFIX,
-        "durable GCounter state",
-    )
+    logical_crdt_key(store_key, CrdtKind::GCounter, CrdtStoreNamespace::State)
 }
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1234,6 +1264,22 @@ fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_op_log_id(store_key: &[u8]) -> anyhow::Result<String> {
     logical_key_for_prefix(store_key, OP_LOG_STORE_PREFIX, "op log OpId")
+}
+
+fn logical_crdt_key(
+    store_key: &[u8],
+    kind: CrdtKind,
+    namespace: CrdtStoreNamespace,
+) -> anyhow::Result<String> {
+    let namespace_label = match namespace {
+        CrdtStoreNamespace::Materialized => "materialized",
+        CrdtStoreNamespace::State => "durable state",
+    };
+    logical_key_for_prefix(
+        store_key,
+        kind.prefix(namespace),
+        &format!("{namespace_label} {}", kind.label()),
+    )
 }
 
 fn logical_key_for_prefix(store_key: &[u8], prefix: &str, kind: &str) -> anyhow::Result<String> {
@@ -1665,14 +1711,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             continue;
         }
 
-        match &op.kind {
-            OpKind::GCounterIncrement { key, increment } => {
-                let counter = counter_updates
-                    .entry(key.clone())
-                    .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(GCounter::new));
-                counter.increment(&op.origin, *increment);
-            }
-        }
+        apply_remote_op_to_counter_updates(op, &counters, &mut counter_updates);
 
         inserted_ids.push(op_id.to_string());
         inserted_ops.push(op.clone());
@@ -1724,6 +1763,31 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     }
 
     Ok(())
+}
+
+fn apply_remote_op_to_counter_updates(
+    op: &Op,
+    counters: &HashMap<String, GCounter>,
+    counter_updates: &mut HashMap<String, GCounter>,
+) {
+    match &op.kind {
+        OpKind::GCounterIncrement { key, increment } => {
+            apply_remote_gcounter_increment(op, key, *increment, counters, counter_updates);
+        }
+    }
+}
+
+fn apply_remote_gcounter_increment(
+    op: &Op,
+    key: &str,
+    increment: u64,
+    counters: &HashMap<String, GCounter>,
+    counter_updates: &mut HashMap<String, GCounter>,
+) {
+    let counter = counter_updates
+        .entry(key.to_string())
+        .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(GCounter::new));
+    counter.increment(&op.origin, increment);
 }
 
 #[cfg(test)]
@@ -1938,6 +2002,41 @@ mod tests {
         let handle = manager.handle();
         manager.start().await.unwrap();
         (manager, handle, store)
+    }
+
+    #[test]
+    fn crdt_store_keys_roundtrip_through_generic_namespace_helpers() {
+        let materialized = crdt_store_key(
+            CrdtKind::GCounter,
+            CrdtStoreNamespace::Materialized,
+            "counter:visits",
+        );
+        let durable_state = crdt_store_key(
+            CrdtKind::GCounter,
+            CrdtStoreNamespace::State,
+            "counter:visits",
+        );
+
+        assert_eq!(materialized, materialized_gcounter_key("counter:visits"));
+        assert_eq!(durable_state, durable_gcounter_state_key("counter:visits"));
+        assert_eq!(
+            logical_crdt_key(
+                &materialized,
+                CrdtKind::GCounter,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "counter:visits"
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &durable_state,
+                CrdtKind::GCounter,
+                CrdtStoreNamespace::State
+            )
+            .unwrap(),
+            "counter:visits"
+        );
     }
 
     #[test]

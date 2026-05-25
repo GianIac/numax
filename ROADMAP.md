@@ -397,6 +397,12 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 ### Phase 14: Complete CRDTs 🧮
 **Goal**: Data structures for real use cases
 
+**Groundwork**:
+- [x] Multi-CRDT storage namespace helpers, so durable/materialized keys are
+      no longer hard-coded only through GCounter-specific helpers.
+- [x] Remote op application split behind CRDT-specific helpers, keeping the
+      SyncManager ready for additional `OpKind` variants.
+
 | CRDT | Description | Priority |
 |------|-------------|----------|
 | **PNCounter** | Counter with increment/decrement | High |
@@ -405,7 +411,13 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 | **LWW-Map** | Key→value map with LWW | Medium |
 | **RGA** | Replicated Growable Array (ordered lists) | Low |
 
-For each one: implementation, property tests, OpKind, docs, example.
+Completion rule for each CRDT:
+- implementation in `nx-sync`
+- `OpKind` and wire serialization support
+- durable state/op-log integration in `nx-core`
+- host API + SDK wrapper
+- property/unit tests and SyncManager E2E coverage
+- solid distributed example with a README and reproducible 2-3 node run
 
 ---
 
