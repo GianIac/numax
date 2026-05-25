@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.4` - developer preview.
+> **Current release**: `v0.1.0-alpha.5` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -67,13 +67,30 @@ Known limitations:
   explicitly.
 - API and wire format may change before `v0.1.0`.
 
+### v0.1.0-alpha.5 ✅
+**Purpose**: extended host API and load-testing preview.
+
+Includes:
+- Everything in `v0.1.0-alpha.4`.
+- Phase 12 extended host API: paginated/prefix database APIs, time APIs,
+  crypto primitives, system APIs, network introspection and runtime capability
+  queries.
+- Phase 13 load testing: reproducible single-node, multi-node full-mesh and
+  chaos/restart Cargo bench runners with JSON reports.
+
+Known limitations:
+- RAM/CPU profiling for load runs is not automated yet; current reports cover
+  throughput, latency percentiles, convergence time and chaos restart count.
+- WIT/Component Model formalization remains future API hardening.
+- API and wire format may change before `v0.1.0`.
+
 ### v0.1.0 🎯
 **Purpose**: first production-ready release for non-critical workloads.
 
 Requires the completion of the P0/P1 phases listed below, in particular:
 Phase 7 lifecycle, Phase 8 backpressure, Phase 9 minimal observability,
-Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 minimal
-host API and Phase 13 load testing.
+Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 host
+API and Phase 13 load testing.
 
 ---
 
@@ -381,8 +398,8 @@ HTTP endpoint over Tokio.
 ### Phase 12: Extended Host API 🔌
 **Goal**: Complete API for WASM modules
 
-> ⚠️ **WIP** - this phase is actively being shaped. The items below reflect the current agreed minimum for `v0.1.0`.
-> See [#57](https://github.com/GianIac/numax/issues/57) for the ongoing discussion on formalizing this API surface in WIT + Component Model.
+> ✅ **Implemented in `v0.1.0-alpha.5`**. Future hardening will formalize this
+> API surface in WIT + Component Model.
 
 **Database**:
 - [x] `db_scan` — prefix scan with iterator / paginated results
@@ -475,9 +492,9 @@ For each one: implementation, property tests, OpKind, docs, example.
 | 7 | Graceful Lifecycle | ✅ | **P0** |
 | 8 | Backpressure | ✅ | **P0** |
 | 9 | Observability | ✅ | **P1** |
-| 10 | Network Resilience | ⏳ | **P1** |
-| 11 | Dual Serialization | ⏳ | **P1** |
-| 12 | Extended Host API | ⏳ | **P1** |
+| 10 | Network Resilience | ✅ | **P1** |
+| 11 | Dual Serialization | ✅ | **P1** |
+| 12 | Extended Host API | ✅ | **P1** |
 | 13 | Load Testing | ✅ | **P1** |
 | 14 | Complete CRDTs | ⏳ | **P2** |
 | 15 | Deployment & Docs | ⏳ | **P2** |
@@ -502,7 +519,7 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 9 (Observability) at least logging + health
 - [x] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [x] Phase 11 (Serialization) JSON + bincode working
-- [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
+- [x] Phase 12 (Host API) at least db_scan, time_now, random_bytes
 - [x] Phase 13 (Load testing) single-node, multi-node and chaos gates
 - [ ] All tests pass
 - [ ] No clippy warnings
@@ -540,6 +557,17 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 11 dual-mode serialization complete
 - [x] `cargo test` passes
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
+
+---
+
+## v0.1.0-alpha.5 Release Criteria
+
+- [x] Phase 12 extended host API complete
+- [x] Phase 13 load testing complete
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Load reports generated for single-node, multi-node and chaos gates
 - [x] Known limitations documented in the roadmap
 
 ---
