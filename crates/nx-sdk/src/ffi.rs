@@ -3,11 +3,66 @@ unsafe extern "C" {
     // DB (namespace "nx")
     pub fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn db_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32;
+    pub fn db_exists(key_ptr: u32, key_len: u32) -> i32;
+    pub fn db_scan(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        cursor: u64,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
+    pub fn db_scan_after(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        start_after_ptr: u32,
+        start_after_len: u32,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
+    pub fn db_keys(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        cursor: u64,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
+    pub fn db_keys_after(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        start_after_ptr: u32,
+        start_after_len: u32,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
     pub fn db_delete(key_ptr: u32, key_len: u32) -> i32;
 
     // CRDT (namespace "nx")
     pub fn crdt_gcounter_inc(key_ptr: u32, key_len: u32, delta: u64) -> i32;
     pub fn crdt_gcounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+
+    // Time (namespace "nx")
+    pub fn time_now() -> u64;
+    pub fn time_monotonic() -> u64;
+
+    // Crypto (namespace "nx")
+    pub fn random_bytes(out_ptr: u32, out_len: u32) -> i32;
+    pub fn hash_sha256(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn hash_blake3(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+
+    // System (namespace "nx")
+    pub fn env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn module_id(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn host_capabilities(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn event_emit(name_ptr: u32, name_len: u32, payload_ptr: u32, payload_len: u32) -> i32;
+    pub fn abort(msg_ptr: u32, msg_len: u32);
+
+    // Network (namespace "nx")
+    pub fn net_node_id(out_ptr: u32, out_cap: u32) -> i32;
+    pub fn net_peers(out_ptr: u32, out_cap: u32) -> i32;
 
     // Legacy: for compatibility with older guests / examples. Signature must remain (u32,u32)->().
     #[expect(dead_code, reason = "legacy guest import kept for compatibility")]

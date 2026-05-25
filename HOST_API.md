@@ -39,6 +39,7 @@ fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
 | `-1` | Key not found |
 | `-2` | Buffer too small (retry with larger buffer) |
 | `-3` | Internal error |
+| `-4` | Reserved key |
 
 **Example (Rust with nx-sdk):**
 
@@ -46,6 +47,42 @@ fn db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
 use nx_sdk::db;
 
 let value = db::get("my_key")?;
+```
+
+---
+
+#### `db_exists`
+
+Checks whether a key exists without reading the value.
+
+```text
+fn db_exists(key_ptr: u32, key_len: u32) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key_ptr` | `u32` | Pointer to the key in WASM memory |
+| `key_len` | `u32` | Length of the key in bytes |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `1` | Key exists |
+| `0` | Key does not exist |
+| `-3` | Internal error |
+| `-4` | Reserved key |
+
+**Example:**
+
+```rust
+use nx_sdk::db;
+
+if db::exists("my_key")? {
+    // Key is present.
+}
 ```
 
 ---
@@ -73,6 +110,7 @@ fn db_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32
 |-------|---------|
 | `0` | Success |
 | `-3` | Internal error |
+| `-4` | Reserved key |
 
 **Example:**
 
@@ -80,6 +118,153 @@ fn db_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32
 use nx_sdk::db;
 
 db::set("my_key", b"my_value")?;
+```
+
+---
+
+#### `db_scan`
+
+Scans key/value pairs matching a prefix and returns a bounded page.
+
+```text
+fn db_scan(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    cursor: u64,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `prefix_ptr` | `u32` | Pointer to the prefix in WASM memory |
+| `prefix_len` | `u32` | Length of the prefix in bytes |
+| `cursor` | `u64` | Logical row offset among visible rows matching the prefix |
+| `limit` | `u32` | Maximum rows to return, capped by the host |
+| `out_ptr` | `u32` | Pointer to output buffer |
+| `out_cap` | `u32` | Output buffer capacity |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Buffer too small (retry with larger buffer) |
+| `-3` | Internal error |
+| `-4` | Reserved prefix |
+
+**Output encoding:**
+
+```text
+u32 row_count
+repeat row_count times:
+  u32 key_len
+  u32 value_len
+  u8[key_len] key
+  u8[value_len] value
+```
+
+All integer fields are little-endian. Runtime-reserved keys under `__nx/` are never returned.
+`db_scan` keeps the legacy offset cursor ABI for compatibility. New modules should prefer
+`db_scan_after`, which uses the last returned key as a stable cursor for large key spaces.
+
+#### `db_scan_after`
+
+Scans key/value pairs matching a prefix after a specific key cursor.
+
+```text
+fn db_scan_after(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    start_after_ptr: u32,
+    start_after_len: u32,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+`start_after_len = 0` starts at the first visible key. Otherwise, the cursor must be a key
+under the requested prefix. The output encoding and return codes are the same as `db_scan`.
+
+**Example:**
+
+```rust
+use nx_sdk::db;
+
+let rows = db::scan("user:")?;
+```
+
+---
+
+#### `db_keys`
+
+Lists keys matching a prefix and returns a bounded page.
+
+```text
+fn db_keys(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    cursor: u64,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+**Parameters:** same as `db_scan`.
+`db_keys` keeps the legacy offset cursor ABI for compatibility. New modules should prefer
+`db_keys_after`, which uses the last returned key as a stable cursor.
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Buffer too small (retry with larger buffer) |
+| `-3` | Internal error |
+| `-4` | Reserved prefix |
+
+**Output encoding:**
+
+```text
+u32 key_count
+repeat key_count times:
+  u32 key_len
+  u8[key_len] key
+```
+
+All integer fields are little-endian. Runtime-reserved keys under `__nx/` are never returned.
+
+#### `db_keys_after`
+
+Lists keys matching a prefix after a specific key cursor.
+
+```text
+fn db_keys_after(
+    prefix_ptr: u32,
+    prefix_len: u32,
+    start_after_ptr: u32,
+    start_after_len: u32,
+    limit: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+`start_after_len = 0` starts at the first visible key. Otherwise, the cursor must be a key
+under the requested prefix. The output encoding and return codes are the same as `db_keys`.
+
+**Example:**
+
+```rust
+use nx_sdk::db;
+
+let keys = db::keys("user:")?;
 ```
 
 ---
@@ -105,6 +290,342 @@ fn db_delete(key_ptr: u32, key_len: u32) -> i32
 |-------|---------|
 | `0` | Success (even if key did not exist) |
 | `-3` | Internal error |
+| `-4` | Reserved key |
+
+---
+
+### Time
+
+Time functions expose host-managed clocks to WASM modules.
+
+#### `time_now`
+
+Returns the current Unix timestamp in milliseconds.
+
+```text
+fn time_now() -> u64
+```
+
+**Return:** milliseconds since `1970-01-01T00:00:00Z`.
+
+**Example:**
+
+```rust
+use nx_sdk::time;
+
+let now_ms = time::now();
+```
+
+---
+
+#### `time_monotonic`
+
+Returns monotonic milliseconds since the runtime process initialized its
+monotonic clock. Use this for measuring elapsed durations, not for persisted
+timestamps.
+
+```text
+fn time_monotonic() -> u64
+```
+
+**Return:** monotonic milliseconds relative to the runtime process.
+
+**Example:**
+
+```rust
+use nx_sdk::time;
+
+let start = time::monotonic();
+// work
+let elapsed_ms = time::monotonic() - start;
+```
+
+---
+
+### Crypto
+
+Crypto functions expose host-provided randomness and hashing primitives to WASM
+modules. All crypto functions are bounded to protect host memory.
+
+#### `random_bytes`
+
+Fills a guest buffer with cryptographically secure random bytes from the host.
+The SDK rejects requests above 1 MiB before allocating the guest buffer; the
+host enforces the same 1 MiB maximum.
+
+```text
+fn random_bytes(out_ptr: u32, out_len: u32) -> i32
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `out_ptr` | `u32` | Pointer to output buffer |
+| `out_len` | `u32` | Number of random bytes to write |
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let nonce = crypto::random_bytes(16)?;
+```
+
+---
+
+#### `hash_sha256`
+
+Computes a 32-byte SHA-256 digest.
+
+```text
+fn hash_sha256(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `32` | Success; digest written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let digest = crypto::hash_sha256(b"payload")?;
+```
+
+---
+
+#### `hash_blake3`
+
+Computes a 32-byte BLAKE3 digest.
+
+```text
+fn hash_blake3(input_ptr: u32, input_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:** same as `hash_sha256`.
+
+**Example:**
+
+```rust
+use nx_sdk::crypto;
+
+let digest = crypto::hash_blake3(b"payload")?;
+```
+
+---
+
+### System
+
+System functions expose a small, controlled runtime surface to WASM modules.
+
+#### `env_get`
+
+Reads an allowed host environment variable. To avoid accidental secret leakage,
+the current policy exposes only uppercase variables whose names start with
+`NX_` or `NUMAX_`.
+
+```text
+fn env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-1` | Variable not present or not allowed |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let value = system::env_get("NX_FEATURE_FLAG")?;
+```
+
+---
+
+#### `module_id`
+
+Returns the current module identifier provided by the runtime.
+
+```text
+fn module_id(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let id = system::module_id()?;
+```
+
+---
+
+#### `host_capabilities`
+
+Returns the host API capabilities exposed by the current runtime.
+
+```text
+fn host_capabilities(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+
+**Output encoding:** UTF-8 capability names separated by `\n`.
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+let capabilities = system::host_capabilities()?;
+```
+
+---
+
+#### `event_emit`
+
+Emits a named event to the runtime. This is a foundation for future callback and
+event routing work; today the runtime records the event through tracing.
+
+```text
+fn event_emit(name_ptr: u32, name_len: u32, payload_ptr: u32, payload_len: u32) -> i32
+```
+
+Event names must be non-empty ASCII names using letters, digits, `_`, `-`, `.`
+or `:`. Payloads are bounded.
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `0` | Success |
+| `-3` | Internal error |
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+system::event_emit("user.created", b"{\"id\":1}")?;
+```
+
+---
+
+#### `abort`
+
+Terminates guest execution with a host-visible error message.
+
+```text
+fn abort(msg_ptr: u32, msg_len: u32)
+```
+
+The host turns this call into a Wasmtime trap. The SDK exposes it as
+`system::abort(message) -> !`.
+
+**Example:**
+
+```rust
+use nx_sdk::system;
+
+system::abort("invalid module state");
+```
+
+---
+
+### Network
+
+Network functions expose sync runtime introspection to WASM modules. They require
+sync to be enabled; otherwise they return `-5` (`ERR_SYNC_DISABLED`).
+
+#### `net_node_id`
+
+Returns the local sync `NodeId`.
+
+```text
+fn net_node_id(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:**
+
+| Value | Meaning |
+|-------|---------|
+| `>= 0` | Number of bytes written to `out_ptr` |
+| `-2` | Output buffer too small |
+| `-3` | Internal error |
+| `-5` | Sync is disabled |
+
+**Example:**
+
+```rust
+use nx_sdk::net;
+
+let node_id = net::node_id()?;
+```
+
+---
+
+#### `net_peers`
+
+Returns currently connected sync peers.
+
+```text
+fn net_peers(out_ptr: u32, out_cap: u32) -> i32
+```
+
+**Return:** same as `net_node_id`.
+
+**Output encoding:**
+
+```text
+u32 peer_count
+repeat peer_count times:
+  u32 addr_len
+  u32 node_id_len
+  u8[addr_len] addr
+  u8[node_id_len] node_id
+```
+
+All integer fields are little-endian.
+
+**Example:**
+
+```rust
+use nx_sdk::net;
+
+let peers = net::peers()?;
+```
 
 ---
 
@@ -274,24 +795,24 @@ pub extern "C" fn run() {
 > It may vary, we are still in development
 
 ### Database
-- [ ] `db_scan` - Scan by prefix
-- [ ] `db_exists` - Check key existence (without reading the value)
-- [ ] `db_keys` - List all keys with prefix
+- [x] `db_scan` - Scan by prefix
+- [x] `db_exists` - Check key existence (without reading the value)
+- [x] `db_keys` - List all keys with prefix
 
 ### Network
 - [ ] `net_send` - Send message to specific peer
 - [ ] `net_broadcast` - Broadcast to all peers
-- [ ] `net_peers` - List connected peers
-- [ ] `net_node_id` - Get own NodeId
+- [x] `net_peers` - List connected peers
+- [x] `net_node_id` - Get own NodeId
 
 ### Time
-- [ ] `time_now` - Current Unix timestamp (ms)
-- [ ] `time_monotonic` - Monotonic clock for measurements
+- [x] `time_now` - Current Unix timestamp (ms)
+- [x] `time_monotonic` - Monotonic clock for measurements
 
 ### Crypto
-- [ ] `random_bytes` - Secure random number generation
-- [ ] `hash_sha256` - SHA-256 hash
-- [ ] `hash_blake3` - BLAKE3 hash (faster)
+- [x] `random_bytes` - Secure random number generation
+- [x] `hash_sha256` - SHA-256 hash
+- [x] `hash_blake3` - BLAKE3 hash (faster)
 
 ### CRDT
 - [x] `crdt_gcounter_inc` - Increment GCounter
@@ -305,9 +826,11 @@ pub extern "C" fn run() {
 - [ ] `crdt_set_contains` - Check membership
 
 ### System
-- [ ] `env_get` - Read environment variable
-- [ ] `module_id` - Get current module ID
-- [ ] `abort` - Terminate execution with error
+- [x] `env_get` - Read environment variable
+- [x] `module_id` - Get current module ID
+- [x] `abort` - Terminate execution with error
+- [x] `host_capabilities` - Query available host APIs
+- [x] `event_emit` - Emit a named event to the runtime
 
 ### Events (Callbacks)
 - [ ] `on_peer_connect` - Callback when a peer connects

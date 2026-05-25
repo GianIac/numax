@@ -44,6 +44,9 @@ pub struct RuntimeConfig {
 
     /// Observability HTTP endpoint (None = disabled).
     pub observability: Option<ObservabilityConfig>,
+
+    /// Identifier exposed to the guest module through the System host API.
+    pub module_id: String,
 }
 
 impl Default for RuntimeConfig {
@@ -54,6 +57,7 @@ impl Default for RuntimeConfig {
             datastore_path: PathBuf::from("./nx-data"),
             sync: None,
             observability: None,
+            module_id: "unknown".to_string(),
         }
     }
 }
@@ -63,6 +67,7 @@ pub struct HostState {
     pub wasi: Option<p1::WasiP1Ctx>,
     pub store: Arc<NxStore>,
     pub sync_handle: Option<SyncHandle>,
+    pub module_id: Arc<str>,
 }
 
 pub struct Runtime {
@@ -91,6 +96,18 @@ impl Runtime {
 
         // host_db (namespace "nx", func "db_get", "db_set" etc.)
         host_api::db::add_to_linker(&mut linker)?;
+
+        // host_time (namespace "nx", func "time_now", "time_monotonic")
+        host_api::time::add_to_linker(&mut linker)?;
+
+        // host_crypto (namespace "nx", func "random_bytes", "hash_sha256", "hash_blake3")
+        host_api::crypto::add_to_linker(&mut linker)?;
+
+        // host_system (namespace "nx", func "env_get", "module_id", "abort")
+        host_api::system::add_to_linker(&mut linker)?;
+
+        // host_net (namespace "nx", func "net_node_id", "net_peers")
+        host_api::net::add_to_linker(&mut linker)?;
 
         // host_crdt (namespace "nx", func "crdt_gcounter_inc", "crdt_gcounter_value")
         host_api::crdt::add_to_linker(&mut linker)?;
@@ -294,6 +311,7 @@ impl Runtime {
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
+        let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
 
         // Builds the host state for this run
         let host_state = if self.config.enable_wasi {
@@ -303,12 +321,14 @@ impl Runtime {
                 wasi: Some(wasi),
                 store: store_db,
                 sync_handle: self.sync_handle.clone(),
+                module_id,
             }
         } else {
             HostState {
                 wasi: None,
                 store: store_db,
                 sync_handle: self.sync_handle.clone(),
+                module_id,
             }
         };
 

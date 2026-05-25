@@ -38,6 +38,10 @@ impl Store {
         Ok(v.map(|ivec| ivec.to_vec()))
     }
 
+    pub fn exists(&self, key: &[u8]) -> Result<bool, StoreError> {
+        Ok(self.db.contains_key(key)?)
+    }
+
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.db.insert(key, value)?;
         // For now, there's no explicit flush; sled is safe. I expect a stronger "durability":
@@ -90,6 +94,158 @@ impl Store {
             let (k, v) = item?;
             out.push((k.to_vec(), v.to_vec()));
         }
+        Ok(out)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        cursor: u64,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let mut out = Vec::new();
+        let mut skipped = 0u64;
+        let limit = limit as usize;
+
+        for item in self.db.scan_prefix(prefix) {
+            let (k, v) = item?;
+            if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                continue;
+            }
+            if skipped < cursor {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+        }
+
+        Ok(out)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn scan_prefix_page_after(
+        &self,
+        prefix: &[u8],
+        start_after_key: Option<&[u8]>,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let mut out = Vec::new();
+        let limit = limit as usize;
+
+        match start_after_key {
+            Some(start_after) => {
+                for item in self.db.range(start_after.to_vec()..) {
+                    let (k, v) = item?;
+                    if k.as_ref() <= start_after {
+                        continue;
+                    }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+            None => {
+                for item in self.db.scan_prefix(prefix) {
+                    let (k, v) = item?;
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub fn keys_prefix_page(
+        &self,
+        prefix: &[u8],
+        cursor: u64,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut out = Vec::new();
+        let mut skipped = 0u64;
+        let limit = limit as usize;
+
+        for item in self.db.scan_prefix(prefix) {
+            let (k, _) = item?;
+            if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                continue;
+            }
+            if skipped < cursor {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            out.push(k.to_vec());
+        }
+
+        Ok(out)
+    }
+
+    pub fn keys_prefix_page_after(
+        &self,
+        prefix: &[u8],
+        start_after_key: Option<&[u8]>,
+        limit: u32,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut out = Vec::new();
+        let limit = limit as usize;
+
+        match start_after_key {
+            Some(start_after) => {
+                for item in self.db.range(start_after.to_vec()..) {
+                    let (k, _) = item?;
+                    if k.as_ref() <= start_after {
+                        continue;
+                    }
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(k.to_vec());
+                }
+            }
+            None => {
+                for item in self.db.scan_prefix(prefix) {
+                    let (k, _) = item?;
+                    if excluded_prefix.is_some_and(|excluded| k.starts_with(excluded)) {
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(k.to_vec());
+                }
+            }
+        }
+
         Ok(out)
     }
 }

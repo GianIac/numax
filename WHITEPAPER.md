@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.4**, the current public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-alpha.5**, the current public technical preview of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.4` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-alpha.5` - technical preview, API and wire format may change before the stable v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -484,7 +484,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.4:**
+**Out of scope for v0.1.0-alpha.5:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -693,7 +693,11 @@ pub extern "C" fn run() {
 | `db_get` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 | `db_set` | `(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32` | *Implemented* |
 | `db_delete` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
-| `db_scan` | prefix scan | *Planned (Phase 12)* |
+| `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
 
 **Logging** - *(Implemented)*
 
@@ -712,14 +716,22 @@ Log levels: 0 = trace, 1 = debug, 2 = info, 3 = warn, 4 = error.
 
 Increment operations are persisted as CRDT state/op-log metadata, materialized on sled and propagated to peers through the SyncManager. In the absence of sync enabled, the functions return `ERR_SYNC_DISABLED` (-5).
 
-**Extended Host API** - *(Planned, Phase 12)*
+**Extended Host API** - *(Implemented, Phase 12)*
 
 | Function | Description | Status |
 |----------|-------------|--------|
-| `time_now` | Monotonic/UTC timestamp | *Planned* |
-| `random_bytes` | Controlled source of entropy | *Planned* |
-| `hash_*` | Family of hashing functions | *Planned* |
-| `env_get` | Filtered environment variable reading | *Planned* |
+| `time_now` | Current Unix timestamp in milliseconds | *Implemented (Phase 12)* |
+| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented (Phase 12)* |
+| `random_bytes` | Cryptographically secure random bytes | *Implemented (Phase 12)* |
+| `hash_sha256` | SHA-256 digest | *Implemented (Phase 12)* |
+| `hash_blake3` | BLAKE3 digest | *Implemented (Phase 12)* |
+| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented (Phase 12)* |
+| `module_id` | Current module identifier | *Implemented (Phase 12)* |
+| `abort` | Terminate guest execution with an error message | *Implemented (Phase 12)* |
+| `host_capabilities` | Query exposed host APIs | *Implemented (Phase 12)* |
+| `event_emit` | Emit a named runtime event | *Implemented (Phase 12)* |
+| `net_node_id` | Local sync NodeId | *Implemented (Phase 12)* |
+| `net_peers` | Connected sync peers | *Implemented (Phase 12)* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
 ### 6.3 Configuration and Deployment *(Prototype)*
@@ -753,9 +765,9 @@ keys = ["cart:", "user:"]
 
 ## 7. Test Suite
 
-The project includes an automated test suite that covers runtime, store, CRDT, networking and end-to-end flows.
+The project includes an automated test suite that covers runtime, store, CRDT, networking, host APIs, serialization and end-to-end sync flows.
 
-**Current coverage:** more than **38 tests** across unit, integration and end-to-end, distributed across the workspace crates (nx-core, nx-store, nx-sync, nx-net) and the SyncManager E2E flows.
+**Current coverage:** more than **220 test cases** across unit, integration and end-to-end flows, distributed across the workspace crates (`nx-core`, `nx-store`, `nx-sync`, `nx-net`, `nx-cli`) and the SyncManager E2E flows. Long-running smoke/load scenarios are kept behind ignored tests or Cargo bench runners so the default suite remains fast.
 
 **Specific CRDT tests** - explicitly verify the mathematical properties:
 
@@ -774,13 +786,23 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 4. `test` - full test suite execution
 5. `build-wasm` - compilation of WASM examples
 
-**Load testing** - *Planned, Phase 13*.
+**Load testing** - Phase 13 added reproducible load gates with JSON reports:
+
+- single-node store throughput: 10k ops/sec for 1 hour
+- 3-node continuous sync: 1k ops/sec per node
+- 10-node full mesh sync: 100 ops/sec per node
+- chaos restart runner: continuous load with follower restart every 60s
+
+The reports capture throughput, p50/p95/p99 latency, convergence time and
+restart count for chaos runs. RAM/CPU profiling is intentionally left as a
+future hardening extension rather than mixed into the current correctness/load
+gates.
 
 ---
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.4. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.5. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -846,7 +868,7 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.4 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-alpha.5 is a technical preview. We recognize its limits, explicitly:
 
 - **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
@@ -873,11 +895,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.4 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, stable host API for database, log and CRDT, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, multi-OS CI, end-to-end examples.
+v0.1.0-alpha.5 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, extended host API for database, time, crypto, system and network introspection, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, reproducible load/chaos gates, multi-OS CI, end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.4 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-alpha.5 is just the beginning.** But it is a beginning built on code, not on promises.
 
 In closing, I love software and I love numax.
 

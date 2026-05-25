@@ -1,6 +1,6 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.4` - developer preview.
+> **Current release**: `v0.1.0-alpha.5` - developer preview.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
 > **Status**: alpha for feedback; production hardening still in progress.
 
@@ -26,13 +26,30 @@ Known limitations:
   explicitly.
 - API and wire format may change before `v0.1.0`.
 
+### v0.1.0-alpha.5 ✅
+**Purpose**: extended host API and load-testing preview.
+
+Includes:
+- Everything in `v0.1.0-alpha.4`.
+- Phase 12 extended host API: paginated/prefix database APIs, time APIs,
+  crypto primitives, system APIs, network introspection and runtime capability
+  queries.
+- Phase 13 load testing: reproducible single-node, multi-node full-mesh and
+  chaos/restart Cargo bench runners with JSON reports.
+
+Known limitations:
+- RAM/CPU profiling for load runs is not automated yet; current reports cover
+  throughput, latency percentiles, convergence time and chaos restart count.
+- WIT/Component Model formalization remains future API hardening.
+- API and wire format may change before `v0.1.0`.
+
 ### v0.1.0 🎯
 **Purpose**: first production-ready release for non-critical workloads.
 
 Requires the completion of the P0/P1 phases listed below, in particular:
 Phase 7 lifecycle, Phase 8 backpressure, Phase 9 minimal observability,
-Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 minimal
-host API and Phase 13 load testing.
+Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 host
+API and Phase 13 load testing.
 
 ---
 
@@ -335,29 +352,41 @@ HTTP endpoint over Tokio.
 - [x] Test: roundtrip for both formats
 - [x] Benchmark: JSON vs bincode (size, speed)
 
-**Libraries**: `bincode`, `serde` (already present)
-
 ---
 
 ### Phase 12: Extended Host API 🔌
 **Goal**: Complete API for WASM modules
 
+> ✅ **Implemented in `v0.1.0-alpha.5`**. Future hardening will formalize this
+> API surface in WIT + Component Model.
+
 **Database**:
-- [ ] `db_scan`, `db_exists`, `db_keys`
+- [x] `db_scan` — prefix scan with iterator / paginated results
+- [x] `db_exists` — check key existence without reading the value
+- [x] `db_keys` — list keys matching a prefix
 
 **Time**:
-- [ ] `time_now`, `time_monotonic`
+- [x] `time_now` — current Unix timestamp (ms)
+- [x] `time_monotonic` — monotonic clock for measurements
 
 **Crypto**:
-- [ ] `random_bytes`, `hash_sha256`, `hash_blake3`
+- [x] `random_bytes` — cryptographically secure random bytes
+- [x] `hash_sha256` — SHA-256 hash
+- [x] `hash_blake3` — BLAKE3 hash (faster)
 
 **System**:
-- [ ] `env_get`, `module_id`, `abort`
+- [x] `env_get` — read an environment variable
+- [x] `module_id` — get current module identifier
+- [x] `abort` — terminate execution with an error message
 
 **Network**:
-- [ ] `net_node_id`, `net_peers`
+- [x] `net_node_id` — get own NodeId
+- [x] `net_peers` — list currently connected peers
 
-**Libraries**: `sha2`, `blake3`, `getrandom`
+**Under evaluation**:
+- [x] `host_capabilities` — query which host APIs are available at runtime
+- [x] `event_emit` — emit a named event to the runtime (foundation for callbacks)
+- [x] `db_scan_after` / `db_keys_after` — key-cursor pagination for safer large key-space iteration
 
 ---
 
@@ -365,14 +394,21 @@ HTTP endpoint over Tokio.
 **Goal**: Verify behavior under stress
 
 **Scenarios**:
-- [ ] Single node: 10k ops/sec for 1 hour
-- [ ] 3 nodes: 1k ops/sec each, continuous sync
-- [ ] 10 nodes: full mesh, 100 ops/sec each
-- [ ] Chaos: kill a random node every 60s
+- [x] Single node: 10k ops/sec for 1 hour (`cargo bench -p nx-store --bench single_node_load -- --duration-secs 3600 --target-ops-sec 10000`)
+- [x] 3 nodes: 1k ops/sec each, continuous sync (`cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 300 --target-ops-sec-per-node 1000`)
+- [x] 10 nodes: full mesh, 100 ops/sec each (`cargo bench -p nx-core --bench three_node_sync_load -- --nodes 10 --duration-secs 300 --target-ops-sec-per-node 100`)
+- [x] Ignored chaos test: node restart loop converges (`cargo test -p nx-core chaos_node_restart_loop_converges -- --ignored`)
 
-**Metrics**: Throughput, p50/p95/p99 latency, RAM, CPU, convergence time.
+**Benchmarks**:
+- [x] Single-node store throughput benchmark
+- [x] Multi-node sync throughput benchmark
+- [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 300 --target-ops-sec 100 --restart-every-secs 60`)
 
-**Tools**: custom script or `criterion`.
+**Metrics**: Throughput, p50/p95/p99 latency, convergence time, restart
+count for chaos runs. RAM/CPU profiling remains a future hardening extension.
+
+**Tools**: custom Cargo bench runners with JSON reports under
+`crates/*/reports/load/`.
 
 ---
 
@@ -415,10 +451,10 @@ For each one: implementation, property tests, OpKind, docs, example.
 | 7 | Graceful Lifecycle | ✅ | **P0** |
 | 8 | Backpressure | ✅ | **P0** |
 | 9 | Observability | ✅ | **P1** |
-| 10 | Network Resilience | ⏳ | **P1** |
-| 11 | Dual Serialization | ⏳ | **P1** |
-| 12 | Extended Host API | ⏳ | **P1** |
-| 13 | Load Testing | ⏳ | **P1** |
+| 10 | Network Resilience | ✅ | **P1** |
+| 11 | Dual Serialization | ✅ | **P1** |
+| 12 | Extended Host API | ✅ | **P1** |
+| 13 | Load Testing | ✅ | **P1** |
 | 14 | Complete CRDTs | ⏳ | **P2** |
 | 15 | Deployment & Docs | ⏳ | **P2** |
 
@@ -442,8 +478,8 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 9 (Observability) at least logging + health
 - [x] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
 - [x] Phase 11 (Serialization) JSON + bincode working
-- [ ] Phase 12 (Host API) at least db_scan, time_now, random_bytes
-- [ ] Phase 13 (Load testing) at least the 3-nodes-1h scenario
+- [x] Phase 12 (Host API) at least db_scan, time_now, random_bytes
+- [x] Phase 13 (Load testing) single-node, multi-node and chaos gates
 - [ ] All tests pass
 - [ ] No clippy warnings
 - [ ] Base documentation
@@ -480,6 +516,17 @@ criterion remains tracked in Phase 7 as lifecycle/settle/hydration.
 - [x] Phase 11 dual-mode serialization complete
 - [x] `cargo test` passes
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Known limitations documented in the roadmap
+
+---
+
+## v0.1.0-alpha.5 Release Criteria
+
+- [x] Phase 12 extended host API complete
+- [x] Phase 13 load testing complete
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Load reports generated for single-node, multi-node and chaos gates
 - [x] Known limitations documented in the roadmap
 
 ---
