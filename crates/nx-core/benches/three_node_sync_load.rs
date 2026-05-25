@@ -21,6 +21,9 @@ const TICK: Duration = Duration::from_millis(100);
 const HISTOGRAM_MAX_MICROS: usize = 1_000_000;
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const NODE_COUNT: u64 = 3;
+const LOAD_LIMIT_HEADROOM_OPS: u64 = 100_000;
+const LOAD_TEST_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Config {
@@ -41,6 +44,8 @@ struct Report {
     ops_total: u64,
     ops_sec_avg: f64,
     errors_total: u64,
+    op_log_limit: usize,
+    seen_ops_limit: usize,
     expected_counter: u64,
     observed_counters: [u64; 3],
     converged: bool,
@@ -151,7 +156,8 @@ fn run() -> Result<(), String> {
 async fn run_async(config: Config) -> Result<(), String> {
     let key = "load:counter";
     let addrs = [free_addr()?, free_addr()?, free_addr()?];
-    let mut nodes = start_full_mesh(&addrs).await?;
+    let limits = LoadLimits::for_config(&config);
+    let mut nodes = start_full_mesh(&addrs, limits).await?;
     wait_for_full_mesh(&nodes).await?;
 
     let started = Instant::now();
@@ -198,6 +204,8 @@ async fn run_async(config: Config) -> Result<(), String> {
         ops_total,
         ops_sec_avg: ops_total as f64 / load_elapsed.as_secs_f64(),
         errors_total,
+        op_log_limit: limits.op_log_limit,
+        seen_ops_limit: limits.seen_ops_limit,
         expected_counter,
         observed_counters,
         converged,
@@ -250,15 +258,42 @@ async fn run_async(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn start_full_mesh(addrs: &[String; 3]) -> Result<Vec<BenchNode>, String> {
+#[derive(Debug, Clone, Copy)]
+struct LoadLimits {
+    op_log_limit: usize,
+    seen_ops_limit: usize,
+    max_message_size: usize,
+}
+
+impl LoadLimits {
+    fn for_config(config: &Config) -> Self {
+        let per_node_expected = config
+            .target_ops_sec_per_node
+            .saturating_mul(config.duration.as_secs())
+            .saturating_add(LOAD_LIMIT_HEADROOM_OPS);
+        let total_expected = per_node_expected.saturating_mul(NODE_COUNT);
+
+        Self {
+            op_log_limit: per_node_expected.min(usize::MAX as u64) as usize,
+            seen_ops_limit: total_expected.min(usize::MAX as u64) as usize,
+            max_message_size: LOAD_TEST_MAX_MESSAGE_SIZE,
+        }
+    }
+}
+
+async fn start_full_mesh(
+    addrs: &[String; 3],
+    limits: LoadLimits,
+) -> Result<Vec<BenchNode>, String> {
     let configs = [
         SyncConfig::new()
             .with_listen_addr(addrs[0].clone())
             .with_peer(addrs[1].clone())
             .with_peer(addrs[2].clone())
             .with_queued_ops_limit(100_000)
-            .with_op_log_limit(200_000)
-            .with_seen_ops_limit(300_000)
+            .with_op_log_limit(limits.op_log_limit)
+            .with_seen_ops_limit(limits.seen_ops_limit)
+            .with_max_message_size(limits.max_message_size)
             .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
             .with_anti_entropy_interval(Duration::from_secs(60)),
         SyncConfig::new()
@@ -266,8 +301,9 @@ async fn start_full_mesh(addrs: &[String; 3]) -> Result<Vec<BenchNode>, String> 
             .with_peer(addrs[0].clone())
             .with_peer(addrs[2].clone())
             .with_queued_ops_limit(100_000)
-            .with_op_log_limit(200_000)
-            .with_seen_ops_limit(300_000)
+            .with_op_log_limit(limits.op_log_limit)
+            .with_seen_ops_limit(limits.seen_ops_limit)
+            .with_max_message_size(limits.max_message_size)
             .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
             .with_anti_entropy_interval(Duration::from_secs(60)),
         SyncConfig::new()
@@ -275,8 +311,9 @@ async fn start_full_mesh(addrs: &[String; 3]) -> Result<Vec<BenchNode>, String> 
             .with_peer(addrs[0].clone())
             .with_peer(addrs[1].clone())
             .with_queued_ops_limit(100_000)
-            .with_op_log_limit(200_000)
-            .with_seen_ops_limit(300_000)
+            .with_op_log_limit(limits.op_log_limit)
+            .with_seen_ops_limit(limits.seen_ops_limit)
+            .with_max_message_size(limits.max_message_size)
             .with_reconnect_backoff(Duration::from_millis(50), Duration::from_millis(250))
             .with_anti_entropy_interval(Duration::from_secs(60)),
     ];
@@ -479,6 +516,8 @@ impl Report {
                 "  \"ops_total\": {},\n",
                 "  \"ops_sec_avg\": {:.2},\n",
                 "  \"errors_total\": {},\n",
+                "  \"op_log_limit\": {},\n",
+                "  \"seen_ops_limit\": {},\n",
                 "  \"expected_counter\": {},\n",
                 "  \"observed_counters\": [{}, {}, {}],\n",
                 "  \"converged\": {},\n",
@@ -501,6 +540,8 @@ impl Report {
             self.ops_total,
             self.ops_sec_avg,
             self.errors_total,
+            self.op_log_limit,
+            self.seen_ops_limit,
             self.expected_counter,
             self.observed_counters[0],
             self.observed_counters[1],

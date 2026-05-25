@@ -1,13 +1,15 @@
 {
   "scenario": "three-node-sync-gcounter",
   "nodes": 3,
-  "load_duration_secs": 30.023,
-  "total_duration_secs": 30.023,
+  "load_duration_secs": 30.024,
+  "total_duration_secs": 30.024,
   "target_ops_sec_per_node": 1000,
   "target_ops_sec_total": 3000,
   "ops_total": 90000,
-  "ops_sec_avg": 2997.66,
+  "ops_sec_avg": 2997.57,
   "errors_total": 0,
+  "op_log_limit": 130000,
+  "seen_ops_limit": 390000,
   "expected_counter": 90000,
   "observed_counters": [90000, 90000, 90000],
   "converged": true,
@@ -15,8 +17,8 @@
   "latency_ms": {
     "p50": 0.004,
     "p95": 0.008,
-    "p99": 0.151,
-    "max": 31.221,
-    "avg": 0.168
+    "p99": 0.191,
+    "max": 45.643,
+    "avg": 0.163
   }
 }
