@@ -100,6 +100,8 @@ Same module, any node. State stays local. Sync happens through the runtime.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.
+- [`examples/distributed_settings`](./examples/distributed_settings) - replicated LWW-Map settings.
+- [`examples/distributed_comments`](./examples/distributed_comments) - replicated RGA comments.
 
 ---
 

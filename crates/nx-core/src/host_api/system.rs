@@ -28,6 +28,9 @@ const HOST_CAPABILITIES: &[&str] = &[
     "crdt_pncounter_dec",
     "crdt_pncounter_inc",
     "crdt_pncounter_value",
+    "crdt_rga_delete",
+    "crdt_rga_insert",
+    "crdt_rga_values",
     "db_delete",
     "db_exists",
     "db_get",
@@ -377,5 +380,7 @@ mod tests {
         assert!(capabilities.contains("db_scan"));
         assert!(capabilities.contains("db_scan_after"));
         assert!(capabilities.contains("db_keys_after"));
+        assert!(capabilities.contains("crdt_rga_insert"));
+        assert!(capabilities.contains("crdt_rga_values"));
     }
 }

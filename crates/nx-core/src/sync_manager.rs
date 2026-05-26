@@ -7,7 +7,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -28,6 +28,8 @@ const LWW_MAP_STORE_PREFIX: &str = "__nx/crdt/lww-map/";
 const LWW_MAP_STATE_STORE_PREFIX: &str = "__nx/crdt/state/lww-map/";
 const ORSET_STORE_PREFIX: &str = "__nx/crdt/orset/";
 const ORSET_STATE_STORE_PREFIX: &str = "__nx/crdt/state/orset/";
+const RGA_STORE_PREFIX: &str = "__nx/crdt/rga/";
+const RGA_STATE_STORE_PREFIX: &str = "__nx/crdt/state/rga/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
 const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
@@ -44,6 +46,7 @@ enum CrdtKind {
     LwwRegister,
     LwwMap,
     ORSet,
+    Rga,
 }
 
 impl CrdtKind {
@@ -54,6 +57,7 @@ impl CrdtKind {
             Self::LwwRegister => "LWW-Register",
             Self::LwwMap => "LWW-Map",
             Self::ORSet => "ORSet",
+            Self::Rga => "RGA",
         }
     }
 
@@ -69,6 +73,8 @@ impl CrdtKind {
             (Self::LwwMap, CrdtStoreNamespace::State) => LWW_MAP_STATE_STORE_PREFIX,
             (Self::ORSet, CrdtStoreNamespace::Materialized) => ORSET_STORE_PREFIX,
             (Self::ORSet, CrdtStoreNamespace::State) => ORSET_STATE_STORE_PREFIX,
+            (Self::Rga, CrdtStoreNamespace::Materialized) => RGA_STORE_PREFIX,
+            (Self::Rga, CrdtStoreNamespace::State) => RGA_STATE_STORE_PREFIX,
         }
     }
 }
@@ -186,6 +192,7 @@ struct RemoteOpApplyContext<'a> {
     lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,
     lww_maps: &'a Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: &'a Arc<RwLock<HashMap<String, ORSet>>>,
+    rgas: &'a Arc<RwLock<HashMap<String, Rga>>>,
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
     op_log: &'a Arc<RwLock<Vec<Op>>>,
@@ -201,6 +208,7 @@ struct RemoteCrdtRegistries<'a> {
     lww_registers: &'a HashMap<String, LwwRegister>,
     lww_maps: &'a HashMap<String, LwwMap>,
     orsets: &'a HashMap<String, ORSet>,
+    rgas: &'a HashMap<String, Rga>,
 }
 
 struct RemoteCrdtUpdates<'a> {
@@ -209,6 +217,16 @@ struct RemoteCrdtUpdates<'a> {
     lww_registers: &'a mut HashMap<String, LwwRegister>,
     lww_maps: &'a mut HashMap<String, LwwMap>,
     orsets: &'a mut HashMap<String, ORSet>,
+    rgas: &'a mut HashMap<String, Rga>,
+}
+
+struct RemoteCrdtUpdateBatch<'a> {
+    counters: &'a HashMap<String, GCounter>,
+    pncounters: &'a HashMap<String, PNCounter>,
+    lww_registers: &'a HashMap<String, LwwRegister>,
+    lww_maps: &'a HashMap<String, LwwMap>,
+    orsets: &'a HashMap<String, ORSet>,
+    rgas: &'a HashMap<String, Rga>,
 }
 
 struct OpPersistencePlan {
@@ -226,6 +244,7 @@ struct NodeEventContext {
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
     lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
+    rgas: Arc<RwLock<HashMap<String, Rga>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
@@ -293,6 +312,7 @@ pub struct SyncHandle {
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
     lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
+    rgas: Arc<RwLock<HashMap<String, Rga>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
@@ -332,6 +352,11 @@ impl SyncHandle {
     /// Read-side handle over the ORSet registry.
     pub fn orsets(&self) -> Arc<RwLock<HashMap<String, ORSet>>> {
         Arc::clone(&self.orsets)
+    }
+
+    /// Read-side handle over the RGA registry.
+    pub fn rgas(&self) -> Arc<RwLock<HashMap<String, Rga>>> {
+        Arc::clone(&self.rgas)
     }
 
     /// Shared datastore used to materialize CRDT values.
@@ -381,6 +406,9 @@ pub struct SyncManager {
 
     /// ORSet
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
+
+    /// RGA
+    rgas: Arc<RwLock<HashMap<String, Rga>>>,
 
     /// Store used to materialize replicated values.
     store: Arc<NxStore>,
@@ -448,6 +476,7 @@ impl SyncManager {
         let mut lww_registers = HashMap::new();
         let mut lww_maps = HashMap::new();
         let mut orsets = HashMap::new();
+        let mut rgas = HashMap::new();
         let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
             Ok(hydrated) => hydrated,
             Err(e) => {
@@ -484,11 +513,15 @@ impl SyncManager {
         if let Err(e) = hydrate_orset_registry(&store, &mut orsets) {
             warn!(error = %e, "failed to hydrate ORSet registry");
         }
+        if let Err(e) = hydrate_rga_registry(&store, &mut rgas) {
+            warn!(error = %e, "failed to hydrate RGA registry");
+        }
         let counters = Arc::new(RwLock::new(counters));
         let pncounters = Arc::new(RwLock::new(pncounters));
         let lww_registers = Arc::new(RwLock::new(lww_registers));
         let lww_maps = Arc::new(RwLock::new(lww_maps));
         let orsets = Arc::new(RwLock::new(orsets));
+        let rgas = Arc::new(RwLock::new(rgas));
 
         Self {
             node_id,
@@ -499,6 +532,7 @@ impl SyncManager {
             lww_registers,
             lww_maps,
             orsets,
+            rgas,
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(seen_ops)),
@@ -543,6 +577,7 @@ impl SyncManager {
             lww_registers: Arc::clone(&self.lww_registers),
             lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
+            rgas: Arc::clone(&self.rgas),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             peer_node_ids: Arc::clone(&self.peer_node_ids),
@@ -606,6 +641,7 @@ impl SyncManager {
             lww_registers: Arc::clone(&self.lww_registers),
             lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
+            rgas: Arc::clone(&self.rgas),
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
@@ -763,6 +799,12 @@ impl SyncManager {
     pub async fn get_orset_elements(&self, key: &str) -> Vec<String> {
         let sets = self.orsets.read().await;
         sets.get(key).map(|set| set.elements()).unwrap_or_default()
+    }
+
+    /// Returns the visible values of an RGA.
+    pub async fn get_rga_values(&self, key: &str) -> Vec<Vec<u8>> {
+        let rgas = self.rgas.read().await;
+        rgas.get(key).map(|rga| rga.values()).unwrap_or_default()
     }
 
     /// Gracefully stop sync tasks and close network connections.
@@ -1294,6 +1336,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
                 lww_registers: &context.lww_registers,
                 lww_maps: &context.lww_maps,
                 orsets: &context.orsets,
+                rgas: &context.rgas,
                 seen_ops: &context.seen_ops,
                 seen_ops_next_sequence: &context.seen_ops_next_sequence,
                 op_log: &context.op_log,
@@ -1403,6 +1446,14 @@ fn durable_orset_state_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::ORSet, CrdtStoreNamespace::State, key)
 }
 
+pub(crate) fn materialized_rga_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::Rga, CrdtStoreNamespace::Materialized, key)
+}
+
+fn durable_rga_state_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::Rga, CrdtStoreNamespace::State, key)
+}
+
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
     prefixed_store_key(SEEN_OP_STORE_PREFIX, op_id)
 }
@@ -1456,6 +1507,10 @@ fn logical_lww_map_state_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_orset_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     logical_crdt_key(store_key, CrdtKind::ORSet, CrdtStoreNamespace::State)
+}
+
+fn logical_rga_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(store_key, CrdtKind::Rga, CrdtStoreNamespace::State)
 }
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1619,6 +1674,17 @@ fn hydrate_orset_registry(
         "hydrated ORSet registry from sled"
     );
     Ok(sets.len())
+}
+
+fn hydrate_rga_registry(store: &NxStore, rgas: &mut HashMap<String, Rga>) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_rga_state(store, rgas)?;
+
+    debug!(
+        durable_count,
+        total = rgas.len(),
+        "hydrated RGA registry from sled"
+    );
+    Ok(rgas.len())
 }
 
 fn hydrate_seen_ops(store: &NxStore, limit: usize) -> anyhow::Result<(SeenOps, u64)> {
@@ -1868,6 +1934,37 @@ fn hydrate_durable_orset_state(
     Ok(hydrated)
 }
 
+fn hydrate_durable_rga_state(
+    store: &NxStore,
+    rgas: &mut HashMap<String, Rga>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(RGA_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_rga_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable RGA state key");
+                continue;
+            }
+        };
+        let rga = match parse_durable_rga_state(&value_bytes) {
+            Ok(rga) => rga,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable RGA state");
+                continue;
+            }
+        };
+
+        materialize_rga_values(store, &key, &rga.values())?;
+        rgas.insert(key, rga);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 fn hydrate_materialized_gcounter_values(
     store: &NxStore,
     node_id: &NodeId,
@@ -1996,6 +2093,17 @@ pub(crate) fn materialize_orset_elements(
     Ok(())
 }
 
+pub(crate) fn materialize_rga_values(
+    store: &NxStore,
+    key: &str,
+    values: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let store_key = materialized_rga_key(key);
+    let values_json = serde_json::to_vec(values)?;
+    store.set(&store_key, &values_json)?;
+    Ok(())
+}
+
 fn parse_durable_gcounter_state(bytes: &[u8]) -> anyhow::Result<GCounter> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable GCounter state: {e}"))?;
@@ -2025,6 +2133,12 @@ fn parse_durable_orset_state(bytes: &[u8]) -> anyhow::Result<ORSet> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable ORSet state: {e}"))?;
     ORSet::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable ORSet JSON: {e}"))
+}
+
+fn parse_durable_rga_state(bytes: &[u8]) -> anyhow::Result<Rga> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable RGA state: {e}"))?;
+    Rga::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable RGA JSON: {e}"))
 }
 
 pub(crate) fn persist_gcounter_state(
@@ -2080,6 +2194,14 @@ pub(crate) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> an
     let state_json = set.to_json()?;
     store.set(&store_key, state_json.as_bytes())?;
     materialize_orset_elements(store, key, &set.elements())?;
+    Ok(())
+}
+
+pub(crate) fn persist_rga_state(store: &NxStore, key: &str, rga: &Rga) -> anyhow::Result<()> {
+    let store_key = durable_rga_state_key(key);
+    let state_json = rga.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_rga_values(store, key, &rga.values())?;
     Ok(())
 }
 
@@ -2188,11 +2310,7 @@ fn persist_local_ops_batch(store: &NxStore, plans: &[OpPersistencePlan]) -> anyh
 fn persist_remote_ops_batch(
     store: &NxStore,
     plans: &[OpPersistencePlan],
-    counter_updates: &HashMap<String, GCounter>,
-    pncounter_updates: &HashMap<String, PNCounter>,
-    lww_register_updates: &HashMap<String, LwwRegister>,
-    lww_map_updates: &HashMap<String, LwwMap>,
-    orset_updates: &HashMap<String, ORSet>,
+    updates: RemoteCrdtUpdateBatch<'_>,
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -2201,11 +2319,11 @@ fn persist_remote_ops_batch(
     let mut set_keys = Vec::new();
     let mut set_values = Vec::new();
     let mut delete_keys = Vec::new();
-    let mut changed_counter_keys = counter_updates.keys().collect::<Vec<_>>();
+    let mut changed_counter_keys = updates.counters.keys().collect::<Vec<_>>();
     changed_counter_keys.sort();
 
     for key in changed_counter_keys {
-        let Some(counter) = counter_updates.get(key.as_str()) else {
+        let Some(counter) = updates.counters.get(key.as_str()) else {
             continue;
         };
         set_keys.push(durable_gcounter_state_key(key));
@@ -2214,11 +2332,11 @@ fn persist_remote_ops_batch(
         set_values.push(counter.value().to_le_bytes().to_vec());
     }
 
-    let mut changed_pncounter_keys = pncounter_updates.keys().collect::<Vec<_>>();
+    let mut changed_pncounter_keys = updates.pncounters.keys().collect::<Vec<_>>();
     changed_pncounter_keys.sort();
 
     for key in changed_pncounter_keys {
-        let Some(counter) = pncounter_updates.get(key.as_str()) else {
+        let Some(counter) = updates.pncounters.get(key.as_str()) else {
             continue;
         };
         set_keys.push(durable_pncounter_state_key(key));
@@ -2227,11 +2345,11 @@ fn persist_remote_ops_batch(
         set_values.push(counter.value().to_le_bytes().to_vec());
     }
 
-    let mut changed_lww_register_keys = lww_register_updates.keys().collect::<Vec<_>>();
+    let mut changed_lww_register_keys = updates.lww_registers.keys().collect::<Vec<_>>();
     changed_lww_register_keys.sort();
 
     for key in changed_lww_register_keys {
-        let Some(register) = lww_register_updates.get(key.as_str()) else {
+        let Some(register) = updates.lww_registers.get(key.as_str()) else {
             continue;
         };
         set_keys.push(durable_lww_register_state_key(key));
@@ -2240,11 +2358,11 @@ fn persist_remote_ops_batch(
         set_values.push(register.value_bytes());
     }
 
-    let mut changed_lww_map_keys = lww_map_updates.keys().collect::<Vec<_>>();
+    let mut changed_lww_map_keys = updates.lww_maps.keys().collect::<Vec<_>>();
     changed_lww_map_keys.sort();
 
     for key in changed_lww_map_keys {
-        let Some(map) = lww_map_updates.get(key.as_str()) else {
+        let Some(map) = updates.lww_maps.get(key.as_str()) else {
             continue;
         };
         set_keys.push(durable_lww_map_state_key(key));
@@ -2253,17 +2371,30 @@ fn persist_remote_ops_batch(
         set_values.push(serde_json::to_vec(&map.entries())?);
     }
 
-    let mut changed_orset_keys = orset_updates.keys().collect::<Vec<_>>();
+    let mut changed_orset_keys = updates.orsets.keys().collect::<Vec<_>>();
     changed_orset_keys.sort();
 
     for key in changed_orset_keys {
-        let Some(set) = orset_updates.get(key.as_str()) else {
+        let Some(set) = updates.orsets.get(key.as_str()) else {
             continue;
         };
         set_keys.push(durable_orset_state_key(key));
         set_values.push(set.to_json()?.into_bytes());
         set_keys.push(materialized_orset_key(key));
         set_values.push(serde_json::to_vec(&set.elements())?);
+    }
+
+    let mut changed_rga_keys = updates.rgas.keys().collect::<Vec<_>>();
+    changed_rga_keys.sort();
+
+    for key in changed_rga_keys {
+        let Some(rga) = updates.rgas.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_rga_state_key(key));
+        set_values.push(rga.to_json()?.into_bytes());
+        set_keys.push(materialized_rga_key(key));
+        set_values.push(serde_json::to_vec(&rga.values())?);
     }
 
     for plan in plans {
@@ -2302,6 +2433,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut lww_registers = context.lww_registers.write().await;
     let mut lww_maps = context.lww_maps.write().await;
     let mut orsets = context.orsets.write().await;
+    let mut rgas = context.rgas.write().await;
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
     let mut inserted_ids = Vec::new();
@@ -2312,6 +2444,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut lww_register_updates = HashMap::new();
     let mut lww_map_updates = HashMap::new();
     let mut orset_updates = HashMap::new();
+    let mut rga_updates = HashMap::new();
 
     for op in ops {
         let op_id = op.id.as_str();
@@ -2326,6 +2459,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             lww_registers: &lww_registers,
             lww_maps: &lww_maps,
             orsets: &orsets,
+            rgas: &rgas,
         };
         let mut updates = RemoteCrdtUpdates {
             counters: &mut counter_updates,
@@ -2333,6 +2467,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             lww_registers: &mut lww_register_updates,
             lww_maps: &mut lww_map_updates,
             orsets: &mut orset_updates,
+            rgas: &mut rga_updates,
         };
         apply_remote_op_to_crdt_updates(op, &registries, &mut updates);
 
@@ -2367,11 +2502,14 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     persist_remote_ops_batch(
         context.store,
         &plans,
-        &counter_updates,
-        &pncounter_updates,
-        &lww_register_updates,
-        &lww_map_updates,
-        &orset_updates,
+        RemoteCrdtUpdateBatch {
+            counters: &counter_updates,
+            pncounters: &pncounter_updates,
+            lww_registers: &lww_register_updates,
+            lww_maps: &lww_map_updates,
+            orsets: &orset_updates,
+            rgas: &rga_updates,
+        },
     )?;
 
     let applied_count = plans.len() as u64;
@@ -2392,6 +2530,9 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     }
     for (key, set) in orset_updates {
         orsets.insert(key, set);
+    }
+    for (key, rga) in rga_updates {
+        rgas.insert(key, rga);
     }
     context
         .seen_ops_next_sequence
@@ -2485,6 +2626,24 @@ fn apply_remote_op_to_crdt_updates(
                 registries.orsets,
                 updates.orsets,
             );
+        }
+        OpKind::RgaInsert {
+            key,
+            id,
+            parent,
+            value,
+        } => {
+            apply_remote_rga_insert(
+                key,
+                id,
+                parent.as_deref(),
+                value,
+                registries.rgas,
+                updates.rgas,
+            );
+        }
+        OpKind::RgaDelete { key, id } => {
+            apply_remote_rga_delete(key, id, registries.rgas, updates.rgas);
         }
     }
 }
@@ -2601,6 +2760,32 @@ fn apply_remote_orset_remove(
     set.apply_remove(element, observed_tags.iter().cloned());
 }
 
+fn apply_remote_rga_insert(
+    key: &str,
+    id: &str,
+    parent: Option<&str>,
+    value: &[u8],
+    rgas: &HashMap<String, Rga>,
+    rga_updates: &mut HashMap<String, Rga>,
+) {
+    let rga = rga_updates
+        .entry(key.to_string())
+        .or_insert_with(|| rgas.get(key).cloned().unwrap_or_else(Rga::new));
+    rga.apply_insert(id.to_string(), parent.map(str::to_string), value.to_vec());
+}
+
+fn apply_remote_rga_delete(
+    key: &str,
+    id: &str,
+    rgas: &HashMap<String, Rga>,
+    rga_updates: &mut HashMap<String, Rga>,
+) {
+    let rga = rga_updates
+        .entry(key.to_string())
+        .or_insert_with(|| rgas.get(key).cloned().unwrap_or_else(Rga::new));
+    rga.apply_delete(id.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2691,6 +2876,18 @@ mod tests {
         parse_durable_orset_state(&bytes).unwrap()
     }
 
+    fn read_materialized_rga(store: &NxStore, key: &str) -> Vec<Vec<u8>> {
+        let key = materialized_rga_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn read_durable_rga_state(store: &NxStore, key: &str) -> Rga {
+        let key = durable_rga_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_rga_state(&bytes).unwrap()
+    }
+
     fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
         store.get(&seen_op_store_key(op_id)).unwrap().is_some()
     }
@@ -2715,6 +2912,7 @@ mod tests {
             lww_registers: Arc::new(RwLock::new(HashMap::new())),
             lww_maps: Arc::new(RwLock::new(HashMap::new())),
             orsets: Arc::new(RwLock::new(HashMap::new())),
+            rgas: Arc::new(RwLock::new(HashMap::new())),
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
@@ -2746,6 +2944,7 @@ mod tests {
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters,
@@ -2753,6 +2952,7 @@ mod tests {
             lww_registers: &lww_registers,
             lww_maps: &lww_maps,
             orsets: &orsets,
+            rgas: &rgas,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2779,6 +2979,7 @@ mod tests {
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
@@ -2786,6 +2987,7 @@ mod tests {
             lww_registers: &lww_registers,
             lww_maps: &lww_maps,
             orsets: &orsets,
+            rgas: &rgas,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2812,6 +3014,7 @@ mod tests {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
@@ -2819,6 +3022,7 @@ mod tests {
             lww_registers: registers,
             lww_maps: &lww_maps,
             orsets: &orsets,
+            rgas: &rgas,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2845,6 +3049,7 @@ mod tests {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
@@ -2852,6 +3057,7 @@ mod tests {
             lww_registers: &lww_registers,
             lww_maps: maps,
             orsets: &orsets,
+            rgas: &rgas,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2878,6 +3084,7 @@ mod tests {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let lww_maps = Arc::new(RwLock::new(HashMap::new()));
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
@@ -2885,6 +3092,42 @@ mod tests {
             lww_registers: &lww_registers,
             lww_maps: &lww_maps,
             orsets: sets,
+            rgas: &rgas,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_next_sequence,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_remote_rga_op_for_test(
+        op: &Op,
+        rgas: &Arc<RwLock<HashMap<String, Rga>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
+        store: &Arc<NxStore>,
+    ) {
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let lww_maps = Arc::new(RwLock::new(HashMap::new()));
+        let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters: &counters,
+            pncounters: &pncounters,
+            lww_registers: &lww_registers,
+            lww_maps: &lww_maps,
+            orsets: &orsets,
+            rgas,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2976,6 +3219,24 @@ mod tests {
         }
     }
 
+    async fn wait_for_rga(manager: &SyncManager, key: &str, expected: &[&[u8]]) {
+        let expected = expected
+            .iter()
+            .map(|value| (*value).to_vec())
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_rga_values(key).await == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rga {key} did not reach expected values"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn wait_for_connected_peer(manager: &SyncManager) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -3042,12 +3303,7 @@ mod tests {
         handle.op_sender().send(op).await.unwrap();
     }
 
-    async fn local_lww_map_remove(
-        handle: &SyncHandle,
-        key: &str,
-        field: &str,
-        timestamp_ms: u64,
-    ) {
+    async fn local_lww_map_remove(handle: &SyncHandle, key: &str, field: &str, timestamp_ms: u64) {
         let op = apply_local_lww_map_remove(handle, key, field, timestamp_ms).await;
         handle.op_sender().send(op).await.unwrap();
     }
@@ -3056,6 +3312,22 @@ mod tests {
         if let Some(op) = apply_local_orset_remove(handle, key, element).await {
             handle.op_sender().send(op).await.unwrap();
         }
+    }
+
+    async fn local_rga_insert_after(
+        handle: &SyncHandle,
+        key: &str,
+        parent: Option<&str>,
+        value: &[u8],
+    ) -> String {
+        let (id, op) = apply_local_rga_insert_after(handle, key, parent, value).await;
+        handle.op_sender().send(op).await.unwrap();
+        id
+    }
+
+    async fn local_rga_delete(handle: &SyncHandle, key: &str, id: &str) {
+        let op = apply_local_rga_delete(handle, key, id).await;
+        handle.op_sender().send(op).await.unwrap();
     }
 
     async fn dropped_local_increment(
@@ -3248,6 +3520,50 @@ mod tests {
             element,
             observed_tags,
         ))
+    }
+
+    async fn apply_local_rga_insert_after(
+        handle: &SyncHandle,
+        key: &str,
+        parent: Option<&str>,
+        value: &[u8],
+    ) -> (String, Op) {
+        let op = Op::rga_insert_with_op_id(
+            handle.node_id().clone(),
+            key,
+            parent.map(ToOwned::to_owned),
+            value.to_vec(),
+        );
+        let id = match &op.kind {
+            OpKind::RgaInsert { id, .. } => id.clone(),
+            other => panic!("unexpected op kind: {other:?}"),
+        };
+
+        {
+            let rgas_arc = handle.rgas();
+            let mut rgas = rgas_arc.write().await;
+            let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+            rga.insert(id.clone(), parent.map(ToOwned::to_owned), value.to_vec());
+
+            persist_rga_state(&handle.store(), key, &rga).unwrap();
+            rgas.insert(key.to_string(), rga);
+        }
+
+        (id, op)
+    }
+
+    async fn apply_local_rga_delete(handle: &SyncHandle, key: &str, id: &str) -> Op {
+        {
+            let rgas_arc = handle.rgas();
+            let mut rgas = rgas_arc.write().await;
+            let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+            rga.delete(id.to_string());
+
+            persist_rga_state(&handle.store(), key, &rga).unwrap();
+            rgas.insert(key.to_string(), rga);
+        }
+
+        Op::rga_delete(handle.node_id().clone(), key, id)
     }
 
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -3451,6 +3767,30 @@ mod tests {
             )
             .unwrap(),
             "tags:item-1"
+        );
+
+        let rga_materialized = crdt_store_key(
+            CrdtKind::Rga,
+            CrdtStoreNamespace::Materialized,
+            "comments:doc-1",
+        );
+        let rga_durable_state =
+            crdt_store_key(CrdtKind::Rga, CrdtStoreNamespace::State, "comments:doc-1");
+
+        assert_eq!(rga_materialized, materialized_rga_key("comments:doc-1"));
+        assert_eq!(rga_durable_state, durable_rga_state_key("comments:doc-1"));
+        assert_eq!(
+            logical_crdt_key(
+                &rga_materialized,
+                CrdtKind::Rga,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "comments:doc-1"
+        );
+        assert_eq!(
+            logical_crdt_key(&rga_durable_state, CrdtKind::Rga, CrdtStoreNamespace::State).unwrap(),
+            "comments:doc-1"
         );
     }
 
@@ -4146,12 +4486,8 @@ mod tests {
             b"dark".to_vec(),
             100,
         );
-        let remove = Op::lww_map_remove(
-            NodeId::new("remote-b"),
-            "settings:service-a",
-            "theme",
-            200,
-        );
+        let remove =
+            Op::lww_map_remove(NodeId::new("remote-b"), "settings:service-a", "theme", 200);
 
         apply_remote_lww_map_op_for_test(
             &set,
@@ -4188,12 +4524,8 @@ mod tests {
         let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
         let op_log = Arc::new(RwLock::new(Vec::new()));
         let op_log_next_sequence = Arc::new(AtomicU64::new(0));
-        let remove = Op::lww_map_remove(
-            NodeId::new("remote-b"),
-            "settings:service-a",
-            "theme",
-            200,
-        );
+        let remove =
+            Op::lww_map_remove(NodeId::new("remote-b"), "settings:service-a", "theme", 200);
         let older_set = Op::lww_map_set(
             NodeId::new("remote-a"),
             "settings:service-a",
@@ -4380,6 +4712,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_remote_rga_insert_materializes_visible_values() {
+        let store = temp_store();
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let insert_a = Op::rga_insert(
+            NodeId::new("remote-a"),
+            "comments:doc-1",
+            "op-a",
+            None::<String>,
+            b"a".to_vec(),
+        );
+        let insert_b = Op::rga_insert(
+            NodeId::new("remote-b"),
+            "comments:doc-1",
+            "op-b",
+            Some("op-a"),
+            b"b".to_vec(),
+        );
+
+        apply_remote_rga_op_for_test(
+            &insert_b,
+            &rgas,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_rga_op_for_test(
+            &insert_a,
+            &rgas,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            read_materialized_rga(&store, "comments:doc-1"),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        let state = read_durable_rga_state(&store, "comments:doc-1");
+        assert_eq!(state.ordered_ids(), vec!["op-a", "op-b"]);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_rga_delete_hides_value_and_keeps_child_visible() {
+        let store = temp_store();
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let insert_a = Op::rga_insert(
+            NodeId::new("remote-a"),
+            "comments:doc-1",
+            "op-a",
+            None::<String>,
+            b"a".to_vec(),
+        );
+        let insert_b = Op::rga_insert(
+            NodeId::new("remote-b"),
+            "comments:doc-1",
+            "op-b",
+            Some("op-a"),
+            b"b".to_vec(),
+        );
+        let delete_a = Op::rga_delete(NodeId::new("remote-c"), "comments:doc-1", "op-a");
+
+        for op in [&insert_a, &insert_b, &delete_a] {
+            apply_remote_rga_op_for_test(
+                op,
+                &rgas,
+                &seen_ops,
+                &seen_ops_next_sequence,
+                &op_log,
+                &op_log_next_sequence,
+                &store,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            read_materialized_rga(&store, "comments:doc-1"),
+            vec![b"b".to_vec()]
+        );
+        let state = read_durable_rga_state(&store, "comments:doc-1");
+        assert!(!state.contains("op-a"));
+        assert!(state.contains("op-b"));
+    }
+
+    #[tokio::test]
+    async fn apply_remote_rga_duplicate_does_not_double_apply() {
+        let store = temp_store();
+        let rgas = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::rga_insert(
+            NodeId::new("remote-a"),
+            "comments:doc-1",
+            "op-a",
+            None::<String>,
+            b"a".to_vec(),
+        );
+
+        apply_remote_rga_op_for_test(
+            &op,
+            &rgas,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_rga_op_for_test(
+            &op,
+            &rgas,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(op_log.read().await.len(), 1);
+        let state = read_durable_rga_state(&store, "comments:doc-1");
+        assert_eq!(state.values(), vec![b"a".to_vec()]);
+    }
+
+    #[tokio::test]
     async fn duplicate_remote_op_after_restart_does_not_double_count() {
         let store = temp_store();
         let origin = NodeId::new("remote-a");
@@ -4551,7 +5023,10 @@ mod tests {
         let hydrated = maps.get("settings:service-a").unwrap();
         assert_eq!(hydrated.get_bytes("theme"), Some(b"dark".to_vec()));
         assert!(!hydrated.entry("region").unwrap().is_visible());
-        assert_eq!(read_materialized_lww_map(&store, "settings:service-a").len(), 1);
+        assert_eq!(
+            read_materialized_lww_map(&store, "settings:service-a").len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4581,6 +5056,38 @@ mod tests {
         assert!(!hydrated.contains("blue"));
         assert!(hydrated.contains("red"));
         assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    }
+
+    #[tokio::test]
+    async fn manager_hydrates_rga_registry_from_durable_state() {
+        let store = temp_store();
+        let mut rga = Rga::new();
+        rga.insert("op-a", None::<String>, b"a".to_vec());
+        rga.insert("op-b", Some("op-a"), b"b".to_vec());
+        rga.delete("op-a");
+
+        persist_rga_state(&store, "comments:doc-1", &rga).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_rga_values("comments:doc-1").await,
+            vec![b"b".to_vec()]
+        );
+
+        let rgas = manager.rgas.read().await;
+        let hydrated = rgas.get("comments:doc-1").unwrap();
+        assert!(!hydrated.contains("op-a"));
+        assert!(hydrated.contains("op-b"));
+        assert_eq!(
+            read_materialized_rga(&store, "comments:doc-1"),
+            vec![b"b".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -4665,6 +5172,32 @@ mod tests {
         assert_eq!(
             read_materialized_orset(&store, "tags:item-1"),
             vec!["fresh".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_rga_state_takes_precedence_over_materialized_values() {
+        let store = temp_store();
+        let mut rga = Rga::new();
+        rga.insert("op-a", None::<String>, b"fresh".to_vec());
+
+        persist_rga_state(&store, "comments:doc-1", &rga).unwrap();
+        materialize_rga_values(&store, "comments:doc-1", &[b"stale".to_vec()]).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_rga_values("comments:doc-1").await,
+            vec![b"fresh".to_vec()]
+        );
+        assert_eq!(
+            read_materialized_rga(&store, "comments:doc-1"),
+            vec![b"fresh".to_vec()]
         );
     }
 
@@ -4891,6 +5424,46 @@ mod tests {
         assert!(!state_b.contains("blue"));
         assert!(state_a.contains("red"));
         assert!(state_b.contains("red"));
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_rga_insert_delete_converge() {
+        let key = "comments:doc-1";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        let first_id = local_rga_insert_after(&handle_a, key, None, b"first").await;
+        wait_for_rga(&manager_a, key, &[b"first"]).await;
+        wait_for_rga(&manager_b, key, &[b"first"]).await;
+
+        let second_id =
+            local_rga_insert_after(&handle_b, key, Some(first_id.as_str()), b"second").await;
+        wait_for_rga(&manager_a, key, &[b"first", b"second"]).await;
+        wait_for_rga(&manager_b, key, &[b"first", b"second"]).await;
+
+        local_rga_delete(&handle_a, key, &first_id).await;
+        wait_for_rga(&manager_a, key, &[b"second"]).await;
+        wait_for_rga(&manager_b, key, &[b"second"]).await;
+        assert_eq!(
+            read_materialized_rga(&store_a, key),
+            vec![b"second".to_vec()]
+        );
+        assert_eq!(
+            read_materialized_rga(&store_b, key),
+            vec![b"second".to_vec()]
+        );
+
+        let state_a = read_durable_rga_state(&store_a, key);
+        let state_b = read_durable_rga_state(&store_b, key);
+        assert!(!state_a.contains(&first_id));
+        assert!(!state_b.contains(&first_id));
+        assert!(state_a.contains(&second_id));
+        assert!(state_b.contains(&second_id));
     }
 
     #[tokio::test]

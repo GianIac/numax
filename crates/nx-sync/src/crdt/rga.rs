@@ -179,7 +179,10 @@ impl Rga {
                 Some(parent) if self.elements.contains_key(parent) => Some(parent.clone()),
                 _ => None,
             };
-            children.entry(parent).or_default().push(element.id().clone());
+            children
+                .entry(parent)
+                .or_default()
+                .push(element.id().clone());
         }
 
         let mut ordered = Vec::new();
@@ -333,7 +336,10 @@ mod tests {
         let right = a.merged_with(&right_inner);
 
         assert_eq!(left, right);
-        assert_eq!(left.values(), vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(
+            left.values(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
     }
 
     #[test]

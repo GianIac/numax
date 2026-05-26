@@ -67,6 +67,15 @@ pub enum OpKind {
         element: String,
         observed_tags: Vec<String>,
     },
+    /// RGA insert.
+    RgaInsert {
+        key: String,
+        id: String,
+        parent: Option<String>,
+        value: Vec<u8>,
+    },
+    /// RGA delete.
+    RgaDelete { key: String, id: String },
 }
 
 /// A complete CRDT operation, ready to be sent/received.
@@ -226,6 +235,59 @@ impl Op {
                 key: key.into(),
                 element: element.into(),
                 observed_tags: observed_tags.into(),
+            },
+        }
+    }
+
+    /// Creates a new RgaInsert operation with an explicit element id.
+    pub fn rga_insert(
+        origin: NodeId,
+        key: impl Into<String>,
+        id: impl Into<String>,
+        parent: Option<impl Into<String>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::RgaInsert {
+                key: key.into(),
+                id: id.into(),
+                parent: parent.map(Into::into),
+                value: value.into(),
+            },
+        }
+    }
+
+    /// Creates a new RgaInsert operation using the generated OpId as element id.
+    pub fn rga_insert_with_op_id(
+        origin: NodeId,
+        key: impl Into<String>,
+        parent: Option<impl Into<String>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Self {
+        let id = OpId::generate();
+        let element_id = id.as_str().to_string();
+        Self {
+            id,
+            origin,
+            kind: OpKind::RgaInsert {
+                key: key.into(),
+                id: element_id,
+                parent: parent.map(Into::into),
+                value: value.into(),
+            },
+        }
+    }
+
+    /// Creates a new RgaDelete operation.
+    pub fn rga_delete(origin: NodeId, key: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::RgaDelete {
+                key: key.into(),
+                id: id.into(),
             },
         }
     }
@@ -433,6 +495,71 @@ mod tests {
     }
 
     #[test]
+    fn test_op_rga_insert() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_insert(
+            node.clone(),
+            "comments:doc-1",
+            "op-a",
+            Some("op-root"),
+            b"hello".to_vec(),
+        );
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::RgaInsert {
+                key,
+                id,
+                parent,
+                value,
+            } => {
+                assert_eq!(key, "comments:doc-1");
+                assert_eq!(id, "op-a");
+                assert_eq!(parent.as_deref(), Some("op-root"));
+                assert_eq!(value, b"hello");
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_rga_insert_with_op_id() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_insert_with_op_id(node.clone(), "comments:doc-1", None::<String>, b"a");
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::RgaInsert {
+                key,
+                id,
+                parent,
+                value,
+            } => {
+                assert_eq!(key, "comments:doc-1");
+                assert_eq!(id, op.id.as_str());
+                assert_eq!(parent, &None);
+                assert_eq!(value, b"a");
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_rga_delete() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_delete(node.clone(), "comments:doc-1", "op-a");
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::RgaDelete { key, id } => {
+                assert_eq!(key, "comments:doc-1");
+                assert_eq!(id, "op-a");
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_op_json_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::gcounter_increment(node, "counter:test", 42);
@@ -587,6 +714,56 @@ mod tests {
     fn test_op_orset_remove_bytes_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::orset_remove(node, "tags:item-1", "blue", vec!["add-tag-1".to_string()]);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_rga_insert_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_insert(
+            node,
+            "comments:doc-1",
+            "op-a",
+            Some("op-root"),
+            b"hello".to_vec(),
+        );
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_rga_insert_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_insert_with_op_id(node, "comments:doc-1", None::<String>, b"hello");
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_rga_delete_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_delete(node, "comments:doc-1", "op-a");
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_rga_delete_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::rga_delete(node, "comments:doc-1", "op-a");
 
         let bytes = op.to_bytes().unwrap();
         let parsed = Op::from_bytes(&bytes).unwrap();

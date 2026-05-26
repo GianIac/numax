@@ -56,12 +56,7 @@ unsafe extern "C" {
         value_ptr: u32,
         value_len: u32,
     ) -> i32;
-    pub fn crdt_lww_map_remove(
-        key_ptr: u32,
-        key_len: u32,
-        field_ptr: u32,
-        field_len: u32,
-    ) -> i32;
+    pub fn crdt_lww_map_remove(key_ptr: u32, key_len: u32, field_ptr: u32, field_len: u32) -> i32;
     pub fn crdt_lww_map_get(
         key_ptr: u32,
         key_len: u32,
@@ -70,12 +65,8 @@ unsafe extern "C" {
         out_ptr: u32,
         out_cap: u32,
     ) -> i32;
-    pub fn crdt_lww_map_contains(
-        key_ptr: u32,
-        key_len: u32,
-        field_ptr: u32,
-        field_len: u32,
-    ) -> i32;
+    pub fn crdt_lww_map_contains(key_ptr: u32, key_len: u32, field_ptr: u32, field_len: u32)
+    -> i32;
     pub fn crdt_lww_map_entries(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn crdt_orset_add(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32) -> i32;
     pub fn crdt_orset_remove(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32)
@@ -87,6 +78,18 @@ unsafe extern "C" {
         element_len: u32,
     ) -> i32;
     pub fn crdt_orset_elements(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn crdt_rga_insert(
+        key_ptr: u32,
+        key_len: u32,
+        parent_ptr: u32,
+        parent_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+        out_id_ptr: u32,
+        out_id_cap: u32,
+    ) -> i32;
+    pub fn crdt_rga_delete(key_ptr: u32, key_len: u32, id_ptr: u32, id_len: u32) -> i32;
+    pub fn crdt_rga_values(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
 
     // Time (namespace "nx")
     pub fn time_now() -> u64;

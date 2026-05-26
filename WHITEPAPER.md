@@ -424,7 +424,7 @@ pub fn merge(&mut self, other: &GCounter) {
 | LWW-Register | Last-writer-wins register | *Implemented* |
 | ORSet | Set with observed add/remove | *Implemented* |
 | LWW-Map | Map with LWW semantics | *Implemented* |
-| RGA | Replicated Growable Array (sequences) | *Planned* |
+| RGA | Replicated Growable Array (sequences) | *Implemented* |
 
 ### 5.4 Numax Net - Networking *(Implemented base, Prototype resilience)*
 
@@ -832,7 +832,7 @@ The compute is portable: the same `.wasm` module runs on an ARM gateway, on a cl
 
 **Problem.** Applications that must work without a connection (collaborative notes, distributed configurations, field applications, maritime/aerial/rural devices) and reconcile when they come back online, without imposing manual conflict resolution.
 
-**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet and LWW-Map available in Phase 14, the model already covers counters, statuses, observed-remove sets and replicated settings; RGA will extend it to ordered collaborative sequences.
+**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available in Phase 14, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
 
 The `distributed_chat` example (today in local-only mode) represents the skeleton of this use case.
 
@@ -875,7 +875,7 @@ v0.1.0-alpha.5 is a technical preview. We recognize its limits, explicitly:
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Minimal observability.** Structured logs, Prometheus-compatible metrics and health checks are available as an opt-in endpoint; richer dashboards and alerting remain outside the current preview.
 - **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. The current wire protocol is versioned (`PROTOCOL_VERSION = 2`) and supports bincode by default with JSON debug mode.
-- **Available CRDTs are still expanding.** GCounter, PNCounter, LWW-Register, ORSet and LWW-Map are implemented; RGA remains planned for ordered collaborative sequences.
+- **Available CRDTs are still expanding.** GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA are implemented; additional CRDT families remain future work.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
 - **Not optimized for CPU-bound workloads.** The focus is I/O and coordination, not intensive computation.
 - **Data models must be compatible with CRDTs.** Patterns based on locks or strong distributed transactions do not map directly.

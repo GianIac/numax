@@ -62,7 +62,9 @@ impl PNCounter {
             | OpKind::LwwMapSet { .. }
             | OpKind::LwwMapRemove { .. }
             | OpKind::ORSetAdd { .. }
-            | OpKind::ORSetRemove { .. } => Ok(false),
+            | OpKind::ORSetRemove { .. }
+            | OpKind::RgaInsert { .. }
+            | OpKind::RgaDelete { .. } => Ok(false),
         }
     }
 

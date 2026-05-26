@@ -79,12 +79,7 @@ impl LwwMap {
     }
 
     /// Removes a field if the tombstone wins the field-level LWW ordering.
-    pub fn remove(
-        &mut self,
-        field: impl Into<String>,
-        timestamp_ms: u64,
-        writer: NodeId,
-    ) -> bool {
+    pub fn remove(&mut self, field: impl Into<String>, timestamp_ms: u64, writer: NodeId) -> bool {
         let field = field.into();
         let candidate = LwwMapEntry::tombstone(timestamp_ms, writer);
         self.apply_entry(field, candidate)

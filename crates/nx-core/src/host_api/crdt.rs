@@ -1,12 +1,12 @@
 use anyhow::Result;
-use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 use crate::sync_manager::{
     persist_gcounter_state, persist_lww_map_state, persist_lww_register_state, persist_orset_state,
-    persist_pncounter_state,
+    persist_pncounter_state, persist_rga_state,
 };
 
 // error codes
@@ -20,6 +20,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
 const MAX_ELEMENT_LEN: u32 = 8 * 1024;
 const MAX_FIELD_LEN: u32 = 8 * 1024;
+const MAX_RGA_ID_LEN: u32 = 8 * 1024;
 const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB, aligned with db.rs
 const MAX_OUT_CAP: u32 = 1024 * 1024; // 1 MiB
 const U64_LEN: u32 = 8;
@@ -118,6 +119,20 @@ fn encode_string_list(values: &[String]) -> Result<Vec<u8>, i32> {
         let len = u32::try_from(bytes.len()).map_err(|_| ERR_INTERNAL)?;
         encoded.extend_from_slice(&len.to_le_bytes());
         encoded.extend_from_slice(bytes);
+    }
+
+    Ok(encoded)
+}
+
+fn encode_bytes_list(values: &[Vec<u8>]) -> Result<Vec<u8>, i32> {
+    let mut encoded = Vec::new();
+    let count = u32::try_from(values.len()).map_err(|_| ERR_INTERNAL)?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+
+    for value in values {
+        let len = u32::try_from(value.len()).map_err(|_| ERR_INTERNAL)?;
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(value);
     }
 
     Ok(encoded)
@@ -820,7 +835,9 @@ async fn crdt_lww_map_contains_impl(
     let contains = {
         let maps_arc = handle.lww_maps();
         let maps = maps_arc.read().await;
-        maps.get(&key).map(|map| map.contains(&field)).unwrap_or(false)
+        maps.get(&key)
+            .map(|map| map.contains(&field))
+            .unwrap_or(false)
     };
 
     i32::from(contains)
@@ -1130,6 +1147,246 @@ async fn crdt_orset_elements_impl(
     encoded.len() as i32
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RgaInsertArgs {
+    key_ptr: u32,
+    key_len: u32,
+    parent_ptr: u32,
+    parent_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+    out_id_ptr: u32,
+    out_id_cap: u32,
+}
+
+async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsertArgs) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_rga_insert: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if args.out_id_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_rga_insert: output capacity too large: {} (max {MAX_OUT_CAP})",
+            args.out_id_cap
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, args.key_ptr, args.key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let parent = if args.parent_len == 0 {
+        None
+    } else {
+        match read_utf8_arg(
+            &mut caller,
+            &memory,
+            args.parent_ptr,
+            args.parent_len,
+            MAX_RGA_ID_LEN,
+            "crdt_rga_insert",
+            "parent",
+        ) {
+            Ok(parent) => Some(parent),
+            Err(code) => return code,
+        }
+    };
+    let value = match read_value_bytes(
+        &mut caller,
+        &memory,
+        args.value_ptr,
+        args.value_len,
+        "crdt_rga_insert",
+    ) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_rga_insert: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let op = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        key.clone(),
+        parent.clone(),
+        value.clone(),
+    );
+    let element_id = match &op.kind {
+        OpKind::RgaInsert { id, .. } => id.clone(),
+        _ => {
+            handle.metrics().record_sync_error();
+            return ERR_INTERNAL;
+        }
+    };
+    let id_bytes = element_id.as_bytes();
+    if id_bytes.len() > args.out_id_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    {
+        let rgas_arc = handle.rgas();
+        let mut rgas = rgas_arc.write().await;
+        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
+        rga.insert(element_id.clone(), parent, value);
+        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
+            return ERR_INTERNAL;
+        }
+        rgas.insert(key, rga);
+    }
+
+    if let Err(e) = memory.write(&mut caller, args.out_id_ptr as usize, id_bytes) {
+        eprintln!("[nx-core] crdt_rga_insert: failed to write output id: {e}");
+        return ERR_INTERNAL;
+    }
+
+    tracing::debug!(op_id = %op.id, "queued local RGA insert");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    id_bytes.len() as i32
+}
+
+async fn crdt_rga_delete_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    id_ptr: u32,
+    id_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_rga_delete: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let id = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        id_ptr,
+        id_len,
+        MAX_RGA_ID_LEN,
+        "crdt_rga_delete",
+        "id",
+    ) {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_rga_delete: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    {
+        let rgas_arc = handle.rgas();
+        let mut rgas = rgas_arc.write().await;
+        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
+        rga.delete(id.clone());
+        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_rga_delete: failed to persist sequence");
+            return ERR_INTERNAL;
+        }
+        rgas.insert(key.clone(), rga);
+    }
+
+    let op = Op::rga_delete(handle.node_id().clone(), key, id);
+    tracing::debug!(op_id = %op.id, "queued local RGA delete");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_rga_values_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_rga_values: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_rga_values: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let values = {
+        let rgas_arc = handle.rgas();
+        let rgas = rgas_arc.read().await;
+        rgas.get(&key).map(|rga| rga.values()).unwrap_or_default()
+    };
+    let encoded = match encode_bytes_list(&values) {
+        Ok(encoded) => encoded,
+        Err(code) => return code,
+    };
+
+    if encoded.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &encoded) {
+        eprintln!("[nx-core] crdt_rga_values: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    encoded.len() as i32
+}
+
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap_async(
         "nx",
@@ -1319,6 +1576,58 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>,
          (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(crdt_orset_elements_impl(
+                caller, key_ptr, key_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_rga_insert",
+        |caller: Caller<'_, HostState>,
+         (
+            key_ptr,
+            key_len,
+            parent_ptr,
+            parent_len,
+            value_ptr,
+            value_len,
+            out_id_ptr,
+            out_id_cap,
+        ): (u32, u32, u32, u32, u32, u32, u32, u32)| {
+            Box::new(crdt_rga_insert_impl(
+                caller,
+                RgaInsertArgs {
+                    key_ptr,
+                    key_len,
+                    parent_ptr,
+                    parent_len,
+                    value_ptr,
+                    value_len,
+                    out_id_ptr,
+                    out_id_cap,
+                },
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_rga_delete",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, id_ptr, id_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_rga_delete_impl(
+                caller, key_ptr, key_len, id_ptr, id_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_rga_values",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+            Box::new(crdt_rga_values_impl(
                 caller, key_ptr, key_len, out_ptr, out_cap,
             ))
         },

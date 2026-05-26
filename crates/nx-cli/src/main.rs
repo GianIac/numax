@@ -64,6 +64,10 @@ enum Cli {
         #[arg(long, value_name = "KEY")]
         print_orset: Option<String>,
 
+        /// Print the final visible values of an RGA after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_rga: Option<String>,
+
         /// Maximum time allowed for shutdown before returning an error.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         shutdown_timeout: Option<Duration>,
@@ -139,6 +143,7 @@ async fn real_main() -> Result<()> {
             print_lww_register,
             print_lww_map,
             print_orset,
+            print_rga,
             shutdown_timeout,
             verbose,
             log_level,
@@ -182,6 +187,7 @@ async fn real_main() -> Result<()> {
             validate_print_lww_register(&sync, &print_lww_register)?;
             validate_print_lww_map(&sync, &print_lww_map)?;
             validate_print_orset(&sync, &print_orset)?;
+            validate_print_rga(&sync, &print_rga)?;
             let observability = build_observability_config(
                 observability_listen,
                 file_config.observability.as_ref(),
@@ -252,9 +258,7 @@ async fn real_main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--print-lww-map requires sync"))?;
                     let formatted = entries
                         .iter()
-                        .map(|(field, value)| {
-                            format!("{field}={}", String::from_utf8_lossy(value))
-                        })
+                        .map(|(field, value)| format!("{field}={}", String::from_utf8_lossy(value)))
                         .collect::<Vec<_>>()
                         .join(", ");
                     println!("{key} = {{{formatted}}}");
@@ -265,6 +269,18 @@ async fn real_main() -> Result<()> {
                         .await
                         .ok_or_else(|| anyhow::anyhow!("--print-orset requires sync"))?;
                     println!("{key} = [{}]", elements.join(", "));
+                }
+                if let Some(key) = print_rga {
+                    let values = rt
+                        .get_rga_values(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-rga requires sync"))?;
+                    let formatted = values
+                        .iter()
+                        .map(|value| String::from_utf8_lossy(value).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("{key} = [{formatted}]");
                 }
                 Ok(())
             }
@@ -560,6 +576,14 @@ fn validate_print_lww_map(sync: &Option<SyncConfig>, print_lww_map: &Option<Stri
 fn validate_print_orset(sync: &Option<SyncConfig>, print_orset: &Option<String>) -> Result<()> {
     if print_orset.is_some() && sync.is_none() {
         bail!("--print-orset requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_rga(sync: &Option<SyncConfig>, print_rga: &Option<String>) -> Result<()> {
+    if print_rga.is_some() && sync.is_none() {
+        bail!("--print-rga requires sync to be enabled with --listen");
     }
 
     Ok(())
@@ -1039,6 +1063,20 @@ mod tests {
             let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
             assert!(validate_print_orset(&sync, &Some("tags:doc-1".to_string())).is_ok());
         }
+
+        #[test]
+        fn print_rga_without_sync_fails() {
+            let err = validate_print_rga(&None, &Some("comments:doc-1".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-rga requires sync"));
+        }
+
+        #[test]
+        fn print_rga_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_rga(&sync, &Some("comments:doc-1".to_string())).is_ok());
+        }
     }
 
     // build_tls_config
@@ -1446,6 +1484,17 @@ mod tests {
             match cli {
                 Cli::Run { print_orset, .. } => {
                     assert_eq!(print_orset.as_deref(), Some("tags:doc-1"));
+                }
+            }
+        }
+
+        #[test]
+        fn print_rga_parsed() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--print-rga", "comments:doc-1"])
+                .unwrap();
+            match cli {
+                Cli::Run { print_rga, .. } => {
+                    assert_eq!(print_rga.as_deref(), Some("comments:doc-1"));
                 }
             }
         }

@@ -309,7 +309,7 @@ A CRDT host API is considered complete only when it has:
 | LWW-Register | `crdt_lww_set`, `crdt_lww_get` | Implemented |
 | ORSet | `crdt_orset_add`, `crdt_orset_remove`, `crdt_orset_contains`, `crdt_orset_elements` | Implemented |
 | LWW-Map | `crdt_lww_map_set`, `crdt_lww_map_remove`, `crdt_lww_map_get`, `crdt_lww_map_contains`, `crdt_lww_map_entries` | Implemented |
-| RGA | TBD | Planned, Phase 14 |
+| RGA | `crdt_rga_insert`, `crdt_rga_delete`, `crdt_rga_values` | Implemented |
 
 ### GCounter
 
@@ -707,17 +707,104 @@ use nx_sdk::crdt::orset;
 let tags = orset::elements("tags:item-1")?;
 ```
 
-### Future CRDT Documentation Slots
+### RGA
 
-The following sections should be expanded as each CRDT lands.
+An RGA stores an ordered sequence of byte values per key. Inserts create stable
+element ids and optionally point at a parent element id. Deletes tombstone an
+element id, so children inserted after a deleted element remain visible and
+ordered.
 
-| CRDT | Suggested Example | Notes |
-|------|-------------------|-------|
-| PNCounter | `examples/distributed_inventory` | Implemented |
-| LWW-Register | `examples/distributed_status` | Implemented |
-| ORSet | `examples/distributed_tags` | Implemented |
-| LWW-Map | `examples/distributed_settings` | Implemented |
-| RGA | `examples/distributed_comments` | Ordered sequence, likely last |
+Use it for ordered comments, collaborative text/list building blocks, workflow
+logs, or any append/insert-after sequence that must converge without
+coordination.
+
+#### `crdt_rga_insert`
+
+```text
+fn crdt_rga_insert(
+    key_ptr: u32,
+    key_len: u32,
+    parent_ptr: u32,
+    parent_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+    out_id_ptr: u32,
+    out_id_cap: u32
+) -> i32
+```
+
+Inserts `value` after `parent`. Use `parent_len = 0` to insert at the head. The
+host generates the element id from the local `OpId`, writes it to `out_id_ptr`,
+and returns the number of id bytes written.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::rga;
+
+let id = rga::insert_after("comments:doc-1", None, b"first comment")?;
+let reply_id = rga::insert_after("comments:doc-1", Some(&id), b"reply")?;
+```
+
+#### `crdt_rga_delete`
+
+```text
+fn crdt_rga_delete(
+    key_ptr: u32,
+    key_len: u32,
+    id_ptr: u32,
+    id_len: u32
+) -> i32
+```
+
+Tombstones the element identified by `id` and returns `0` on success.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::rga;
+
+rga::delete("comments:doc-1", &reply_id)?;
+```
+
+#### `crdt_rga_values`
+
+```text
+fn crdt_rga_values(
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes visible values in deterministic sequence order and returns the number of
+bytes written. Tombstoned elements are not returned. The raw output encoding is:
+
+```text
+u32 value_count
+repeat value_count times:
+  u32 value_len
+  u8[value_len] value
+```
+
+SDK:
+
+```rust
+use nx_sdk::crdt::rga;
+
+let comments = rga::values("comments:doc-1")?;
+```
+
+### Distributed CRDT Examples
+
+| CRDT | Example | Notes |
+|------|---------|-------|
+| PNCounter | `examples/distributed_inventory` | Increment/decrement inventory |
+| LWW-Register | `examples/distributed_status` | Single status value |
+| ORSet | `examples/distributed_tags` | Observed-remove tags |
+| LWW-Map | `examples/distributed_settings` | Per-field settings |
+| RGA | `examples/distributed_comments` | Ordered comments |
 
 ---
 

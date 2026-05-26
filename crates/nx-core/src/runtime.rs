@@ -266,6 +266,12 @@ impl Runtime {
         Some(manager.get_lww_map_entries(key).await)
     }
 
+    /// Return the visible values of an RGA, if sync is enabled.
+    pub async fn get_rga_values(&self, key: &str) -> Option<Vec<Vec<u8>>> {
+        let manager = self.sync_manager.as_ref()?;
+        Some(manager.get_rga_values(key).await)
+    }
+
     /// Keep the runtime alive while sync background tasks do their work.
     pub async fn serve(&self) -> Result<()> {
         let _ = self
