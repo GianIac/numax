@@ -1983,6 +1983,7 @@ fn apply_remote_op_to_counter_updates(
         OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
             apply_remote_pncounter_op(op, key, pncounters, pncounter_updates);
         }
+        OpKind::LwwRegisterSet { .. } => {}
     }
 }
 

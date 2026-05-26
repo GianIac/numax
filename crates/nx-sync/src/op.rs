@@ -36,6 +36,12 @@ pub enum OpKind {
     PNCounterIncrement { key: String, increment: u64 },
     /// PNCounter negative-side increment.
     PNCounterDecrement { key: String, decrement: u64 },
+    /// LWW-Register assignment.
+    LwwRegisterSet {
+        key: String,
+        value: Vec<u8>,
+        timestamp_ms: u64,
+    },
 }
 
 /// A complete CRDT operation, ready to be sent/received.
@@ -84,6 +90,24 @@ impl Op {
             kind: OpKind::PNCounterDecrement {
                 key: key.into(),
                 decrement,
+            },
+        }
+    }
+
+    /// Creates a new LwwRegisterSet operation.
+    pub fn lww_register_set(
+        origin: NodeId,
+        key: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::LwwRegisterSet {
+                key: key.into(),
+                value: value.into(),
+                timestamp_ms,
             },
         }
     }
@@ -170,6 +194,26 @@ mod tests {
     }
 
     #[test]
+    fn test_op_lww_register_set() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_register_set(node.clone(), "status:user-1", b"online".to_vec(), 123);
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::LwwRegisterSet {
+                key,
+                value,
+                timestamp_ms,
+            } => {
+                assert_eq!(key, "status:user-1");
+                assert_eq!(value, b"online");
+                assert_eq!(*timestamp_ms, 123);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_op_json_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::gcounter_increment(node, "counter:test", 42);
@@ -209,6 +253,28 @@ mod tests {
     fn test_op_pncounter_bytes_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::pncounter_increment(node, "stock:sku-1", 11);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_register_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_register_set(node, "status:user-1", b"away".to_vec(), 456);
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_register_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_register_set(node, "status:user-1", b"busy".to_vec(), 789);
 
         let bytes = op.to_bytes().unwrap();
         let parsed = Op::from_bytes(&bytes).unwrap();
