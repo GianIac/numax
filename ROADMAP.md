@@ -422,7 +422,7 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 **LWW-Register progress**:
 - [x] CRDT implementation in `nx-sync` with deterministic conflict ordering
 - [x] `OpKind` variants and operation constructors
-- [ ] durable state/op-log integration in `nx-core`
+- [x] durable state/op-log integration in `nx-core`
 - [ ] host API + SDK wrapper
 - [ ] SyncManager E2E coverage
 - [ ] distributed example with README

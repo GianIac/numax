@@ -7,7 +7,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, NodeId, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwRegister, NodeId, Op, OpKind, PNCounter};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -22,6 +22,8 @@ const GCOUNTER_STORE_PREFIX: &str = "__nx/crdt/gcounter/";
 const GCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/gcounter/";
 const PNCOUNTER_STORE_PREFIX: &str = "__nx/crdt/pncounter/";
 const PNCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/pncounter/";
+const LWW_REGISTER_STORE_PREFIX: &str = "__nx/crdt/lww-register/";
+const LWW_REGISTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/lww-register/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
 const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
@@ -35,6 +37,7 @@ enum CrdtStoreNamespace {
 enum CrdtKind {
     GCounter,
     PNCounter,
+    LwwRegister,
 }
 
 impl CrdtKind {
@@ -42,6 +45,7 @@ impl CrdtKind {
         match self {
             Self::GCounter => "GCounter",
             Self::PNCounter => "PNCounter",
+            Self::LwwRegister => "LWW-Register",
         }
     }
 
@@ -51,6 +55,8 @@ impl CrdtKind {
             (Self::GCounter, CrdtStoreNamespace::State) => GCOUNTER_STATE_STORE_PREFIX,
             (Self::PNCounter, CrdtStoreNamespace::Materialized) => PNCOUNTER_STORE_PREFIX,
             (Self::PNCounter, CrdtStoreNamespace::State) => PNCOUNTER_STATE_STORE_PREFIX,
+            (Self::LwwRegister, CrdtStoreNamespace::Materialized) => LWW_REGISTER_STORE_PREFIX,
+            (Self::LwwRegister, CrdtStoreNamespace::State) => LWW_REGISTER_STATE_STORE_PREFIX,
         }
     }
 }
@@ -165,6 +171,7 @@ struct BroadcastLoopContext {
 struct RemoteOpApplyContext<'a> {
     counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
+    lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
     op_log: &'a Arc<RwLock<Vec<Op>>>,
@@ -186,6 +193,7 @@ struct OpPersistencePlan {
 struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
+    lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
@@ -250,6 +258,7 @@ pub struct SyncHandle {
     op_tx: mpsc::Sender<Op>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
+    lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
@@ -274,6 +283,11 @@ impl SyncHandle {
     /// Read-side handle over the PNCounter registry.
     pub fn pncounters(&self) -> Arc<RwLock<HashMap<String, PNCounter>>> {
         Arc::clone(&self.pncounters)
+    }
+
+    /// Read-side handle over the LWW-Register registry.
+    pub fn lww_registers(&self) -> Arc<RwLock<HashMap<String, LwwRegister>>> {
+        Arc::clone(&self.lww_registers)
     }
 
     /// Shared datastore used to materialize CRDT values.
@@ -314,6 +328,9 @@ pub struct SyncManager {
 
     /// PNCounter
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
+
+    /// LWW-Register
+    lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
 
     /// Store used to materialize replicated values.
     store: Arc<NxStore>,
@@ -378,6 +395,7 @@ impl SyncManager {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut counters = HashMap::new();
         let mut pncounters = HashMap::new();
+        let mut lww_registers = HashMap::new();
         let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
             Ok(hydrated) => hydrated,
             Err(e) => {
@@ -405,8 +423,12 @@ impl SyncManager {
         if let Err(e) = hydrate_pncounter_registry(&store, &node_id, &mut pncounters) {
             warn!(error = %e, "failed to hydrate PNCounter registry");
         }
+        if let Err(e) = hydrate_lww_register_registry(&store, &mut lww_registers) {
+            warn!(error = %e, "failed to hydrate LWW-Register registry");
+        }
         let counters = Arc::new(RwLock::new(counters));
         let pncounters = Arc::new(RwLock::new(pncounters));
+        let lww_registers = Arc::new(RwLock::new(lww_registers));
 
         Self {
             node_id,
@@ -414,6 +436,7 @@ impl SyncManager {
             node: None,
             counters,
             pncounters,
+            lww_registers,
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(seen_ops)),
@@ -455,6 +478,7 @@ impl SyncManager {
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
+            lww_registers: Arc::clone(&self.lww_registers),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             peer_node_ids: Arc::clone(&self.peer_node_ids),
@@ -515,6 +539,7 @@ impl SyncManager {
         let event_context = NodeEventContext {
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
+            lww_registers: Arc::clone(&self.lww_registers),
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
@@ -654,6 +679,12 @@ impl SyncManager {
     pub async fn get_pncounter_value(&self, key: &str) -> i64 {
         let pncounters = self.pncounters.read().await;
         pncounters.get(key).map(|c| c.value()).unwrap_or(0)
+    }
+
+    /// Returns the current value of an LWW-Register.
+    pub async fn get_lww_register_value(&self, key: &str) -> Option<Vec<u8>> {
+        let registers = self.lww_registers.read().await;
+        registers.get(key).map(|register| register.value_bytes())
     }
 
     /// Gracefully stop sync tasks and close network connections.
@@ -1182,6 +1213,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
             let apply_context = RemoteOpApplyContext {
                 counters: &context.counters,
                 pncounters: &context.pncounters,
+                lww_registers: &context.lww_registers,
                 seen_ops: &context.seen_ops,
                 seen_ops_next_sequence: &context.seen_ops_next_sequence,
                 op_log: &context.op_log,
@@ -1267,6 +1299,14 @@ fn durable_pncounter_state_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::PNCounter, CrdtStoreNamespace::State, key)
 }
 
+pub(crate) fn materialized_lww_register_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::LwwRegister, CrdtStoreNamespace::Materialized, key)
+}
+
+fn durable_lww_register_state_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::LwwRegister, CrdtStoreNamespace::State, key)
+}
+
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
     prefixed_store_key(SEEN_OP_STORE_PREFIX, op_id)
 }
@@ -1308,6 +1348,10 @@ fn logical_pncounter_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_pncounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     logical_crdt_key(store_key, CrdtKind::PNCounter, CrdtStoreNamespace::State)
+}
+
+fn logical_lww_register_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(store_key, CrdtKind::LwwRegister, CrdtStoreNamespace::State)
 }
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1429,6 +1473,20 @@ fn hydrate_pncounter_registry(
         "hydrated PNCounter registry from sled"
     );
     Ok(counters.len())
+}
+
+fn hydrate_lww_register_registry(
+    store: &NxStore,
+    registers: &mut HashMap<String, LwwRegister>,
+) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_lww_register_state(store, registers)?;
+
+    debug!(
+        durable_count,
+        total = registers.len(),
+        "hydrated LWW-Register registry from sled"
+    );
+    Ok(registers.len())
 }
 
 fn hydrate_seen_ops(store: &NxStore, limit: usize) -> anyhow::Result<(SeenOps, u64)> {
@@ -1585,6 +1643,37 @@ fn hydrate_durable_pncounter_state(
     Ok(hydrated)
 }
 
+fn hydrate_durable_lww_register_state(
+    store: &NxStore,
+    registers: &mut HashMap<String, LwwRegister>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(LWW_REGISTER_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_lww_register_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable LWW-Register state key");
+                continue;
+            }
+        };
+        let register = match parse_durable_lww_register_state(&value_bytes) {
+            Ok(register) => register,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable LWW-Register state");
+                continue;
+            }
+        };
+
+        materialize_lww_register_value(store, &key, register.value())?;
+        registers.insert(key, register);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 fn hydrate_materialized_gcounter_values(
     store: &NxStore,
     node_id: &NodeId,
@@ -1681,6 +1770,16 @@ pub(crate) fn materialize_pncounter_value(
     Ok(())
 }
 
+pub(crate) fn materialize_lww_register_value(
+    store: &NxStore,
+    key: &str,
+    value: &[u8],
+) -> anyhow::Result<()> {
+    let store_key = materialized_lww_register_key(key);
+    store.set(&store_key, value)?;
+    Ok(())
+}
+
 fn parse_durable_gcounter_state(bytes: &[u8]) -> anyhow::Result<GCounter> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable GCounter state: {e}"))?;
@@ -1691,6 +1790,13 @@ fn parse_durable_pncounter_state(bytes: &[u8]) -> anyhow::Result<PNCounter> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable PNCounter state: {e}"))?;
     PNCounter::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable PNCounter JSON: {e}"))
+}
+
+fn parse_durable_lww_register_state(bytes: &[u8]) -> anyhow::Result<LwwRegister> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable LWW-Register state: {e}"))?;
+    LwwRegister::from_json(json)
+        .map_err(|e| anyhow::anyhow!("invalid durable LWW-Register JSON: {e}"))
 }
 
 pub(crate) fn persist_gcounter_state(
@@ -1714,6 +1820,19 @@ pub(crate) fn persist_pncounter_state(
     let state_json = counter.to_json()?;
     store.set(&store_key, state_json.as_bytes())?;
     materialize_pncounter_value(store, key, counter.value())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn persist_lww_register_state(
+    store: &NxStore,
+    key: &str,
+    register: &LwwRegister,
+) -> anyhow::Result<()> {
+    let store_key = durable_lww_register_state_key(key);
+    let state_json = register.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_lww_register_value(store, key, register.value())?;
     Ok(())
 }
 
@@ -1824,6 +1943,7 @@ fn persist_remote_ops_batch(
     plans: &[OpPersistencePlan],
     counter_updates: &HashMap<String, GCounter>,
     pncounter_updates: &HashMap<String, PNCounter>,
+    lww_register_updates: &HashMap<String, LwwRegister>,
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1856,6 +1976,19 @@ fn persist_remote_ops_batch(
         set_values.push(counter.to_json()?.into_bytes());
         set_keys.push(materialized_pncounter_key(key));
         set_values.push(counter.value().to_le_bytes().to_vec());
+    }
+
+    let mut changed_lww_register_keys = lww_register_updates.keys().collect::<Vec<_>>();
+    changed_lww_register_keys.sort();
+
+    for key in changed_lww_register_keys {
+        let Some(register) = lww_register_updates.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_lww_register_state_key(key));
+        set_values.push(register.to_json()?.into_bytes());
+        set_keys.push(materialized_lww_register_key(key));
+        set_values.push(register.value_bytes());
     }
 
     for plan in plans {
@@ -1891,6 +2024,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut log = context.op_log.write().await;
     let mut counters = context.counters.write().await;
     let mut pncounters = context.pncounters.write().await;
+    let mut lww_registers = context.lww_registers.write().await;
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
     let mut inserted_ids = Vec::new();
@@ -1898,6 +2032,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut plans = Vec::new();
     let mut counter_updates = HashMap::new();
     let mut pncounter_updates = HashMap::new();
+    let mut lww_register_updates = HashMap::new();
 
     for op in ops {
         let op_id = op.id.as_str();
@@ -1912,6 +2047,8 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             &mut counter_updates,
             &pncounters,
             &mut pncounter_updates,
+            &lww_registers,
+            &mut lww_register_updates,
         );
 
         inserted_ids.push(op_id.to_string());
@@ -1942,7 +2079,13 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
         next_op_log_sequence = next_op_log_sequence.saturating_add(1);
     }
 
-    persist_remote_ops_batch(context.store, &plans, &counter_updates, &pncounter_updates)?;
+    persist_remote_ops_batch(
+        context.store,
+        &plans,
+        &counter_updates,
+        &pncounter_updates,
+        &lww_register_updates,
+    )?;
 
     let applied_count = plans.len() as u64;
     apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
@@ -1953,6 +2096,9 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     }
     for (key, counter) in pncounter_updates {
         pncounters.insert(key, counter);
+    }
+    for (key, register) in lww_register_updates {
+        lww_registers.insert(key, register);
     }
     context
         .seen_ops_next_sequence
@@ -1975,6 +2121,8 @@ fn apply_remote_op_to_counter_updates(
     counter_updates: &mut HashMap<String, GCounter>,
     pncounters: &HashMap<String, PNCounter>,
     pncounter_updates: &mut HashMap<String, PNCounter>,
+    lww_registers: &HashMap<String, LwwRegister>,
+    lww_register_updates: &mut HashMap<String, LwwRegister>,
 ) {
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
@@ -1983,7 +2131,20 @@ fn apply_remote_op_to_counter_updates(
         OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
             apply_remote_pncounter_op(op, key, pncounters, pncounter_updates);
         }
-        OpKind::LwwRegisterSet { .. } => {}
+        OpKind::LwwRegisterSet {
+            key,
+            value,
+            timestamp_ms,
+        } => {
+            apply_remote_lww_register_set(
+                op,
+                key,
+                value,
+                *timestamp_ms,
+                lww_registers,
+                lww_register_updates,
+            );
+        }
     }
 }
 
@@ -2010,6 +2171,33 @@ fn apply_remote_pncounter_op(
         .entry(key.to_string())
         .or_insert_with(|| counters.get(key).cloned().unwrap_or_else(PNCounter::new));
     let _ = counter.apply_op(op);
+}
+
+fn apply_remote_lww_register_set(
+    op: &Op,
+    key: &str,
+    value: &[u8],
+    timestamp_ms: u64,
+    registers: &HashMap<String, LwwRegister>,
+    register_updates: &mut HashMap<String, LwwRegister>,
+) {
+    if let Some(register) = register_updates.get_mut(key) {
+        register.assign(value.to_vec(), timestamp_ms, op.origin.clone());
+        return;
+    }
+
+    let Some(existing) = registers.get(key) else {
+        register_updates.insert(
+            key.to_string(),
+            LwwRegister::new(value.to_vec(), timestamp_ms, op.origin.clone()),
+        );
+        return;
+    };
+
+    let mut register = existing.clone();
+    if register.assign(value.to_vec(), timestamp_ms, op.origin.clone()) {
+        register_updates.insert(key.to_string(), register);
+    }
 }
 
 #[cfg(test)]
@@ -2067,6 +2255,17 @@ mod tests {
         parse_durable_pncounter_state(&bytes).unwrap()
     }
 
+    fn read_materialized_lww_register(store: &NxStore, key: &str) -> Vec<u8> {
+        let key = materialized_lww_register_key(key);
+        store.get(&key).unwrap().unwrap()
+    }
+
+    fn read_durable_lww_register_state(store: &NxStore, key: &str) -> LwwRegister {
+        let key = durable_lww_register_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_lww_register_state(&bytes).unwrap()
+    }
+
     fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
         store.get(&seen_op_store_key(op_id)).unwrap().is_some()
     }
@@ -2088,6 +2287,7 @@ mod tests {
         NodeEventContext {
             counters,
             pncounters: Arc::new(RwLock::new(HashMap::new())),
+            lww_registers: Arc::new(RwLock::new(HashMap::new())),
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
@@ -2116,10 +2316,12 @@ mod tests {
         store: &Arc<NxStore>,
     ) {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters,
             pncounters: &pncounters,
+            lww_registers: &lww_registers,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2143,10 +2345,41 @@ mod tests {
         store: &Arc<NxStore>,
     ) {
         let counters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters,
+            lww_registers: &lww_registers,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_next_sequence,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_remote_lww_register_op_for_test(
+        op: &Op,
+        registers: &Arc<RwLock<HashMap<String, LwwRegister>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
+        store: &Arc<NxStore>,
+    ) {
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters: &counters,
+            pncounters: &pncounters,
+            lww_registers: registers,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2401,6 +2634,44 @@ mod tests {
             )
             .unwrap(),
             "stock:sku-1"
+        );
+
+        let lww_materialized = crdt_store_key(
+            CrdtKind::LwwRegister,
+            CrdtStoreNamespace::Materialized,
+            "status:user-1",
+        );
+        let lww_durable_state = crdt_store_key(
+            CrdtKind::LwwRegister,
+            CrdtStoreNamespace::State,
+            "status:user-1",
+        );
+
+        assert_eq!(
+            lww_materialized,
+            materialized_lww_register_key("status:user-1")
+        );
+        assert_eq!(
+            lww_durable_state,
+            durable_lww_register_state_key("status:user-1")
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &lww_materialized,
+                CrdtKind::LwwRegister,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "status:user-1"
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &lww_durable_state,
+                CrdtKind::LwwRegister,
+                CrdtStoreNamespace::State
+            )
+            .unwrap(),
+            "status:user-1"
         );
     }
 
@@ -2918,6 +3189,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_remote_lww_register_set_materializes_value() {
+        let store = temp_store();
+        let registers = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let origin = NodeId::new("remote-a");
+        let op = Op::lww_register_set(origin.clone(), "status:user-1", b"online".to_vec(), 100);
+
+        apply_remote_lww_register_op_for_test(
+            &op,
+            &registers,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            read_materialized_lww_register(&store, "status:user-1"),
+            b"online".to_vec()
+        );
+        let state = read_durable_lww_register_state(&store, "status:user-1");
+        assert_eq!(state.value(), b"online");
+        assert_eq!(state.timestamp_ms(), 100);
+        assert_eq!(state.writer(), &origin);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_lww_register_older_set_does_not_overwrite() {
+        let store = temp_store();
+        let registers = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let newer = Op::lww_register_set(
+            NodeId::new("remote-a"),
+            "status:user-1",
+            b"online".to_vec(),
+            200,
+        );
+        let older = Op::lww_register_set(
+            NodeId::new("remote-b"),
+            "status:user-1",
+            b"away".to_vec(),
+            100,
+        );
+
+        apply_remote_lww_register_op_for_test(
+            &newer,
+            &registers,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_lww_register_op_for_test(
+            &older,
+            &registers,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            read_materialized_lww_register(&store, "status:user-1"),
+            b"online".to_vec()
+        );
+        let state = read_durable_lww_register_state(&store, "status:user-1");
+        assert_eq!(state.value(), b"online");
+        assert_eq!(state.timestamp_ms(), 200);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_lww_register_duplicate_does_not_double_apply() {
+        let store = temp_store();
+        let registers = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::lww_register_set(
+            NodeId::new("remote-a"),
+            "status:user-1",
+            b"online".to_vec(),
+            100,
+        );
+
+        apply_remote_lww_register_op_for_test(
+            &op,
+            &registers,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_lww_register_op_for_test(
+            &op,
+            &registers,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(op_log.read().await.len(), 1);
+        assert_eq!(
+            read_materialized_lww_register(&store, "status:user-1"),
+            b"online".to_vec()
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_remote_op_after_restart_does_not_double_count() {
         let store = temp_store();
         let origin = NodeId::new("remote-a");
@@ -3030,6 +3427,64 @@ mod tests {
         let hydrated = pncounters.get("stock:sku-1").unwrap();
         assert_eq!(hydrated.positive_for(&node_a), 8);
         assert_eq!(hydrated.negative_for(&node_b), 11);
+    }
+
+    #[tokio::test]
+    async fn manager_hydrates_lww_register_registry_from_durable_state() {
+        let store = temp_store();
+        let writer = NodeId::new("node-a");
+        let register = LwwRegister::new(b"online".to_vec(), 123, writer.clone());
+
+        persist_lww_register_state(&store, "status:user-1", &register).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager
+                .get_lww_register_value("status:user-1")
+                .await
+                .unwrap(),
+            b"online".to_vec()
+        );
+
+        let registers = manager.lww_registers.read().await;
+        let hydrated = registers.get("status:user-1").unwrap();
+        assert_eq!(hydrated.value(), b"online");
+        assert_eq!(hydrated.timestamp_ms(), 123);
+        assert_eq!(hydrated.writer(), &writer);
+    }
+
+    #[tokio::test]
+    async fn durable_lww_register_state_takes_precedence_over_materialized_value() {
+        let store = temp_store();
+        let register = LwwRegister::new(b"online".to_vec(), 123, NodeId::new("node-a"));
+
+        persist_lww_register_state(&store, "status:user-1", &register).unwrap();
+        materialize_lww_register_value(&store, "status:user-1", b"stale").unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager
+                .get_lww_register_value("status:user-1")
+                .await
+                .unwrap(),
+            b"online".to_vec()
+        );
+        assert_eq!(
+            read_materialized_lww_register(&store, "status:user-1"),
+            b"online".to_vec()
+        );
     }
 
     #[tokio::test]
