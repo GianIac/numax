@@ -423,7 +423,7 @@ The following sections should be expanded as each CRDT lands.
 
 | CRDT | Suggested Example | Notes |
 |------|-------------------|-------|
-| PNCounter | `examples/distributed_inventory` | First Phase 14 target |
+| PNCounter | `examples/distributed_inventory` | Implemented |
 | LWW-Register | `examples/distributed_status` | Requires timestamp/conflict policy docs |
 | ORSet | `examples/distributed_tags` | Requires add/remove tag semantics |
 | LWW-Map | `examples/distributed_settings` | Likely builds on LWW-Register |

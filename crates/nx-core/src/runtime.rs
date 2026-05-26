@@ -242,6 +242,12 @@ impl Runtime {
         Some(manager.get_counter_value(key).await)
     }
 
+    /// Return the current value of a PNCounter, if sync is enabled.
+    pub async fn get_pncounter_value(&self, key: &str) -> Option<i64> {
+        let manager = self.sync_manager.as_ref()?;
+        Some(manager.get_pncounter_value(key).await)
+    }
+
     /// Keep the runtime alive while sync background tasks do their work.
     pub async fn serve(&self) -> Result<()> {
         let _ = self

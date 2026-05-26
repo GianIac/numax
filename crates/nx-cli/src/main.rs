@@ -48,6 +48,10 @@ enum Cli {
         #[arg(long, value_name = "KEY")]
         print_gcounter: Option<String>,
 
+        /// Print the final value of a PNCounter after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_pncounter: Option<String>,
+
         /// Maximum time allowed for shutdown before returning an error.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         shutdown_timeout: Option<Duration>,
@@ -119,6 +123,7 @@ async fn real_main() -> Result<()> {
             settle_for,
             wait_before_run,
             print_gcounter,
+            print_pncounter,
             shutdown_timeout,
             verbose,
             log_level,
@@ -158,6 +163,7 @@ async fn real_main() -> Result<()> {
             validate_settle_mode(&sync, settle_for)?;
             validate_wait_before_run(&sync, wait_before_run)?;
             validate_print_gcounter(&sync, &print_gcounter)?;
+            validate_print_pncounter(&sync, &print_pncounter)?;
             let observability = build_observability_config(
                 observability_listen,
                 file_config.observability.as_ref(),
@@ -202,6 +208,13 @@ async fn real_main() -> Result<()> {
                         .get_counter_value(&key)
                         .await
                         .ok_or_else(|| anyhow::anyhow!("--print-gcounter requires sync"))?;
+                    println!("{key} = {value}");
+                }
+                if let Some(key) = print_pncounter {
+                    let value = rt
+                        .get_pncounter_value(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-pncounter requires sync"))?;
                     println!("{key} = {value}");
                 }
                 Ok(())
@@ -460,6 +473,17 @@ fn validate_print_gcounter(
 ) -> Result<()> {
     if print_gcounter.is_some() && sync.is_none() {
         bail!("--print-gcounter requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_pncounter(
+    sync: &Option<SyncConfig>,
+    print_pncounter: &Option<String>,
+) -> Result<()> {
+    if print_pncounter.is_some() && sync.is_none() {
+        bail!("--print-pncounter requires sync to be enabled with --listen");
     }
 
     Ok(())
@@ -869,7 +893,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn print_without_sync_fails() {
+        fn print_gcounter_without_sync_fails() {
             let err = validate_print_gcounter(&None, &Some("counter:visits".to_string()))
                 .unwrap_err()
                 .to_string();
@@ -877,9 +901,23 @@ mod tests {
         }
 
         #[test]
-        fn print_with_sync_is_ok() {
+        fn print_gcounter_with_sync_is_ok() {
             let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
             assert!(validate_print_gcounter(&sync, &Some("counter:visits".to_string())).is_ok());
+        }
+
+        #[test]
+        fn print_pncounter_without_sync_fails() {
+            let err = validate_print_pncounter(&None, &Some("inventory:sku-1".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-pncounter requires sync"));
+        }
+
+        #[test]
+        fn print_pncounter_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_pncounter(&sync, &Some("inventory:sku-1".to_string())).is_ok());
         }
     }
 
@@ -1222,6 +1260,25 @@ mod tests {
             match cli {
                 Cli::Run { print_gcounter, .. } => {
                     assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
+                }
+            }
+        }
+
+        #[test]
+        fn print_pncounter_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "run",
+                "x.wasm",
+                "--print-pncounter",
+                "inventory:sku-1",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run {
+                    print_pncounter, ..
+                } => {
+                    assert_eq!(print_pncounter.as_deref(), Some("inventory:sku-1"));
                 }
             }
         }
