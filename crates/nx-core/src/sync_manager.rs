@@ -7,7 +7,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, LwwRegister, NodeId, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -24,6 +24,8 @@ const PNCOUNTER_STORE_PREFIX: &str = "__nx/crdt/pncounter/";
 const PNCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/pncounter/";
 const LWW_REGISTER_STORE_PREFIX: &str = "__nx/crdt/lww-register/";
 const LWW_REGISTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/lww-register/";
+const ORSET_STORE_PREFIX: &str = "__nx/crdt/orset/";
+const ORSET_STATE_STORE_PREFIX: &str = "__nx/crdt/state/orset/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
 const OP_LOG_STORE_PREFIX: &str = "__nx/crdt/op-log/";
 
@@ -38,6 +40,7 @@ enum CrdtKind {
     GCounter,
     PNCounter,
     LwwRegister,
+    ORSet,
 }
 
 impl CrdtKind {
@@ -46,6 +49,7 @@ impl CrdtKind {
             Self::GCounter => "GCounter",
             Self::PNCounter => "PNCounter",
             Self::LwwRegister => "LWW-Register",
+            Self::ORSet => "ORSet",
         }
     }
 
@@ -57,6 +61,8 @@ impl CrdtKind {
             (Self::PNCounter, CrdtStoreNamespace::State) => PNCOUNTER_STATE_STORE_PREFIX,
             (Self::LwwRegister, CrdtStoreNamespace::Materialized) => LWW_REGISTER_STORE_PREFIX,
             (Self::LwwRegister, CrdtStoreNamespace::State) => LWW_REGISTER_STATE_STORE_PREFIX,
+            (Self::ORSet, CrdtStoreNamespace::Materialized) => ORSET_STORE_PREFIX,
+            (Self::ORSet, CrdtStoreNamespace::State) => ORSET_STATE_STORE_PREFIX,
         }
     }
 }
@@ -172,6 +178,7 @@ struct RemoteOpApplyContext<'a> {
     counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,
+    orsets: &'a Arc<RwLock<HashMap<String, ORSet>>>,
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
     op_log: &'a Arc<RwLock<Vec<Op>>>,
@@ -179,6 +186,20 @@ struct RemoteOpApplyContext<'a> {
     op_log_limit: usize,
     store: &'a Arc<NxStore>,
     metrics: &'a Arc<RuntimeMetrics>,
+}
+
+struct RemoteCrdtRegistries<'a> {
+    counters: &'a HashMap<String, GCounter>,
+    pncounters: &'a HashMap<String, PNCounter>,
+    lww_registers: &'a HashMap<String, LwwRegister>,
+    orsets: &'a HashMap<String, ORSet>,
+}
+
+struct RemoteCrdtUpdates<'a> {
+    counters: &'a mut HashMap<String, GCounter>,
+    pncounters: &'a mut HashMap<String, PNCounter>,
+    lww_registers: &'a mut HashMap<String, LwwRegister>,
+    orsets: &'a mut HashMap<String, ORSet>,
 }
 
 struct OpPersistencePlan {
@@ -194,6 +215,7 @@ struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+    orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
     op_log: Arc<RwLock<Vec<Op>>>,
@@ -259,6 +281,7 @@ pub struct SyncHandle {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+    orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
@@ -288,6 +311,11 @@ impl SyncHandle {
     /// Read-side handle over the LWW-Register registry.
     pub fn lww_registers(&self) -> Arc<RwLock<HashMap<String, LwwRegister>>> {
         Arc::clone(&self.lww_registers)
+    }
+
+    /// Read-side handle over the ORSet registry.
+    pub fn orsets(&self) -> Arc<RwLock<HashMap<String, ORSet>>> {
+        Arc::clone(&self.orsets)
     }
 
     /// Shared datastore used to materialize CRDT values.
@@ -331,6 +359,9 @@ pub struct SyncManager {
 
     /// LWW-Register
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+
+    /// ORSet
+    orsets: Arc<RwLock<HashMap<String, ORSet>>>,
 
     /// Store used to materialize replicated values.
     store: Arc<NxStore>,
@@ -396,6 +427,7 @@ impl SyncManager {
         let mut counters = HashMap::new();
         let mut pncounters = HashMap::new();
         let mut lww_registers = HashMap::new();
+        let mut orsets = HashMap::new();
         let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
             Ok(hydrated) => hydrated,
             Err(e) => {
@@ -426,9 +458,13 @@ impl SyncManager {
         if let Err(e) = hydrate_lww_register_registry(&store, &mut lww_registers) {
             warn!(error = %e, "failed to hydrate LWW-Register registry");
         }
+        if let Err(e) = hydrate_orset_registry(&store, &mut orsets) {
+            warn!(error = %e, "failed to hydrate ORSet registry");
+        }
         let counters = Arc::new(RwLock::new(counters));
         let pncounters = Arc::new(RwLock::new(pncounters));
         let lww_registers = Arc::new(RwLock::new(lww_registers));
+        let orsets = Arc::new(RwLock::new(orsets));
 
         Self {
             node_id,
@@ -437,6 +473,7 @@ impl SyncManager {
             counters,
             pncounters,
             lww_registers,
+            orsets,
             store,
             metrics,
             seen_ops: Arc::new(RwLock::new(seen_ops)),
@@ -479,6 +516,7 @@ impl SyncManager {
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
+            orsets: Arc::clone(&self.orsets),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             peer_node_ids: Arc::clone(&self.peer_node_ids),
@@ -540,6 +578,7 @@ impl SyncManager {
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
+            orsets: Arc::clone(&self.orsets),
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
             op_log: Arc::clone(&self.op_log),
@@ -685,6 +724,12 @@ impl SyncManager {
     pub async fn get_lww_register_value(&self, key: &str) -> Option<Vec<u8>> {
         let registers = self.lww_registers.read().await;
         registers.get(key).map(|register| register.value_bytes())
+    }
+
+    /// Returns the visible elements of an ORSet.
+    pub async fn get_orset_elements(&self, key: &str) -> Vec<String> {
+        let sets = self.orsets.read().await;
+        sets.get(key).map(|set| set.elements()).unwrap_or_default()
     }
 
     /// Gracefully stop sync tasks and close network connections.
@@ -1214,6 +1259,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
                 counters: &context.counters,
                 pncounters: &context.pncounters,
                 lww_registers: &context.lww_registers,
+                orsets: &context.orsets,
                 seen_ops: &context.seen_ops,
                 seen_ops_next_sequence: &context.seen_ops_next_sequence,
                 op_log: &context.op_log,
@@ -1307,6 +1353,14 @@ fn durable_lww_register_state_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::LwwRegister, CrdtStoreNamespace::State, key)
 }
 
+pub(crate) fn materialized_orset_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::ORSet, CrdtStoreNamespace::Materialized, key)
+}
+
+fn durable_orset_state_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::ORSet, CrdtStoreNamespace::State, key)
+}
+
 fn seen_op_store_key(op_id: &str) -> Vec<u8> {
     prefixed_store_key(SEEN_OP_STORE_PREFIX, op_id)
 }
@@ -1352,6 +1406,10 @@ fn logical_pncounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_lww_register_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     logical_crdt_key(store_key, CrdtKind::LwwRegister, CrdtStoreNamespace::State)
+}
+
+fn logical_orset_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(store_key, CrdtKind::ORSet, CrdtStoreNamespace::State)
 }
 
 fn logical_seen_op_id(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1487,6 +1545,20 @@ fn hydrate_lww_register_registry(
         "hydrated LWW-Register registry from sled"
     );
     Ok(registers.len())
+}
+
+fn hydrate_orset_registry(
+    store: &NxStore,
+    sets: &mut HashMap<String, ORSet>,
+) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_orset_state(store, sets)?;
+
+    debug!(
+        durable_count,
+        total = sets.len(),
+        "hydrated ORSet registry from sled"
+    );
+    Ok(sets.len())
 }
 
 fn hydrate_seen_ops(store: &NxStore, limit: usize) -> anyhow::Result<(SeenOps, u64)> {
@@ -1674,6 +1746,37 @@ fn hydrate_durable_lww_register_state(
     Ok(hydrated)
 }
 
+fn hydrate_durable_orset_state(
+    store: &NxStore,
+    sets: &mut HashMap<String, ORSet>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(ORSET_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_orset_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable ORSet state key");
+                continue;
+            }
+        };
+        let set = match parse_durable_orset_state(&value_bytes) {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable ORSet state");
+                continue;
+            }
+        };
+
+        materialize_orset_elements(store, &key, &set.elements())?;
+        sets.insert(key, set);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 fn hydrate_materialized_gcounter_values(
     store: &NxStore,
     node_id: &NodeId,
@@ -1780,6 +1883,17 @@ pub(crate) fn materialize_lww_register_value(
     Ok(())
 }
 
+pub(crate) fn materialize_orset_elements(
+    store: &NxStore,
+    key: &str,
+    elements: &[String],
+) -> anyhow::Result<()> {
+    let store_key = materialized_orset_key(key);
+    let elements_json = serde_json::to_vec(elements)?;
+    store.set(&store_key, &elements_json)?;
+    Ok(())
+}
+
 fn parse_durable_gcounter_state(bytes: &[u8]) -> anyhow::Result<GCounter> {
     let json = std::str::from_utf8(bytes)
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable GCounter state: {e}"))?;
@@ -1797,6 +1911,12 @@ fn parse_durable_lww_register_state(bytes: &[u8]) -> anyhow::Result<LwwRegister>
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable LWW-Register state: {e}"))?;
     LwwRegister::from_json(json)
         .map_err(|e| anyhow::anyhow!("invalid durable LWW-Register JSON: {e}"))
+}
+
+fn parse_durable_orset_state(bytes: &[u8]) -> anyhow::Result<ORSet> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable ORSet state: {e}"))?;
+    ORSet::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable ORSet JSON: {e}"))
 }
 
 pub(crate) fn persist_gcounter_state(
@@ -1832,6 +1952,14 @@ pub(crate) fn persist_lww_register_state(
     let state_json = register.to_json()?;
     store.set(&store_key, state_json.as_bytes())?;
     materialize_lww_register_value(store, key, register.value())?;
+    Ok(())
+}
+
+pub(crate) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> anyhow::Result<()> {
+    let store_key = durable_orset_state_key(key);
+    let state_json = set.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_orset_elements(store, key, &set.elements())?;
     Ok(())
 }
 
@@ -1943,6 +2071,7 @@ fn persist_remote_ops_batch(
     counter_updates: &HashMap<String, GCounter>,
     pncounter_updates: &HashMap<String, PNCounter>,
     lww_register_updates: &HashMap<String, LwwRegister>,
+    orset_updates: &HashMap<String, ORSet>,
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1990,6 +2119,19 @@ fn persist_remote_ops_batch(
         set_values.push(register.value_bytes());
     }
 
+    let mut changed_orset_keys = orset_updates.keys().collect::<Vec<_>>();
+    changed_orset_keys.sort();
+
+    for key in changed_orset_keys {
+        let Some(set) = orset_updates.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_orset_state_key(key));
+        set_values.push(set.to_json()?.into_bytes());
+        set_keys.push(materialized_orset_key(key));
+        set_values.push(serde_json::to_vec(&set.elements())?);
+    }
+
     for plan in plans {
         set_keys.push(seen_op_store_key(plan.op.id.as_str()));
         set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
@@ -2024,6 +2166,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut counters = context.counters.write().await;
     let mut pncounters = context.pncounters.write().await;
     let mut lww_registers = context.lww_registers.write().await;
+    let mut orsets = context.orsets.write().await;
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
     let mut inserted_ids = Vec::new();
@@ -2032,6 +2175,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut counter_updates = HashMap::new();
     let mut pncounter_updates = HashMap::new();
     let mut lww_register_updates = HashMap::new();
+    let mut orset_updates = HashMap::new();
 
     for op in ops {
         let op_id = op.id.as_str();
@@ -2040,15 +2184,19 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             continue;
         }
 
-        apply_remote_op_to_counter_updates(
-            op,
-            &counters,
-            &mut counter_updates,
-            &pncounters,
-            &mut pncounter_updates,
-            &lww_registers,
-            &mut lww_register_updates,
-        );
+        let registries = RemoteCrdtRegistries {
+            counters: &counters,
+            pncounters: &pncounters,
+            lww_registers: &lww_registers,
+            orsets: &orsets,
+        };
+        let mut updates = RemoteCrdtUpdates {
+            counters: &mut counter_updates,
+            pncounters: &mut pncounter_updates,
+            lww_registers: &mut lww_register_updates,
+            orsets: &mut orset_updates,
+        };
+        apply_remote_op_to_crdt_updates(op, &registries, &mut updates);
 
         inserted_ids.push(op_id.to_string());
         inserted_ops.push(op.clone());
@@ -2084,6 +2232,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
         &counter_updates,
         &pncounter_updates,
         &lww_register_updates,
+        &orset_updates,
     )?;
 
     let applied_count = plans.len() as u64;
@@ -2098,6 +2247,9 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     }
     for (key, register) in lww_register_updates {
         lww_registers.insert(key, register);
+    }
+    for (key, set) in orset_updates {
+        orsets.insert(key, set);
     }
     context
         .seen_ops_next_sequence
@@ -2114,21 +2266,23 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     Ok(())
 }
 
-fn apply_remote_op_to_counter_updates(
+fn apply_remote_op_to_crdt_updates(
     op: &Op,
-    counters: &HashMap<String, GCounter>,
-    counter_updates: &mut HashMap<String, GCounter>,
-    pncounters: &HashMap<String, PNCounter>,
-    pncounter_updates: &mut HashMap<String, PNCounter>,
-    lww_registers: &HashMap<String, LwwRegister>,
-    lww_register_updates: &mut HashMap<String, LwwRegister>,
+    registries: &RemoteCrdtRegistries<'_>,
+    updates: &mut RemoteCrdtUpdates<'_>,
 ) {
     match &op.kind {
         OpKind::GCounterIncrement { key, increment } => {
-            apply_remote_gcounter_increment(op, key, *increment, counters, counter_updates);
+            apply_remote_gcounter_increment(
+                op,
+                key,
+                *increment,
+                registries.counters,
+                updates.counters,
+            );
         }
         OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
-            apply_remote_pncounter_op(op, key, pncounters, pncounter_updates);
+            apply_remote_pncounter_op(op, key, registries.pncounters, updates.pncounters);
         }
         OpKind::LwwRegisterSet {
             key,
@@ -2140,8 +2294,24 @@ fn apply_remote_op_to_counter_updates(
                 key,
                 value,
                 *timestamp_ms,
-                lww_registers,
-                lww_register_updates,
+                registries.lww_registers,
+                updates.lww_registers,
+            );
+        }
+        OpKind::ORSetAdd { key, element, tag } => {
+            apply_remote_orset_add(key, element, tag, registries.orsets, updates.orsets);
+        }
+        OpKind::ORSetRemove {
+            key,
+            element,
+            observed_tags,
+        } => {
+            apply_remote_orset_remove(
+                key,
+                element,
+                observed_tags,
+                registries.orsets,
+                updates.orsets,
             );
         }
     }
@@ -2197,6 +2367,32 @@ fn apply_remote_lww_register_set(
     if register.assign(value.to_vec(), timestamp_ms, op.origin.clone()) {
         register_updates.insert(key.to_string(), register);
     }
+}
+
+fn apply_remote_orset_add(
+    key: &str,
+    element: &str,
+    tag: &str,
+    sets: &HashMap<String, ORSet>,
+    set_updates: &mut HashMap<String, ORSet>,
+) {
+    let set = set_updates
+        .entry(key.to_string())
+        .or_insert_with(|| sets.get(key).cloned().unwrap_or_else(ORSet::new));
+    set.apply_add(element, tag);
+}
+
+fn apply_remote_orset_remove(
+    key: &str,
+    element: &str,
+    observed_tags: &[String],
+    sets: &HashMap<String, ORSet>,
+    set_updates: &mut HashMap<String, ORSet>,
+) {
+    let set = set_updates
+        .entry(key.to_string())
+        .or_insert_with(|| sets.get(key).cloned().unwrap_or_else(ORSet::new));
+    set.apply_remove(element, observed_tags.iter().cloned());
 }
 
 #[cfg(test)]
@@ -2265,6 +2461,18 @@ mod tests {
         parse_durable_lww_register_state(&bytes).unwrap()
     }
 
+    fn read_materialized_orset(store: &NxStore, key: &str) -> Vec<String> {
+        let key = materialized_orset_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn read_durable_orset_state(store: &NxStore, key: &str) -> ORSet {
+        let key = durable_orset_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_orset_state(&bytes).unwrap()
+    }
+
     fn seen_op_exists(store: &NxStore, op_id: &str) -> bool {
         store.get(&seen_op_store_key(op_id)).unwrap().is_some()
     }
@@ -2287,6 +2495,7 @@ mod tests {
             counters,
             pncounters: Arc::new(RwLock::new(HashMap::new())),
             lww_registers: Arc::new(RwLock::new(HashMap::new())),
+            orsets: Arc::new(RwLock::new(HashMap::new())),
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
             op_log,
@@ -2316,11 +2525,13 @@ mod tests {
     ) {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters,
             pncounters: &pncounters,
             lww_registers: &lww_registers,
+            orsets: &orsets,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2345,11 +2556,13 @@ mod tests {
     ) {
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters,
             lww_registers: &lww_registers,
+            orsets: &orsets,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2374,11 +2587,44 @@ mod tests {
     ) {
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters: &pncounters,
             lww_registers: registers,
+            orsets: &orsets,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_next_sequence,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_remote_orset_op_for_test(
+        op: &Op,
+        sets: &Arc<RwLock<HashMap<String, ORSet>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
+        store: &Arc<NxStore>,
+    ) {
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters: &counters,
+            pncounters: &pncounters,
+            lww_registers: &lww_registers,
+            orsets: sets,
             seen_ops,
             seen_ops_next_sequence,
             op_log,
@@ -2434,6 +2680,24 @@ mod tests {
         }
     }
 
+    async fn wait_for_orset(manager: &SyncManager, key: &str, expected: &[&str]) {
+        let expected = expected
+            .iter()
+            .map(|element| (*element).to_string())
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_orset_elements(key).await == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orset {key} did not reach expected elements {expected:?}"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn wait_for_connected_peer(manager: &SyncManager) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2482,6 +2746,17 @@ mod tests {
     ) {
         let op = apply_local_lww_register_set(handle, key, value, timestamp_ms).await;
         handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_orset_add(handle: &SyncHandle, key: &str, element: &str) {
+        let op = apply_local_orset_add(handle, key, element).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_orset_remove(handle: &SyncHandle, key: &str, element: &str) {
+        if let Some(op) = apply_local_orset_remove(handle, key, element).await {
+            handle.op_sender().send(op).await.unwrap();
+        }
     }
 
     async fn dropped_local_increment(
@@ -2581,6 +2856,49 @@ mod tests {
         }
 
         Op::lww_register_set(handle.node_id().clone(), key, value.to_vec(), timestamp_ms)
+    }
+
+    async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {
+        let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key, element);
+        let tag = match &op.kind {
+            OpKind::ORSetAdd { tag, .. } => tag.clone(),
+            other => panic!("unexpected op kind: {other:?}"),
+        };
+
+        {
+            let sets_arc = handle.orsets();
+            let mut sets = sets_arc.write().await;
+            let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+            set.add(element, tag);
+
+            persist_orset_state(&handle.store(), key, &set).unwrap();
+            sets.insert(key.to_string(), set);
+        }
+
+        op
+    }
+
+    async fn apply_local_orset_remove(handle: &SyncHandle, key: &str, element: &str) -> Option<Op> {
+        let observed_tags = {
+            let sets_arc = handle.orsets();
+            let mut sets = sets_arc.write().await;
+            let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+            let observed_tags = set.remove(element);
+            if observed_tags.is_empty() {
+                return None;
+            }
+
+            persist_orset_state(&handle.store(), key, &set).unwrap();
+            sets.insert(key.to_string(), set);
+            observed_tags
+        };
+
+        Some(Op::orset_remove(
+            handle.node_id().clone(),
+            key,
+            element,
+            observed_tags,
+        ))
     }
 
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -2717,6 +3035,35 @@ mod tests {
             )
             .unwrap(),
             "status:user-1"
+        );
+
+        let orset_materialized = crdt_store_key(
+            CrdtKind::ORSet,
+            CrdtStoreNamespace::Materialized,
+            "tags:item-1",
+        );
+        let orset_durable_state =
+            crdt_store_key(CrdtKind::ORSet, CrdtStoreNamespace::State, "tags:item-1");
+
+        assert_eq!(orset_materialized, materialized_orset_key("tags:item-1"));
+        assert_eq!(orset_durable_state, durable_orset_state_key("tags:item-1"));
+        assert_eq!(
+            logical_crdt_key(
+                &orset_materialized,
+                CrdtKind::ORSet,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "tags:item-1"
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &orset_durable_state,
+                CrdtKind::ORSet,
+                CrdtStoreNamespace::State
+            )
+            .unwrap(),
+            "tags:item-1"
         );
     }
 
@@ -3360,6 +3707,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_remote_orset_add_materializes_visible_element() {
+        let store = temp_store();
+        let sets = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::orset_add(NodeId::new("remote-a"), "tags:item-1", "blue", "add-tag-1");
+
+        apply_remote_orset_op_for_test(
+            &op,
+            &sets,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            read_materialized_orset(&store, "tags:item-1"),
+            vec!["blue".to_string()]
+        );
+        let state = read_durable_orset_state(&store, "tags:item-1");
+        assert!(state.contains("blue"));
+        assert_eq!(state.observed_tags("blue"), vec!["add-tag-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_orset_remove_hides_observed_element() {
+        let store = temp_store();
+        let sets = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let add = Op::orset_add(NodeId::new("remote-a"), "tags:item-1", "blue", "add-tag-1");
+        let remove = Op::orset_remove(
+            NodeId::new("remote-b"),
+            "tags:item-1",
+            "blue",
+            vec!["add-tag-1".to_string()],
+        );
+
+        apply_remote_orset_op_for_test(
+            &add,
+            &sets,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_orset_op_for_test(
+            &remove,
+            &sets,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
+        let state = read_durable_orset_state(&store, "tags:item-1");
+        assert!(!state.contains("blue"));
+    }
+
+    #[tokio::test]
+    async fn apply_remote_orset_duplicate_does_not_double_apply() {
+        let store = temp_store();
+        let sets = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::orset_add(NodeId::new("remote-a"), "tags:item-1", "blue", "add-tag-1");
+
+        apply_remote_orset_op_for_test(
+            &op,
+            &sets,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_orset_op_for_test(
+            &op,
+            &sets,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(op_log.read().await.len(), 1);
+        let state = read_durable_orset_state(&store, "tags:item-1");
+        assert_eq!(state.observed_tags("blue"), vec!["add-tag-1".to_string()]);
+    }
+
+    #[tokio::test]
     async fn duplicate_remote_op_after_restart_does_not_double_count() {
         let store = temp_store();
         let origin = NodeId::new("remote-a");
@@ -3505,6 +3960,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_hydrates_orset_registry_from_durable_state() {
+        let store = temp_store();
+        let mut set = ORSet::new();
+        set.add("blue", "add-tag-1");
+        set.add("red", "add-tag-2");
+        set.remove("blue");
+
+        persist_orset_state(&store, "tags:item-1", &set).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_orset_elements("tags:item-1").await,
+            vec!["red".to_string()]
+        );
+
+        let sets = manager.orsets.read().await;
+        let hydrated = sets.get("tags:item-1").unwrap();
+        assert!(!hydrated.contains("blue"));
+        assert!(hydrated.contains("red"));
+        assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    }
+
+    #[tokio::test]
     async fn durable_lww_register_state_takes_precedence_over_materialized_value() {
         let store = temp_store();
         let register = LwwRegister::new(b"online".to_vec(), 123, NodeId::new("node-a"));
@@ -3529,6 +4013,32 @@ mod tests {
         assert_eq!(
             read_materialized_lww_register(&store, "status:user-1"),
             b"online".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_orset_state_takes_precedence_over_materialized_elements() {
+        let store = temp_store();
+        let mut set = ORSet::new();
+        set.add("fresh", "add-tag-1");
+
+        persist_orset_state(&store, "tags:item-1", &set).unwrap();
+        materialize_orset_elements(&store, "tags:item-1", &["stale".to_string()]).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_orset_elements("tags:item-1").await,
+            vec!["fresh".to_string()]
+        );
+        assert_eq!(
+            read_materialized_orset(&store, "tags:item-1"),
+            vec!["fresh".to_string()]
         );
     }
 
@@ -3672,6 +4182,46 @@ mod tests {
         assert_eq!(state_b.timestamp_ms(), 200);
         assert_eq!(state_a.writer(), handle_b.node_id());
         assert_eq!(state_b.writer(), handle_b.node_id());
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_orset_adds_and_observed_remove_converge() {
+        let key = "tags:item-1";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        tokio::join!(
+            local_orset_add(&handle_a, key, "blue"),
+            local_orset_add(&handle_b, key, "red"),
+        );
+
+        wait_for_orset(&manager_a, key, &["blue", "red"]).await;
+        wait_for_orset(&manager_b, key, &["blue", "red"]).await;
+
+        local_orset_remove(&handle_a, key, "blue").await;
+
+        wait_for_orset(&manager_a, key, &["red"]).await;
+        wait_for_orset(&manager_b, key, &["red"]).await;
+        assert_eq!(
+            read_materialized_orset(&store_a, key),
+            vec!["red".to_string()]
+        );
+        assert_eq!(
+            read_materialized_orset(&store_b, key),
+            vec!["red".to_string()]
+        );
+
+        let state_a = read_durable_orset_state(&store_a, key);
+        let state_b = read_durable_orset_state(&store_b, key);
+        assert!(!state_a.contains("blue"));
+        assert!(!state_b.contains("blue"));
+        assert!(state_a.contains("red"));
+        assert!(state_b.contains("red"));
     }
 
     #[tokio::test]

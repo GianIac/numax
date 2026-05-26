@@ -57,7 +57,10 @@ impl PNCounter {
                 self.decrement(&op.origin, *decrement);
                 Ok(self.negative_for(&op.origin) != before)
             }
-            OpKind::GCounterIncrement { .. } | OpKind::LwwRegisterSet { .. } => Ok(false),
+            OpKind::GCounterIncrement { .. }
+            | OpKind::LwwRegisterSet { .. }
+            | OpKind::ORSetAdd { .. }
+            | OpKind::ORSetRemove { .. } => Ok(false),
         }
     }
 

@@ -9,4 +9,5 @@ pub use op::{Op, OpId, OpKind};
 
 pub use crdt::gcounter::GCounter;
 pub use crdt::lww_register::LwwRegister;
+pub use crdt::orset::ORSet;
 pub use crdt::pncounter::PNCounter;

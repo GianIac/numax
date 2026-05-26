@@ -42,6 +42,18 @@ pub enum OpKind {
         value: Vec<u8>,
         timestamp_ms: u64,
     },
+    /// ORSet observed add.
+    ORSetAdd {
+        key: String,
+        element: String,
+        tag: String,
+    },
+    /// ORSet observed remove.
+    ORSetRemove {
+        key: String,
+        element: String,
+        observed_tags: Vec<String>,
+    },
 }
 
 /// A complete CRDT operation, ready to be sent/received.
@@ -108,6 +120,61 @@ impl Op {
                 key: key.into(),
                 value: value.into(),
                 timestamp_ms,
+            },
+        }
+    }
+
+    /// Creates a new ORSetAdd operation with an explicit add tag.
+    pub fn orset_add(
+        origin: NodeId,
+        key: impl Into<String>,
+        element: impl Into<String>,
+        tag: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::ORSetAdd {
+                key: key.into(),
+                element: element.into(),
+                tag: tag.into(),
+            },
+        }
+    }
+
+    /// Creates a new ORSetAdd operation using the generated OpId as add tag.
+    pub fn orset_add_with_op_id_tag(
+        origin: NodeId,
+        key: impl Into<String>,
+        element: impl Into<String>,
+    ) -> Self {
+        let id = OpId::generate();
+        let tag = id.as_str().to_string();
+        Self {
+            id,
+            origin,
+            kind: OpKind::ORSetAdd {
+                key: key.into(),
+                element: element.into(),
+                tag,
+            },
+        }
+    }
+
+    /// Creates a new ORSetRemove operation carrying the tags observed locally.
+    pub fn orset_remove(
+        origin: NodeId,
+        key: impl Into<String>,
+        element: impl Into<String>,
+        observed_tags: impl Into<Vec<String>>,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::ORSetRemove {
+                key: key.into(),
+                element: element.into(),
+                observed_tags: observed_tags.into(),
             },
         }
     }
@@ -214,6 +281,59 @@ mod tests {
     }
 
     #[test]
+    fn test_op_orset_add() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_add(node.clone(), "tags:item-1", "blue", "add-tag-1");
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::ORSetAdd { key, element, tag } => {
+                assert_eq!(key, "tags:item-1");
+                assert_eq!(element, "blue");
+                assert_eq!(tag, "add-tag-1");
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_orset_add_with_op_id_tag() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_add_with_op_id_tag(node.clone(), "tags:item-1", "blue");
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::ORSetAdd { key, element, tag } => {
+                assert_eq!(key, "tags:item-1");
+                assert_eq!(element, "blue");
+                assert_eq!(tag, op.id.as_str());
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_orset_remove() {
+        let node = NodeId::new("node-1");
+        let observed_tags = vec!["add-tag-1".to_string(), "add-tag-2".to_string()];
+        let op = Op::orset_remove(node.clone(), "tags:item-1", "blue", observed_tags.clone());
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::ORSetRemove {
+                key,
+                element,
+                observed_tags: tags,
+            } => {
+                assert_eq!(key, "tags:item-1");
+                assert_eq!(element, "blue");
+                assert_eq!(tags, &observed_tags);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_op_json_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::gcounter_increment(node, "counter:test", 42);
@@ -275,6 +395,55 @@ mod tests {
     fn test_op_lww_register_bytes_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::lww_register_set(node, "status:user-1", b"busy".to_vec(), 789);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_orset_add_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_add(node, "tags:item-1", "blue", "add-tag-1");
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_orset_add_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_add_with_op_id_tag(node, "tags:item-1", "blue");
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_orset_remove_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_remove(
+            node,
+            "tags:item-1",
+            "blue",
+            vec!["add-tag-1".to_string(), "add-tag-2".to_string()],
+        );
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_orset_remove_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::orset_remove(node, "tags:item-1", "blue", vec!["add-tag-1".to_string()]);
 
         let bytes = op.to_bytes().unwrap();
         let parsed = Op::from_bytes(&bytes).unwrap();

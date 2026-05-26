@@ -1,11 +1,12 @@
 use anyhow::Result;
-use nx_sync::{GCounter, LwwRegister, Op, PNCounter};
+use nx_sync::{GCounter, LwwRegister, ORSet, Op, OpKind, PNCounter};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 use crate::sync_manager::{
-    persist_gcounter_state, persist_lww_register_state, persist_pncounter_state,
+    persist_gcounter_state, persist_lww_register_state, persist_orset_state,
+    persist_pncounter_state,
 };
 
 // error codes
@@ -17,6 +18,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 
 // limits
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
+const MAX_ELEMENT_LEN: u32 = 8 * 1024;
 const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB, aligned with db.rs
 const MAX_OUT_CAP: u32 = 1024 * 1024; // 1 MiB
 const U64_LEN: u32 = 8;
@@ -78,6 +80,46 @@ fn read_value_bytes(
         ERR_INTERNAL
     })?;
     Ok(buf)
+}
+
+fn read_utf8_arg(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    ptr: u32,
+    len: u32,
+    max_len: u32,
+    api_name: &str,
+    arg_name: &str,
+) -> Result<String, i32> {
+    if len > max_len {
+        eprintln!("[nx-core] {api_name}: invalid {arg_name} length: {len} (max {max_len})");
+        return Err(ERR_INTERNAL);
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    memory.read(caller, ptr as usize, &mut buf).map_err(|e| {
+        eprintln!("[nx-core] {api_name}: failed to read {arg_name}: {e}");
+        ERR_INTERNAL
+    })?;
+    String::from_utf8(buf).map_err(|e| {
+        eprintln!("[nx-core] {api_name}: {arg_name} is not UTF-8: {e}");
+        ERR_INTERNAL
+    })
+}
+
+fn encode_string_list(values: &[String]) -> Result<Vec<u8>, i32> {
+    let mut encoded = Vec::new();
+    let count = u32::try_from(values.len()).map_err(|_| ERR_INTERNAL)?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+
+    for value in values {
+        let bytes = value.as_bytes();
+        let len = u32::try_from(bytes.len()).map_err(|_| ERR_INTERNAL)?;
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(bytes);
+    }
+
+    Ok(encoded)
 }
 
 fn unix_epoch_millis() -> Result<u64, i32> {
@@ -480,6 +522,256 @@ async fn crdt_lww_get_impl(
     value.len() as i32
 }
 
+async fn crdt_orset_add_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_orset_add: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let element = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        element_ptr,
+        element_len,
+        MAX_ELEMENT_LEN,
+        "crdt_orset_add",
+        "element",
+    ) {
+        Ok(element) => element,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_add: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key.clone(), element.clone());
+    let tag = match &op.kind {
+        OpKind::ORSetAdd { tag, .. } => tag.clone(),
+        _ => {
+            handle.metrics().record_sync_error();
+            return ERR_INTERNAL;
+        }
+    };
+
+    {
+        let sets_arc = handle.orsets();
+        let mut sets = sets_arc.write().await;
+        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
+        set.add(element, tag);
+        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_add: failed to persist set");
+            return ERR_INTERNAL;
+        }
+        sets.insert(key, set);
+    }
+
+    tracing::debug!(op_id = %op.id, "queued local ORSet add");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_orset_remove_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_orset_remove: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let element = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        element_ptr,
+        element_len,
+        MAX_ELEMENT_LEN,
+        "crdt_orset_remove",
+        "element",
+    ) {
+        Ok(element) => element,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_remove: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let observed_tags = {
+        let sets_arc = handle.orsets();
+        let mut sets = sets_arc.write().await;
+        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
+        let observed_tags = set.remove(&element);
+        if observed_tags.is_empty() {
+            return 0;
+        }
+        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_remove: failed to persist set");
+            return ERR_INTERNAL;
+        }
+        sets.insert(key.clone(), set);
+        observed_tags
+    };
+
+    let op = Op::orset_remove(handle.node_id().clone(), key, element, observed_tags);
+    tracing::debug!(op_id = %op.id, "queued local ORSet remove");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_orset_contains_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_orset_contains: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let element = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        element_ptr,
+        element_len,
+        MAX_ELEMENT_LEN,
+        "crdt_orset_contains",
+        "element",
+    ) {
+        Ok(element) => element,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let contains = {
+        let sets_arc = handle.orsets();
+        let sets = sets_arc.read().await;
+        sets.get(&key)
+            .map(|set| set.contains(&element))
+            .unwrap_or(false)
+    };
+
+    i32::from(contains)
+}
+
+async fn crdt_orset_elements_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_orset_elements: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_orset_elements: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let elements = {
+        let sets_arc = handle.orsets();
+        let sets = sets_arc.read().await;
+        sets.get(&key).map(|set| set.elements()).unwrap_or_default()
+    };
+    let encoded = match encode_string_list(&elements) {
+        Ok(encoded) => encoded,
+        Err(code) => return code,
+    };
+
+    if encoded.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &encoded) {
+        eprintln!("[nx-core] crdt_orset_elements: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    encoded.len() as i32
+}
+
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap_async(
         "nx",
@@ -544,6 +836,62 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>,
          (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(crdt_lww_get_impl(
+                caller, key_ptr, key_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_orset_add",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, element_ptr, element_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_orset_add_impl(
+                caller,
+                key_ptr,
+                key_len,
+                element_ptr,
+                element_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_orset_remove",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, element_ptr, element_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_orset_remove_impl(
+                caller,
+                key_ptr,
+                key_len,
+                element_ptr,
+                element_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_orset_contains",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, element_ptr, element_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_orset_contains_impl(
+                caller,
+                key_ptr,
+                key_len,
+                element_ptr,
+                element_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_orset_elements",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+            Box::new(crdt_orset_elements_impl(
                 caller, key_ptr, key_len, out_ptr, out_cap,
             ))
         },

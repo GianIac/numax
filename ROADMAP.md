@@ -427,6 +427,14 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 - [x] SyncManager E2E coverage
 - [x] distributed example with README
 
+**ORSet progress**:
+- [x] CRDT implementation in `nx-sync` with observed-remove semantics
+- [x] `OpKind` variants and operation constructors
+- [x] durable state/op-log integration in `nx-core`
+- [x] host API + SDK wrapper
+- [x] SyncManager E2E coverage
+- [x] distributed example with README
+
 Completion rule for each CRDT:
 - implementation in `nx-sync`
 - `OpKind` and wire serialization support
@@ -441,13 +449,10 @@ Completion rule for each CRDT:
 **Goal**: Ready for external users
 
 - [ ] Precompiled binaries (Linux x86_64, ARM64, macOS, Windows)
-- [ ] `cargo install numax`
 - [ ] Tutorial: "Distributed Hello World in 5 minutes"
 - [ ] Tutorial: "Deploy 3+ nodes with mTLS"
 - [ ] Guide: production configuration
 - [ ] Guide: troubleshooting
-- [ ] CHANGELOG.md
-- [ ] CONTRIBUTING.md
 
 ---
 

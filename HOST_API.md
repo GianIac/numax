@@ -307,7 +307,7 @@ A CRDT host API is considered complete only when it has:
 | GCounter | `crdt_gcounter_inc`, `crdt_gcounter_value` | Implemented |
 | PNCounter | `crdt_pncounter_inc`, `crdt_pncounter_dec`, `crdt_pncounter_value` | Implemented |
 | LWW-Register | `crdt_lww_set`, `crdt_lww_get` | Implemented |
-| ORSet | TBD | Planned, Phase 14 |
+| ORSet | `crdt_orset_add`, `crdt_orset_remove`, `crdt_orset_contains`, `crdt_orset_elements` | Implemented |
 | LWW-Map | TBD | Planned, Phase 14 |
 | RGA | TBD | Planned, Phase 14 |
 
@@ -474,6 +474,109 @@ use nx_sdk::crdt::lww_register;
 let status = lww_register::get("status:user-1")?;
 ```
 
+### ORSet
+
+An observed-remove set stores visible string elements per key. Each add creates
+a unique add-tag. A remove carries the add-tags observed locally for that
+element, so concurrent adds that were not observed by the remove remain visible
+after merge.
+
+Use it for tags, labels, feature sets, membership, or other string sets where
+adds/removes must converge without coordination.
+
+#### `crdt_orset_add`
+
+```text
+fn crdt_orset_add(
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32
+) -> i32
+```
+
+Returns `0` on success. The host generates the add-tag from the local `OpId`.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::orset;
+
+orset::add("tags:item-1", "blue")?;
+```
+
+#### `crdt_orset_remove`
+
+```text
+fn crdt_orset_remove(
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32
+) -> i32
+```
+
+Returns `0` on success. Removing an element that has no locally observed add-tags
+is a no-op.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::orset;
+
+orset::remove("tags:item-1", "blue")?;
+```
+
+#### `crdt_orset_contains`
+
+```text
+fn crdt_orset_contains(
+    key_ptr: u32,
+    key_len: u32,
+    element_ptr: u32,
+    element_len: u32
+) -> i32
+```
+
+Returns `1` when the element is visible and `0` when it is absent.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::orset;
+
+let has_blue = orset::contains("tags:item-1", "blue")?;
+```
+
+#### `crdt_orset_elements`
+
+```text
+fn crdt_orset_elements(
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes visible elements in deterministic order and returns the number of bytes
+written. The raw output encoding is:
+
+```text
+u32 element_count
+repeat element_count times:
+  u32 element_len
+  u8[element_len] utf8_element
+```
+
+SDK:
+
+```rust
+use nx_sdk::crdt::orset;
+
+let tags = orset::elements("tags:item-1")?;
+```
+
 ### Future CRDT Documentation Slots
 
 The following sections should be expanded as each CRDT lands.
@@ -482,7 +585,7 @@ The following sections should be expanded as each CRDT lands.
 |------|-------------------|-------|
 | PNCounter | `examples/distributed_inventory` | Implemented |
 | LWW-Register | `examples/distributed_status` | Implemented |
-| ORSet | `examples/distributed_tags` | Requires add/remove tag semantics |
+| ORSet | `examples/distributed_tags` | Implemented |
 | LWW-Map | `examples/distributed_settings` | Likely builds on LWW-Register |
 | RGA | `examples/distributed_comments` | Ordered sequence, likely last |
 
@@ -717,7 +820,8 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
   `db_scan_after`, `db_keys`, `db_keys_after`
 - CRDT: `crdt_gcounter_inc`, `crdt_gcounter_value`, `crdt_pncounter_inc`,
   `crdt_pncounter_dec`, `crdt_pncounter_value`, `crdt_lww_set`,
-  `crdt_lww_get`
+  `crdt_lww_get`, `crdt_orset_add`, `crdt_orset_remove`,
+  `crdt_orset_contains`, `crdt_orset_elements`
 - Time: `time_now`, `time_monotonic`
 - Crypto: `random_bytes`, `hash_sha256`, `hash_blake3`
 - System: `env_get`, `module_id`, `abort`, `host_capabilities`, `event_emit`

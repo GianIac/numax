@@ -51,7 +51,9 @@ impl GCounter {
             }
             OpKind::PNCounterIncrement { .. }
             | OpKind::PNCounterDecrement { .. }
-            | OpKind::LwwRegisterSet { .. } => Ok(false),
+            | OpKind::LwwRegisterSet { .. }
+            | OpKind::ORSetAdd { .. }
+            | OpKind::ORSetRemove { .. } => Ok(false),
         }
     }
 

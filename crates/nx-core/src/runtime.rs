@@ -254,6 +254,12 @@ impl Runtime {
         Some(manager.get_lww_register_value(key).await)
     }
 
+    /// Return the visible elements of an ORSet, if sync is enabled.
+    pub async fn get_orset_elements(&self, key: &str) -> Option<Vec<String>> {
+        let manager = self.sync_manager.as_ref()?;
+        Some(manager.get_orset_elements(key).await)
+    }
+
     /// Keep the runtime alive while sync background tasks do their work.
     pub async fn serve(&self) -> Result<()> {
         let _ = self

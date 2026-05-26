@@ -56,6 +56,10 @@ enum Cli {
         #[arg(long, value_name = "KEY")]
         print_lww_register: Option<String>,
 
+        /// Print the final visible elements of an ORSet after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_orset: Option<String>,
+
         /// Maximum time allowed for shutdown before returning an error.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         shutdown_timeout: Option<Duration>,
@@ -129,6 +133,7 @@ async fn real_main() -> Result<()> {
             print_gcounter,
             print_pncounter,
             print_lww_register,
+            print_orset,
             shutdown_timeout,
             verbose,
             log_level,
@@ -170,6 +175,7 @@ async fn real_main() -> Result<()> {
             validate_print_gcounter(&sync, &print_gcounter)?;
             validate_print_pncounter(&sync, &print_pncounter)?;
             validate_print_lww_register(&sync, &print_lww_register)?;
+            validate_print_orset(&sync, &print_orset)?;
             let observability = build_observability_config(
                 observability_listen,
                 file_config.observability.as_ref(),
@@ -232,6 +238,13 @@ async fn real_main() -> Result<()> {
                         Some(bytes) => println!("{key} = {}", String::from_utf8_lossy(&bytes)),
                         None => println!("{key} = <unset>"),
                     }
+                }
+                if let Some(key) = print_orset {
+                    let elements = rt
+                        .get_orset_elements(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-orset requires sync"))?;
+                    println!("{key} = [{}]", elements.join(", "));
                 }
                 Ok(())
             }
@@ -511,6 +524,14 @@ fn validate_print_lww_register(
 ) -> Result<()> {
     if print_lww_register.is_some() && sync.is_none() {
         bail!("--print-lww-register requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_orset(sync: &Option<SyncConfig>, print_orset: &Option<String>) -> Result<()> {
+    if print_orset.is_some() && sync.is_none() {
+        bail!("--print-orset requires sync to be enabled with --listen");
     }
 
     Ok(())
@@ -962,6 +983,20 @@ mod tests {
                 validate_print_lww_register(&sync, &Some("status:service-a".to_string())).is_ok()
             );
         }
+
+        #[test]
+        fn print_orset_without_sync_fails() {
+            let err = validate_print_orset(&None, &Some("tags:doc-1".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-orset requires sync"));
+        }
+
+        #[test]
+        fn print_orset_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_orset(&sync, &Some("tags:doc-1".to_string())).is_ok());
+        }
     }
 
     // build_tls_config
@@ -1341,6 +1376,17 @@ mod tests {
                     print_lww_register, ..
                 } => {
                     assert_eq!(print_lww_register.as_deref(), Some("status:service-a"));
+                }
+            }
+        }
+
+        #[test]
+        fn print_orset_parsed() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--print-orset", "tags:doc-1"])
+                .unwrap();
+            match cli {
+                Cli::Run { print_orset, .. } => {
+                    assert_eq!(print_orset.as_deref(), Some("tags:doc-1"));
                 }
             }
         }

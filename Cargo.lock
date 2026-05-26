@@ -1526,6 +1526,7 @@ dependencies = [
  "nx-net",
  "nx-store",
  "nx-sync",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
