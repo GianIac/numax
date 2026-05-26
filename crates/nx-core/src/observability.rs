@@ -310,15 +310,14 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_store() -> Arc<NxStore> {
         let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("numax-observability-test-{nanos}"));
+        let id = TEST_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let process_id = std::process::id();
+        path.push(format!("numax-observability-test-{process_id}-{id}"));
         Arc::new(NxStore::open(path).unwrap())
     }
 
