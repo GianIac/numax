@@ -2792,14 +2792,18 @@ mod tests {
     use crate::runtime::{Runtime, RuntimeConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, Instant, sleep};
-
+    
     fn temp_store() -> Arc<NxStore> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("numax-core-sync-test-{nanos}"));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.push(format!("numax-core-sync-test-{nanos}-{seq}"));
         Arc::new(NxStore::open(path).unwrap())
     }
 
