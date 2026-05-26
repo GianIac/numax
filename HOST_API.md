@@ -14,7 +14,7 @@ the wire contract and future SDK bindings can stay consistent.
 - [Limits](#limits)
 - [Database API](#database-api)
 - [CRDT API](#crdt-api)
-- [Time API](#time-api)brv
+- [Time API](#time-api)
 - [Crypto API](#crypto-api)
 - [System API](#system-api)
 - [Network API](#network-api)
