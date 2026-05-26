@@ -481,7 +481,7 @@ The following sections should be expanded as each CRDT lands.
 | CRDT | Suggested Example | Notes |
 |------|-------------------|-------|
 | PNCounter | `examples/distributed_inventory` | Implemented |
-| LWW-Register | `examples/distributed_status` | Host API implemented; example pending |
+| LWW-Register | `examples/distributed_status` | Implemented |
 | ORSet | `examples/distributed_tags` | Requires add/remove tag semantics |
 | LWW-Map | `examples/distributed_settings` | Likely builds on LWW-Register |
 | RGA | `examples/distributed_comments` | Ordered sequence, likely last |

@@ -97,6 +97,8 @@ Same module, any node. State stays local. Sync happens through the runtime.
 - [`WHITEPAPER.md`](./WHITEPAPER.md) - the vision, the architecture, the principles.
 - [`ROADMAP_v0.1.0.md`](./ROADMAP.md) - where we are, where we're going, what's still missing.
 - [`HOST_API.md`](./HOST_API.md) - the host API available to WASM modules.
+- [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
+- [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 
 ---
 
