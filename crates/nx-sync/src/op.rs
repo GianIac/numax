@@ -42,6 +42,19 @@ pub enum OpKind {
         value: Vec<u8>,
         timestamp_ms: u64,
     },
+    /// LWW-Map field assignment.
+    LwwMapSet {
+        key: String,
+        field: String,
+        value: Vec<u8>,
+        timestamp_ms: u64,
+    },
+    /// LWW-Map field removal.
+    LwwMapRemove {
+        key: String,
+        field: String,
+        timestamp_ms: u64,
+    },
     /// ORSet observed add.
     ORSetAdd {
         key: String,
@@ -119,6 +132,44 @@ impl Op {
             kind: OpKind::LwwRegisterSet {
                 key: key.into(),
                 value: value.into(),
+                timestamp_ms,
+            },
+        }
+    }
+
+    /// Creates a new LwwMapSet operation.
+    pub fn lww_map_set(
+        origin: NodeId,
+        key: impl Into<String>,
+        field: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::LwwMapSet {
+                key: key.into(),
+                field: field.into(),
+                value: value.into(),
+                timestamp_ms,
+            },
+        }
+    }
+
+    /// Creates a new LwwMapRemove operation.
+    pub fn lww_map_remove(
+        origin: NodeId,
+        key: impl Into<String>,
+        field: impl Into<String>,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            id: OpId::generate(),
+            origin,
+            kind: OpKind::LwwMapRemove {
+                key: key.into(),
+                field: field.into(),
                 timestamp_ms,
             },
         }
@@ -281,6 +332,54 @@ mod tests {
     }
 
     #[test]
+    fn test_op_lww_map_set() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_set(
+            node.clone(),
+            "settings:service-a",
+            "theme",
+            b"dark".to_vec(),
+            123,
+        );
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::LwwMapSet {
+                key,
+                field,
+                value,
+                timestamp_ms,
+            } => {
+                assert_eq!(key, "settings:service-a");
+                assert_eq!(field, "theme");
+                assert_eq!(value, b"dark");
+                assert_eq!(*timestamp_ms, 123);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_op_lww_map_remove() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_remove(node.clone(), "settings:service-a", "theme", 456);
+
+        assert_eq!(op.origin, node);
+        match &op.kind {
+            OpKind::LwwMapRemove {
+                key,
+                field,
+                timestamp_ms,
+            } => {
+                assert_eq!(key, "settings:service-a");
+                assert_eq!(field, "theme");
+                assert_eq!(*timestamp_ms, 456);
+            }
+            other => panic!("unexpected op kind: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_op_orset_add() {
         let node = NodeId::new("node-1");
         let op = Op::orset_add(node.clone(), "tags:item-1", "blue", "add-tag-1");
@@ -395,6 +494,50 @@ mod tests {
     fn test_op_lww_register_bytes_roundtrip() {
         let node = NodeId::new("node-1");
         let op = Op::lww_register_set(node, "status:user-1", b"busy".to_vec(), 789);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_map_set_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_set(node, "settings:service-a", "theme", b"dark".to_vec(), 456);
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_map_set_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_set(node, "settings:service-a", "theme", b"light".to_vec(), 789);
+
+        let bytes = op.to_bytes().unwrap();
+        let parsed = Op::from_bytes(&bytes).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_map_remove_json_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_remove(node, "settings:service-a", "theme", 456);
+
+        let json = op.to_json().unwrap();
+        let parsed = Op::from_json(&json).unwrap();
+
+        assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_op_lww_map_remove_bytes_roundtrip() {
+        let node = NodeId::new("node-1");
+        let op = Op::lww_map_remove(node, "settings:service-a", "theme", 789);
 
         let bytes = op.to_bytes().unwrap();
         let parsed = Op::from_bytes(&bytes).unwrap();

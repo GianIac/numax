@@ -308,7 +308,7 @@ A CRDT host API is considered complete only when it has:
 | PNCounter | `crdt_pncounter_inc`, `crdt_pncounter_dec`, `crdt_pncounter_value` | Implemented |
 | LWW-Register | `crdt_lww_set`, `crdt_lww_get` | Implemented |
 | ORSet | `crdt_orset_add`, `crdt_orset_remove`, `crdt_orset_contains`, `crdt_orset_elements` | Implemented |
-| LWW-Map | TBD | Planned, Phase 14 |
+| LWW-Map | `crdt_lww_map_set`, `crdt_lww_map_remove`, `crdt_lww_map_get`, `crdt_lww_map_contains`, `crdt_lww_map_entries` | Implemented |
 | RGA | TBD | Planned, Phase 14 |
 
 ### GCounter
@@ -474,6 +474,136 @@ use nx_sdk::crdt::lww_register;
 let status = lww_register::get("status:user-1")?;
 ```
 
+### LWW-Map
+
+A key-value map where each field is an independent last-writer-wins register.
+Removes are stored as tombstones, so old writes cannot resurrect deleted fields
+after reconnect or anti-entropy replay.
+
+Use it for replicated settings, feature flags, service metadata, and small
+configuration documents.
+
+#### `crdt_lww_map_set`
+
+```text
+fn crdt_lww_map_set(
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+    value_ptr: u32,
+    value_len: u32
+) -> i32
+```
+
+Sets one field. The host assigns the timestamp and local writer NodeId.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_map;
+
+lww_map::set("settings:service-a", "theme", b"dark")?;
+```
+
+#### `crdt_lww_map_remove`
+
+```text
+fn crdt_lww_map_remove(
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32
+) -> i32
+```
+
+Removes one field by writing a tombstone.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_map;
+
+lww_map::remove("settings:service-a", "region")?;
+```
+
+#### `crdt_lww_map_get`
+
+```text
+fn crdt_lww_map_get(
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes the visible field value and returns the number of bytes written. Returns
+`ERR_NOT_FOUND` when the map or field is absent, including tombstoned fields.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_map;
+
+let value = lww_map::get("settings:service-a", "theme")?;
+```
+
+#### `crdt_lww_map_contains`
+
+```text
+fn crdt_lww_map_contains(
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32
+) -> i32
+```
+
+Returns `1` when the field has a visible value and `0` when it is absent or
+tombstoned.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_map;
+
+let has_theme = lww_map::contains("settings:service-a", "theme")?;
+```
+
+#### `crdt_lww_map_entries`
+
+```text
+fn crdt_lww_map_entries(
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes visible entries in deterministic field order and returns the number of
+bytes written. Tombstones are not returned. The raw output encoding is:
+
+```text
+u32 entry_count
+repeat entry_count times:
+  u32 field_len
+  u8[field_len] utf8_field
+  u32 value_len
+  u8[value_len] value
+```
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_map;
+
+let entries = lww_map::entries("settings:service-a")?;
+```
+
 ### ORSet
 
 An observed-remove set stores visible string elements per key. Each add creates
@@ -586,7 +716,7 @@ The following sections should be expanded as each CRDT lands.
 | PNCounter | `examples/distributed_inventory` | Implemented |
 | LWW-Register | `examples/distributed_status` | Implemented |
 | ORSet | `examples/distributed_tags` | Implemented |
-| LWW-Map | `examples/distributed_settings` | Likely builds on LWW-Register |
+| LWW-Map | `examples/distributed_settings` | Implemented |
 | RGA | `examples/distributed_comments` | Ordered sequence, likely last |
 
 ---
@@ -820,8 +950,10 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
   `db_scan_after`, `db_keys`, `db_keys_after`
 - CRDT: `crdt_gcounter_inc`, `crdt_gcounter_value`, `crdt_pncounter_inc`,
   `crdt_pncounter_dec`, `crdt_pncounter_value`, `crdt_lww_set`,
-  `crdt_lww_get`, `crdt_orset_add`, `crdt_orset_remove`,
-  `crdt_orset_contains`, `crdt_orset_elements`
+  `crdt_lww_get`, `crdt_lww_map_set`, `crdt_lww_map_remove`,
+  `crdt_lww_map_get`, `crdt_lww_map_contains`, `crdt_lww_map_entries`,
+  `crdt_orset_add`, `crdt_orset_remove`, `crdt_orset_contains`,
+  `crdt_orset_elements`
 - Time: `time_now`, `time_monotonic`
 - Crypto: `random_bytes`, `hash_sha256`, `hash_blake3`
 - System: `env_get`, `module_id`, `abort`, `host_capabilities`, `event_emit`
@@ -829,7 +961,7 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
 
 ### Planned
 
-- CRDT: ORSet, LWW-Map, RGA
+- CRDT: RGA
 - Network messaging callbacks/events: `on_peer_connect`, `on_peer_disconnect`,
   `on_message`, `on_timer`
 - Optional HTTP/client APIs remain out of scope until a capability model is

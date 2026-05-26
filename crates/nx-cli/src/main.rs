@@ -56,6 +56,10 @@ enum Cli {
         #[arg(long, value_name = "KEY")]
         print_lww_register: Option<String>,
 
+        /// Print the final visible entries of an LWW-Map after settle/serve completes.
+        #[arg(long, value_name = "KEY")]
+        print_lww_map: Option<String>,
+
         /// Print the final visible elements of an ORSet after settle/serve completes.
         #[arg(long, value_name = "KEY")]
         print_orset: Option<String>,
@@ -133,6 +137,7 @@ async fn real_main() -> Result<()> {
             print_gcounter,
             print_pncounter,
             print_lww_register,
+            print_lww_map,
             print_orset,
             shutdown_timeout,
             verbose,
@@ -175,6 +180,7 @@ async fn real_main() -> Result<()> {
             validate_print_gcounter(&sync, &print_gcounter)?;
             validate_print_pncounter(&sync, &print_pncounter)?;
             validate_print_lww_register(&sync, &print_lww_register)?;
+            validate_print_lww_map(&sync, &print_lww_map)?;
             validate_print_orset(&sync, &print_orset)?;
             let observability = build_observability_config(
                 observability_listen,
@@ -238,6 +244,20 @@ async fn real_main() -> Result<()> {
                         Some(bytes) => println!("{key} = {}", String::from_utf8_lossy(&bytes)),
                         None => println!("{key} = <unset>"),
                     }
+                }
+                if let Some(key) = print_lww_map {
+                    let entries = rt
+                        .get_lww_map_entries(&key)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("--print-lww-map requires sync"))?;
+                    let formatted = entries
+                        .iter()
+                        .map(|(field, value)| {
+                            format!("{field}={}", String::from_utf8_lossy(value))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("{key} = {{{formatted}}}");
                 }
                 if let Some(key) = print_orset {
                     let elements = rt
@@ -524,6 +544,14 @@ fn validate_print_lww_register(
 ) -> Result<()> {
     if print_lww_register.is_some() && sync.is_none() {
         bail!("--print-lww-register requires sync to be enabled with --listen");
+    }
+
+    Ok(())
+}
+
+fn validate_print_lww_map(sync: &Option<SyncConfig>, print_lww_map: &Option<String>) -> Result<()> {
+    if print_lww_map.is_some() && sync.is_none() {
+        bail!("--print-lww-map requires sync to be enabled with --listen");
     }
 
     Ok(())
@@ -985,6 +1013,20 @@ mod tests {
         }
 
         #[test]
+        fn print_lww_map_without_sync_fails() {
+            let err = validate_print_lww_map(&None, &Some("settings:service-a".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--print-lww-map requires sync"));
+        }
+
+        #[test]
+        fn print_lww_map_with_sync_is_ok() {
+            let sync = Some(SyncConfig::new().with_listen_addr("127.0.0.1:9000"));
+            assert!(validate_print_lww_map(&sync, &Some("settings:service-a".to_string())).is_ok());
+        }
+
+        #[test]
         fn print_orset_without_sync_fails() {
             let err = validate_print_orset(&None, &Some("tags:doc-1".to_string()))
                 .unwrap_err()
@@ -1376,6 +1418,23 @@ mod tests {
                     print_lww_register, ..
                 } => {
                     assert_eq!(print_lww_register.as_deref(), Some("status:service-a"));
+                }
+            }
+        }
+
+        #[test]
+        fn print_lww_map_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "run",
+                "x.wasm",
+                "--print-lww-map",
+                "settings:service-a",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Run { print_lww_map, .. } => {
+                    assert_eq!(print_lww_map.as_deref(), Some("settings:service-a"));
                 }
             }
         }

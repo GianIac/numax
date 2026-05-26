@@ -59,6 +59,8 @@ impl PNCounter {
             }
             OpKind::GCounterIncrement { .. }
             | OpKind::LwwRegisterSet { .. }
+            | OpKind::LwwMapSet { .. }
+            | OpKind::LwwMapRemove { .. }
             | OpKind::ORSetAdd { .. }
             | OpKind::ORSetRemove { .. } => Ok(false),
         }

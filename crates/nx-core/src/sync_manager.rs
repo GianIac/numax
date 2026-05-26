@@ -7,7 +7,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, Node, NodeConfig, NodeEvent};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -24,6 +24,8 @@ const PNCOUNTER_STORE_PREFIX: &str = "__nx/crdt/pncounter/";
 const PNCOUNTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/pncounter/";
 const LWW_REGISTER_STORE_PREFIX: &str = "__nx/crdt/lww-register/";
 const LWW_REGISTER_STATE_STORE_PREFIX: &str = "__nx/crdt/state/lww-register/";
+const LWW_MAP_STORE_PREFIX: &str = "__nx/crdt/lww-map/";
+const LWW_MAP_STATE_STORE_PREFIX: &str = "__nx/crdt/state/lww-map/";
 const ORSET_STORE_PREFIX: &str = "__nx/crdt/orset/";
 const ORSET_STATE_STORE_PREFIX: &str = "__nx/crdt/state/orset/";
 const SEEN_OP_STORE_PREFIX: &str = "__nx/crdt/seen-op/";
@@ -40,6 +42,7 @@ enum CrdtKind {
     GCounter,
     PNCounter,
     LwwRegister,
+    LwwMap,
     ORSet,
 }
 
@@ -49,6 +52,7 @@ impl CrdtKind {
             Self::GCounter => "GCounter",
             Self::PNCounter => "PNCounter",
             Self::LwwRegister => "LWW-Register",
+            Self::LwwMap => "LWW-Map",
             Self::ORSet => "ORSet",
         }
     }
@@ -61,6 +65,8 @@ impl CrdtKind {
             (Self::PNCounter, CrdtStoreNamespace::State) => PNCOUNTER_STATE_STORE_PREFIX,
             (Self::LwwRegister, CrdtStoreNamespace::Materialized) => LWW_REGISTER_STORE_PREFIX,
             (Self::LwwRegister, CrdtStoreNamespace::State) => LWW_REGISTER_STATE_STORE_PREFIX,
+            (Self::LwwMap, CrdtStoreNamespace::Materialized) => LWW_MAP_STORE_PREFIX,
+            (Self::LwwMap, CrdtStoreNamespace::State) => LWW_MAP_STATE_STORE_PREFIX,
             (Self::ORSet, CrdtStoreNamespace::Materialized) => ORSET_STORE_PREFIX,
             (Self::ORSet, CrdtStoreNamespace::State) => ORSET_STATE_STORE_PREFIX,
         }
@@ -178,6 +184,7 @@ struct RemoteOpApplyContext<'a> {
     counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,
+    lww_maps: &'a Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: &'a Arc<RwLock<HashMap<String, ORSet>>>,
     seen_ops: &'a Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: &'a Arc<AtomicU64>,
@@ -192,6 +199,7 @@ struct RemoteCrdtRegistries<'a> {
     counters: &'a HashMap<String, GCounter>,
     pncounters: &'a HashMap<String, PNCounter>,
     lww_registers: &'a HashMap<String, LwwRegister>,
+    lww_maps: &'a HashMap<String, LwwMap>,
     orsets: &'a HashMap<String, ORSet>,
 }
 
@@ -199,6 +207,7 @@ struct RemoteCrdtUpdates<'a> {
     counters: &'a mut HashMap<String, GCounter>,
     pncounters: &'a mut HashMap<String, PNCounter>,
     lww_registers: &'a mut HashMap<String, LwwRegister>,
+    lww_maps: &'a mut HashMap<String, LwwMap>,
     orsets: &'a mut HashMap<String, ORSet>,
 }
 
@@ -215,6 +224,7 @@ struct NodeEventContext {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+    lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     seen_ops: Arc<RwLock<SeenOps>>,
     seen_ops_next_sequence: Arc<AtomicU64>,
@@ -281,6 +291,7 @@ pub struct SyncHandle {
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+    lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
@@ -311,6 +322,11 @@ impl SyncHandle {
     /// Read-side handle over the LWW-Register registry.
     pub fn lww_registers(&self) -> Arc<RwLock<HashMap<String, LwwRegister>>> {
         Arc::clone(&self.lww_registers)
+    }
+
+    /// Read-side handle over the LWW-Map registry.
+    pub fn lww_maps(&self) -> Arc<RwLock<HashMap<String, LwwMap>>> {
+        Arc::clone(&self.lww_maps)
     }
 
     /// Read-side handle over the ORSet registry.
@@ -359,6 +375,9 @@ pub struct SyncManager {
 
     /// LWW-Register
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
+
+    /// LWW-Map
+    lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
 
     /// ORSet
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
@@ -427,6 +446,7 @@ impl SyncManager {
         let mut counters = HashMap::new();
         let mut pncounters = HashMap::new();
         let mut lww_registers = HashMap::new();
+        let mut lww_maps = HashMap::new();
         let mut orsets = HashMap::new();
         let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
             Ok(hydrated) => hydrated,
@@ -458,12 +478,16 @@ impl SyncManager {
         if let Err(e) = hydrate_lww_register_registry(&store, &mut lww_registers) {
             warn!(error = %e, "failed to hydrate LWW-Register registry");
         }
+        if let Err(e) = hydrate_lww_map_registry(&store, &mut lww_maps) {
+            warn!(error = %e, "failed to hydrate LWW-Map registry");
+        }
         if let Err(e) = hydrate_orset_registry(&store, &mut orsets) {
             warn!(error = %e, "failed to hydrate ORSet registry");
         }
         let counters = Arc::new(RwLock::new(counters));
         let pncounters = Arc::new(RwLock::new(pncounters));
         let lww_registers = Arc::new(RwLock::new(lww_registers));
+        let lww_maps = Arc::new(RwLock::new(lww_maps));
         let orsets = Arc::new(RwLock::new(orsets));
 
         Self {
@@ -473,6 +497,7 @@ impl SyncManager {
             counters,
             pncounters,
             lww_registers,
+            lww_maps,
             orsets,
             store,
             metrics,
@@ -516,6 +541,7 @@ impl SyncManager {
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
+            lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
@@ -578,6 +604,7 @@ impl SyncManager {
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
+            lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
             seen_ops: Arc::clone(&self.seen_ops),
             seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
@@ -724,6 +751,12 @@ impl SyncManager {
     pub async fn get_lww_register_value(&self, key: &str) -> Option<Vec<u8>> {
         let registers = self.lww_registers.read().await;
         registers.get(key).map(|register| register.value_bytes())
+    }
+
+    /// Returns the visible entries of an LWW-Map.
+    pub async fn get_lww_map_entries(&self, key: &str) -> Vec<(String, Vec<u8>)> {
+        let maps = self.lww_maps.read().await;
+        maps.get(key).map(|map| map.entries()).unwrap_or_default()
     }
 
     /// Returns the visible elements of an ORSet.
@@ -1259,6 +1292,7 @@ async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
                 counters: &context.counters,
                 pncounters: &context.pncounters,
                 lww_registers: &context.lww_registers,
+                lww_maps: &context.lww_maps,
                 orsets: &context.orsets,
                 seen_ops: &context.seen_ops,
                 seen_ops_next_sequence: &context.seen_ops_next_sequence,
@@ -1353,6 +1387,14 @@ fn durable_lww_register_state_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::LwwRegister, CrdtStoreNamespace::State, key)
 }
 
+pub(crate) fn materialized_lww_map_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::LwwMap, CrdtStoreNamespace::Materialized, key)
+}
+
+fn durable_lww_map_state_key(key: &str) -> Vec<u8> {
+    crdt_store_key(CrdtKind::LwwMap, CrdtStoreNamespace::State, key)
+}
+
 pub(crate) fn materialized_orset_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::ORSet, CrdtStoreNamespace::Materialized, key)
 }
@@ -1406,6 +1448,10 @@ fn logical_pncounter_state_key(store_key: &[u8]) -> anyhow::Result<String> {
 
 fn logical_lww_register_state_key(store_key: &[u8]) -> anyhow::Result<String> {
     logical_crdt_key(store_key, CrdtKind::LwwRegister, CrdtStoreNamespace::State)
+}
+
+fn logical_lww_map_state_key(store_key: &[u8]) -> anyhow::Result<String> {
+    logical_crdt_key(store_key, CrdtKind::LwwMap, CrdtStoreNamespace::State)
 }
 
 fn logical_orset_state_key(store_key: &[u8]) -> anyhow::Result<String> {
@@ -1545,6 +1591,20 @@ fn hydrate_lww_register_registry(
         "hydrated LWW-Register registry from sled"
     );
     Ok(registers.len())
+}
+
+fn hydrate_lww_map_registry(
+    store: &NxStore,
+    maps: &mut HashMap<String, LwwMap>,
+) -> anyhow::Result<usize> {
+    let durable_count = hydrate_durable_lww_map_state(store, maps)?;
+
+    debug!(
+        durable_count,
+        total = maps.len(),
+        "hydrated LWW-Map registry from sled"
+    );
+    Ok(maps.len())
 }
 
 fn hydrate_orset_registry(
@@ -1746,6 +1806,37 @@ fn hydrate_durable_lww_register_state(
     Ok(hydrated)
 }
 
+fn hydrate_durable_lww_map_state(
+    store: &NxStore,
+    maps: &mut HashMap<String, LwwMap>,
+) -> anyhow::Result<usize> {
+    let entries = store.scan_prefix(LWW_MAP_STATE_STORE_PREFIX.as_bytes())?;
+    let mut hydrated = 0;
+
+    for (store_key, value_bytes) in entries {
+        let key = match logical_lww_map_state_key(&store_key) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "skipping invalid durable LWW-Map state key");
+                continue;
+            }
+        };
+        let map = match parse_durable_lww_map_state(&value_bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(key = %key, error = %e, "skipping invalid durable LWW-Map state");
+                continue;
+            }
+        };
+
+        materialize_lww_map_entries(store, &key, &map.entries())?;
+        maps.insert(key, map);
+        hydrated += 1;
+    }
+
+    Ok(hydrated)
+}
+
 fn hydrate_durable_orset_state(
     store: &NxStore,
     sets: &mut HashMap<String, ORSet>,
@@ -1883,6 +1974,17 @@ pub(crate) fn materialize_lww_register_value(
     Ok(())
 }
 
+pub(crate) fn materialize_lww_map_entries(
+    store: &NxStore,
+    key: &str,
+    entries: &[(String, Vec<u8>)],
+) -> anyhow::Result<()> {
+    let store_key = materialized_lww_map_key(key);
+    let entries_json = serde_json::to_vec(entries)?;
+    store.set(&store_key, &entries_json)?;
+    Ok(())
+}
+
 pub(crate) fn materialize_orset_elements(
     store: &NxStore,
     key: &str,
@@ -1911,6 +2013,12 @@ fn parse_durable_lww_register_state(bytes: &[u8]) -> anyhow::Result<LwwRegister>
         .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable LWW-Register state: {e}"))?;
     LwwRegister::from_json(json)
         .map_err(|e| anyhow::anyhow!("invalid durable LWW-Register JSON: {e}"))
+}
+
+fn parse_durable_lww_map_state(bytes: &[u8]) -> anyhow::Result<LwwMap> {
+    let json = std::str::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in durable LWW-Map state: {e}"))?;
+    LwwMap::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable LWW-Map JSON: {e}"))
 }
 
 fn parse_durable_orset_state(bytes: &[u8]) -> anyhow::Result<ORSet> {
@@ -1952,6 +2060,18 @@ pub(crate) fn persist_lww_register_state(
     let state_json = register.to_json()?;
     store.set(&store_key, state_json.as_bytes())?;
     materialize_lww_register_value(store, key, register.value())?;
+    Ok(())
+}
+
+pub(crate) fn persist_lww_map_state(
+    store: &NxStore,
+    key: &str,
+    map: &LwwMap,
+) -> anyhow::Result<()> {
+    let store_key = durable_lww_map_state_key(key);
+    let state_json = map.to_json()?;
+    store.set(&store_key, state_json.as_bytes())?;
+    materialize_lww_map_entries(store, key, &map.entries())?;
     Ok(())
 }
 
@@ -2071,6 +2191,7 @@ fn persist_remote_ops_batch(
     counter_updates: &HashMap<String, GCounter>,
     pncounter_updates: &HashMap<String, PNCounter>,
     lww_register_updates: &HashMap<String, LwwRegister>,
+    lww_map_updates: &HashMap<String, LwwMap>,
     orset_updates: &HashMap<String, ORSet>,
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
@@ -2117,6 +2238,19 @@ fn persist_remote_ops_batch(
         set_values.push(register.to_json()?.into_bytes());
         set_keys.push(materialized_lww_register_key(key));
         set_values.push(register.value_bytes());
+    }
+
+    let mut changed_lww_map_keys = lww_map_updates.keys().collect::<Vec<_>>();
+    changed_lww_map_keys.sort();
+
+    for key in changed_lww_map_keys {
+        let Some(map) = lww_map_updates.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_lww_map_state_key(key));
+        set_values.push(map.to_json()?.into_bytes());
+        set_keys.push(materialized_lww_map_key(key));
+        set_values.push(serde_json::to_vec(&map.entries())?);
     }
 
     let mut changed_orset_keys = orset_updates.keys().collect::<Vec<_>>();
@@ -2166,6 +2300,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut counters = context.counters.write().await;
     let mut pncounters = context.pncounters.write().await;
     let mut lww_registers = context.lww_registers.write().await;
+    let mut lww_maps = context.lww_maps.write().await;
     let mut orsets = context.orsets.write().await;
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
@@ -2175,6 +2310,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     let mut counter_updates = HashMap::new();
     let mut pncounter_updates = HashMap::new();
     let mut lww_register_updates = HashMap::new();
+    let mut lww_map_updates = HashMap::new();
     let mut orset_updates = HashMap::new();
 
     for op in ops {
@@ -2188,12 +2324,14 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
             counters: &counters,
             pncounters: &pncounters,
             lww_registers: &lww_registers,
+            lww_maps: &lww_maps,
             orsets: &orsets,
         };
         let mut updates = RemoteCrdtUpdates {
             counters: &mut counter_updates,
             pncounters: &mut pncounter_updates,
             lww_registers: &mut lww_register_updates,
+            lww_maps: &mut lww_map_updates,
             orsets: &mut orset_updates,
         };
         apply_remote_op_to_crdt_updates(op, &registries, &mut updates);
@@ -2232,6 +2370,7 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
         &counter_updates,
         &pncounter_updates,
         &lww_register_updates,
+        &lww_map_updates,
         &orset_updates,
     )?;
 
@@ -2247,6 +2386,9 @@ async fn apply_remote_ops(ops: &[Op], context: &RemoteOpApplyContext<'_>) -> any
     }
     for (key, register) in lww_register_updates {
         lww_registers.insert(key, register);
+    }
+    for (key, map) in lww_map_updates {
+        lww_maps.insert(key, map);
     }
     for (key, set) in orset_updates {
         orsets.insert(key, set);
@@ -2296,6 +2438,36 @@ fn apply_remote_op_to_crdt_updates(
                 *timestamp_ms,
                 registries.lww_registers,
                 updates.lww_registers,
+            );
+        }
+        OpKind::LwwMapSet {
+            key,
+            field,
+            value,
+            timestamp_ms,
+        } => {
+            apply_remote_lww_map_set(
+                op,
+                key,
+                field,
+                value,
+                *timestamp_ms,
+                registries.lww_maps,
+                updates.lww_maps,
+            );
+        }
+        OpKind::LwwMapRemove {
+            key,
+            field,
+            timestamp_ms,
+        } => {
+            apply_remote_lww_map_remove(
+                op,
+                key,
+                field,
+                *timestamp_ms,
+                registries.lww_maps,
+                updates.lww_maps,
             );
         }
         OpKind::ORSetAdd { key, element, tag } => {
@@ -2367,6 +2539,40 @@ fn apply_remote_lww_register_set(
     if register.assign(value.to_vec(), timestamp_ms, op.origin.clone()) {
         register_updates.insert(key.to_string(), register);
     }
+}
+
+fn apply_remote_lww_map_set(
+    op: &Op,
+    key: &str,
+    field: &str,
+    value: &[u8],
+    timestamp_ms: u64,
+    maps: &HashMap<String, LwwMap>,
+    map_updates: &mut HashMap<String, LwwMap>,
+) {
+    let map = map_updates
+        .entry(key.to_string())
+        .or_insert_with(|| maps.get(key).cloned().unwrap_or_else(LwwMap::new));
+    map.set(
+        field.to_string(),
+        value.to_vec(),
+        timestamp_ms,
+        op.origin.clone(),
+    );
+}
+
+fn apply_remote_lww_map_remove(
+    op: &Op,
+    key: &str,
+    field: &str,
+    timestamp_ms: u64,
+    maps: &HashMap<String, LwwMap>,
+    map_updates: &mut HashMap<String, LwwMap>,
+) {
+    let map = map_updates
+        .entry(key.to_string())
+        .or_insert_with(|| maps.get(key).cloned().unwrap_or_else(LwwMap::new));
+    map.remove(field.to_string(), timestamp_ms, op.origin.clone());
 }
 
 fn apply_remote_orset_add(
@@ -2461,6 +2667,18 @@ mod tests {
         parse_durable_lww_register_state(&bytes).unwrap()
     }
 
+    fn read_materialized_lww_map(store: &NxStore, key: &str) -> Vec<(String, Vec<u8>)> {
+        let key = materialized_lww_map_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn read_durable_lww_map_state(store: &NxStore, key: &str) -> LwwMap {
+        let key = durable_lww_map_state_key(key);
+        let bytes = store.get(&key).unwrap().unwrap();
+        parse_durable_lww_map_state(&bytes).unwrap()
+    }
+
     fn read_materialized_orset(store: &NxStore, key: &str) -> Vec<String> {
         let key = materialized_orset_key(key);
         let bytes = store.get(&key).unwrap().unwrap();
@@ -2495,6 +2713,7 @@ mod tests {
             counters,
             pncounters: Arc::new(RwLock::new(HashMap::new())),
             lww_registers: Arc::new(RwLock::new(HashMap::new())),
+            lww_maps: Arc::new(RwLock::new(HashMap::new())),
             orsets: Arc::new(RwLock::new(HashMap::new())),
             seen_ops,
             seen_ops_next_sequence: Arc::new(AtomicU64::new(0)),
@@ -2525,12 +2744,14 @@ mod tests {
     ) {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters,
             pncounters: &pncounters,
             lww_registers: &lww_registers,
+            lww_maps: &lww_maps,
             orsets: &orsets,
             seen_ops,
             seen_ops_next_sequence,
@@ -2556,12 +2777,14 @@ mod tests {
     ) {
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters,
             lww_registers: &lww_registers,
+            lww_maps: &lww_maps,
             orsets: &orsets,
             seen_ops,
             seen_ops_next_sequence,
@@ -2587,12 +2810,47 @@ mod tests {
     ) {
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let orsets = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters: &pncounters,
             lww_registers: registers,
+            lww_maps: &lww_maps,
+            orsets: &orsets,
+            seen_ops,
+            seen_ops_next_sequence,
+            op_log,
+            op_log_next_sequence,
+            op_log_limit: 1024,
+            store,
+            metrics: &metrics,
+        };
+        apply_remote_ops(std::slice::from_ref(op), &context)
+            .await
+            .unwrap();
+    }
+
+    async fn apply_remote_lww_map_op_for_test(
+        op: &Op,
+        maps: &Arc<RwLock<HashMap<String, LwwMap>>>,
+        seen_ops: &Arc<RwLock<SeenOps>>,
+        seen_ops_next_sequence: &Arc<AtomicU64>,
+        op_log: &Arc<RwLock<Vec<Op>>>,
+        op_log_next_sequence: &Arc<AtomicU64>,
+        store: &Arc<NxStore>,
+    ) {
+        let counters = Arc::new(RwLock::new(HashMap::new()));
+        let pncounters = Arc::new(RwLock::new(HashMap::new()));
+        let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let orsets = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = metrics();
+        let context = RemoteOpApplyContext {
+            counters: &counters,
+            pncounters: &pncounters,
+            lww_registers: &lww_registers,
+            lww_maps: maps,
             orsets: &orsets,
             seen_ops,
             seen_ops_next_sequence,
@@ -2619,11 +2877,13 @@ mod tests {
         let counters = Arc::new(RwLock::new(HashMap::new()));
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+        let lww_maps = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
             counters: &counters,
             pncounters: &pncounters,
             lww_registers: &lww_registers,
+            lww_maps: &lww_maps,
             orsets: sets,
             seen_ops,
             seen_ops_next_sequence,
@@ -2698,6 +2958,24 @@ mod tests {
         }
     }
 
+    async fn wait_for_lww_map(manager: &SyncManager, key: &str, expected: &[(&str, &[u8])]) {
+        let expected = expected
+            .iter()
+            .map(|(field, value)| ((*field).to_string(), (*value).to_vec()))
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_lww_map_entries(key).await == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lww-map {key} did not reach expected entries"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn wait_for_connected_peer(manager: &SyncManager) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2750,6 +3028,27 @@ mod tests {
 
     async fn local_orset_add(handle: &SyncHandle, key: &str, element: &str) {
         let op = apply_local_orset_add(handle, key, element).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_lww_map_set(
+        handle: &SyncHandle,
+        key: &str,
+        field: &str,
+        value: &[u8],
+        timestamp_ms: u64,
+    ) {
+        let op = apply_local_lww_map_set(handle, key, field, value, timestamp_ms).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_lww_map_remove(
+        handle: &SyncHandle,
+        key: &str,
+        field: &str,
+        timestamp_ms: u64,
+    ) {
+        let op = apply_local_lww_map_remove(handle, key, field, timestamp_ms).await;
         handle.op_sender().send(op).await.unwrap();
     }
 
@@ -2856,6 +3155,56 @@ mod tests {
         }
 
         Op::lww_register_set(handle.node_id().clone(), key, value.to_vec(), timestamp_ms)
+    }
+
+    async fn apply_local_lww_map_set(
+        handle: &SyncHandle,
+        key: &str,
+        field: &str,
+        value: &[u8],
+        timestamp_ms: u64,
+    ) -> Op {
+        {
+            let maps_arc = handle.lww_maps();
+            let mut maps = maps_arc.write().await;
+            let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
+            map.set(
+                field.to_string(),
+                value.to_vec(),
+                timestamp_ms,
+                handle.node_id().clone(),
+            );
+
+            persist_lww_map_state(&handle.store(), key, &map).unwrap();
+            maps.insert(key.to_string(), map);
+        }
+
+        Op::lww_map_set(
+            handle.node_id().clone(),
+            key,
+            field,
+            value.to_vec(),
+            timestamp_ms,
+        )
+    }
+
+    async fn apply_local_lww_map_remove(
+        handle: &SyncHandle,
+        key: &str,
+        field: &str,
+        timestamp_ms: u64,
+    ) -> Op {
+        {
+            let maps_arc = handle.lww_maps();
+            let mut maps = maps_arc.write().await;
+            let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
+            map.remove(field.to_string(), timestamp_ms, handle.node_id().clone());
+
+            persist_lww_map_state(&handle.store(), key, &map).unwrap();
+            maps.insert(key.to_string(), map);
+        }
+
+        Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms)
     }
 
     async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {
@@ -3035,6 +3384,44 @@ mod tests {
             )
             .unwrap(),
             "status:user-1"
+        );
+
+        let lww_map_materialized = crdt_store_key(
+            CrdtKind::LwwMap,
+            CrdtStoreNamespace::Materialized,
+            "settings:service-a",
+        );
+        let lww_map_durable_state = crdt_store_key(
+            CrdtKind::LwwMap,
+            CrdtStoreNamespace::State,
+            "settings:service-a",
+        );
+
+        assert_eq!(
+            lww_map_materialized,
+            materialized_lww_map_key("settings:service-a")
+        );
+        assert_eq!(
+            lww_map_durable_state,
+            durable_lww_map_state_key("settings:service-a")
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &lww_map_materialized,
+                CrdtKind::LwwMap,
+                CrdtStoreNamespace::Materialized,
+            )
+            .unwrap(),
+            "settings:service-a"
+        );
+        assert_eq!(
+            logical_crdt_key(
+                &lww_map_durable_state,
+                CrdtKind::LwwMap,
+                CrdtStoreNamespace::State
+            )
+            .unwrap(),
+            "settings:service-a"
         );
 
         let orset_materialized = crdt_store_key(
@@ -3707,6 +4094,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_remote_lww_map_set_materializes_visible_entries() {
+        let store = temp_store();
+        let maps = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let origin = NodeId::new("remote-a");
+        let op = Op::lww_map_set(
+            origin.clone(),
+            "settings:service-a",
+            "theme",
+            b"dark".to_vec(),
+            100,
+        );
+
+        apply_remote_lww_map_op_for_test(
+            &op,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(
+            read_materialized_lww_map(&store, "settings:service-a"),
+            vec![("theme".to_string(), b"dark".to_vec())]
+        );
+        let state = read_durable_lww_map_state(&store, "settings:service-a");
+        assert_eq!(state.get_bytes("theme"), Some(b"dark".to_vec()));
+        assert_eq!(state.entry("theme").unwrap().timestamp_ms(), 100);
+        assert_eq!(state.entry("theme").unwrap().writer(), &origin);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_lww_map_remove_hides_field() {
+        let store = temp_store();
+        let maps = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let set = Op::lww_map_set(
+            NodeId::new("remote-a"),
+            "settings:service-a",
+            "theme",
+            b"dark".to_vec(),
+            100,
+        );
+        let remove = Op::lww_map_remove(
+            NodeId::new("remote-b"),
+            "settings:service-a",
+            "theme",
+            200,
+        );
+
+        apply_remote_lww_map_op_for_test(
+            &set,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_lww_map_op_for_test(
+            &remove,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+        let state = read_durable_lww_map_state(&store, "settings:service-a");
+        assert!(!state.entry("theme").unwrap().is_visible());
+        assert_eq!(state.entry("theme").unwrap().timestamp_ms(), 200);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_lww_map_older_set_does_not_resurrect_removed_field() {
+        let store = temp_store();
+        let maps = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let remove = Op::lww_map_remove(
+            NodeId::new("remote-b"),
+            "settings:service-a",
+            "theme",
+            200,
+        );
+        let older_set = Op::lww_map_set(
+            NodeId::new("remote-a"),
+            "settings:service-a",
+            "theme",
+            b"dark".to_vec(),
+            100,
+        );
+
+        apply_remote_lww_map_op_for_test(
+            &remove,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_lww_map_op_for_test(
+            &older_set,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+        let state = read_durable_lww_map_state(&store, "settings:service-a");
+        assert!(!state.entry("theme").unwrap().is_visible());
+        assert_eq!(state.entry("theme").unwrap().timestamp_ms(), 200);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_lww_map_duplicate_does_not_double_apply() {
+        let store = temp_store();
+        let maps = Arc::new(RwLock::new(HashMap::new()));
+        let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+        let op_log = Arc::new(RwLock::new(Vec::new()));
+        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+        let op = Op::lww_map_set(
+            NodeId::new("remote-a"),
+            "settings:service-a",
+            "theme",
+            b"dark".to_vec(),
+            100,
+        );
+
+        apply_remote_lww_map_op_for_test(
+            &op,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+        apply_remote_lww_map_op_for_test(
+            &op,
+            &maps,
+            &seen_ops,
+            &seen_ops_next_sequence,
+            &op_log,
+            &op_log_next_sequence,
+            &store,
+        )
+        .await;
+
+        assert_eq!(op_log.read().await.len(), 1);
+        let state = read_durable_lww_map_state(&store, "settings:service-a");
+        assert_eq!(state.get_bytes("theme"), Some(b"dark".to_vec()));
+    }
+
+    #[tokio::test]
     async fn apply_remote_orset_add_materializes_visible_element() {
         let store = temp_store();
         let sets = Arc::new(RwLock::new(HashMap::new()));
@@ -3960,6 +4525,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_hydrates_lww_map_registry_from_durable_state() {
+        let store = temp_store();
+        let writer = NodeId::new("node-a");
+        let mut map = LwwMap::new();
+        map.set("theme", b"dark".to_vec(), 123, writer.clone());
+        map.set("region", b"eu".to_vec(), 124, writer.clone());
+        map.remove("region", 125, writer.clone());
+
+        persist_lww_map_state(&store, "settings:service-a", &map).unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_lww_map_entries("settings:service-a").await,
+            vec![("theme".to_string(), b"dark".to_vec())]
+        );
+
+        let maps = manager.lww_maps.read().await;
+        let hydrated = maps.get("settings:service-a").unwrap();
+        assert_eq!(hydrated.get_bytes("theme"), Some(b"dark".to_vec()));
+        assert!(!hydrated.entry("region").unwrap().is_visible());
+        assert_eq!(read_materialized_lww_map(&store, "settings:service-a").len(), 1);
+    }
+
+    #[tokio::test]
     async fn manager_hydrates_orset_registry_from_durable_state() {
         let store = temp_store();
         let mut set = ORSet::new();
@@ -4013,6 +4608,37 @@ mod tests {
         assert_eq!(
             read_materialized_lww_register(&store, "status:user-1"),
             b"online".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_lww_map_state_takes_precedence_over_materialized_entries() {
+        let store = temp_store();
+        let mut map = LwwMap::new();
+        map.set("theme", b"dark".to_vec(), 123, NodeId::new("node-a"));
+
+        persist_lww_map_state(&store, "settings:service-a", &map).unwrap();
+        materialize_lww_map_entries(
+            &store,
+            "settings:service-a",
+            &[("theme".to_string(), b"stale".to_vec())],
+        )
+        .unwrap();
+
+        let manager = SyncManager::new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        assert_eq!(
+            manager.get_lww_map_entries("settings:service-a").await,
+            vec![("theme".to_string(), b"dark".to_vec())]
+        );
+        assert_eq!(
+            read_materialized_lww_map(&store, "settings:service-a"),
+            vec![("theme".to_string(), b"dark".to_vec())]
         );
     }
 
@@ -4182,6 +4808,49 @@ mod tests {
         assert_eq!(state_b.timestamp_ms(), 200);
         assert_eq!(state_a.writer(), handle_b.node_id());
         assert_eq!(state_b.writer(), handle_b.node_id());
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_lww_map_sets_and_remove_converge() {
+        let key = "settings:service-a";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        tokio::join!(
+            local_lww_map_set(&handle_a, key, "theme", b"dark", 100),
+            local_lww_map_set(&handle_b, key, "region", b"eu", 100),
+        );
+
+        wait_for_lww_map(&manager_a, key, &[("region", b"eu"), ("theme", b"dark")]).await;
+        wait_for_lww_map(&manager_b, key, &[("region", b"eu"), ("theme", b"dark")]).await;
+
+        tokio::join!(
+            local_lww_map_set(&handle_a, key, "theme", b"light", 200),
+            local_lww_map_remove(&handle_b, key, "region", 300),
+        );
+
+        wait_for_lww_map(&manager_a, key, &[("theme", b"light")]).await;
+        wait_for_lww_map(&manager_b, key, &[("theme", b"light")]).await;
+        assert_eq!(
+            read_materialized_lww_map(&store_a, key),
+            vec![("theme".to_string(), b"light".to_vec())]
+        );
+        assert_eq!(
+            read_materialized_lww_map(&store_b, key),
+            vec![("theme".to_string(), b"light".to_vec())]
+        );
+
+        let state_a = read_durable_lww_map_state(&store_a, key);
+        let state_b = read_durable_lww_map_state(&store_b, key);
+        assert_eq!(state_a.get_bytes("theme"), Some(b"light".to_vec()));
+        assert_eq!(state_b.get_bytes("theme"), Some(b"light".to_vec()));
+        assert!(!state_a.entry("region").unwrap().is_visible());
+        assert!(!state_b.entry("region").unwrap().is_visible());
     }
 
     #[tokio::test]

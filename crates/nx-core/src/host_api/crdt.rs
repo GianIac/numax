@@ -1,11 +1,11 @@
 use anyhow::Result;
-use nx_sync::{GCounter, LwwRegister, ORSet, Op, OpKind, PNCounter};
+use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 use crate::sync_manager::{
-    persist_gcounter_state, persist_lww_register_state, persist_orset_state,
+    persist_gcounter_state, persist_lww_map_state, persist_lww_register_state, persist_orset_state,
     persist_pncounter_state,
 };
 
@@ -19,6 +19,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 // limits
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
 const MAX_ELEMENT_LEN: u32 = 8 * 1024;
+const MAX_FIELD_LEN: u32 = 8 * 1024;
 const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB, aligned with db.rs
 const MAX_OUT_CAP: u32 = 1024 * 1024; // 1 MiB
 const U64_LEN: u32 = 8;
@@ -117,6 +118,24 @@ fn encode_string_list(values: &[String]) -> Result<Vec<u8>, i32> {
         let len = u32::try_from(bytes.len()).map_err(|_| ERR_INTERNAL)?;
         encoded.extend_from_slice(&len.to_le_bytes());
         encoded.extend_from_slice(bytes);
+    }
+
+    Ok(encoded)
+}
+
+fn encode_lww_map_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, i32> {
+    let mut encoded = Vec::new();
+    let count = u32::try_from(entries.len()).map_err(|_| ERR_INTERNAL)?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+
+    for (field, value) in entries {
+        let field_bytes = field.as_bytes();
+        let field_len = u32::try_from(field_bytes.len()).map_err(|_| ERR_INTERNAL)?;
+        let value_len = u32::try_from(value.len()).map_err(|_| ERR_INTERNAL)?;
+        encoded.extend_from_slice(&field_len.to_le_bytes());
+        encoded.extend_from_slice(field_bytes);
+        encoded.extend_from_slice(&value_len.to_le_bytes());
+        encoded.extend_from_slice(value);
     }
 
     Ok(encoded)
@@ -522,6 +541,345 @@ async fn crdt_lww_get_impl(
     value.len() as i32
 }
 
+async fn crdt_lww_map_set_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_map_set: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let field = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        field_ptr,
+        field_len,
+        MAX_FIELD_LEN,
+        "crdt_lww_map_set",
+        "field",
+    ) {
+        Ok(field) => field,
+        Err(code) => return code,
+    };
+    let value = match read_value_bytes(
+        &mut caller,
+        &memory,
+        value_ptr,
+        value_len,
+        "crdt_lww_map_set",
+    ) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let observed_timestamp_ms = match unix_epoch_millis() {
+        Ok(timestamp_ms) => timestamp_ms,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_map_set: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let mut timestamp_ms = observed_timestamp_ms;
+    {
+        let maps_arc = handle.lww_maps();
+        let mut maps = maps_arc.write().await;
+        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
+        if let Some(existing) = map.entry(&field) {
+            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
+        }
+        map.set(
+            field.clone(),
+            value.clone(),
+            timestamp_ms,
+            handle.node_id().clone(),
+        );
+        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_map_set: failed to persist map");
+            return ERR_INTERNAL;
+        }
+        maps.insert(key.clone(), map);
+    }
+
+    let op = Op::lww_map_set(handle.node_id().clone(), key, field, value, timestamp_ms);
+    tracing::debug!(op_id = %op.id, "queued local LWW-Map set");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_lww_map_remove_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_map_remove: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let field = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        field_ptr,
+        field_len,
+        MAX_FIELD_LEN,
+        "crdt_lww_map_remove",
+        "field",
+    ) {
+        Ok(field) => field,
+        Err(code) => return code,
+    };
+    let observed_timestamp_ms = match unix_epoch_millis() {
+        Ok(timestamp_ms) => timestamp_ms,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_map_remove: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let mut timestamp_ms = observed_timestamp_ms;
+    {
+        let maps_arc = handle.lww_maps();
+        let mut maps = maps_arc.write().await;
+        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
+        if let Some(existing) = map.entry(&field) {
+            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
+        }
+        map.remove(field.clone(), timestamp_ms, handle.node_id().clone());
+        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_map_remove: failed to persist map");
+            return ERR_INTERNAL;
+        }
+        maps.insert(key.clone(), map);
+    }
+
+    let op = Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms);
+    tracing::debug!(op_id = %op.id, "queued local LWW-Map remove");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_lww_map_get_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_map_get: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_lww_map_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let field = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        field_ptr,
+        field_len,
+        MAX_FIELD_LEN,
+        "crdt_lww_map_get",
+        "field",
+    ) {
+        Ok(field) => field,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let value = {
+        let maps_arc = handle.lww_maps();
+        let maps = maps_arc.read().await;
+        let Some(map) = maps.get(&key) else {
+            return ERR_NOT_FOUND;
+        };
+        let Some(value) = map.get_bytes(&field) else {
+            return ERR_NOT_FOUND;
+        };
+        value
+    };
+
+    if value.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &value) {
+        eprintln!("[nx-core] crdt_lww_map_get: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    value.len() as i32
+}
+
+async fn crdt_lww_map_contains_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    field_ptr: u32,
+    field_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_map_contains: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let field = match read_utf8_arg(
+        &mut caller,
+        &memory,
+        field_ptr,
+        field_len,
+        MAX_FIELD_LEN,
+        "crdt_lww_map_contains",
+        "field",
+    ) {
+        Ok(field) => field,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let contains = {
+        let maps_arc = handle.lww_maps();
+        let maps = maps_arc.read().await;
+        maps.get(&key).map(|map| map.contains(&field)).unwrap_or(false)
+    };
+
+    i32::from(contains)
+}
+
+async fn crdt_lww_map_entries_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_map_entries: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_lww_map_entries: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let entries = {
+        let maps_arc = handle.lww_maps();
+        let maps = maps_arc.read().await;
+        maps.get(&key).map(|map| map.entries()).unwrap_or_default()
+    };
+    let encoded = match encode_lww_map_entries(&entries) {
+        Ok(encoded) => encoded,
+        Err(code) => return code,
+    };
+
+    if encoded.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &encoded) {
+        eprintln!("[nx-core] crdt_lww_map_entries: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    encoded.len() as i32
+}
+
 async fn crdt_orset_add_impl(
     mut caller: Caller<'_, HostState>,
     key_ptr: u32,
@@ -836,6 +1194,75 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>,
          (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(crdt_lww_get_impl(
+                caller, key_ptr, key_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_map_set",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, field_ptr, field_len, value_ptr, value_len): (
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+        )| {
+            Box::new(crdt_lww_map_set_impl(
+                caller, key_ptr, key_len, field_ptr, field_len, value_ptr, value_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_map_remove",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, field_ptr, field_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_lww_map_remove_impl(
+                caller, key_ptr, key_len, field_ptr, field_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_map_get",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, field_ptr, field_len, out_ptr, out_cap): (
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+        )| {
+            Box::new(crdt_lww_map_get_impl(
+                caller, key_ptr, key_len, field_ptr, field_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_map_contains",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, field_ptr, field_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_lww_map_contains_impl(
+                caller, key_ptr, key_len, field_ptr, field_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_map_entries",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+            Box::new(crdt_lww_map_entries_impl(
                 caller, key_ptr, key_len, out_ptr, out_cap,
             ))
         },

@@ -48,6 +48,35 @@ unsafe extern "C" {
     pub fn crdt_pncounter_value(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn crdt_lww_set(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32) -> i32;
     pub fn crdt_lww_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
+    pub fn crdt_lww_map_set(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+    ) -> i32;
+    pub fn crdt_lww_map_remove(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+    ) -> i32;
+    pub fn crdt_lww_map_get(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    ) -> i32;
+    pub fn crdt_lww_map_contains(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+    ) -> i32;
+    pub fn crdt_lww_map_entries(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32;
     pub fn crdt_orset_add(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32) -> i32;
     pub fn crdt_orset_remove(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32)
     -> i32;
