@@ -2420,6 +2420,20 @@ mod tests {
         }
     }
 
+    async fn wait_for_lww_register(manager: &SyncManager, key: &str, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.get_lww_register_value(key).await.as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lww-register {key} did not reach expected value"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn wait_for_connected_peer(manager: &SyncManager) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2457,6 +2471,16 @@ mod tests {
 
     async fn local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) {
         let op = apply_local_pncounter_dec(handle, key, delta).await;
+        handle.op_sender().send(op).await.unwrap();
+    }
+
+    async fn local_lww_register_set(
+        handle: &SyncHandle,
+        key: &str,
+        value: &[u8],
+        timestamp_ms: u64,
+    ) {
+        let op = apply_local_lww_register_set(handle, key, value, timestamp_ms).await;
         handle.op_sender().send(op).await.unwrap();
     }
 
@@ -2535,6 +2559,28 @@ mod tests {
                 Op::pncounter_decrement(handle.node_id().clone(), key, delta)
             }
         }
+    }
+
+    async fn apply_local_lww_register_set(
+        handle: &SyncHandle,
+        key: &str,
+        value: &[u8],
+        timestamp_ms: u64,
+    ) -> Op {
+        {
+            let registers_arc = handle.lww_registers();
+            let mut registers = registers_arc.write().await;
+            let candidate =
+                LwwRegister::new(value.to_vec(), timestamp_ms, handle.node_id().clone());
+            let register = registers
+                .entry(key.to_string())
+                .or_insert_with(|| candidate.clone());
+            register.merge(&candidate);
+
+            persist_lww_register_state(&handle.store(), key, register).unwrap();
+        }
+
+        Op::lww_register_set(handle.node_id().clone(), key, value.to_vec(), timestamp_ms)
     }
 
     async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -3589,6 +3635,43 @@ mod tests {
         wait_for_pncounter(&manager_b, key, 6).await;
         assert_eq!(read_materialized_pncounter(&store_a, key), 6);
         assert_eq!(read_materialized_pncounter(&store_b, key), 6);
+    }
+
+    #[tokio::test]
+    async fn e2e_two_nodes_lww_register_sets_converge_to_latest_value() {
+        let key = "status:user-1";
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let (manager_a, handle_a, store_a) = started_manager(addr_a.clone()).await;
+        let (manager_b, handle_b, store_b) = started_manager(addr_b.clone()).await;
+
+        manager_a.connect_to_peer(&addr_b).await.unwrap();
+        manager_b.connect_to_peer(&addr_a).await.unwrap();
+
+        tokio::join!(
+            local_lww_register_set(&handle_a, key, b"online", 100),
+            local_lww_register_set(&handle_b, key, b"away", 200),
+        );
+
+        wait_for_lww_register(&manager_a, key, b"away").await;
+        wait_for_lww_register(&manager_b, key, b"away").await;
+        assert_eq!(
+            read_materialized_lww_register(&store_a, key),
+            b"away".to_vec()
+        );
+        assert_eq!(
+            read_materialized_lww_register(&store_b, key),
+            b"away".to_vec()
+        );
+
+        let state_a = read_durable_lww_register_state(&store_a, key);
+        let state_b = read_durable_lww_register_state(&store_b, key);
+        assert_eq!(state_a.value(), b"away");
+        assert_eq!(state_b.value(), b"away");
+        assert_eq!(state_a.timestamp_ms(), 200);
+        assert_eq!(state_b.timestamp_ms(), 200);
+        assert_eq!(state_a.writer(), handle_b.node_id());
+        assert_eq!(state_b.writer(), handle_b.node_id());
     }
 
     #[tokio::test]

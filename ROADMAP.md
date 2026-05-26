@@ -424,7 +424,7 @@ count for chaos runs. RAM/CPU profiling remains a future hardening extension.
 - [x] `OpKind` variants and operation constructors
 - [x] durable state/op-log integration in `nx-core`
 - [x] host API + SDK wrapper
-- [ ] SyncManager E2E coverage
+- [x] SyncManager E2E coverage
 - [ ] distributed example with README
 
 Completion rule for each CRDT:
