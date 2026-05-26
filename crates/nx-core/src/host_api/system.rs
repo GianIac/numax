@@ -19,6 +19,8 @@ const HOST_CAPABILITIES: &[&str] = &[
     "abort",
     "crdt_gcounter_inc",
     "crdt_gcounter_value",
+    "crdt_lww_get",
+    "crdt_lww_set",
     "crdt_pncounter_dec",
     "crdt_pncounter_inc",
     "crdt_pncounter_value",

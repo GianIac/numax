@@ -306,7 +306,7 @@ A CRDT host API is considered complete only when it has:
 |------|-----------|--------|
 | GCounter | `crdt_gcounter_inc`, `crdt_gcounter_value` | Implemented |
 | PNCounter | `crdt_pncounter_inc`, `crdt_pncounter_dec`, `crdt_pncounter_value` | Implemented |
-| LWW-Register | TBD | Planned, Phase 14 |
+| LWW-Register | `crdt_lww_set`, `crdt_lww_get` | Implemented |
 | ORSet | TBD | Planned, Phase 14 |
 | LWW-Map | TBD | Planned, Phase 14 |
 | RGA | TBD | Planned, Phase 14 |
@@ -417,6 +417,63 @@ use nx_sdk::crdt::pncounter;
 let available = pncounter::value("inventory:sku-1")?;
 ```
 
+### LWW-Register
+
+A last-writer-wins register stores a single byte value per key. Each write is
+tagged by the host with a timestamp and the local `NodeId`; higher timestamps
+win, and equal timestamps are resolved deterministically by `NodeId`.
+
+The host keeps local writes monotonic against the currently observed register
+state, so repeated writes from the same module can still replace earlier local
+values even when they happen within the same millisecond.
+
+Use it for statuses, labels, configuration values, selected modes, or other
+single-value state where "latest known value wins" is the right conflict policy.
+
+#### `crdt_lww_set`
+
+```text
+fn crdt_lww_set(
+    key_ptr: u32,
+    key_len: u32,
+    value_ptr: u32,
+    value_len: u32
+) -> i32
+```
+
+Returns `0` on success. Values are bounded to 1 MiB.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_register;
+
+lww_register::set("status:user-1", b"online")?;
+```
+
+#### `crdt_lww_get`
+
+```text
+fn crdt_lww_get(
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32
+) -> i32
+```
+
+Writes the current winning value into `out_ptr` and returns the number of bytes
+written. Returns `ERR_NOT_FOUND` when the register has no value and
+`ERR_BUF_TOO_SMALL` when `out_cap` is not large enough.
+
+SDK:
+
+```rust
+use nx_sdk::crdt::lww_register;
+
+let status = lww_register::get("status:user-1")?;
+```
+
 ### Future CRDT Documentation Slots
 
 The following sections should be expanded as each CRDT lands.
@@ -424,7 +481,7 @@ The following sections should be expanded as each CRDT lands.
 | CRDT | Suggested Example | Notes |
 |------|-------------------|-------|
 | PNCounter | `examples/distributed_inventory` | Implemented |
-| LWW-Register | `examples/distributed_status` | Requires timestamp/conflict policy docs |
+| LWW-Register | `examples/distributed_status` | Host API implemented; example pending |
 | ORSet | `examples/distributed_tags` | Requires add/remove tag semantics |
 | LWW-Map | `examples/distributed_settings` | Likely builds on LWW-Register |
 | RGA | `examples/distributed_comments` | Ordered sequence, likely last |
@@ -659,7 +716,8 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
 - Database: `db_get`, `db_set`, `db_delete`, `db_exists`, `db_scan`,
   `db_scan_after`, `db_keys`, `db_keys_after`
 - CRDT: `crdt_gcounter_inc`, `crdt_gcounter_value`, `crdt_pncounter_inc`,
-  `crdt_pncounter_dec`, `crdt_pncounter_value`
+  `crdt_pncounter_dec`, `crdt_pncounter_value`, `crdt_lww_set`,
+  `crdt_lww_get`
 - Time: `time_now`, `time_monotonic`
 - Crypto: `random_bytes`, `hash_sha256`, `hash_blake3`
 - System: `env_get`, `module_id`, `abort`, `host_capabilities`, `event_emit`
@@ -667,7 +725,7 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
 
 ### Planned
 
-- CRDT: PNCounter, LWW-Register, ORSet, LWW-Map, RGA
+- CRDT: ORSet, LWW-Map, RGA
 - Network messaging callbacks/events: `on_peer_connect`, `on_peer_disconnect`,
   `on_message`, `on_timer`
 - Optional HTTP/client APIs remain out of scope until a capability model is

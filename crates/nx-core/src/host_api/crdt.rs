@@ -1,11 +1,15 @@
 use anyhow::Result;
-use nx_sync::{GCounter, Op, PNCounter};
+use nx_sync::{GCounter, LwwRegister, Op, PNCounter};
+use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::{persist_gcounter_state, persist_pncounter_state};
+use crate::sync_manager::{
+    persist_gcounter_state, persist_lww_register_state, persist_pncounter_state,
+};
 
 // error codes
+const ERR_NOT_FOUND: i32 = -1;
 const ERR_BUF_TOO_SMALL: i32 = -2;
 const ERR_INTERNAL: i32 = -3;
 const ERR_RESERVED_KEY: i32 = -4;
@@ -13,6 +17,8 @@ const ERR_SYNC_DISABLED: i32 = -5;
 
 // limits
 const MAX_KEY_LEN: u32 = 8 * 1024; // 8 KiB, aligned with db.rs
+const MAX_VALUE_LEN: u32 = 1024 * 1024; // 1 MiB, aligned with db.rs
+const MAX_OUT_CAP: u32 = 1024 * 1024; // 1 MiB
 const U64_LEN: u32 = 8;
 const I64_LEN: u32 = 8;
 
@@ -52,6 +58,40 @@ fn read_validated_key(
         return Err(ERR_RESERVED_KEY);
     }
     Ok(s.to_string())
+}
+
+fn read_value_bytes(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    ptr: u32,
+    len: u32,
+    api_name: &str,
+) -> Result<Vec<u8>, i32> {
+    if len > MAX_VALUE_LEN {
+        eprintln!("[nx-core] {api_name}: invalid value length: {len} (max {MAX_VALUE_LEN})");
+        return Err(ERR_INTERNAL);
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    memory.read(caller, ptr as usize, &mut buf).map_err(|e| {
+        eprintln!("[nx-core] {api_name}: failed to read value: {e}");
+        ERR_INTERNAL
+    })?;
+    Ok(buf)
+}
+
+fn unix_epoch_millis() -> Result<u64, i32> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| {
+            eprintln!("[nx-core] crdt_lww_set: system clock before Unix epoch: {e}");
+            ERR_INTERNAL
+        })?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| {
+        eprintln!("[nx-core] crdt_lww_set: Unix timestamp does not fit into u64");
+        ERR_INTERNAL
+    })
 }
 
 async fn crdt_gcounter_inc_impl(
@@ -306,6 +346,140 @@ async fn crdt_pncounter_value_impl(
     I64_LEN as i32
 }
 
+async fn crdt_lww_set_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_set: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+    let value = match read_value_bytes(&mut caller, &memory, value_ptr, value_len, "crdt_lww_set") {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let observed_timestamp_ms = match unix_epoch_millis() {
+        Ok(timestamp_ms) => timestamp_ms,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let op_tx = handle.op_sender();
+    let op_permit = match op_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_set: broadcast queue full");
+            return ERR_INTERNAL;
+        }
+    };
+
+    let mut timestamp_ms = observed_timestamp_ms;
+    {
+        let registers_arc = handle.lww_registers();
+        let mut registers = registers_arc.write().await;
+        if let Some(existing) = registers.get(&key) {
+            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
+        }
+        let candidate = LwwRegister::new(value.clone(), timestamp_ms, handle.node_id().clone());
+        let next_register = match registers.get(&key) {
+            Some(register) => {
+                let mut next = register.clone();
+                if next.merge(&candidate) {
+                    Some(next)
+                } else {
+                    None
+                }
+            }
+            None => Some(candidate.clone()),
+        };
+
+        if let Some(register) = next_register {
+            if let Err(e) = persist_lww_register_state(&handle.store(), &key, &register) {
+                handle.metrics().record_sync_error();
+                tracing::warn!(error = %e, "crdt_lww_set: failed to persist register");
+                return ERR_INTERNAL;
+            }
+            registers.insert(key.clone(), register);
+        }
+    }
+
+    let op = Op::lww_register_set(handle.node_id().clone(), key, value, timestamp_ms);
+    tracing::debug!(op_id = %op.id, "queued local LWW-Register set");
+    op_permit.send(op);
+    handle.metrics().record_ops(1);
+
+    0
+}
+
+async fn crdt_lww_get_impl(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: u32,
+    key_len: u32,
+    out_ptr: u32,
+    out_cap: u32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => {
+            eprintln!("[nx-core] crdt_lww_get: no `memory` export on guest");
+            return ERR_INTERNAL;
+        }
+    };
+
+    if out_cap > MAX_OUT_CAP {
+        eprintln!(
+            "[nx-core] crdt_lww_get: output capacity too large: {out_cap} (max {MAX_OUT_CAP})"
+        );
+        return ERR_INTERNAL;
+    }
+
+    let key = match read_validated_key(&mut caller, &memory, key_ptr, key_len) {
+        Ok(k) => k,
+        Err(code) => return code,
+    };
+
+    let handle = match caller.data().sync_handle.as_ref() {
+        Some(h) => h.clone(),
+        None => return ERR_SYNC_DISABLED,
+    };
+
+    let value = {
+        let registers_arc = handle.lww_registers();
+        let registers = registers_arc.read().await;
+        let Some(register) = registers.get(&key) else {
+            return ERR_NOT_FOUND;
+        };
+        register.value_bytes()
+    };
+
+    if value.len() > out_cap as usize {
+        return ERR_BUF_TOO_SMALL;
+    }
+
+    if let Err(e) = memory.write(&mut caller, out_ptr as usize, &value) {
+        eprintln!("[nx-core] crdt_lww_get: failed to write output: {e}");
+        return ERR_INTERNAL;
+    }
+
+    value.len() as i32
+}
+
 pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap_async(
         "nx",
@@ -348,6 +522,28 @@ pub fn add_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>,
          (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(crdt_pncounter_value_impl(
+                caller, key_ptr, key_len, out_ptr, out_cap,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_set",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, value_ptr, value_len): (u32, u32, u32, u32)| {
+            Box::new(crdt_lww_set_impl(
+                caller, key_ptr, key_len, value_ptr, value_len,
+            ))
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "nx",
+        "crdt_lww_get",
+        |caller: Caller<'_, HostState>,
+         (key_ptr, key_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+            Box::new(crdt_lww_get_impl(
                 caller, key_ptr, key_len, out_ptr, out_cap,
             ))
         },

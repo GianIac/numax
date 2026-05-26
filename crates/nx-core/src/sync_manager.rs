@@ -1823,8 +1823,7 @@ pub(crate) fn persist_pncounter_state(
     Ok(())
 }
 
-#[cfg(test)]
-fn persist_lww_register_state(
+pub(crate) fn persist_lww_register_state(
     store: &NxStore,
     key: &str,
     register: &LwwRegister,
