@@ -2792,7 +2792,7 @@ mod tests {
     use crate::runtime::{Runtime, RuntimeConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{Duration, Instant, sleep};
-    
+
     fn temp_store() -> Arc<NxStore> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);

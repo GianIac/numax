@@ -346,7 +346,8 @@ impl Runtime {
         let store_db = Arc::clone(&self.store);
         let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
 
-        // Build per-invocation resource limits. Max_memory_bytes is cast to usize; on 32-bit targets values above
+        // Build per-invocation resource limits. max_memory_bytes is cast to usize;
+        // on 32-bit hosts values above 4 GiB would truncate silently, but numax targets 64-bit hostswhere usize == u64, so the cast is lossless.
         let mut limits_builder = StoreLimitsBuilder::new();
         if let Some(max_bytes) = self.config.max_memory_bytes {
             limits_builder = limits_builder.memory_size(max_bytes as usize);
