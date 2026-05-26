@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-use wasmtime::{Engine, Linker, Module, Store};
+use wasmtime::{Engine, Linker, Module, Store, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, p1};
 
 use nx_store::Store as NxStore;
@@ -33,7 +33,8 @@ pub struct RuntimeConfig {
     /// enable or not wasi support
     pub enable_wasi: bool,
 
-    /// Maximum memory limit per module (not yet enforced)
+    /// Maximum linear memory a module may allocate, in bytes.
+    /// Enforced per-invocation via wasmtime StoreLimits.
     pub max_memory_bytes: Option<u64>,
 
     /// The path to the datastore.
@@ -68,6 +69,8 @@ pub struct HostState {
     pub store: Arc<NxStore>,
     pub sync_handle: Option<SyncHandle>,
     pub module_id: Arc<str>,
+    /// Per-invocation resource limits (memory cap, instance/table counts).
+    pub limits: wasmtime::StoreLimits,
 }
 
 pub struct Runtime {
@@ -343,6 +346,13 @@ impl Runtime {
         let store_db = Arc::clone(&self.store);
         let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
 
+        // Build per-invocation resource limits. Max_memory_bytes is cast to usize; on 32-bit targets values above
+        let mut limits_builder = StoreLimitsBuilder::new();
+        if let Some(max_bytes) = self.config.max_memory_bytes {
+            limits_builder = limits_builder.memory_size(max_bytes as usize);
+        }
+        let limits = limits_builder.build();
+
         // Builds the host state for this run
         let host_state = if self.config.enable_wasi {
             let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
@@ -352,6 +362,7 @@ impl Runtime {
                 store: store_db,
                 sync_handle: self.sync_handle.clone(),
                 module_id,
+                limits,
             }
         } else {
             HostState {
@@ -359,10 +370,14 @@ impl Runtime {
                 store: store_db,
                 sync_handle: self.sync_handle.clone(),
                 module_id,
+                limits,
             }
         };
 
         let mut store = Store::new(&self.engine, host_state);
+
+        // Register the limiter so wasmtime enforces memory_size on every
+        store.limiter(|state| &mut state.limits);
 
         // Form completion / validation
         let module = Module::new(&self.engine, wasm_bytes)
@@ -461,12 +476,16 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     fn temp_datastore_path(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("{prefix}-{nanos}"));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.push(format!("{prefix}-{nanos}-{seq}"));
         path
     }
 
