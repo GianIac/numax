@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 use wasmtime::{Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -79,6 +80,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
+    module_cache: Mutex<HashMap<[u8; 32], Module>>,
 
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
@@ -153,6 +155,7 @@ impl Runtime {
             config,
             store,
             metrics,
+            module_cache: Mutex::new(HashMap::new()),
             sync_manager,
             sync_handle,
             observability_server: None,
@@ -380,9 +383,10 @@ impl Runtime {
         // Register the limiter so wasmtime enforces memory_size on every
         store.limiter(|state| &mut state.limits);
 
-        // Form completion / validation
-        let module = Module::new(&self.engine, wasm_bytes)
-            .map_err(|e| anyhow!("Invalid module (compile/validate): {e}"))?;
+        // Form completion / validation. Compiled modules are cached in-memory
+        // so embedded runtimes can call run_module repeatedly without paying
+        // Wasmtime compilation cost for identical bytes.
+        let module = self.compile_or_get_cached_module(wasm_bytes)?;
 
         // Instantiation
         let instance = self
@@ -403,6 +407,35 @@ impl Runtime {
             .map_err(|e| anyhow!("Error while executing module: {e}"))?;
 
         Ok(())
+    }
+
+    fn compile_or_get_cached_module(&self, wasm_bytes: &[u8]) -> Result<Module> {
+        let hash = blake3::hash(wasm_bytes);
+        let cache_key = *hash.as_bytes();
+
+        if let Some(module) = self
+            .module_cache
+            .lock()
+            .map_err(|_| anyhow!("module cache lock poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(module);
+        }
+
+        let module = Module::new(&self.engine, wasm_bytes)
+            .map_err(|e| anyhow!("Invalid module (compile/validate): {e}"))?;
+        self.module_cache
+            .lock()
+            .map_err(|_| anyhow!("module cache lock poisoned"))?
+            .insert(cache_key, module.clone());
+
+        Ok(module)
+    }
+
+    #[cfg(test)]
+    fn cached_module_count(&self) -> usize {
+        self.module_cache.lock().unwrap().len()
     }
 }
 
@@ -488,6 +521,16 @@ mod tests {
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         path.push(format!("{prefix}-{nanos}-{seq}"));
         path
+    }
+
+    fn minimal_run_module() -> Vec<u8> {
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+            0x03, 0x02, 0x01, 0x00, // function section
+            0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00, // export run
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
+        ]
     }
 
     #[tokio::test]
@@ -607,6 +650,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(runtime.store.get(b"key").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn run_module_reuses_compiled_module_for_same_bytes() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-module-cache-test"),
+            enable_wasi: false,
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let wasm = minimal_run_module();
+
+        runtime.run_module(&wasm).await.unwrap();
+        runtime.run_module(&wasm).await.unwrap();
+
+        assert_eq!(runtime.cached_module_count(), 1);
     }
 
     #[test]
