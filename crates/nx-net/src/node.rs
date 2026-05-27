@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nx_sync::{NodeId, Op};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -29,6 +29,8 @@ pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Time allowed for network tasks to finish cooperatively after shutdown.
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
+
 #[derive(Debug, Clone, Copy)]
 struct NodeLimits {
     max_peers: usize,
@@ -44,6 +46,17 @@ struct IncomingContext {
     event_tx: mpsc::Sender<NodeEvent>,
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+struct ReadLoopContext {
+    peer_node_id: NodeId,
+    addr: String,
+    event_tx: mpsc::Sender<NodeEvent>,
+    writer: PeerWriter,
+    serialization_format: SerializationFormat,
+    max_message_size: usize,
+    socket_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -154,7 +167,7 @@ struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
     serialization_format: SerializationFormat,
-    writer: Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<crate::tls::NetStream>>>>,
+    writer: Option<PeerWriter>,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -391,6 +404,7 @@ impl Node {
         }
 
         // Save connection
+        let writer = Arc::new(Mutex::new(writer));
         let peers_connected = {
             let mut peers = self.peers.write().await;
             ensure_peer_slot_available(&peers, self.config.max_peers, Some(addr))?;
@@ -400,7 +414,7 @@ impl Node {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     state: PeerState::Connected,
                     serialization_format: negotiated_format,
-                    writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
+                    writer: Some(Arc::clone(&writer)),
                     _slot: slot,
                 },
             );
@@ -428,12 +442,16 @@ impl Node {
         let task = tokio::spawn(async move {
             if let Err(e) = read_loop(
                 reader,
-                peer_node_id.clone(),
-                addr_owned.clone(),
-                event_tx.clone(),
-                max_message_size,
-                socket_timeout,
-                shutdown_rx,
+                ReadLoopContext {
+                    peer_node_id: peer_node_id.clone(),
+                    addr: addr_owned.clone(),
+                    event_tx: event_tx.clone(),
+                    writer,
+                    serialization_format: negotiated_format,
+                    max_message_size,
+                    socket_timeout,
+                    shutdown_rx,
+                },
             )
             .await
             {
@@ -733,6 +751,7 @@ async fn handle_incoming(
     let ack = Message::hello_ack_with_format(our_node_id, negotiated_format);
     write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
+    let writer = Arc::new(Mutex::new(writer));
     let peers_connected = {
         let mut peers = peers.write().await;
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
@@ -742,7 +761,7 @@ async fn handle_incoming(
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 state: PeerState::Connected,
                 serialization_format: negotiated_format,
-                writer: Some(Arc::new(tokio::sync::Mutex::new(writer))),
+                writer: Some(Arc::clone(&writer)),
                 _slot: slot,
             },
         );
@@ -763,12 +782,16 @@ async fn handle_incoming(
     // Read Loop
     let read_result = read_loop(
         reader,
-        peer_node_id.clone(),
-        addr.clone(),
-        event_tx.clone(),
-        limits.max_message_size,
-        limits.socket_timeout,
-        shutdown_rx,
+        ReadLoopContext {
+            peer_node_id: peer_node_id.clone(),
+            addr: addr.clone(),
+            event_tx: event_tx.clone(),
+            writer,
+            serialization_format: negotiated_format,
+            max_message_size: limits.max_message_size,
+            socket_timeout: limits.socket_timeout,
+            shutdown_rx,
+        },
     )
     .await;
 
@@ -852,13 +875,19 @@ fn protocol_version_mismatch(their_version: u32) -> NetError {
 /// Loop for reading messages from a peer until disconnection
 async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
-    peer_node_id: NodeId,
-    addr: String,
-    event_tx: mpsc::Sender<NodeEvent>,
-    max_message_size: usize,
-    socket_timeout: Duration,
-    mut shutdown_rx: watch::Receiver<bool>,
+    context: ReadLoopContext,
 ) -> NetResult<()> {
+    let ReadLoopContext {
+        peer_node_id,
+        addr,
+        event_tx,
+        writer,
+        serialization_format,
+        max_message_size,
+        socket_timeout,
+        mut shutdown_rx,
+    } = context;
+
     loop {
         let msg = tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -903,7 +932,17 @@ async fn read_loop(
             }
             MessageKind::Ping => {
                 debug!(peer = %peer_node_id, "received ping");
-                // TODO: send Pong (serve writer)
+                let mut writer = writer.lock().await;
+                write_message(
+                    &mut *writer,
+                    &Message::pong(),
+                    serialization_format,
+                    socket_timeout,
+                )
+                .await?;
+            }
+            MessageKind::Pong => {
+                debug!(peer = %peer_node_id, "received pong");
             }
             _ => {
                 debug!(peer = %peer_node_id, kind = ?msg.kind, "unhandled message");
@@ -1324,6 +1363,52 @@ mod tests {
         );
 
         node_a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn incoming_ping_gets_pong_response() {
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+        let addr = node.start_listener().await.unwrap();
+
+        let mut stream = NetStream::Plain(TcpStream::connect(addr).await.unwrap());
+        let hello = Message::hello(NodeId::new("peer-a"));
+        let bytes = hello.to_bytes().unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let ack = read_message(
+            &mut stream,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let negotiated_format = match ack.kind {
+            MessageKind::HelloAck {
+                selected_format, ..
+            } => selected_format,
+            other => panic!("expected HelloAck, got {other:?}"),
+        };
+
+        let ping = Message::ping()
+            .to_bytes_with_format(negotiated_format)
+            .unwrap();
+        stream.write_all(&ping).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let pong = read_message(
+            &mut stream,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(pong.kind, MessageKind::Pong));
+
+        node.shutdown().await;
     }
 
     #[tokio::test]
