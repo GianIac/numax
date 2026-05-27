@@ -290,7 +290,6 @@ impl Node {
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
-        self.ensure_peer_slot_available().await?;
         let slot = Arc::clone(&self.connection_slots)
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
@@ -602,11 +601,6 @@ impl Node {
         peers
             .get(addr)
             .is_some_and(|conn| conn.state == PeerState::Connected)
-    }
-
-    async fn ensure_peer_slot_available(&self) -> NetResult<()> {
-        let peers = self.peers.read().await;
-        ensure_peer_slot_available(&peers, self.config.max_peers, None)
     }
 
     async fn mark_peer_failed(&self, addr: &str) -> Option<(NodeId, usize)> {
