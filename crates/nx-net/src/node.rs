@@ -273,7 +273,7 @@ impl Node {
                                         error!(%addr, error = %e, "connection error");
                                     }
                                 });
-                                tasks.lock().await.push(task);
+                                track_task(&tasks, task).await;
                             }
                             Err(e) => {
                                 error!(error = %e, "accept error");
@@ -283,7 +283,7 @@ impl Node {
                 }
             }
         });
-        self.tasks.lock().await.push(listener_task);
+        track_task(&self.tasks, listener_task).await;
 
         Ok(bound_addr)
     }
@@ -482,7 +482,7 @@ impl Node {
                     .await;
             }
         });
-        self.tasks.lock().await.push(task);
+        track_task(&self.tasks, task).await;
 
         Ok(())
     }
@@ -872,6 +872,12 @@ fn protocol_version_mismatch(their_version: u32) -> NetError {
     ))
 }
 
+async fn track_task(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: JoinHandle<()>) {
+    let mut tasks = tasks.lock().await;
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(task);
+}
+
 /// Loop for reading messages from a peer until disconnection
 async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
@@ -1130,6 +1136,37 @@ mod tests {
 
         assert_eq!(node_id, NodeId::new("peer-a"));
         assert_eq!(connected, 1);
+    }
+
+    #[tokio::test]
+    async fn track_task_prunes_finished_handles_before_push() {
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let finished = tokio::spawn(async {});
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if finished.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        track_task(&tasks, finished).await;
+        assert_eq!(tasks.lock().await.len(), 1);
+
+        let pending = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        track_task(&tasks, pending).await;
+
+        let mut tasks = tasks.lock().await;
+        assert_eq!(tasks.len(), 1);
+        for task in tasks.drain(..) {
+            task.abort();
+        }
     }
 
     #[tokio::test]
