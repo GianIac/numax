@@ -293,8 +293,6 @@ impl Op {
     }
 
     /// Serializes the operation to JSON.
-    ///
-    /// TODO(phase4-serialization): add method for bincode/msgpack
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
@@ -304,14 +302,12 @@ impl Op {
         serde_json::from_str(json)
     }
 
-    /// Serializes to bytes (JSON for now).
-    ///
-    /// TODO(phase4-serialization): when switching to bincode, change here.
+    /// Serializes the operation to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
 
-    /// Deserializes from bytes.
+    /// Deserializes an operation from JSON bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }

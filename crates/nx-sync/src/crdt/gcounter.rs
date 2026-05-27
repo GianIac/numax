@@ -34,6 +34,10 @@ impl GCounter {
     }
 
     /// Applies an operation to the GCounter.
+    ///
+    /// Note: this method is not idempotent for a single operation. Applying the
+    /// same `OpId` twice increments twice. Callers that consume replicated ops
+    /// must deduplicate by `OpId` before calling this method.
     pub fn apply_op(&mut self, op: &Op) -> SyncResult<bool> {
         match &op.kind {
             OpKind::GCounterIncrement { key: _, increment } => {

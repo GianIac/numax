@@ -26,6 +26,9 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Default timeout for socket reads and writes.
 pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default number of node events buffered for the runtime event loop.
+pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 /// Time allowed for network tasks to finish cooperatively after shutdown.
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
@@ -86,6 +89,9 @@ pub struct NodeConfig {
 
     /// Serialization format used for outgoing messages.
     pub serialization_format: SerializationFormat,
+
+    /// Number of node events buffered for the runtime event loop.
+    pub event_channel_capacity: usize,
 }
 
 impl NodeConfig {
@@ -99,6 +105,7 @@ impl NodeConfig {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
             serialization_format: SerializationFormat::Bincode,
+            event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
         }
     }
 
@@ -131,6 +138,11 @@ impl NodeConfig {
         self.serialization_format = serialization_format;
         self
     }
+
+    pub fn with_event_channel_capacity(mut self, event_channel_capacity: usize) -> Self {
+        self.event_channel_capacity = event_channel_capacity;
+        self
+    }
 }
 
 /// Node exit event (for runtime).
@@ -161,8 +173,10 @@ pub enum NodeEvent {
     },
 }
 
-#[allow(dead_code)]
-/// internal state for each peer connection.
+/// Internal state for each peer connection.
+///
+/// `_slot` intentionally holds the semaphore permit for the lifetime of the
+/// connection; dropping the connection releases capacity.
 struct PeerConnection {
     info: PeerInfo,
     state: PeerState,
@@ -185,7 +199,8 @@ pub struct Node {
 impl Node {
     /// crate new node
     pub fn new(config: NodeConfig) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(100);
+        let event_channel_capacity = config.event_channel_capacity.max(1);
+        let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let max_peers = config.max_peers;
 
@@ -420,15 +435,16 @@ impl Node {
             connected_peer_count(&peers)
         };
 
-        // Notify Event
-        let _ = self
-            .event_tx
-            .send(NodeEvent::PeerConnected {
+        send_node_event(
+            &self.event_tx,
+            "PeerConnected",
+            NodeEvent::PeerConnected {
                 node_id: peer_node_id.clone(),
                 addr: addr.to_string(),
                 peers_connected,
-            })
-            .await;
+            },
+        )
+        .await;
 
         // Start read loop
         let peers = Arc::clone(&self.peers);
@@ -472,13 +488,16 @@ impl Node {
             };
 
             if let Some((node_id, addr, peers_connected)) = disconnected {
-                let _ = event_tx
-                    .send(NodeEvent::PeerDisconnected {
+                send_node_event(
+                    &event_tx,
+                    "PeerDisconnected",
+                    NodeEvent::PeerDisconnected {
                         node_id,
                         addr,
                         peers_connected,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         });
         track_task(&self.tasks, task).await;
@@ -532,14 +551,16 @@ impl Node {
                 warn!(%addr, error = %e, "failed to send ops");
                 failed.push(addr.clone());
                 if let Some((node_id, peers_connected)) = self.mark_peer_failed(&addr).await {
-                    let _ = self
-                        .event_tx
-                        .send(NodeEvent::PeerDisconnected {
+                    send_node_event(
+                        &self.event_tx,
+                        "PeerDisconnected",
+                        NodeEvent::PeerDisconnected {
                             node_id,
                             addr: addr.clone(),
                             peers_connected,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -574,14 +595,16 @@ impl Node {
         if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
             warn!(%addr, error = %e, "failed to send message to peer");
             if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr).await {
-                let _ = self
-                    .event_tx
-                    .send(NodeEvent::PeerDisconnected {
+                send_node_event(
+                    &self.event_tx,
+                    "PeerDisconnected",
+                    NodeEvent::PeerDisconnected {
                         node_id,
                         addr: addr.to_string(),
                         peers_connected,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             return Err(e);
         }
@@ -764,14 +787,16 @@ async fn handle_incoming(
 
     info!(peer = %peer_node_id, serialization_format = ?negotiated_format, "incoming peer connected");
 
-    // Notify Event
-    let _ = event_tx
-        .send(NodeEvent::PeerConnected {
+    send_node_event(
+        &event_tx,
+        "PeerConnected",
+        NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
             addr: addr.clone(),
             peers_connected,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Read Loop
     let read_result = read_loop(
@@ -804,13 +829,16 @@ async fn handle_incoming(
     };
 
     if let Some((node_id, addr, peers_connected)) = disconnected {
-        let _ = event_tx
-            .send(NodeEvent::PeerDisconnected {
+        send_node_event(
+            &event_tx,
+            "PeerDisconnected",
+            NodeEvent::PeerDisconnected {
                 node_id,
                 addr,
                 peers_connected,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     read_result
@@ -866,6 +894,16 @@ fn protocol_version_mismatch(their_version: u32) -> NetError {
     ))
 }
 
+async fn send_node_event(
+    event_tx: &mpsc::Sender<NodeEvent>,
+    event_name: &'static str,
+    event: NodeEvent,
+) {
+    if let Err(e) = event_tx.send(event).await {
+        warn!(event = event_name, error = %e, "failed to send node event; receiver closed");
+    }
+}
+
 async fn track_task(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: JoinHandle<()>) {
     let mut tasks = tasks.lock().await;
     tasks.retain(|task| !task.is_finished());
@@ -913,22 +951,28 @@ async fn read_loop(
         match msg.kind {
             MessageKind::PushOps { ops } => {
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");
-                let _ = event_tx
-                    .send(NodeEvent::OpsReceived {
+                send_node_event(
+                    &event_tx,
+                    "OpsReceived",
+                    NodeEvent::OpsReceived {
                         from: peer_node_id.clone(),
                         ops,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             MessageKind::PullSince { since_op_id } => {
                 debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
-                let _ = event_tx
-                    .send(NodeEvent::PullRequested {
+                send_node_event(
+                    &event_tx,
+                    "PullRequested",
+                    NodeEvent::PullRequested {
                         from: peer_node_id.clone(),
                         addr: addr.clone(),
                         since_op_id,
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             MessageKind::Ping => {
                 debug!(peer = %peer_node_id, "received ping");
@@ -1027,6 +1071,10 @@ mod tests {
         assert_eq!(config.max_peers, DEFAULT_MAX_PEERS);
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(config.socket_timeout, DEFAULT_SOCKET_TIMEOUT);
+        assert_eq!(
+            config.event_channel_capacity,
+            DEFAULT_EVENT_CHANNEL_CAPACITY
+        );
     }
 
     #[test]
@@ -1199,10 +1247,12 @@ mod tests {
     fn node_config_allows_custom_wire_limits() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:9000")
             .with_max_message_size(1024)
-            .with_socket_timeout(Duration::from_secs(3));
+            .with_socket_timeout(Duration::from_secs(3))
+            .with_event_channel_capacity(4096);
 
         assert_eq!(config.max_message_size, 1024);
         assert_eq!(config.socket_timeout, Duration::from_secs(3));
+        assert_eq!(config.event_channel_capacity, 4096);
     }
 
     #[tokio::test]
