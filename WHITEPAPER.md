@@ -1,7 +1,7 @@
 # Numax Runtime - Technical Whitepaper
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-alpha.5**, the current public technical preview of Numax.
+> This whitepaper is aligned with **v0.1.0-rc.1**, the current release candidate of Numax.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,7 +9,7 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-alpha.5` - technical preview, API and wire format may change before the stable v0.1.0.
+> **Version reference**: `v0.1.0-rc.1` - release candidate, API and wire format may still change before the final v0.1.0.
 >
 > > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
 > Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
@@ -484,7 +484,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-alpha.5:**
+**Out of scope for v0.1.0-rc.1:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -802,7 +802,7 @@ gates.
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-alpha.5. They do not describe visions: they describe what the runtime already knows how to do, or will know how to do as soon as the last preview phases are closed.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0-rc.1. They do not describe visions: they describe what the runtime already knows how to do with the release-candidate feature set.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -868,7 +868,7 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-alpha.5 is a technical preview. We recognize its limits, explicitly:
+v0.1.0-rc.1 is a release candidate. We recognize its limits, explicitly:
 
 - **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
@@ -895,11 +895,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-alpha.5 is a technical preview. What it contains is real, tested, working: WASM runtime, sled store, GCounter CRDT, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, extended host API for database, time, crypto, system and network introspection, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, reproducible load/chaos gates, multi-OS CI, end-to-end examples.
+v0.1.0-rc.1 is a release candidate. What it contains is real, tested, working: WASM runtime, sled store, GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA CRDTs, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, extended host API for database, time, crypto, system and network introspection, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, reproducible load/chaos gates, multi-OS CI, release-candidate network/runtime hardening and end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-alpha.5 is just the beginning.** But it is a beginning built on code, not on promises.
+**v0.1.0-rc.1 is the first release candidate.** It is built on code, tests and documented limits rather than promises.
 
 In closing, I love software and I love numax.
 
@@ -919,11 +919,15 @@ numax/
 │   └── nx-cli/             # CLI
 ├── examples/
 │   ├── distributed_counter/
-│   ├── distributed_chat/
+│   ├── distributed_inventory/
+│   ├── distributed_status/
+│   ├── distributed_tags/
+│   ├── distributed_settings/
+│   ├── distributed_comments/
 │   └── vote_tally_tls/
 ├── HOST_API.md
 ├── WHITEPAPER.md
-├── ROADMAP_v0.1.0.md
+├── ROADMAP.md
 └── LICENSE
 ```
 

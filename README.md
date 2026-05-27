@@ -17,8 +17,8 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
-> **Status:** `v0.1.0-alpha.5` - public technical preview.
-> It works, it's tested, it's honest about what's missing. See [`ROADMAP.md`](./ROADMAP.md).
+> **Status:** `v0.1.0-rc.1` - release candidate for the first v0.1.0 line.
+> It works, it's tested, and the remaining limits are documented. See [`ROADMAP.md`](./ROADMAP.md).
 
 ---
 
@@ -95,7 +95,7 @@ Same module, any node. State stays local. Sync happens through the runtime.
 ## Learn more
 
 - [`WHITEPAPER.md`](./WHITEPAPER.md) - the vision, the architecture, the principles.
-- [`ROADMAP_v0.1.0.md`](./ROADMAP.md) - where we are, where we're going, what's still missing.
+- [`ROADMAP.md`](./ROADMAP.md) - where we are, where we're going, what's still missing.
 - [`HOST_API.md`](./HOST_API.md) - the host API available to WASM modules.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
@@ -115,7 +115,7 @@ Right now it's pretty much the only signal I have to understand whether this is 
 
 ## Try it. Break it. Tell me.
 
-numax is in alpha. It's the moment where feedback matters most.
+numax is in release-candidate mode. It's the moment where focused feedback matters most.
 
 - Clone it, run the examples, see if the two nodes really converge on your machine.
 - Write a tiny module of your own and try to break the sandbox or the sync.

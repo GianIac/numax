@@ -1040,7 +1040,8 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
   `crdt_lww_get`, `crdt_lww_map_set`, `crdt_lww_map_remove`,
   `crdt_lww_map_get`, `crdt_lww_map_contains`, `crdt_lww_map_entries`,
   `crdt_orset_add`, `crdt_orset_remove`, `crdt_orset_contains`,
-  `crdt_orset_elements`
+  `crdt_orset_elements`, `crdt_rga_insert`, `crdt_rga_delete`,
+  `crdt_rga_values`
 - Time: `time_now`, `time_monotonic`
 - Crypto: `random_bytes`, `hash_sha256`, `hash_blake3`
 - System: `env_get`, `module_id`, `abort`, `host_capabilities`, `event_emit`
@@ -1048,7 +1049,6 @@ roadmap lives in [ROADMAP.md](./ROADMAP.md).
 
 ### Planned
 
-- CRDT: RGA
 - Network messaging callbacks/events: `on_peer_connect`, `on_peer_disconnect`,
   `on_message`, `on_timer`
 - Optional HTTP/client APIs remain out of scope until a capability model is

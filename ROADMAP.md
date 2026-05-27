@@ -1,29 +1,37 @@
 # Numax Roadmap
 
-> **Current release**: `v0.1.0-alpha.5` - developer preview.
+> **Current release**: `v0.1.0-rc.1` - release candidate.
 > **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
-> **Status**: alpha for feedback; production hardening still in progress.
+> **Status**: release-candidate hardening; no known blocker for the v0.1.0 line.
 
 ---
 
 ## Release Status
 
-### v0.1.0-alpha.5 ✅
-**Purpose**: extended host API and load-testing preview.
+### v0.1.0-rc.1 ✅
+**Purpose**: release candidate for the first v0.1.0 line.
 
 Includes:
-- Everything in `v0.1.0-alpha.4`.
-- Phase 12 extended host API: paginated/prefix database APIs, time APIs,
-  crypto primitives, system APIs, network introspection and runtime capability
-  queries.
-- Phase 13 load testing: reproducible single-node, multi-node full-mesh and
-  chaos/restart Cargo bench runners with JSON reports.
+- Everything in `v0.1.0-alpha.5`.
+- Phase 14 complete CRDT set: PNCounter, LWW-Register, ORSet, LWW-Map and
+  RGA, each with durable sync integration, Host API/SDK surface, E2E coverage
+  and a distributed example.
+- RC hardening for networking and runtime behavior:
+  - Ping/Pong protocol is fully handled.
+  - completed network task handles are pruned before tracking new tasks.
+  - outbound peer slot acquisition trusts the semaphore instead of a pre-check.
+  - network event channel capacity is configurable and aligned with
+    `queued_ops_limit` through `SyncManager`.
+  - node event send failures are logged.
+  - repeated `Runtime::run_module` calls reuse compiled WASM modules in-memory.
+- Documentation cleanup for stale serialization TODOs and CRDT caveats.
 
 Known limitations:
+- API and wire format may still change before the final `v0.1.0`.
+- Full dynamic peer discovery and K-fanout gossip remain future work.
 - RAM/CPU profiling for load runs is not automated yet; current reports cover
   throughput, latency percentiles, convergence time and chaos restart count.
 - WIT/Component Model formalization remains future API hardening.
-- API and wire format may change before `v0.1.0`.
 
 ### v0.1.0 🎯
 **Purpose**: first production-ready release for non-critical workloads.
@@ -31,7 +39,7 @@ Known limitations:
 Requires the completion of the P0/P1 phases listed below, in particular:
 Phase 7 lifecycle, Phase 8 backpressure, Phase 9 minimal observability,
 Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 host
-API and Phase 13 load testing.
+API, Phase 13 load testing and Phase 14 complete CRDTs.
 
 ---
 
@@ -488,7 +496,7 @@ Completion rule for each CRDT:
 | 11 | Dual Serialization | ✅ | **P1** |
 | 12 | Extended Host API | ✅ | **P1** |
 | 13 | Load Testing | ✅ | **P1** |
-| 14 | Complete CRDTs | ⏳ | **P2** |
+| 14 | Complete CRDTs | ✅ | **P2** |
 | 15 | Deployment & Docs | ⏳ | **P2** |
 
 **Legend**:
@@ -558,6 +566,17 @@ Completion rule for each CRDT:
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [x] Load reports generated for single-node, multi-node and chaos gates
 - [x] Known limitations documented in the roadmap
+
+## v0.1.0-rc.1 Release Criteria
+
+- [x] Phase 14 complete CRDTs implemented and documented
+- [x] Distributed examples available for each CRDT family
+- [x] RC network hardening complete: Ping/Pong, task tracking, peer slot
+      acquisition and event channel behavior
+- [x] Runtime module compilation cache implemented for repeated runs
+- [x] `cargo test --workspace` passes
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [x] Known limitations documented in the roadmap and whitepaper
 
 ---
 
