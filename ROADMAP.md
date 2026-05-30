@@ -1,584 +1,582 @@
-# Numax Roadmap
+# Numax Roadmap - towards `v0.2.0`
 
-> **Current release**: `v0.1.0-rc.1` - release candidate.
-> **Final goal `v0.1.0`**: production-ready runtime for non-critical workloads.
-> **Status**: release-candidate hardening; no known blocker for the v0.1.0 line.
-
----
-
-## Release Status
-
-### v0.1.0-rc.1 ✅
-**Purpose**: release candidate for the first v0.1.0 line.
-
-Includes:
-- Everything in `v0.1.0-alpha.5`.
-- Phase 14 complete CRDT set: PNCounter, LWW-Register, ORSet, LWW-Map and
-  RGA, each with durable sync integration, Host API/SDK surface, E2E coverage
-  and a distributed example.
-- RC hardening for networking and runtime behavior:
-  - Ping/Pong protocol is fully handled.
-  - completed network task handles are pruned before tracking new tasks.
-  - outbound peer slot acquisition trusts the semaphore instead of a pre-check.
-  - network event channel capacity is configurable and aligned with
-    `queued_ops_limit` through `SyncManager`.
-  - node event send failures are logged.
-  - repeated `Runtime::run_module` calls reuse compiled WASM modules in-memory.
-- Documentation cleanup for stale serialization TODOs and CRDT caveats.
-
-Known limitations:
-- API and wire format may still change before the final `v0.1.0`.
-- Full dynamic peer discovery and K-fanout gossip remain future work.
-- RAM/CPU profiling for load runs is not automated yet; current reports cover
-  throughput, latency percentiles, convergence time and chaos restart count.
-- WIT/Component Model formalization remains future API hardening.
-
-### v0.1.0 🎯
-**Purpose**: first production-ready release for non-critical workloads.
-
-Requires the completion of the P0/P1 phases listed below, in particular:
-Phase 7 lifecycle, Phase 8 backpressure, Phase 9 minimal observability,
-Phase 10 network resilience, Phase 11 dual-mode serialization, Phase 12 host
-API, Phase 13 load testing and Phase 14 complete CRDTs.
+> **Note on the mutability of this roadmap:**
+>
+> This roadmap can change, even significantly, based on:
+> - community feedback (issues, discussions, real-world usage),
+> - technical constraints that emerge during implementation,
+> - external dependencies (Wasmtime, sled, the WASM/WASI ecosystem, Component Model standard),
+> - new ideas, opportunities, or simply how one wakes up in the morning with a better intuition.
+>
+> **Proposing changes**: anyone can open a **Pull Request against `ROADMAP.md`** to:
+> - suggest a new item in a future version,
+> - move an item between versions with motivation,
+> - flag a risk or dependency that justifies a change in priority,
+> - propose a completely new version.
+>
+> Roadmap PRs are **as welcome as code PRs** !
 
 ---
 
-## Completed Phases
+## Status and goal
 
-### Phase 0: Bootstrap ✅
-- [x] Multi-crate Cargo workspace
-- [x] Directory structure
-- [x] Base CI
+- **Upcoming version**: `v0.1.0` ⏳ (in progress - includes documentation, distribution & configuration)
+- **Final goal of the cycle**: stable `v0.2.0`.
+- **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
-### Phase 1: nx-core ✅
-- [x] Wasmtime runtime
-- [x] Host API (db_get, db_set, db_delete, host_log_v2)
-- [x] WASI preview1 integration
-- [x] Security guardrails (key/value limits)
-
-### Phase 2: nx-store ✅
-- [x] Embedded sled store
-- [x] get/set/delete/scan_prefix API
-- [x] Unit and integration tests
-
-### Phase 3: nx-sync ✅
-- [x] NodeId and Op/OpId
-- [x] Complete GCounter CRDT
-- [x] CRDT property tests (commutativity, associativity, idempotency)
-- [x] JSON serialization
-
-### Phase 4: nx-net ✅
-- [x] Message protocol (Hello, PushOps, PullSince, Ping/Pong)
-- [x] Length-prefixed framing
-- [x] Protocol versioning
-
-### Phase 5: Documentation and CI ✅
-- [x] Automated tests
-- [x] Multi-OS CI (Ubuntu, macOS, Windows)
-- [x] Clippy + rustfmt
-- [x] WHITEPAPER.md aligned with the code
-- [x] HOST_API.md
-- [x] WASM examples (distributed_counter, distributed_chat)
-
-> ⚠️ Note: the Phase 5 examples worked only locally; end-to-end convergence
-> between peers was actually wired up in Phase 6.5.
+Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
+- **dynamic peer discovery** without manual configuration,
+- a **reactive event model**, no longer just `run()` one-shot,
+- granular **capability-based security** with per-module quotas,
+- **complete operability** (snapshot, restore, replay, diff, hot reload),
+- **wire and schema versioning** with documented compatibility,
+- **hardened supply chain** (signatures, SBOM, continuous fuzzing),
+- **complete observability** (metrics, dashboard, TUI).
 
 ---
 
-## Production-Ready Phases
+## Version map
 
-### Phase 6: Transport Security 🔒 ✅
-**Goal**: Secure and authenticated communications between nodes.
+| Version | Theme | Status |
+|---|---|---|
+| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | ⏳ |
+| `v0.1.1` | Architectural Cleanup & Versioning | 📋 |
+| `v0.1.2` | Performance & Profiling | 📋 |
+| `v0.1.3` | Supply Chain & Fuzzing | 📋 |
+| `v0.1.4` | Management API | 📋 |
+| `v0.1.5` | Peer Discovery - Foundations | 📋 |
+| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | 📋 |
+| `v0.1.7` | Reactive Module Model - Events | 📋 |
+| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | 📋 |
+| `v0.1.9` | Capability-Based Security | 📋 |
+| `v0.1.10` | Resource Quotas & Multi-tenant | 📋 |
+| `v0.1.11` | Op-log Compaction & Snapshots | 📋 |
+| `v0.1.12` | Operability Tools | 📋 |
+| `v0.1.13` | Built-in Dashboard | 📋 |
+| `v0.1.14` | TUI & Advanced CRDTs | 📋 |
+| `v0.1.15` | WIT & Component Model | 📋 |
+| `v0.2.0-rc.1` | Release Candidate hardening | 📋 |
+| `v0.2.0` | **Stable - production-ready, any criticality** | 🎯 |
 
-**Base TLS:**
-- [x] TLS 1.3 for TCP connections
-- [x] Auto-generated certificates for development (`rcgen`)
-- [x] Custom certificates support for production
-- [x] Forward secrecy (ECDHE automatic with TLS 1.3)
-- [x] TLS wrapper: `TlsAcceptor` (server), `TlsConnector` (client)
-
-**Mutual TLS (mTLS):**
-- [x] Client must present a certificate
-- [x] Server verifies the client certificate
-- [x] Custom CA support for verification (`--tls-ca`)
-- [x] Test: client without cert → rejected
-- [x] Test: client with invalid cert → rejected
-
-**Identity & NodeID:**
-- [x] NodeID derived from public key: `NodeId = hash(cert.public_key)` (Protocol identity: 16 bytes and Fingerprint/debug: 32 bytes)
-- [x] Function `derive_node_id_from_cert(cert) -> NodeId`
-- [x] Verification during Hello handshake: cert.pubkey → expected NodeId
-- [x] NodeID mismatch → immediate disconnect
-
-**Peer Verification:**
-- [x] Hostname/CN verification in the certificate
-- [x] Optional allowlist of authorized NodeIDs
-- [x] Connection from a NodeID not in the list → rejected (if allowlist is active)
-
-**CLI Flags:**
-- [x] `--tls-cert <path>` - Node certificate
-- [x] `--tls-key <path>` - Node private key
-- [x] `--tls-ca <path>` - CA used to verify peers
-- [x] `--allowed-peers <id1,id2,...>` - NodeID allowlist
-- [x] `--tls-insecure` - Dev only, skip verify (warning)
-
-**Security Tests:**
-- [x] Test: TLS connection works between 2 nodes
-- [x] Test: connection rejected without certificate
-- [x] Test: connection rejected with expired/invalid cert
-- [x] Test: mTLS - both peers authenticated
-- [x] Test: NodeID mismatch → disconnect
-- [x] Test: peer not in allowlist → rejected
-- [x] Test: tests for the new CLI flags
-
-**Libraries**: `rustls`, `tokio-rustls`, `rcgen`, `sha2`
-
-**Achieved security matrix:**
-
-| Attack | Protected |
-|--------|-----------|
-| Eavesdropping | ✅ TLS |
-| Tampering | ✅ TLS |
-| Replay | ✅ TLS |
-| MITM server | ✅ Cert verify |
-| MITM client | ✅ mTLS |
-| Rogue node | ✅ Allowlist |
-| Spoofed NodeID | ✅ hash(pubkey) |
+> **Legend**: ✅ released · ⏳ in progress · 📋 planned · 🎯 final goal of the cycle.
 
 ---
 
-### Phase 6.5: End-to-End Sync Wiring 🔗
-**Goal**: close the hidden gaps between guest WASM, SyncManager and datastore, so that replicable operations actually make the full round trip between peers.
-Includes the restructuring of the host API to separate local KV and replicated CRDT without per-key magic.
+## v0.1.0 - First production-ready + Documentation
 
-**Async runtime**:
-- [x] `Runtime::run_module` becomes `async` and runs inside a `tokio::Runtime`.
-- [x] CLI switches to `#[tokio::main]`; `real_main` becomes async.
-- [x] `SyncManager` accessible as `Arc<Mutex<SyncManager>>` (or cloneable handle).
-- [x] `Runtime::start_sync` actually calls `SyncManager::start().await`.
-- [x] `wasmtime` loaded with `add_to_linker_async` and `run.call_async` so it does
-      not block the tokio runtime during host calls.
+**Goal**: initial release of the runtime + Deployment & Docs.
+Add the configuration file as the first alternative to the CLI.
 
-**CRDT Host API (new)**:
-- [x] `crdt_gcounter_inc(key_ptr, key_len, delta: u64) -> i32`
-      applies locally, materializes the total in sled and emits an Op via channel.
-- [x] `crdt_gcounter_value(key_ptr, key_len, out_ptr, out_cap) -> i32`
-      reads the current total from the in-memory registry.
-- [x] SDK wrapper `nx_sdk::crdt::gcounter::{inc, value}`.
+**Documentation**:
+- [ ] Dedicated documentation site
+- [ ] Dedicated domain (`numax.dev` or `numax.run`)
+- [ ] Tutorial: "Distributed Hello World in 5 minutes"
+- [ ] Tutorial: "Deploy 3 nodes with real mTLS"
+- [ ] Tutorial: "Your first collaborative CRDT module"
+- [ ] Guide: production configuration
+- [ ] Guide: troubleshooting divergences
+- [ ] Comparison page vs Spin / wasmCloud / Lunatic / Fermyon
 
-**End-to-end wiring**:
-- [x] `HostState` includes a handle to the SyncManager (Op sender + GCounter accessor).
-- [x] `apply_remote_op` updates the GCounter **and** rewrites the total in sled.
-- [x] Atomic materialization: GCounter update → sled write in a single logical
-      transaction (a sled batch is acceptable).
+**Distribution**:
+- [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
+- [ ] Automated release from tag on GitHub
+- [ ] SHA256 checksum for each asset
 
-**Cleanup of the past**:
-- [x] Remove the `--sync-prefix` CLI flag.
-- [x] Update log messages and help.
-- [x] Update `HOST_API.md` with the `db_*` vs `crdt_*` separation.
+**Configuration (alternative to the CLI)**:
+- [ ] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
+- [ ] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
+- [ ] Explicit precedence: **CLI flags > env > file > default**
+- [ ] `nx config init` - generates a commented `numax.toml`
+- [ ] `nx config validate` - validates a file without running it
+- [ ] `nx config show --effective` - shows the resulting effective configuration
 
-**Examples migration**:
-- [x] `examples/distributed_counter`: rewritten with `nx_sdk::crdt::gcounter`.
-- [x] `examples/distributed_chat`: marked as "non-replicated (local LWW)"
-      or removed until ORSet/RGA are available (Phase 14).
-- [x] `examples/vote_tally_tls`: new example with mTLS + allowlist + real
-      CRDT counter across 3 nodes.
+**Ready-made observability**:
+- [ ] `docs/dashboards/numax.json` - official Grafana dashboard
+- [ ] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
+- [ ] PromQL alert examples in the docs site
 
-**Tests**:
-- [x] E2E test: 2 nodes, A runs `gcounter::inc("visits", 1)`, after handshake
-      and one round of PushOps B reads `gcounter::value("visits") == 1`.
-- [x] E2E test: 2 nodes, A and B increment in parallel, converge on the same
-      total.
-- [x] Test: no Op emitted when sync is disabled.
-- [x] Test: `apply_remote_op` is idempotent (same Op twice → no double counting).
+**Governance**:
+- [ ] `SECURITY.md` with responsible disclosure process
+- [ ] `CODE_OF_CONDUCT.md`
+- [ ] `MAINTAINERS.md`
 
 **Closing criterion**:
-```bash
-# Terminal A
-nx run counter.wasm --listen 127.0.0.1:9000 --peer 127.0.0.1:9001 \
-    --datastore-path ./data-a --wait-before-run 1500ms \
-    --settle-for 2s --print-gcounter counter:visits
-# Terminal B
-nx run counter.wasm --listen 127.0.0.1:9001 --peer 127.0.0.1:9000 \
-    --datastore-path ./data-b --wait-before-run 1500ms \
-    --settle-for 2s --print-gcounter counter:visits
-# Both nodes print: counter:visits = 2
-```
-
-> Note: the internal wiring of Phase 6.5 is covered by E2E tests on `SyncManager`, including handshake, PushOps, convergence and sled materialization.
-> The CLI criterion above is now covered by the Phase 7 lifecycle/smoke tests: startup hydration, settle mode, signal-aware shutdown, final flush and multi-process convergence.
+> A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.
 
 ---
 
-### Phase 7: Graceful Lifecycle 🔄
-**Goal**: Clean shutdown and recovery from crash
+## v0.1.1 - Architectural Cleanup & Versioning 🧹
 
-- [x] Robust long-running mode for the runtime with sync enabled.
-- [x] Hydration on startup: rebuild the GCounter registry from the values
-      materialized in sled.
-- [x] Settle mode for `nx run` with sync enabled: give time to handshake,
-      PushOps and remote apply before exit, or replace it with a long-running
-      lifecycle.
-- [x] Multi-process CLI smoke test: two `nx run distributed_counter.wasm`
-      converge and print the same value within a few seconds.
-- [x] Signal handling (SIGTERM, SIGINT, SIGHUP)
-- [x] Graceful shutdown: complete in-flight ops, close connections
-- [x] Store flush before exit
-- [x] Configurable timeout for shutdown (default 30s)
-- [x] Test: kill -TERM → no data corruption
-- [x] Test: crash → restart → consistent state
+**Goal**: clean up the architectural debt of `0.1.0` and introduce wire/schema versioning.
 
-**Remaining hardening:**
-- [x] Read loops listen to the runtime shutdown signal instead of relying only
-      on socket close/timeout.
-- [x] Node shutdown waits a bounded time for network tasks to exit
-      cooperatively before aborting them.
-- [x] Test: active peer connections shut down without waiting for the socket
-      read timeout.
+**Split of `sync_manager.rs`** (I created a monster):
+- [ ] Turn the single file into a `sync_manager/` module with various sub-modules
+- [ ] `OpApplier` trait for each CRDT family
+- [ ] E2E tests split per CRDT family
+- [ ] **Constraint**: the split PR is **only move + re-export**, zero logic changes
 
-**Criteria**:
-```bash
-kill -TERM $PID  # Completes operations, exits with code 0
-```
+**Wire Protocol Versioning**:
+- [ ] Explicit `protocol_version` field in `Hello`
+- [ ] Documented compatibility matrix: N vs N-1, N vs N+1
+- [ ] E2E test with two binaries of different versions in the same cluster
+- [ ] Document `docs/design/wire-versioning.md`
+
+**Schema Persistence Versioning**:
+- [ ] Magic number + version in every sled "table"
+- [ ] Explicit migrations version N → N+1
+- [ ] "Rolling upgrade" test: old node + new node in the same cluster
+- [ ] CLI `nx migrate` for offline migration
+
+**Typed Error Frames**:
+- [ ] Enum `WireError`: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal`
+- [ ] Documented retry vs fatal semantics
+- [ ] Backoff differentiated by error type
+
+**Closing criterion**:
+> `sync_manager.rs` no longer exists as a single file. A cluster with a `0.1.1` node and a `0.1.0` node refuses the connection with a clear, versioned error, not with a crash.
 
 ---
 
-### Phase 8: Backpressure and Limits ⚡
-**Goal**: Stability under load
+## v0.1.2 - Performance & Profiling 📊
 
-- [x] Peer connection limit (default: 64)
-- [x] Queued ops limit (default: 10000)
-- [x] Message size limit (default: 16 MiB)
-- [x] Graceful rejection when overloaded
-- [x] Socket read/write timeouts (default: 30s)
-- [x] Test: 1000 simultaneous connections → no crash
+**Goal**: make performance observation automatic and visible, prevent silent regressions.
+
+**Profiling tools**:
+- [ ] `tokio-console` integration (visibility into tasks)
+- [ ] CPU flamegraph in CI with `pprof-rs` or `samply`
+- [ ] Heap profiling with `dhat` integrated into benchmarks
+- [ ] Per-WASM-module profiling (CPU time, bytes allocated)
+
+**Regression gate**:
+- [ ] Phase 13 benchmarks extended with automatic JSON report
+- [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
+- [ ] Baseline history committed in `crates/*/reports/baselines/`
+
+**Additional metrics**:
+- [ ] `numax_module_cpu_ms` per module
+- [ ] `numax_module_memory_bytes` per module
+- [ ] `numax_op_apply_duration_ms` distribution
+
+**Closing criterion**:
+> A PR that worsens sync p99 by > 5% is automatically blocked by CI with the regression details.
+
+---
+
+## v0.1.3 - Supply Chain & Fuzzing 🔐
+
+**Goal**: make numax adoptable by those with strict supply-chain policies.
+
+**Supply chain**:
+- [ ] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
+- [ ] `cargo-audit` scheduled (daily workflow)
+- [ ] CycloneDX SBOM generated for every release
+- [ ] Releases signed with Sigstore / cosign
+- [ ] GitHub workflows with minimal `permissions:`
+- [ ] Action SHA pinning (no `@v3` but `@<sha>`)
+
+**Fuzzing**:
+- [ ] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
+- [ ] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
+- [ ] **OSS-Fuzz** integration
+- [ ] Seed corpus committed in `fuzz/corpus/`
+
+**Sled hardening**:
+- [ ] Test: sled file corruption → recovery from op-log
+- [ ] Test: full disk → graceful degrade
+
+**Closing criterion**:
+> 24 hours of fuzzing on all targets without panic. Verifiable SBOM. Releases verifiable with `cosign verify`.
+
+---
+
+## v0.1.4 - Management API 🔌
+
+**Goal**: provide a programmatic alternative to the CLI for integration with automation tooling.
+
+**REST API `/api/v1/*`**:
+- [ ] Served on a separate port (default `127.0.0.1:9102`)
+- [ ] Auth with bearer token (never open without)
+- [ ] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
+- [ ] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
+
+**v1 endpoints**:
+- [ ] `GET/POST /api/v1/modules` - module management
+- [ ] `GET /api/v1/peers` - list connected peers
+- [ ] `POST /api/v1/peers` - manually add a peer
+- [ ] `GET /api/v1/keys?prefix=...` - list keys
+- [ ] `GET /api/v1/keys/{key}` - read a value
+- [ ] `GET /api/v1/health`, `GET /api/v1/ready` (aliases of existing observability endpoints)
+- [ ] `POST /api/v1/snapshot` - trigger snapshot
+
+**Internal pattern**:
+- [ ] Single source of truth: `RuntimeIntrospection` trait used by CLI, REST API, dashboard, TUI
+
+**Closing criterion**:
+> A numax node can be managed exclusively via REST API, without ever invoking the CLI. A working Terraform provider example exists in `examples/terraform-provider/`.
+
+---
+
+## v0.1.5 - Peer Discovery: Foundations 🌐
+
+**Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce the abstraction and mechanical bootstrap (not yet gossip-based; that comes in 0.1.6).
+
+**Abstraction**:
+- [ ] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
+- [ ] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
+
+**Initial implementations**:
+- [ ] `StaticDiscovery` - peer list from config (backward-compatible)
+- [ ] `BootstrapGossipDiscovery` - join with 1 address, learn the others through `Hello` exchange
+- [ ] `MdnsDiscovery` - LAN discovery for demo and dev
+- [ ] `DnsSrvDiscovery` - discovery via DNS-SRV record
+- [ ] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
 
 **Configuration**:
+- [ ] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
+
+**Explicit decision**:
+- [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.
+
+**Closing criterion**:
+> Three nodes on the same LAN discover each other via mDNS without any `--peer` flag. Reproducible demo in `examples/discovery_lan/`.
+
+---
+
+## v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout 🕸
+
+**Goal**: **dynamic** discovery, with membership, failure detection and dissemination separated. This is **the strength of `0.2.0`**.
+
+**Design doc as a public RFC**:
+- [ ] `peer-discovery.md`
+- [ ] Documented failure scenarios
+- [ ] Detailed test plan
+
+**Three separate channels**:
+- [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)
+- [ ] **Failure detection**: phi-accrual or SWIM-style suspicion (who is dead/suspect)
+- [ ] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
+
+**Adaptive K-fanout gossip**:
+- [ ] Configurable fanout (default `K = ceil(log2(N) + c)`)
+- [ ] Adaptive rate based on load/RTT
+- [ ] Backpressure: controlled drops, never storms
+- [ ] Periodic anti-entropy complementing gossip
+
+**Determinism for tests**:
+- [ ] Seedable gossip PRNG for reproducible tests
+
+**Test scenarios**:
+- [ ] 50 nodes, 10% packet loss, partition recovery
+- [ ] Cluster split-brain → merge without op loss
+- [ ] 100% rolling restart of nodes → cluster survives
+- [ ] False positive detection rate measured
+
+**Closing criterion**:
+> A 50-node cluster on a simulated network with 10% packet loss converges in < 30s after a 60s partition. No false-positive failure detection in nominal conditions for 1h.
+
+---
+
+## v0.1.7 - Reactive Module Model: Events ⚡
+
+**Goal**: modules become **long-running and reactive**.
+
+**Design doc**:
+- [ ] `docs/design/event-model.md` as RFC
+
+**Module lifecycle**:
+- [ ] Long-running module with event loop
+- [ ] `init()` called at startup
+- [ ] `shutdown()` called on graceful shutdown
+- [ ] Backward-compatible `run()` one-shot mode (so existing examples don't break)
+
+**Registerable callbacks**:
+- [ ] `on_remote_op(key, op_kind)` - CRDT op applied by a peer
+- [ ] `on_tick(ms)` - periodic timer
+- [ ] `on_peer_connected(node_id)` / `on_peer_disconnected(node_id)`
+- [ ] `on_message(topic, payload)` - explicit intra-cluster messages
+
+**Guest SDK**:
+- [ ] Macro `nx_sdk::on_remote_op!` for ergonomic registration
+- [ ] Example `examples/reactive_dashboard/` - module that updates in real time
+
+**Closing criterion**:
+> A reactive module receives an op from a peer, runs custom logic (e.g. sends a notification), and the example is documented step-by-step.
+
+---
+
+## v0.1.8 - Reactive Module Model: HTTP & Hot Reload 🔁
+
+**Goal**: modules can **serve HTTP** and be **reloaded without dropping peer connections**.
+
+**HTTP handler**:
+- [ ] `on_request(req) -> response` as a callback
+- [ ] Explicit `network.serve` capability (deny-by-default)
+- [ ] Minimal internal routing (path → handler)
+
+**Hot reload**:
+- [ ] `nx reload <module>` - replaces the module without closing peer connections
+- [ ] CRDT state preserved during reload
+- [ ] Test: reload under load, zero ops lost
+
+**Killer demo**:
+- [ ] `examples/collaborative_todo/` - local-first multi-device todo list, web UI served by the module, real-time CRDT sync. **Filmable for the launch.**
+
+**Closing criterion**:
+> The "collaborative todo list" demo runs on 3 devices, the user edits a todo, the other devices see it in < 500ms. Hot reload in production with no state loss.
+
+---
+
+## v0.1.9 - Capability-Based Security 🔒
+
+**Goal**: the current "enabled/disabled" model is replaced by granular per-module capabilities.
+
+**Per-module policy file**:
+- [ ] `module.policy.toml` next to the `.wasm`
+- [ ] Sections: `[capabilities]`, `[quotas]`
+- [ ] Granular capabilities for keyspace, CRDT family, network, time, random
+
+**Example**:
 ```toml
-[limits]
-max_peers = 64
-queued_ops_limit = 10000
-max_message_size = "16MiB"
-socket_timeout_secs = 30
+[capabilities]
+db.read = ["inventory:*", "settings:*"]
+db.write = ["inventory:*"]
+crdt.gcounter = ["visits:*"]
+crdt.rga = []
+net.peers = false
+network.serve = true
+random = true
+time = true
 ```
 
----
+- [ ] Policy **signed** with the same key as the cert (anti-tampering)
+- [ ] **Deny-by-default**: capability not listed = denied
+- [ ] Enforcement at the host-call level
+- [ ] Audit log of host calls (optional, opt-in)
 
-### Phase 9: Observability 📊
-**Goal**: Visibility into what the runtime is doing
+**CLI/API**:
+- [ ] `nx policy validate <policy.toml>`
+- [ ] `nx policy diff <old> <new>`
 
-**Structured logging**:
-- [x] JSON format for logs
-- [x] Configurable levels (trace/debug/info/warn/error)
-- [x] Correlation ID to trace operations
-
-**Metrics**:
-- [x] `numax_ops_total` - Operations processed
-- [x] `numax_peers_connected` - Active peers
-- [x] `numax_sync_latency_ms` - Sync latency
-- [x] `numax_store_keys` - Keys in the store
-- [x] `numax_store_bytes` - Bytes used
-- [x] `numax_sync_errors_total` - Sync errors
-- [x] `numax_observability_requests_total` - Observability requests
-- [x] `numax_observability_errors_total` - Observability request errors
-- [x] `numax_peer_connects_total` - Peer connections observed
-- [x] `numax_peer_disconnects_total` - Peer disconnections observed
-- [x] `numax_broadcast_batches_total` - Broadcast batches sent
-- [x] `numax_broadcast_ops_total` - Broadcast ops sent
-- [x] `/metrics` endpoint (Prometheus format)
-
-**Health check**:
-- [x] `/health` endpoint (liveness)
-- [x] `/ready` endpoint (readiness)
-- [x] Test: `/ready` returns 503 before runtime readiness
-- [x] Test: unknown observability paths return 404
-- [x] Test: observability request timeout is bounded
-
-**Configuration**:
-```toml
-[observability]
-listen = "127.0.0.1:9100"
-log_level = "info"
-log_format = "text"
-request_timeout_secs = 5
-```
-
-**Implementation**: `tracing`, `tracing-subscriber`, minimal Prometheus-compatible
-HTTP endpoint over Tokio.
+**Closing criterion**:
+> A module without a policy does not start. A module with a minimal policy cannot access keys outside its namespace. Dedicated security tests.
 
 ---
 
-### Phase 10: Network Resilience 🌐
-**Goal**: Robust operation with an unstable network
+## v0.1.10 - Resource Quotas & Multi-tenant 📦
 
-- [x] Automatic reconnect with exponential backoff
-- [x] Peer health tracking (mark dead after N timeouts)
-- [x] Peer rotation (replace dead peers)
-- [x] Periodic anti-entropy (pull every N seconds)
-- [x] Op deduplication (bounded set of OpIds)
-- [x] Durable CRDT state or op log, so restart/reconnect can recover full
-      CRDT state rather than only materialized totals.
-- [x] Startup hydration from durable CRDT state/op log.
-- [x] Persist dedup metadata, or otherwise prevent duplicate remote ops after
-      restart.
-- [x] Test: intermittent network (10% packet loss)
-- [x] Test: node dies and comes back → converges
-- [x] Test: duplicate op after restart does not double count
+**Goal**: numax becomes **multi-tenant safe**: multiple modules on the same node, isolated, with resource quotas.
 
----
+**Resource quotas**:
+- [ ] `cpu_ms_per_run` - max CPU time per invocation
+- [ ] `memory_max_mb` - max module memory
+- [ ] `ops_per_sec` - CRDT op rate limit
+- [ ] `bytes_written_per_sec` - sled write rate limit
+- [ ] Enforcement with module interruption + log + metric
+- [ ] Quota usage metrics in Prometheus
 
-### Phase 11: Dual-Mode Serialization 📦
-**Goal**: JSON for debugging, bincode for production
+**Multi-module per node**:
+- [ ] Internal module supervisor
+- [ ] `nx run <mod1> <mod2> ...` or config file with module list
+- [ ] Op routing based on key prefix per module
+- [ ] Keyspace isolation (ties in with capabilities)
+- [ ] A module crash does not bring the node down
 
-**Motivation**:
-- JSON: readable, debuggable, inspectable with tcpdump/wireshark
-- bincode: compact (~50% size), fast (~10x faster parse)
-
-**Tasks**:
-- [x] Add `bincode` to dependencies
-- [x] `SerializationFormat` enum with a 1-byte header on the wire
-- [x] CLI flag `--debug-protocol`
-- [x] Format negotiation in Hello/HelloAck
-- [x] Test: roundtrip for both formats
-- [x] Benchmark: JSON vs bincode (size, speed)
+**Closing criterion**:
+> 10 modules on the same node, each with different quotas, none can affect the others. "Malicious module" test attempting to exhaust resources → contained correctly.
 
 ---
 
-### Phase 12: Extended Host API 🔌
-**Goal**: Complete API for WASM modules
+## v0.1.11 - Op-log Compaction & Snapshots 🗜
 
-> ✅ **Implemented in `v0.1.0-alpha.5`**. Future hardening will formalize this
-> API surface in WIT + Component Model.
+**Goal**: the op-log does not grow indefinitely. Backup and restore exist.
 
-**Database**:
-- [x] `db_scan` — prefix scan with iterator / paginated results
-- [x] `db_exists` — check key existence without reading the value
-- [x] `db_keys` — list keys matching a prefix
+**Op-log compaction**:
+- [ ] Periodic CRDT state snapshot
+- [ ] Op-log truncation up to the snapshot point
+- [ ] Persisted dedup-set consistent with truncation
+- [ ] Differentiated approach per CRDT family (some support causal compaction, others require full snapshot)
+- [ ] `docs/design/compaction.md`
 
-**Time**:
-- [x] `time_now` — current Unix timestamp (ms)
-- [x] `time_monotonic` — monotonic clock for measurements
+**Snapshot/Restore**:
+- [ ] `nx snapshot create` - atomic datastore snapshot
+- [ ] `nx snapshot list`
+- [ ] `nx snapshot restore <id>`
+- [ ] Exportable snapshot (single file, portable across nodes)
+- [ ] Test: new node joining using a peer's snapshot
 
-**Crypto**:
-- [x] `random_bytes` — cryptographically secure random bytes
-- [x] `hash_sha256` — SHA-256 hash
-- [x] `hash_blake3` — BLAKE3 hash (faster)
+**Storage**:
+- [ ] `KvBackend` abstraction to decouple from sled (preparation for a possible switch to redb/fjall)
 
-**System**:
-- [x] `env_get` — read an environment variable
-- [x] `module_id` — get current module identifier
-- [x] `abort` — terminate execution with an error message
-
-**Network**:
-- [x] `net_node_id` — get own NodeId
-- [x] `net_peers` — list currently connected peers
-
-**Under evaluation**:
-- [x] `host_capabilities` — query which host APIs are available at runtime
-- [x] `event_emit` — emit a named event to the runtime (foundation for callbacks)
-- [x] `db_scan_after` / `db_keys_after` — key-cursor pagination for safer large key-space iteration
+**Closing criterion**:
+> A cluster operating for 7 days with active compaction keeps the op-log within a configured budget. Restore from snapshot in < 60s for a 10GB datastore.
 
 ---
 
-### Phase 13: Load Testing 🔥
-**Goal**: Verify behavior under stress
+## v0.1.12 - Operability Tools 🛠
 
-**Scenarios**:
-- [x] Single node: 10k ops/sec for 1 hour (`cargo bench -p nx-store --bench single_node_load -- --duration-secs 3600 --target-ops-sec 10000`)
-- [x] 3 nodes: 1k ops/sec each, continuous sync (`cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 300 --target-ops-sec-per-node 1000`)
-- [x] 10 nodes: full mesh, 100 ops/sec each (`cargo bench -p nx-core --bench three_node_sync_load -- --nodes 10 --duration-secs 300 --target-ops-sec-per-node 100`)
-- [x] Ignored chaos test: node restart loop converges (`cargo test -p nx-core chaos_node_restart_loop_converges -- --ignored`)
+**Goal**: when something goes wrong, you need the tools to figure it out.
 
-**Benchmarks**:
-- [x] Single-node store throughput benchmark
-- [x] Multi-node sync throughput benchmark
-- [x] Chaos/load runner with metrics output (`cargo bench -p nx-core --bench chaos_sync_load -- --duration-secs 300 --target-ops-sec 100 --restart-every-secs 60`)
+**Replay & diff**:
+- [ ] `nx replay <op-log> <new-datastore>` - applies an exported op-log to an empty datastore
+- [ ] `nx diff <datastore-a> <datastore-b>` - compares two datastores and shows divergences
+- [ ] `nx inspect <key>` - structured CRDT dump for a key
 
-**Metrics**: Throughput, p50/p95/p99 latency, convergence time, restart
-count for chaos runs. RAM/CPU profiling remains a future hardening extension.
+**Optional determinism**:
+- [ ] `--deterministic` mode that disables uncontrolled random/time
+- [ ] Replay perfectly reproducible in deterministic mode
+- [ ] Document `docs/design/determinism.md`
 
-**Tools**: custom Cargo bench runners with JSON reports under
-`crates/*/reports/load/`.
+**Opt-in telemetry**:
+- [ ] **Active** opt-in, default **off**
+- [ ] Collected data: version, OS, arch, average peer count, CRDT families used
+- [ ] Explicit document on what is collected and why
+- [ ] Self-hosted collection endpoint
 
----
-
-### Phase 14: Complete CRDTs 🧮
-**Goal**: Data structures for real use cases
-
-**Groundwork**:
-- [x] Multi-CRDT storage namespace helpers, so durable/materialized keys are
-      no longer hard-coded only through GCounter-specific helpers.
-- [x] Remote op application split behind CRDT-specific helpers, keeping the
-      SyncManager ready for additional `OpKind` variants.
-
-| CRDT | Description | Priority |
-|------|-------------|----------|
-| **PNCounter** | Counter with increment/decrement | High |
-| **LWW-Register** | Single value, last-writer-wins | High |
-| **ORSet** | Set with observed add/remove | High |
-| **LWW-Map** | Key→value map with LWW | Medium |
-| **RGA** | Replicated Growable Array (ordered lists) | Low |
-
-**PNCounter progress**:
-- [x] CRDT implementation in `nx-sync` with merge/property-style unit tests
-- [x] `OpKind` variants and operation constructors
-- [x] durable state/op-log integration in `nx-core`
-- [x] host API + SDK wrapper
-- [x] SyncManager E2E coverage
-- [x] distributed example with README
-
-**LWW-Register progress**:
-- [x] CRDT implementation in `nx-sync` with deterministic conflict ordering
-- [x] `OpKind` variants and operation constructors
-- [x] durable state/op-log integration in `nx-core`
-- [x] host API + SDK wrapper
-- [x] SyncManager E2E coverage
-- [x] distributed example with README
-
-**ORSet progress**:
-- [x] CRDT implementation in `nx-sync` with observed-remove semantics
-- [x] `OpKind` variants and operation constructors
-- [x] durable state/op-log integration in `nx-core`
-- [x] host API + SDK wrapper
-- [x] SyncManager E2E coverage
-- [x] distributed example with README
-
-**LWW-Map progress**:
-- [x] CRDT implementation in `nx-sync` with per-field LWW ordering and
-      tombstones for deletes
-- [x] `OpKind` variants and operation constructors
-- [x] durable state/op-log integration in `nx-core`
-- [x] host API + SDK wrapper
-- [x] SyncManager E2E coverage
-- [x] distributed example with README
-
-**RGA progress**:
-- [x] CRDT implementation in `nx-sync` with deterministic insert ordering and
-      tombstones for deletes
-- [x] `OpKind` variants and operation constructors
-- [x] durable state/op-log integration in `nx-core`
-- [x] host API + SDK wrapper
-- [x] SyncManager E2E coverage
-- [x] distributed example with README
-
-Completion rule for each CRDT:
-- implementation in `nx-sync`
-- `OpKind` and wire serialization support
-- durable state/op-log integration in `nx-core`
-- host API + SDK wrapper
-- property/unit tests and SyncManager E2E coverage
-- solid distributed example with a README and reproducible 2-3 node run
+**Closing criterion**:
+> A real divergence case (even simulated) is diagnosed in < 15 minutes using only the official tools.
 
 ---
 
-### Phase 15: Deployment & Docs 📦
-**Goal**: Ready for external users
+## v0.1.13 - Built-in Dashboard 🎨
 
-- [ ] Precompiled binaries (Linux x86_64, ARM64, macOS, Windows)
-- [ ] Tutorial: "Distributed Hello World in 5 minutes"
-- [ ] Tutorial: "Deploy 3+ nodes with mTLS"
-- [ ] Guide: production configuration
-- [ ] Guide: troubleshooting
+**Goal**: a native, lightweight web dashboard, focused on the 6 views that matter.
 
----
+**Stack**:
+- [ ] Server-side rendering + HTMX + SSE (no React/Vue/heavy bundles)
+- [ ] Theme using a free design system (Pico.css or Tailwind+DaisyUI)
+- [ ] **Compile-time feature flag** `--features dashboard` (base binary stays small)
 
-## Phases Summary
+**The 6 views**:
+- [ ] **Cluster view**: nodes, status (alive/suspect/dead), RTT latency, topology
+- [ ] **CRDT browser**: list of keys, CRDT family, current value, last modification, author
+- [ ] **Op flow**: live stream of incoming/outgoing ops (filterable by key/peer/family)
+- [ ] **Convergence health**: per-node vector clock, highlights lag and suspected divergences
+- [ ] **Throughput/latency**: ops/sec, p50/p95/p99, error rate
+- [ ] **Module info**: active modules, host call counts, consumed quotas
 
-| Phase | Name | Status | Priority |
-|-------|------|--------|----------|
-| 0-5 | Foundation | ✅ | - |
-| 6 | Transport Security | ✅ | **P0** |
-| 6.5 | End-to-End Sync Wiring | ✅* | **P0** |
-| 7 | Graceful Lifecycle | ✅ | **P0** |
-| 8 | Backpressure | ✅ | **P0** |
-| 9 | Observability | ✅ | **P1** |
-| 10 | Network Resilience | ✅ | **P1** |
-| 11 | Dual Serialization | ✅ | **P1** |
-| 12 | Extended Host API | ✅ | **P1** |
-| 13 | Load Testing | ✅ | **P1** |
-| 14 | Complete CRDTs | ✅ | **P2** |
-| 15 | Deployment & Docs | ⏳ | **P2** |
+**Security**:
+- [ ] Served on a separate port (default `127.0.0.1:9101`)
+- [ ] Default bind to `127.0.0.1`
+- [ ] Basic auth + token (never open without)
+- [ ] Read-only by default; mutations require an elevated token
 
-**Legend**:
-- **P0**: Blocking for production
-- **P1**: Required for safe production
-- **P2**: Required for adoption
+**Reuse**:
+- [ ] The dashboard is a consumer of the **same** `RuntimeIntrospection` as the Management API
+
+**Closing criterion**:
+> The "convergence health view" diagnoses a simulated divergence in 1 click. Screenshots ready for the public launch.
 
 ---
 
-## Final v0.1.0 Release Criteria
+## v0.1.14 - TUI & Advanced CRDTs 🖥
 
-- [x] Phases 0-5 complete
-- [x] Phase 6 (TLS) complete
-- [x] Phase 6.5 (End-to-End Sync) complete
-- [x] Phase 7 (Graceful shutdown) complete
-- [x] Phase 8 (Backpressure) complete
-- [x] Phase 9 (Observability) at least logging + health
-- [x] Phase 10 (Resilience) at least reconnect + dedup + durable CRDT recovery
-- [x] Phase 11 (Serialization) JSON + bincode working
-- [x] Phase 12 (Host API) at least db_scan, time_now, random_bytes
-- [x] Phase 13 (Load testing) single-node, multi-node and chaos gates
-- [ ] All tests pass
-- [ ] No clippy warnings
-- [ ] Base documentation
+**Goal**: those who live in SSH have their version. Those who need collaborative text editing have it too.
 
----
+**TUI `nx top`**:
+- [ ] Implemented with `ratatui`
+- [ ] Reuses the Management API `/api/v1` (same 6 views as the dashboard)
+- [ ] Local connection (default) or remote with token
+- [ ] Hotkeys k9s/lazygit-style
 
-## v0.1.0-alpha.2 Release Criteria
+**Advanced CRDTs (integration, not reimplementation)**:
+- [ ] Evaluation and integration of **Yrs** (Rust port of Yjs) as an optional backend for efficient text sequences
+- [ ] Evaluation of **Automerge** for nested JSON CRDT
+- [ ] Document `docs/design/advanced-crdts.md` with tradeoffs
+- [ ] Example `examples/collaborative_editor/` - replicated text editor
 
-- [x] Phases 0-5 complete
-- [x] Phase 6 (TLS) complete
-- [x] Phase 6.5 internal wiring covered by `SyncManager` E2E tests
-- [x] Phase 7 graceful lifecycle complete
-- [x] Base WASM examples present
-- [x] `cargo test` passes outside the sandbox
-- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes
-- [x] Known limitations documented in the roadmap
+**User-defined CRDT** (kick-off, not completion):
+- [ ] Document `docs/design/user-defined-crdts.md` with interface proposal
+- [ ] Prototype behind an experimental feature flag
+- [ ] Required mathematical guarantees documented (commutativity, associativity, idempotency)
+
+**Closing criterion**:
+> `nx top` is usable for production debugging via SSH. Working collaborative editor demo with Yrs.
 
 ---
 
-## v0.1.0-alpha.3 Release Criteria
+## v0.1.15 - WIT & Component Model 🧩
 
-- [x] Phase 7 graceful lifecycle hardening complete
-- [x] Phase 8 backpressure complete
-- [x] Phase 9 minimal observability complete
-- [x] `cargo test` passes
-- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [x] Known limitations documented in the roadmap
+**Goal**: the host API ABI becomes **standard, stable, multi-language** via the WebAssembly Component Model.
 
----
+**Gradualist approach**:
+- [ ] **Step 1**: write the `.wit` describing the current Host API (specification only, no migration)
+- [ ] **Step 2**: automatically generate the guest SDK bindings from `.wit` with `wit-bindgen`
+- [ ] **Step 3**: port the runtime to `wasmtime::component::Linker` behind feature flag `--features components`
+- [ ] **Step 4**: legacy ABI maintained in parallel, deprecated in `0.3.0`
 
-## v0.1.0-alpha.4 Release Criteria
+**WASI Preview 2**:
+- [ ] Optional evaluation and integration (capability-based filesystem/clock/random/sockets)
+- [ ] Naturally ties in with the capability-based security from `0.1.9`
 
-- [x] Phase 10 network resilience complete
-- [x] Phase 11 dual-mode serialization complete
-- [x] `cargo test` passes
-- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [x] Known limitations documented in the roadmap
+**Multi-language**:
+- [ ] Guest example in **Go** (TinyGo)
+- [ ] Guest example in **JavaScript** (ComponentizeJS)
+- [ ] Guest example in **Python** (componentize-py)
 
----
-
-## v0.1.0-alpha.5 Release Criteria
-
-- [x] Phase 12 extended host API complete
-- [x] Phase 13 load testing complete
-- [x] `cargo test --workspace` passes
-- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [x] Load reports generated for single-node, multi-node and chaos gates
-- [x] Known limitations documented in the roadmap
-
-## v0.1.0-rc.1 Release Criteria
-
-- [x] Phase 14 complete CRDTs implemented and documented
-- [x] Distributed examples available for each CRDT family
-- [x] RC network hardening complete: Ping/Pong, task tracking, peer slot
-      acquisition and event channel behavior
-- [x] Runtime module compilation cache implemented for repeated runs
-- [x] `cargo test --workspace` passes
-- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [x] Known limitations documented in the roadmap and whitepaper
+**Closing criterion**:
+> The same `.wit` is used by the Rust SDK, by a Go guest, by a JS guest, and they all converge on the same shared CRDT.
 
 ---
 
-## 0.2.0:
-> coming soon ...
+## v0.2.0-rc.1 - Release Candidate Hardening 🔧
+
+**Goal**: everything built in `0.1.0`–`0.1.15` is put under stress, integrated, documented and finished.
+
+**Integrated hardening**:
+- [ ] Combined stress test: discovery + capability + quotas + compaction + reload under load
+- [ ] Extended chaos test: unstable network, restart loop, malicious module, partition recovery
+- [ ] 7-day soak test on a real cluster (not simulated)
+- [ ] Internal security audit completed
+
+**Final documentation**:
+- [ ] Migration guide `0.1.x → 0.2.0`
+- [ ] Updated production deployment guide
+- [ ] All design docs revised and linked from the docs site
+
+**RC criteria**:
+- [ ] `cargo test --workspace` passes
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [ ] 24h fuzzing green on all targets
+- [ ] Regression gate green
+- [ ] All tutorials verified end-to-end
+
+---
+
+## v0.2.0 - Stable 🎯
+
+**Final goal**: distributed runtime **production-ready for any criticality**.
+
+**Final release criteria**:
+- [ ] All `0.1.0`–`0.1.15` releases closed
+- [ ] Complete and reviewed documentation
+- [ ] `0.3.x` roadmap opened as RFC
+
+---
+
+## Beyond `v0.2.0` - candidate directions for `0.3.x`
+
+> ⚠️ Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
+
+- **NAT traversal and WAN gossip** (STUN, relay, possibly libp2p)
+- **User-defined CRDTs** complete and production-ready
+- **Legacy ABI deprecated**: Component Model only
+- **Federated clusters**: clusters of clusters, with cross-cluster replication policies
+- **Pluggable storage backends**: redb, fjall, custom
+- **GPU/ML guests**: WASI-NN integration
+- **Edge orchestration**: optional integration with existing edge runtimes
+
+---
+
+## How to contribute to the roadmap
+
+1. **Open an issue** with the `roadmap-proposal` label if you want to discuss before writing code or a document.
+2. **Open a PR against `ROADMAP.md`** if you want to propose directly:
+   - a new item in a future version,
+   - moving an item between versions,
+   - a new intermediate version,
+   - a change to a closing criterion.
+3. **Roadmap PRs are treated as code PRs**: review, discussion, merge.
+
+---
+
+*Last revision*: `2026-05-30`
