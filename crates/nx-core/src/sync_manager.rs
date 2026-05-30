@@ -1046,7 +1046,7 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             continue;
                         }
 
-                        let _last_seen_op_id = {
+                        let last_seen_op_id = {
                             let peer_node_ids = peer_node_ids.read().await;
                             let Some(node_id) = peer_node_ids.get(peer) else {
                                 continue;
@@ -1054,7 +1054,7 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             anti_entropy_watermarks.read().await.get(node_id).cloned()
                         };
 
-                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
+                        if let Err(e) = node.send_pull_since_to_addr(peer, last_seen_op_id).await {
                             metrics.record_sync_error();
                             debug!(peer = %peer, error = %e, "anti-entropy pull failed");
                         } else {

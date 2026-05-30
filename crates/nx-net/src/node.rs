@@ -328,7 +328,12 @@ impl Node {
 
             let server_name = server_name.to_owned();
 
-            tls_cfg.connect_stream(tcp, server_name).await?
+            timeout(
+                self.config.socket_timeout,
+                tls_cfg.connect_stream(tcp, server_name),
+            )
+            .await
+            .map_err(|_| NetError::Timeout)??
         } else {
             NetStream::Plain(tcp)
         };
@@ -435,8 +440,10 @@ impl Node {
             connected_peer_count(&peers)
         };
 
+        let shutdown_for_events = self.shutdown_tx.subscribe();
         send_node_event(
             &self.event_tx,
+            &shutdown_for_events,
             "PeerConnected",
             NodeEvent::PeerConnected {
                 node_id: peer_node_id.clone(),
@@ -453,6 +460,7 @@ impl Node {
         let max_message_size = self.config.max_message_size;
         let socket_timeout = self.config.socket_timeout;
         let shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown_for_events = shutdown_rx.clone();
 
         let task = tokio::spawn(async move {
             if let Err(e) = read_loop(
@@ -490,6 +498,7 @@ impl Node {
             if let Some((node_id, addr, peers_connected)) = disconnected {
                 send_node_event(
                     &event_tx,
+                    &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
                         node_id,
@@ -551,8 +560,10 @@ impl Node {
                 warn!(%addr, error = %e, "failed to send ops");
                 failed.push(addr.clone());
                 if let Some((node_id, peers_connected)) = self.mark_peer_failed(&addr).await {
+                    let shutdown_for_events = self.shutdown_tx.subscribe();
                     send_node_event(
                         &self.event_tx,
+                        &shutdown_for_events,
                         "PeerDisconnected",
                         NodeEvent::PeerDisconnected {
                             node_id,
@@ -595,8 +606,10 @@ impl Node {
         if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
             warn!(%addr, error = %e, "failed to send message to peer");
             if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr).await {
+                let shutdown_for_events = self.shutdown_tx.subscribe();
                 send_node_event(
                     &self.event_tx,
+                    &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
                         node_id,
@@ -686,7 +699,9 @@ async fn handle_incoming(
     } = context;
 
     let stream: NetStream = match tls {
-        Some(ref tls_cfg) => tls_cfg.accept_stream(stream).await?,
+        Some(ref tls_cfg) => timeout(limits.socket_timeout, tls_cfg.accept_stream(stream))
+            .await
+            .map_err(|_| NetError::Timeout)??,
         None => NetStream::Plain(stream),
     };
 
@@ -787,8 +802,10 @@ async fn handle_incoming(
 
     info!(peer = %peer_node_id, serialization_format = ?negotiated_format, "incoming peer connected");
 
+    let shutdown_for_events = shutdown_rx.clone();
     send_node_event(
         &event_tx,
+        &shutdown_for_events,
         "PeerConnected",
         NodeEvent::PeerConnected {
             node_id: peer_node_id.clone(),
@@ -831,6 +848,7 @@ async fn handle_incoming(
     if let Some((node_id, addr, peers_connected)) = disconnected {
         send_node_event(
             &event_tx,
+            &shutdown_for_events,
             "PeerDisconnected",
             NodeEvent::PeerDisconnected {
                 node_id,
@@ -896,11 +914,20 @@ fn protocol_version_mismatch(their_version: u32) -> NetError {
 
 async fn send_node_event(
     event_tx: &mpsc::Sender<NodeEvent>,
+    shutdown_rx: &watch::Receiver<bool>,
     event_name: &'static str,
     event: NodeEvent,
 ) {
     if let Err(e) = event_tx.send(event).await {
-        warn!(event = event_name, error = %e, "failed to send node event; receiver closed");
+        if *shutdown_rx.borrow() {
+            debug!(
+                event = event_name,
+                error = %e,
+                "node event receiver already closed during shutdown"
+            );
+        } else {
+            warn!(event = event_name, error = %e, "failed to send node event; receiver closed");
+        }
     }
 }
 
@@ -925,6 +952,7 @@ async fn read_loop(
         socket_timeout,
         mut shutdown_rx,
     } = context;
+    let shutdown_for_events = shutdown_rx.clone();
 
     loop {
         let msg = tokio::select! {
@@ -953,6 +981,7 @@ async fn read_loop(
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");
                 send_node_event(
                     &event_tx,
+                    &shutdown_for_events,
                     "OpsReceived",
                     NodeEvent::OpsReceived {
                         from: peer_node_id.clone(),
@@ -965,6 +994,7 @@ async fn read_loop(
                 debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
                 send_node_event(
                     &event_tx,
+                    &shutdown_for_events,
                     "PullRequested",
                     NodeEvent::PullRequested {
                         from: peer_node_id.clone(),
@@ -1056,6 +1086,7 @@ async fn read_message<R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::TestPki;
 
     fn test_slot() -> OwnedSemaphorePermit {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
@@ -1306,6 +1337,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_to_peer_times_out_during_tls_handshake() {
+        let pki = TestPki::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _addr) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_tls(pki.node1_config())
+                .with_socket_timeout(Duration::from_millis(10)),
+        );
+
+        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+
+        assert!(matches!(err, NetError::Timeout));
+        accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn connect_to_peer_rejects_protocol_version_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1394,6 +1447,26 @@ mod tests {
 
         drop(second);
         drop(first);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn incoming_idle_tls_handshake_releases_peer_slot_after_timeout() {
+        let pki = TestPki::generate().unwrap();
+        let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+            .with_tls(pki.node1_config())
+            .with_max_peers(1)
+            .with_socket_timeout(Duration::from_millis(10));
+        let node = Node::new(config);
+        let addr = node.start_listener().await.unwrap();
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(node.connection_slots.available_permits(), 1);
+        assert_eq!(node.connected_peer_count().await, 0);
+
+        drop(stream);
         node.shutdown().await;
     }
 

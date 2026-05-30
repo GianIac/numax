@@ -20,6 +20,11 @@ const HOST_CAPABILITIES: &[&str] = &[
     "crdt_gcounter_inc",
     "crdt_gcounter_value",
     "crdt_lww_get",
+    "crdt_lww_map_contains",
+    "crdt_lww_map_entries",
+    "crdt_lww_map_get",
+    "crdt_lww_map_remove",
+    "crdt_lww_map_set",
     "crdt_lww_set",
     "crdt_orset_add",
     "crdt_orset_contains",
@@ -380,6 +385,9 @@ mod tests {
         assert!(capabilities.contains("db_scan"));
         assert!(capabilities.contains("db_scan_after"));
         assert!(capabilities.contains("db_keys_after"));
+        assert!(capabilities.contains("crdt_lww_map_set"));
+        assert!(capabilities.contains("crdt_lww_map_remove"));
+        assert!(capabilities.contains("crdt_lww_map_entries"));
         assert!(capabilities.contains("crdt_rga_insert"));
         assert!(capabilities.contains("crdt_rga_values"));
     }

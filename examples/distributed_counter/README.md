@@ -9,6 +9,16 @@ cd examples/distributed_counter
 cargo build --release --target wasm32-unknown-unknown
 ```
 
+## Reset a local demo
+
+The counter is a durable grow-only CRDT. If you reuse `./data-a` and
+`./data-b`, the next run continues from the previously materialized total.
+For a clean two-node demo, remove both local stores first:
+
+```bash
+rm -rf ./data-a ./data-b
+```
+
 ## Run
 
 ### Node A (first node)
@@ -19,7 +29,7 @@ nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
     --peer 127.0.0.1:9001 \
     --datastore-path ./data-a \
     --wait-before-run 1500ms \
-    --settle-for 2s \
+    --settle-for 5s \
     --print-gcounter counter:visits \
     -v
 ```
@@ -32,7 +42,7 @@ nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
     --peer 127.0.0.1:9000 \
     --datastore-path ./data-b \
     --wait-before-run 1500ms \
-    --settle-for 2s \
+    --settle-for 5s \
     --print-gcounter counter:visits \
     -v
 ```
@@ -55,6 +65,10 @@ With the two commands above, both nodes should print:
 ```text
 counter:visits = 2
 ```
+
+If one process exits earlier, or if a third process is still running against the
+same peer set, a node can print before seeing the last remote increment. Use the
+same `--settle-for` window on all terminals when manually checking convergence.
 
 ## Notes
 
