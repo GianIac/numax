@@ -75,7 +75,6 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] Tutorial: "Your first collaborative CRDT module"
 - [ ] Guide: production configuration
 - [ ] Guide: troubleshooting divergences
-- [ ] Comparison page vs Spin / wasmCloud / Lunatic / Fermyon
 
 **Distribution**:
 - [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
@@ -94,11 +93,6 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] `docs/dashboards/numax.json` - official Grafana dashboard
 - [ ] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
 - [ ] PromQL alert examples in the docs site
-
-**Governance**:
-- [ ] `SECURITY.md` with responsible disclosure process
-- [ ] `CODE_OF_CONDUCT.md`
-- [ ] `MAINTAINERS.md`
 
 **Closing criterion**:
 > A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.
