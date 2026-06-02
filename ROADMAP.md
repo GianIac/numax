@@ -83,22 +83,17 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] SHA256 checksum for each asset
 
 **Configuration (alternative to the CLI)**:
-- [ ] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
-- [ ] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
-- [ ] Explicit precedence: **CLI flags > env > file > default**
-- [ ] `nx config init` - generates a commented `numax.toml`
-- [ ] `nx config validate` - validates a file without running it
-- [ ] `nx config show --effective` - shows the resulting effective configuration
+- [x] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
+- [x] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
+- [x] Explicit precedence: **CLI flags > env > file > default**
+- [x] `nx config init` - generates a commented `numax.toml`
+- [x] `nx config validate` - validates a file without running it
+- [x] `nx config show --effective` - shows the resulting effective configuration
 
 **Ready-made observability**:
 - [ ] `docs/dashboards/numax.json` - official Grafana dashboard
 - [ ] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
 - [ ] PromQL alert examples in the docs site
-
-**Governance**:
-- [ ] `SECURITY.md` with responsible disclosure process
-- [ ] `CODE_OF_CONDUCT.md`
-- [ ] `MAINTAINERS.md`
 
 **Closing criterion**:
 > A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.

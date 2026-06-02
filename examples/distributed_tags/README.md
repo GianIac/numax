@@ -62,6 +62,64 @@ blocked
 Run these from the repository root after building the WASM module. Start both
 commands in separate terminals.
 
+### TOML config alternative
+
+Use one file per node for stable network/storage settings:
+
+```bash
+cat > examples/distributed_tags/node-a.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_tags/data-a"
+
+[network]
+listen = "127.0.0.1:9301"
+peers = ["127.0.0.1:9302"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > examples/distributed_tags/node-b.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_tags/data-b"
+
+[network]
+listen = "127.0.0.1:9302"
+peers = ["127.0.0.1:9301"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cargo run -p nx-cli -- config validate --config examples/distributed_tags/node-a.toml
+```
+
+Then run the add scenario with shorter commands:
+
+```bash
+NX_TAG_ACTION=add NX_TAG_VALUE=urgent cargo run -p nx-cli -- run \
+  examples/distributed_tags/target/wasm32-unknown-unknown/release/distributed_tags.wasm \
+  --config examples/distributed_tags/node-a.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-orset tags:doc-1 \
+  -v
+```
+
+```bash
+NX_TAG_ACTION=add NX_TAG_VALUE=review cargo run -p nx-cli -- run \
+  examples/distributed_tags/target/wasm32-unknown-unknown/release/distributed_tags.wasm \
+  --config examples/distributed_tags/node-b.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-orset tags:doc-1 \
+  -v
+```
+
+CLI flags and `NX_*` variables override the file when both are present.
+
 ### Node A: add urgent
 
 ```bash

@@ -59,6 +59,38 @@ nx run distributed_counter.wasm \
 
 The two nodes find each other, sync, and converge. You don't have to do anything else.
 
+You can also move the node settings into TOML files and keep the command line
+focused on run-specific options:
+
+```toml
+# node-a.toml
+[storage]
+datastore_path = "./data-a"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["127.0.0.1:9001"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+```
+
+```bash
+nx config validate --config node-a.toml
+nx config show --config node-a.toml --effective
+
+nx run distributed_counter.wasm \
+    --config node-a.toml \
+    --settle-for 5s \
+    --print-gcounter counter:visits
+```
+
+Runtime precedence is explicit: CLI flags override `NX_*` environment
+variables, environment variables override the TOML file, and the file overrides
+runtime defaults. The distributed examples below include full two-node TOML
+setups.
+
 ---
 
 ## Writing a guest module

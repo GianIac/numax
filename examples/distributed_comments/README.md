@@ -53,6 +53,64 @@ Each run is configured through environment variables:
 Run these from the repository root after building the WASM module. Start both
 commands in separate terminals.
 
+### TOML config alternative
+
+Use one file per node for stable network/storage settings:
+
+```bash
+cat > examples/distributed_comments/node-a.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_comments/data-a"
+
+[network]
+listen = "127.0.0.1:9701"
+peers = ["127.0.0.1:9702"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > examples/distributed_comments/node-b.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_comments/data-b"
+
+[network]
+listen = "127.0.0.1:9702"
+peers = ["127.0.0.1:9701"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cargo run -p nx-cli -- config validate --config examples/distributed_comments/node-a.toml
+```
+
+Then run the append scenario with shorter commands:
+
+```bash
+NX_COMMENT_ACTION=append NX_COMMENT_TEXT="first comment" cargo run -p nx-cli -- run \
+  examples/distributed_comments/target/wasm32-unknown-unknown/release/distributed_comments.wasm \
+  --config examples/distributed_comments/node-a.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-rga comments:doc-1 \
+  -v
+```
+
+```bash
+NX_COMMENT_ACTION=append NX_COMMENT_TEXT="second comment" cargo run -p nx-cli -- run \
+  examples/distributed_comments/target/wasm32-unknown-unknown/release/distributed_comments.wasm \
+  --config examples/distributed_comments/node-b.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-rga comments:doc-1 \
+  -v
+```
+
+CLI flags and `NX_*` variables override the file when both are present.
+
 ### Node A: append first comment
 
 ```bash

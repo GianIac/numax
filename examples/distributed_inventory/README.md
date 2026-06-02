@@ -53,6 +53,65 @@ If `NX_INVENTORY_ACTION` is not set, the module defaults to `restock`.
 
 Run these from the repository root after building the WASM module.
 
+### TOML config alternative
+
+The networking and storage flags can live in config files:
+
+```bash
+cat > examples/distributed_inventory/node-a.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_inventory/data-a"
+
+[network]
+listen = "127.0.0.1:9101"
+peers = ["127.0.0.1:9102"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > examples/distributed_inventory/node-b.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_inventory/data-b"
+
+[network]
+listen = "127.0.0.1:9102"
+peers = ["127.0.0.1:9101"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cargo run -p nx-cli -- config validate --config examples/distributed_inventory/node-a.toml
+cargo run -p nx-cli -- config show --config examples/distributed_inventory/node-a.toml --effective
+```
+
+Then run the same scenario with shorter commands:
+
+```bash
+NX_INVENTORY_ACTION=restock cargo run -p nx-cli -- run \
+  examples/distributed_inventory/target/wasm32-unknown-unknown/release/distributed_inventory.wasm \
+  --config examples/distributed_inventory/node-a.toml \
+  --wait-before-run 1500ms \
+  --settle-for 3s \
+  --print-pncounter inventory:sku-1 \
+  -v
+```
+
+```bash
+NX_INVENTORY_ACTION=sale cargo run -p nx-cli -- run \
+  examples/distributed_inventory/target/wasm32-unknown-unknown/release/distributed_inventory.wasm \
+  --config examples/distributed_inventory/node-b.toml \
+  --wait-before-run 1500ms \
+  --settle-for 3s \
+  --print-pncounter inventory:sku-1 \
+  -v
+```
+
+CLI flags and `NX_*` variables override the file when both are present.
+
 ### Node A: Restock
 
 ```bash

@@ -93,6 +93,111 @@ printf 'node-a=%s\nnode-b=%s\nnode-c=%s\n' "$NODE_A" "$NODE_B" "$NODE_C"
 
 Open three terminals from `examples/vote_tally_tls`.
 
+### With TOML config
+
+After computing `NODE_A`, `NODE_B`, `NODE_C`, generate one config file per
+node. These files keep networking, storage, TLS and allowlist settings out of
+the long run commands:
+
+```bash
+cat > node-a.toml <<EOF
+[storage]
+datastore_path = "./data-a"
+
+[network]
+listen = "127.0.0.1:9100"
+peers = ["127.0.0.1:9101", "127.0.0.1:9102"]
+serialization_format = "bincode"
+
+[tls]
+cert = "tls/node-a.pem"
+key = "tls/node-a-key.pem"
+ca = "tls/ca.pem"
+allowed_peers = ["$NODE_A", "$NODE_B", "$NODE_C"]
+insecure = false
+
+[discovery]
+mode = "static"
+EOF
+
+cat > node-b.toml <<EOF
+[storage]
+datastore_path = "./data-b"
+
+[network]
+listen = "127.0.0.1:9101"
+peers = ["127.0.0.1:9100", "127.0.0.1:9102"]
+serialization_format = "bincode"
+
+[tls]
+cert = "tls/node-b.pem"
+key = "tls/node-b-key.pem"
+ca = "tls/ca.pem"
+allowed_peers = ["$NODE_A", "$NODE_B", "$NODE_C"]
+insecure = false
+
+[discovery]
+mode = "static"
+EOF
+
+cat > node-c.toml <<EOF
+[storage]
+datastore_path = "./data-c"
+
+[network]
+listen = "127.0.0.1:9102"
+peers = ["127.0.0.1:9100", "127.0.0.1:9101"]
+serialization_format = "bincode"
+
+[tls]
+cert = "tls/node-c.pem"
+key = "tls/node-c-key.pem"
+ca = "tls/ca.pem"
+allowed_peers = ["$NODE_A", "$NODE_B", "$NODE_C"]
+insecure = false
+
+[discovery]
+mode = "static"
+EOF
+
+nx config validate --config node-a.toml
+nx config show --config node-a.toml --effective
+```
+
+Then start the three terminals:
+
+```bash
+nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
+    --config node-a.toml \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
+    -v
+```
+
+```bash
+nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
+    --config node-b.toml \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
+    -v
+```
+
+```bash
+nx run target/wasm32-unknown-unknown/release/vote_tally_tls.wasm \
+    --config node-c.toml \
+    --wait-before-run 2s \
+    --settle-for 3s \
+    --print-gcounter vote:tally:yes \
+    -v
+```
+
+CLI flags still override the config file. This is useful for temporarily
+changing `--settle-for`, `--log-format`, or a datastore path during debugging.
+
+### With CLI flags
+
 Terminal A:
 
 ```bash
@@ -159,8 +264,9 @@ vote:tally:yes = 3
 
 - mTLS is enabled by `--tls-cert`, `--tls-key`, and `--tls-ca`.
 - The allowlist admits only the three certificate-derived NodeIds.
-- `--config ./numax.toml` can provide the implemented `[limits]` and
-  `[observability]` sections.
+- `--config <file>` can provide `[network]`, `[tls]`, `[storage]`,
+  `[observability]`, `[limits]` and `[discovery]`. Runtime precedence is:
+  CLI flags > `NX_*` environment variables > config file > defaults.
 - `--log-format json` enables structured logs. `--observability-listen
   127.0.0.1:9300` exposes `/metrics`, `/health` and `/ready` for one node.
 - The guest never writes votes through `nx_sdk::db::*`; replicated state goes

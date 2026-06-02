@@ -539,6 +539,11 @@ nx run <module.wasm> --datastore-path ./my-data
 # Runs with a TOML configuration file
 nx run <module.wasm> --config ./numax.toml
 
+# Generates, validates and inspects a TOML configuration file
+nx config init --output numax.toml
+nx config validate --config numax.toml
+nx config show --config numax.toml --effective
+
 # Runs with the observability endpoint enabled
 nx run <module.wasm> \
     --observability-listen 127.0.0.1:9100 \
@@ -595,21 +600,52 @@ nx run <module.wasm> \
 | `--allowed-peers` | Allowlist of accepted peer NodeIDs |
 | `--tls-insecure` | Disables TLS (local dev only) |
 
-The implemented `limits` section is intentionally small:
+The configuration file is the production-friendly alternative to long CLI
+commands. It supports the runtime sections that are usually stable per node:
 
 ```toml
+[storage]
+datastore_path = "./node-data"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["192.168.1.10:9000", "192.168.1.11:9000"]
+serialization_format = "bincode"
+
+[tls]
+cert = "./certs/node.crt"
+key = "./certs/node.key"
+ca = "./certs/ca.crt"
+allowed_peers = ["node-id-1", "node-id-2"]
+insecure = false
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
+reconnect_initial_delay = "500ms"
+reconnect_max_delay = "30s"
+peer_dead_after_failures = 3
+anti_entropy_interval = "30s"
 
 [observability]
 listen = "127.0.0.1:9100"
 log_level = "info"
 log_format = "text"
 request_timeout_secs = 5
+
+[discovery]
+mode = "static"
 ```
+
+The supported sections are `[network]`, `[tls]`, `[storage]`,
+`[observability]`, `[limits]` and `[discovery]`. Runtime precedence is:
+CLI flags, then `NX_*` environment variables, then the TOML file, then runtime
+defaults. This keeps configuration reproducible without preventing local
+overrides during development or tests.
 
 The same limit values are the runtime defaults when no config file is provided.
 The observability endpoint is opt-in: without `--observability-listen` or
@@ -736,30 +772,56 @@ Increment operations are persisted as CRDT state/op-log metadata, materialized o
 
 ### 6.3 Configuration and Deployment *(Prototype)*
 
-Deployment will consist in shipping a `.wasm` file and a minimal configuration.
-
-The `limits` section below is implemented today. Observability can also be
-configured from file. The other deployment sections remain planned work.
+Deployment consists in shipping a `.wasm` file and one node configuration file.
+The CLI still accepts flags for local overrides, but stable node settings can
+live in TOML and be validated before launch.
 
 ```toml
+[storage]
+datastore_path = "./node-data"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["10.0.0.2:9000", "10.0.0.3:9000"]
+serialization_format = "bincode"
+
+[tls]
+cert = "./certs/node.crt"
+key = "./certs/node.key"
+ca = "./certs/ca.crt"
+allowed_peers = ["node-id-1", "node-id-2", "node-id-3"]
+insecure = false
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
+reconnect_initial_delay = "500ms"
+reconnect_max_delay = "30s"
+peer_dead_after_failures = 3
+anti_entropy_interval = "30s"
 
-[module]
-name = "cart_handler"
-path = "cart_handler.wasm"
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
+request_timeout_secs = 5
 
-[permissions]
-db = true
-network = ["https://api.example.com"]
-
-[sync]
-enabled = true
-keys = ["cart:", "user:"]
+[discovery]
+mode = "static"
 ```
+
+```bash
+nx config validate --config node.toml
+nx config show --config node.toml --effective
+nx run app.wasm --config node.toml
+```
+
+Runtime precedence is deterministic: CLI flags > `NX_*` environment variables
+> TOML file > defaults.
 
 ---
 
