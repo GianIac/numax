@@ -171,8 +171,6 @@ struct AntiEntropyLoopContext {
     interval: Duration,
     shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<RuntimeMetrics>,
-    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
-    anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 }
 
 struct BroadcastLoopContext {
@@ -718,8 +716,6 @@ impl SyncManager {
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
-            peer_node_ids: Arc::clone(&self.peer_node_ids),
-            anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
         });
 
         Ok(())
@@ -1022,8 +1018,6 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
         interval,
         mut shutdown_rx,
         metrics,
-        peer_node_ids,
-        anti_entropy_watermarks,
     } = context;
 
     if peers.is_empty() {
@@ -1046,15 +1040,11 @@ fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle
                             continue;
                         }
 
-                        let last_seen_op_id = {
-                            let peer_node_ids = peer_node_ids.read().await;
-                            let Some(node_id) = peer_node_ids.get(peer) else {
-                                continue;
-                            };
-                            anti_entropy_watermarks.read().await.get(node_id).cloned()
-                        };
-
-                        if let Err(e) = node.send_pull_since_to_addr(peer, last_seen_op_id).await {
+                        // A single "last seen OpId" is not a safe causal frontier: a peer can
+                        // receive a newer op while an older broadcast was dropped. Until the
+                        // protocol has contiguous/causal metadata, anti-entropy pulls the bounded
+                        // op-log and relies on OpId deduplication on the receiver.
+                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
                             metrics.record_sync_error();
                             debug!(peer = %peer, error = %e, "anti-entropy pull failed");
                         } else {
