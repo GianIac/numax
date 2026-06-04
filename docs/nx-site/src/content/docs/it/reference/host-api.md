@@ -3,4 +3,8 @@ title: Host API
 description: Reference delle host function esposte ai moduli WASM.
 ---
 
-TODO: migrare e strutturare `docs/HOST_API.md`.
+La documentazione canonica della Host API e mantenuta in inglese:
+
+- [Host API](/reference/host-api/)
+
+La traduzione italiana completa arrivera quando potremo mantenerla senza duplicare contenuto.

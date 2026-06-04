@@ -4,8 +4,8 @@
 
 # numax
 
-[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./docs/WHITEPAPER.md)
-[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./docs/ROADMAP.md)
+[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./docs/nx-site/src/content/docs/whitepaper/)
+[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./docs/nx-site/src/content/docs/roadmap/)
 
 A portable runtime for distributed apps. Written in Rust.
 
@@ -18,7 +18,7 @@ Three things, and only three:
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
 > **Status:** `v0.1.0-rc.1` - release candidate for the first v0.1.0 line.
-> It works, it's tested, and the remaining limits are documented. See [`ROADMAP.md`](./docs/ROADMAP.md).
+> It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/).
 
 ---
 
@@ -126,9 +126,9 @@ Same module, any node. State stays local. Sync happens through the runtime.
 
 ## Learn more
 
-- [`WHITEPAPER.md`](./docs/WHITEPAPER.md) - the vision, the architecture, the principles.
-- [`ROADMAP.md`](./docs/ROADMAP.md) - where we are, where we're going, what's still missing.
-- [`HOST_API.md`](./docs/HOST_API.md) - the host API available to WASM modules.
+- [`Whitepaper`](./docs/nx-site/src/content/docs/whitepaper/) - the vision, the architecture, the principles.
+- [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/) - where we are, where we're going, what's still missing.
+- [`Host API`](./docs/nx-site/src/content/docs/reference/host-api.md) - the host API available to WASM modules.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.
