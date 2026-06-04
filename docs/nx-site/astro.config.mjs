@@ -102,6 +102,11 @@ export default defineConfig({
               translations: { it: 'Debug dei moduli WASM' },
               slug: 'guides/debugging-wasm-modules',
             },
+            {
+              label: 'Observability',
+              translations: { it: 'Observability' },
+              slug: 'guides/observability',
+            },
           ],
         },
         {
