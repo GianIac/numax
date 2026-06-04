@@ -8,7 +8,7 @@
 > - external dependencies (Wasmtime, sled, the WASM/WASI ecosystem, Component Model standard),
 > - new ideas, opportunities, or simply how one wakes up in the morning with a better intuition.
 >
-> **Proposing changes**: anyone can open a **Pull Request against `ROADMAP.md`** to:
+> **Proposing changes**: anyone can open a **Pull Request against `docs/ROADMAP.md`** to:
 > - suggest a new item in a future version,
 > - move an item between versions with motivation,
 > - flag a risk or dependency that justifies a change in priority,
@@ -68,14 +68,20 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 Add the configuration file as the first alternative to the CLI.
 
 **Documentation**:
-- [ ] Dedicated documentation site
-- [ ] Dedicated domain (`numax.dev` or `numax.run`)
+- [x] Dedicated documentation site scaffold in `docs/nx-site` (Astro Starlight)
+- [ ] Migrate `docs/HOST_API.md` into `docs/nx-site/src/content/docs/reference/host-api.md`
+- [ ] Migrate `docs/ROADMAP.md` into `docs/nx-site/src/content/docs/roadmap/`
+- [ ] Migrate `docs/WHITEPAPER.md` into `docs/nx-site/src/content/docs/whitepaper/`
+- [ ] Versioned docs (`latest`, `v0.1`, future `v0.2`)
+- [ ] "Edit this page on GitHub" on every docs page
+- [ ] Sitemap and Open Graph metadata for docs pages
 - [ ] Tutorial: "Distributed Hello World in 5 minutes"
 - [ ] Tutorial: "Deploy 3 nodes with real mTLS"
 - [ ] Tutorial: "Your first collaborative CRDT module"
 - [ ] Guide: production configuration
 - [ ] Guide: troubleshooting divergences
 - [ ] Comparison page vs Spin / wasmCloud / Lunatic / Fermyon
+- [ ] In-browser WASM playground spike in `docs/nx-site/src/content/docs/playground/`
 
 **Distribution**:
 - [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
@@ -565,7 +571,7 @@ time = true
 ## How to contribute to the roadmap
 
 1. **Open an issue** with the `roadmap-proposal` label if you want to discuss before writing code or a document.
-2. **Open a PR against `ROADMAP.md`** if you want to propose directly:
+2. **Open a PR against `docs/ROADMAP.md`** if you want to propose directly:
    - a new item in a future version,
    - moving an item between versions,
    - a new intermediate version,

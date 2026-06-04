@@ -987,9 +987,11 @@ numax/
 │   ├── distributed_settings/
 │   ├── distributed_comments/
 │   └── vote_tally_tls/
-├── HOST_API.md
-├── WHITEPAPER.md
-├── ROADMAP.md
+├── docs/
+│   ├── HOST_API.md
+│   ├── WHITEPAPER.md
+│   ├── ROADMAP.md
+│   └── nx-site/            # Starlight documentation site
 └── LICENSE
 ```
 
