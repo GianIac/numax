@@ -11,7 +11,7 @@ hero:
       variant: primary
     - text: Read the whitepaper
       link: /whitepaper/
-      icon: open-book
+      icon: document
       variant: secondary
     - text: GitHub
       link: https://github.com/GianIac/numax

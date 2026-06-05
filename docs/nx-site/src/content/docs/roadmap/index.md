@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Upcoming version**: `v0.1.0` ⏳ (in progress - includes documentation, distribution & configuration)
+- **Current release line**: `v0.1.0` (active - includes documentation, distribution & configuration)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -43,26 +43,26 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 | Version | Theme | Status |
 |---|---|---|
-| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | ⏳ |
-| `v0.1.1` | Architectural Cleanup & Versioning | 📋 |
-| `v0.1.2` | Performance & Profiling | 📋 |
-| `v0.1.3` | Supply Chain & Fuzzing | 📋 |
-| `v0.1.4` | Management API | 📋 |
-| `v0.1.5` | Peer Discovery - Foundations | 📋 |
-| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | 📋 |
-| `v0.1.7` | Reactive Module Model - Events | 📋 |
-| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | 📋 |
-| `v0.1.9` | Capability-Based Security | 📋 |
-| `v0.1.10` | Resource Quotas & Multi-tenant | 📋 |
-| `v0.1.11` | Op-log Compaction & Snapshots | 📋 |
-| `v0.1.12` | Operability Tools | 📋 |
-| `v0.1.13` | Built-in Dashboard | 📋 |
-| `v0.1.14` | TUI & Advanced CRDTs | 📋 |
-| `v0.1.15` | WIT & Component Model | 📋 |
-| `v0.2.0-rc.1` | Release Candidate hardening | 📋 |
-| `v0.2.0` | **Stable - production-ready, any criticality** | 🎯 |
+| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | active |
+| `v0.1.1` | Architectural Cleanup & Versioning | planned |
+| `v0.1.2` | Performance & Profiling | planned |
+| `v0.1.3` | Supply Chain & Fuzzing | planned |
+| `v0.1.4` | Management API | planned |
+| `v0.1.5` | Peer Discovery - Foundations | planned |
+| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
+| `v0.1.7` | Reactive Module Model - Events | planned |
+| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | planned |
+| `v0.1.9` | Capability-Based Security | planned |
+| `v0.1.10` | Resource Quotas & Multi-tenant | planned |
+| `v0.1.11` | Op-log Compaction & Snapshots | planned |
+| `v0.1.12` | Operability Tools | planned |
+| `v0.1.13` | Built-in Dashboard | planned |
+| `v0.1.14` | TUI & Advanced CRDTs | planned |
+| `v0.1.15` | WIT & Component Model | planned |
+| `v0.2.0-rc.1` | Release Candidate hardening | planned |
+| `v0.2.0` | **Stable - production-ready, any criticality** | final goal |
 
-> **Legend**: ✅ released · ⏳ in progress · 📋 planned · 🎯 final goal of the cycle.
+> **Legend**: active = current release line; planned = future work; final goal = end of the cycle.
 
 ---
 
@@ -517,7 +517,7 @@ time = true
 
 ---
 
-## v0.2.0-rc.1 - Release Candidate Hardening 🔧
+## v0.2.0-rc.1 - Release Candidate Hardening
 
 **Goal**: everything built in `0.1.0`–`0.1.15` is put under stress, integrated, documented and finished.
 
@@ -541,7 +541,7 @@ time = true
 
 ---
 
-## v0.2.0 - Stable 🎯
+## v0.2.0 - Stable
 
 **Final goal**: distributed runtime **production-ready for any criticality**.
 
@@ -554,7 +554,7 @@ time = true
 
 ## Beyond `v0.2.0` - candidate directions for `0.3.x`
 
-> ⚠️ Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
+> Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
 
 - **NAT traversal and WAN gossip** (STUN, relay, possibly libp2p)
 - **User-defined CRDTs** complete and production-ready

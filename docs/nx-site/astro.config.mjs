@@ -24,6 +24,9 @@ export default defineConfig({
       social: {
         github: 'https://github.com/GianIac/numax',
       },
+      components: {
+        Header: './src/components/Header.astro',
+      },
       sidebar: [
         {
           label: 'Getting Started',
