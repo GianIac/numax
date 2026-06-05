@@ -562,6 +562,10 @@ time = true
 - **Pluggable storage backends**: redb, fjall, custom
 - **GPU/ML guests**: WASI-NN integration
 - **Edge orchestration**: optional integration with existing edge runtimes
+- **Tiny embedded runtimes**: evaluate interpreter-based WASM engines such as
+  `wasmi` or WAMR for Cortex-M / RISC-V devices with RAM measured in kilobytes.
+  Wasmtime is the right native engine for the current runtime, but it is not a
+  microcontroller-class target.
 
 ---
 
