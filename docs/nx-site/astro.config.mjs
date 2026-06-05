@@ -151,7 +151,6 @@ export default defineConfig({
             { label: 'Blog', slug: 'blog' },
             { label: 'Roadmap', slug: 'roadmap' },
             { label: 'Whitepaper', slug: 'whitepaper' },
-            { label: 'Playground', slug: 'playground' },
             { label: 'Community', translations: { it: 'Community' }, slug: 'community' },
             { label: 'Showcase', slug: 'showcase' },
           ],
