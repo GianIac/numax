@@ -17,7 +17,7 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
-> **Status:** `v0.1.0-rc.1` - release candidate for the first v0.1.0 line.
+> **Status:** `v0.1.0` - first stable Numax release line for controlled, non-critical workloads.
 > It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/).
 
 ---
@@ -147,7 +147,7 @@ Right now it's pretty much the only signal I have to understand whether this is 
 
 ## Try it. Break it. Tell me.
 
-numax is in release-candidate mode. It's the moment where focused feedback matters most.
+numax is in its first stable release line. It is usable, but still early: focused feedback matters a lot.
 
 - Clone it, run the examples, see if the two nodes really converge on your machine.
 - Write a tiny module of your own and try to break the sandbox or the sync.
