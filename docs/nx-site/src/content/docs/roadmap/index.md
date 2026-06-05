@@ -78,7 +78,6 @@ Add the configuration file as the first alternative to the CLI.
 - [x] Whitepaper available in the documentation site
 - [ ] Versioned docs (`latest`, `v0.1`, future `v0.2`)
 - [ ] Full Sitemap
-- [ ] In-browser WASM playground spike in `docs/nx-site/src/content/docs/playground/`
 
 **Distribution**:
 - [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
@@ -447,7 +446,7 @@ time = true
 
 **The 6 views**:
 - [ ] **Cluster view**: nodes, status (alive/suspect/dead), RTT latency, topology
-- [ ] **CRDT browser**: list of keys, CRDT family, current value, last modification, author
+- [ ] **CRDT explorer**: list of keys, CRDT family, current value, last modification, author
 - [ ] **Op flow**: live stream of incoming/outgoing ops (filterable by key/peer/family)
 - [ ] **Convergence health**: per-node vector clock, highlights lag and suspected divergences
 - [ ] **Throughput/latency**: ops/sec, p50/p95/p99, error rate

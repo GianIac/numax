@@ -61,7 +61,7 @@ The principles that guide every technical choice:
 
 - **State and code in the same environment.** The datastore is not a remote service: it is part of the runtime. Zero latency between computation and state, local ACID consistency, offline resilience as the default.
 
-- **WASM as a portable unit of computation.** A single `.wasm` artifact can run on server, edge, browser, embedded devices, without conditional branching and without multiple codebases.
+- **WASM as a portable unit of computation.** A single guest `.wasm` artifact can run on Numax nodes across server, edge and embedded environments without multiple application codebases.
 
 - **CRDT instead of locks or distributed transactions.** Synchronization does not require centralized coordination: CRDTs guarantee automatic convergence even with latency, partitions and concurrent updates.
 
@@ -123,15 +123,14 @@ Everything else belongs to upper layers or external tools. The runtime stays int
 
 ### 3.2 Radical portability
 
-A WASM module must be able to run without modifications:
+A WASM guest module should be able to run without modifications on Numax nodes:
 
 - on premise,
 - in cloud,
 - on edge nodes,
-- on embedded devices,
-- in the browser.
+- on embedded devices.
 
-This reduces environment-specific configurations, platform dependencies and conditional branching in the application code to zero.
+This reduces environment-specific configurations, platform dependencies and conditional branching in the application code.
 
 ### 3.3 State close to computation
 
@@ -173,11 +172,10 @@ The separation keeps responsibilities clear and allows components to evolve inde
 
 ### 4.2 Supported environments
 
-Numax is designed to run on:
+Numax `v0.1.0` is designed to run as a native runtime on:
 
 - servers (x86_64, ARM64),
 - edge nodes,
-- browsers (via WASM),
 - mobile (via native integration),
 - IoT (ARM / RISC-V).
 
@@ -892,7 +890,7 @@ The use cases below are **concretely achievable today** with the primitives of v
 
 **Why Numax.** State lives in the sled store of the edge node, always available locally. Operations are replicated to peers (other edge nodes or backhaul nodes) as soon as the network is available. CRDT properties guarantee that, once reconnected, the node loses or duplicates nothing.
 
-The compute is portable: the same `.wasm` module runs on an ARM gateway, on a cloud server for central rollup and - prospectively - on the browser for local dashboards.
+The compute is portable across Numax nodes: the same `.wasm` module can run on an ARM gateway and on a cloud server for central rollup.
 
 ### 8.4 Offline-first and collaborative applications
 
