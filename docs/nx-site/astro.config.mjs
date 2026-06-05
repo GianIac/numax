@@ -59,6 +59,11 @@ export default defineConfig({
           translations: { it: 'Concetti' },
           items: [
             {
+              label: 'Foundations',
+              translations: { it: 'Fondamenta' },
+              slug: 'concepts/foundations',
+            },
+            {
               label: 'Runtime model',
               translations: { it: 'Modello runtime' },
               slug: 'concepts/runtime-model',

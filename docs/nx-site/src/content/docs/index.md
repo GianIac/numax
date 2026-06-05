@@ -39,6 +39,10 @@ gossip.
    Peers exchange operations and converge automatically.
    You don't write reconciliation code.
 
+If terms like WASM, CRDT or gossip are new to you, start with
+[**Foundations**](/concepts/foundations/). It is the short glossary we wish
+every distributed runtime had.
+
 ## What you can build today
 
 The runtime ships with seven tiny examples, usually under 100 lines each.

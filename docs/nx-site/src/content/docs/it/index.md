@@ -41,6 +41,11 @@ CRDT e gossip.
    I peer si scambiano operazioni e convergono automaticamente.
    Non devi scrivere codice di riconciliazione.
 
+Se termini come WASM, CRDT, gossip o local-first ti sono nuovi, parti da
+[**Fondamenta**](/it/concepts/foundations/). E il glossario breve che avremmo
+voluto trovare prima di leggere qualsiasi documentazione su un runtime
+distribuito.
+
 ## Cosa puoi costruire oggi
 
 Il runtime include sette esempi piccoli, spesso sotto le 100 righe.
