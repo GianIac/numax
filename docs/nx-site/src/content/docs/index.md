@@ -23,14 +23,14 @@ hero:
 Numax is a small, portable runtime for distributed applications.
 You write a WebAssembly module. Numax runs it in a sandbox, gives it a local
 key/value store, and keeps that state in sync across nodes using CRDTs and
-gossip.
+gossip. WASM execution is powered by Wasmtime.
 
 
 ## Three things, only three
 
 1. **Sandboxed WebAssembly execution.**
-   Your code runs isolated, on any host that speaks WASM. Rust today,
-   more guest languages on the way through the Component Model.
+   Your code runs isolated through Wasmtime, on any host that speaks WASM.
+   Rust today, more guest languages on the way through the Component Model.
 
 2. **Local embedded datastore.**
    State lives next to the code in a durable key/value store using sled.

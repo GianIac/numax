@@ -33,6 +33,8 @@ Link utili:
 Un **runtime** e il programma che esegue il tuo modulo e gli fornisce i servizi
 attorno.
 
+Numax usa **Wasmtime** come motore di esecuzione WebAssembly.
+
 In Numax, il runtime:
 
 - carica e valida un modulo WASM;

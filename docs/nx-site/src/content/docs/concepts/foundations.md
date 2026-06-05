@@ -33,6 +33,8 @@ Useful links:
 A **runtime** is the program that executes your module and provides the services
 around it.
 
+Numax uses **Wasmtime** as its WebAssembly execution engine.
+
 In Numax, the runtime:
 
 - loads and validates a WASM module;
