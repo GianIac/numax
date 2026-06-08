@@ -146,7 +146,7 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] Per-WASM-module profiling (CPU time, bytes allocated)
 
 **Regression gate**:
-- [ ] Phase 13 benchmarks extended with automatic JSON report
+- [ ] Load benchmarks extended with automatic JSON report
 - [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
 - [ ] Baseline history committed in `crates/*/reports/baselines/`
 

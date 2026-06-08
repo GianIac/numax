@@ -15,8 +15,7 @@ description: Numax vision, architecture and principles.
 >
 > **Version reference**: `v0.1.0` - stable release line for controlled, non-critical workloads. API and wire compatibility are documented, but future `0.1.x` releases may still introduce explicit versioned changes.
 >
-> > **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [Roadmap](/roadmap/).
-> Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
+> **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/roadmap/).
 
 ---
 
@@ -359,7 +358,7 @@ The SDK automatically handles serialization, buffers and retries in case of `ERR
 
 ### 5.3 Numax Sync - Distributed replication *(Implemented core, Prototype end-to-end)*
 
-Numax Sync is responsible for replicating state between nodes. The fundamental primitives are implemented and covered by tests (including the end-to-end wiring of the SyncManager). The full multi-process CLI cycle is tracked as Phase 7 of the roadmap.
+Numax Sync is responsible for replicating state between nodes. The fundamental primitives are implemented and covered by tests, including the end-to-end wiring of the SyncManager and multi-process CLI flows.
 
 **Components:**
 
@@ -418,7 +417,7 @@ pub fn merge(&mut self, other: &GCounter) {
 
 **Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from durable CRDT state/op-log data, with materialized sled totals retained as a fallback. Dedup metadata is also persisted so recent duplicate remote operations after restart do not double count.
 
-**CRDTs (Phase 14):**
+**CRDTs available in `v0.1.0`:**
 
 | Type | Description | Status |
 |------|-------------|--------|
@@ -678,7 +677,7 @@ The model is **peer-to-peer with gossip**:
 
 The approach scales better than full-mesh and remains resilient in the presence of temporary disconnections. Full integration of dynamic fanout is in progress.
 
-### 5.9 Resilience: node down, intermittent network, reconnection *(Prototype - Phase 10)*
+### 5.9 Resilience: node down, intermittent network, reconnection *(Implemented in `v0.1.0`)*
 
 The network is considered fallible by nature. The implemented countermeasures
 for configured peers are:
@@ -731,11 +730,11 @@ pub extern "C" fn run() {
 | `db_get` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 | `db_set` | `(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32` | *Implemented* |
 | `db_delete` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
-| `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
+| `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 
 **Logging** - *(Implemented)*
 
@@ -754,22 +753,22 @@ Log levels: 0 = trace, 1 = debug, 2 = info, 3 = warn, 4 = error.
 
 Increment operations are persisted as CRDT state/op-log metadata, materialized on sled and propagated to peers through the SyncManager. In the absence of sync enabled, the functions return `ERR_SYNC_DISABLED` (-5).
 
-**Extended Host API** - *(Implemented, Phase 12)*
+**Extended Host API** - *(Implemented)*
 
 | Function | Description | Status |
 |----------|-------------|--------|
-| `time_now` | Current Unix timestamp in milliseconds | *Implemented (Phase 12)* |
-| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented (Phase 12)* |
-| `random_bytes` | Cryptographically secure random bytes | *Implemented (Phase 12)* |
-| `hash_sha256` | SHA-256 digest | *Implemented (Phase 12)* |
-| `hash_blake3` | BLAKE3 digest | *Implemented (Phase 12)* |
-| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented (Phase 12)* |
-| `module_id` | Current module identifier | *Implemented (Phase 12)* |
-| `abort` | Terminate guest execution with an error message | *Implemented (Phase 12)* |
-| `host_capabilities` | Query exposed host APIs | *Implemented (Phase 12)* |
-| `event_emit` | Emit a named runtime event | *Implemented (Phase 12)* |
-| `net_node_id` | Local sync NodeId | *Implemented (Phase 12)* |
-| `net_peers` | Connected sync peers | *Implemented (Phase 12)* |
+| `time_now` | Current Unix timestamp in milliseconds | *Implemented* |
+| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented* |
+| `random_bytes` | Cryptographically secure random bytes | *Implemented* |
+| `hash_sha256` | SHA-256 digest | *Implemented* |
+| `hash_blake3` | BLAKE3 digest | *Implemented* |
+| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented* |
+| `module_id` | Current module identifier | *Implemented* |
+| `abort` | Terminate guest execution with an error message | *Implemented* |
+| `host_capabilities` | Query exposed host APIs | *Implemented* |
+| `event_emit` | Emit a named runtime event | *Implemented* |
+| `net_node_id` | Local sync NodeId | *Implemented* |
+| `net_peers` | Connected sync peers | *Implemented* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
 ### 6.3 Configuration and Deployment *(Prototype)*
@@ -850,7 +849,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 4. `test` - full test suite execution
 5. `build-wasm` - compilation of WASM examples
 
-**Load testing** - Phase 13 added reproducible load gates with JSON reports:
+**Load testing** - `v0.1.0` includes reproducible load gates with JSON reports:
 
 - single-node store throughput: 10k ops/sec for 1 hour
 - 3-node continuous sync: 1k ops/sec per node
@@ -896,7 +895,7 @@ The compute is portable across Numax nodes: the same `.wasm` module can run on a
 
 **Problem.** Applications that must work without a connection (collaborative notes, distributed configurations, field applications, maritime/aerial/rural devices) and reconcile when they come back online, without imposing manual conflict resolution.
 
-**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available in Phase 14, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
+**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available in `v0.1.0`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
 
 The `distributed_chat` example (today in local-only mode) represents the skeleton of this use case.
 
