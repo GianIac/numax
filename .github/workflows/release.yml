@@ -28,6 +28,21 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Require tag version to match nx-cli crate version
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          tag_version="${tag#v}"
+          tag_base_version="${tag_version%%-*}"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/nx-cli/Cargo.toml | head -n1)"
+
+          if [[ "$tag_base_version" != "$crate_version" ]]; then
+            echo "Release tag base version ($tag_base_version) does not match crates/nx-cli version ($crate_version)"
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
     needs: validate-tag
@@ -68,9 +83,9 @@ jobs:
             native_smoke: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
         with:
           toolchain: stable
           target: ${{ matrix.target }}
@@ -84,7 +99,7 @@ jobs:
 
       - name: Install Zig
         if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
 
       - name: Build
         shell: bash
@@ -100,6 +115,12 @@ jobs:
         shell: bash
         run: |
           "target/${{ matrix.target }}/release/${{ matrix.exe }}" --version
+
+      - name: Static binary check
+        if: ${{ !matrix.native_smoke }}
+        shell: bash
+        run: |
+          file "target/${{ matrix.target }}/release/${{ matrix.exe }}"
 
       - name: Package
         shell: bash
@@ -123,13 +144,8 @@ jobs:
             tar -C dist -czf "release-assets/${asset}" "$package"
           fi
 
-          (
-            cd release-assets
-            sha256sum "$asset" > "${asset}.sha256"
-          )
-
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-${{ matrix.target }}
           path: release-assets/*
@@ -141,7 +157,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: downloaded
 
@@ -151,7 +167,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p release-assets
-          find downloaded -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+          find downloaded -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
 
           (
             cd release-assets
