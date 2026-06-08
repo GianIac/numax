@@ -80,9 +80,9 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] Full Sitemap
 
 **Distribution**:
-- [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
-- [ ] Automated release from tag on GitHub
-- [ ] SHA256 checksum for each asset
+- [x] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
+- [x] Automated release from tag on GitHub
+- [x] SHA256 checksum for each asset
 
 **Configuration (alternative to the CLI)**:
 - [x] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`

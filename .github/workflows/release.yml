@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require version-like v* tag
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]; then
+            echo "Release tag must look like v0.1.0 or v0.1.0-rc.2, got: $tag"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: true
+            native_smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: true
+            native_smoke: false
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: false
+            native_smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: false
+            native_smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe: nx.exe
+            use_zigbuild: false
+            native_smoke: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        shell: bash
+        run: |
+          cargo install cargo-zigbuild --locked
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v1
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            cargo zigbuild --release --locked -p nx-cli --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked -p nx-cli --target "${{ matrix.target }}"
+          fi
+
+      - name: Smoke test native binary
+        if: matrix.native_smoke
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/${{ matrix.exe }}" --version
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.event.release.tag_name }}"
+          target="${{ matrix.target }}"
+          package="numax-${tag}-${target}"
+          staging="dist/${package}"
+          mkdir -p "$staging" release-assets
+
+          cp "target/${target}/release/${{ matrix.exe }}" "$staging/"
+          cp LICENSE README.md "$staging/"
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${package}.zip"
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'release-assets/${asset}' -Force"
+          else
+            asset="${package}.tar.gz"
+            tar -C dist -czf "release-assets/${asset}" "$package"
+          fi
+
+          (
+            cd release-assets
+            sha256sum "$asset" > "${asset}.sha256"
+          )
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-assets:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Create aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+          find downloaded -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+
+          (
+            cd release-assets
+            : > SHA256SUMS
+            for asset in *.tar.gz *.zip; do
+              [[ -e "$asset" ]] || continue
+              sha256sum "$asset" >> SHA256SUMS
+            done
+            test -s SHA256SUMS
+          )
+
+      - name: Upload assets to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" release-assets/* --clobber
