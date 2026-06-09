@@ -4,8 +4,9 @@
 
 # numax
 
-[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./docs/nx-site/src/content/docs/whitepaper/)
-[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./docs/nx-site/src/content/docs/roadmap/)
+[![Docs](https://img.shields.io/badge/docs-gianiac.github.io%2Fnumax-blue)](https://gianiac.github.io/numax/)
+[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](https://gianiac.github.io/numax/whitepaper/)
+[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](https://gianiac.github.io/numax/roadmap/)
 
 A portable runtime for distributed apps. Written in Rust.
 
@@ -18,7 +19,7 @@ Three things, and only three:
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
 > **Status:** `v0.1.0` - first stable Numax release line for controlled, non-critical workloads.
-> It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/).
+> It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](https://gianiac.github.io/numax/roadmap/).
 
 ---
 
@@ -126,9 +127,10 @@ Same module, any node. State stays local. Sync happens through the runtime.
 
 ## Learn more
 
-- [`Whitepaper`](./docs/nx-site/src/content/docs/whitepaper/) - the vision, the architecture, the principles.
-- [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/) - where we are, where we're going, what's still missing.
-- [`Host API`](./docs/nx-site/src/content/docs/reference/host-api.md) - the host API available to WASM modules.
+- [`Documentation`](https://gianiac.github.io/numax/) - guides, concepts and reference pages.
+- [`Whitepaper`](https://gianiac.github.io/numax/whitepaper/) - the vision, the architecture, the principles.
+- [`Roadmap`](https://gianiac.github.io/numax/roadmap/) - where we are, where we're going, what's still missing.
+- [`Host API`](https://gianiac.github.io/numax/reference/host-api/) - the host API available to WASM modules.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.

@@ -6,11 +6,11 @@ hero:
   tagline: Esegui moduli WebAssembly. Tieni lo stato locale. Lascia che i CRDT facciano il resto.
   actions:
     - text: Quickstart in 5 minuti
-      link: /it/getting-started/quickstart-5-min/
+      link: /numax/it/getting-started/quickstart-5-min/
       icon: right-arrow
       variant: primary
     - text: Leggi il whitepaper
-      link: /it/whitepaper/
+      link: /numax/it/whitepaper/
       icon: document
       variant: secondary
     - text: GitHub
@@ -42,7 +42,7 @@ CRDT e gossip. L'esecuzione WASM e basata su Wasmtime.
    Non devi scrivere codice di riconciliazione.
 
 Se termini come WASM, CRDT, gossip o local-first ti sono nuovi, parti da
-[**Fondamenta**](/it/concepts/foundations/). E il glossario breve che avremmo
+[**Fondamenta**](/numax/it/concepts/foundations/). E il glossario breve che avremmo
 voluto trovare prima di leggere qualsiasi documentazione su un runtime
 distribuito.
 
@@ -80,7 +80,7 @@ Numax e probabilmente uno degli strumenti piu semplici da provare oggi.
 ### Hai costruito qualcosa? Faccelo vedere.
 
 Serio, strano, incompleto: va bene tutto.
-Se lo hai scritto con Numax, ci piacerebbe vederlo nello [**Showcase**](/it/showcase/).
+Se lo hai scritto con Numax, ci piacerebbe vederlo nello [**Showcase**](/numax/it/showcase/).
 
 ## Dove stiamo andando
 
@@ -98,7 +98,7 @@ La direzione e questa:
 - **Component Model + WIT** - ABI stabile e multi-linguaggio. Guest Rust, Go con TinyGo, JavaScript e Python che convergono sugli stessi CRDT.
 
 Il piano completo, versione per versione, e nella
-[**Roadmap**](/it/roadmap/). Le PR alla roadmap sono benvenute quanto le PR al
+[**Roadmap**](/numax/it/roadmap/). Le PR alla roadmap sono benvenute quanto le PR al
 codice.
 
 ## Provalo. Rompilo. Raccontaci cosa succede.
@@ -106,8 +106,8 @@ codice.
 Numax e nel momento in cui feedback mirati possono ancora cambiare molto la
 forma del progetto.
 
-- **[Quickstart in 5 minuti](/it/getting-started/quickstart-5-min/)** - clona, compila, avvia due nodi che convergono.
-- **[Il tuo primo modulo](/it/getting-started/your-first-module/)** - il modulo WASM piu piccolo ma interessante che puoi scrivere.
+- **[Quickstart in 5 minuti](/numax/it/getting-started/quickstart-5-min/)** - clona, compila, avvia due nodi che convergono.
+- **[Il tuo primo modulo](/numax/it/getting-started/your-first-module/)** - il modulo WASM piu piccolo ma interessante che puoi scrivere.
 - **[Apri una issue](https://github.com/GianIac/numax/issues/new)** - bug, opinioni di design, anche piccole sorprese.
 - **[Metti una star al repo](https://github.com/GianIac/numax)** - oggi e il segnale piu semplice che questa idea merita di essere spinta ancora.
 

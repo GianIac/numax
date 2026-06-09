@@ -1033,7 +1033,7 @@ pub extern "C" fn run() {
 ## Roadmap
 
 This section is only a compact API-surface tracker. The authoritative project
-roadmap lives in [Roadmap](/roadmap/).
+roadmap lives in [Roadmap](/numax/roadmap/).
 
 ### Implemented
 

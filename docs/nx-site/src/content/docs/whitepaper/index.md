@@ -15,7 +15,7 @@ description: Numax vision, architecture and principles.
 >
 > **Version reference**: `v0.1.0` - stable release line for controlled, non-critical workloads. API and wire compatibility are documented, but future `0.1.x` releases may still introduce explicit versioned changes.
 >
-> **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/roadmap/).
+> **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/numax/roadmap/).
 
 ---
 

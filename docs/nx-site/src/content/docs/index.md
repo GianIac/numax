@@ -6,11 +6,11 @@ hero:
   tagline: Run WebAssembly modules. Keep state local. Let CRDTs handle the rest.
   actions:
     - text: Quickstart in 5 minutes
-      link: /getting-started/quickstart-5-min/
+      link: /numax/getting-started/quickstart-5-min/
       icon: right-arrow
       variant: primary
     - text: Read the whitepaper
-      link: /whitepaper/
+      link: /numax/whitepaper/
       icon: document
       variant: secondary
     - text: GitHub
@@ -40,7 +40,7 @@ gossip. WASM execution is powered by Wasmtime.
    You don't write reconciliation code.
 
 If terms like WASM, CRDT or gossip are new to you, start with
-[**Foundations**](/concepts/foundations/). It is the short glossary we wish
+[**Foundations**](/numax/concepts/foundations/). It is the short glossary we wish
 every distributed runtime had.
 
 ## What you can build today
@@ -75,7 +75,7 @@ Numax is probably one of the simplest tools you have for the job today.
 ### Built something? Show us.
 
 Serious, silly, half-finished - doesn't matter.
-If you wrote it, we'd love to see it on the [**Showcase**](/showcase/).
+If you wrote it, we'd love to see it on the [**Showcase**](/numax/showcase/).
 
 ## Where we're going
 
@@ -92,14 +92,14 @@ The compass:
 - **Component Model + WIT** - a stable, multi-language ABI. Rust, Go (TinyGo), JavaScript and Python guests all converging on the same CRDT.
 
 The full plan, version by version, lives in the
-[**Roadmap**](/roadmap/). Roadmap PRs are as welcome as code PRs.
+[**Roadmap**](/numax/roadmap/). Roadmap PRs are as welcome as code PRs.
 
 ## Try it. Break it. Tell us.
 
 Numax is in the moment where focused feedback shapes the project the most.
 
-- **[Quickstart in 5 minutes](/getting-started/quickstart-5-min/)** - clone, build, run two converging nodes.
-- **[Your first module](/getting-started/your-first-module/)** - the smallest interesting WASM module you can write.
+- **[Quickstart in 5 minutes](/numax/getting-started/quickstart-5-min/)** - clone, build, run two converging nodes.
+- **[Your first module](/numax/getting-started/your-first-module/)** - the smallest interesting WASM module you can write.
 - **[Open an issue](https://github.com/GianIac/numax/issues/new)** - bugs, design opinions, even small surprises.
 - **[Star the repo](https://github.com/GianIac/numax)** - right now it's the simplest signal that this idea is worth pushing further.
 

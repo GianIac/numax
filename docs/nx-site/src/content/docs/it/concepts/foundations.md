@@ -67,7 +67,7 @@ L'SDK le incapsula in funzioni Rust piu comode, cosi un modulo guest puo usare
 
 Approfondisci:
 
-- [Numax Host API](/it/reference/host-api/)
+- [Numax Host API](/numax/it/reference/host-api/)
 - [Import ed export WebAssembly su MDN](https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Understanding_the_text_format#imports_and_exports)
 
 ## Local-first
@@ -162,7 +162,7 @@ Link utili:
 Se stai iniziando, segui questo ordine:
 
 1. Leggi questa pagina.
-2. Esegui la [Quickstart](/it/getting-started/quickstart-5-min/).
+2. Esegui la [Quickstart](/numax/it/getting-started/quickstart-5-min/).
 3. Apri un esempio distribuito e leggi il modulo guest.
-4. Leggi [CRDT e stato](/it/concepts/crdt-and-state/) quando vuoi capire la convergenza.
-5. Leggi [Host API](/it/reference/host-api/) quando inizi a scrivere un modulo tuo.
+4. Leggi [CRDT e stato](/numax/it/concepts/crdt-and-state/) quando vuoi capire la convergenza.
+5. Leggi [Host API](/numax/it/reference/host-api/) quando inizi a scrivere un modulo tuo.

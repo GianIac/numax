@@ -67,7 +67,7 @@ can call `db::set(...)` or `gcounter::inc(...)`.
 
 Read more:
 
-- [Numax Host API](/reference/host-api/)
+- [Numax Host API](/numax/reference/host-api/)
 - [WebAssembly imports and exports on MDN](https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Understanding_the_text_format#imports_and_exports)
 
 ## Local-first
@@ -162,7 +162,7 @@ Useful links:
 If you are new, use this order:
 
 1. Read this page.
-2. Run the [Quickstart](/getting-started/quickstart-5-min/).
+2. Run the [Quickstart](/numax/getting-started/quickstart-5-min/).
 3. Open one distributed example and read the guest module.
-4. Read [CRDT and state](/concepts/crdt-and-state/) when you want to understand convergence.
-5. Read [Host API](/reference/host-api/) when you start writing your own module.
+4. Read [CRDT and state](/numax/concepts/crdt-and-state/) when you want to understand convergence.
+5. Read [Host API](/numax/reference/host-api/) when you start writing your own module.

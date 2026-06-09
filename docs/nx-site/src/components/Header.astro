@@ -11,11 +11,12 @@ const shouldRenderSearch =
 	config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
 
 const isItalian = Astro.currentLocale === 'it';
+const basePath = import.meta.env.BASE_URL.replace(/\/$/, '');
 const prefix = isItalian ? '/it' : '';
 const navLinks = [
 	{
 		label: isItalian ? 'Documentazione' : 'Documentation',
-		href: `${prefix}/getting-started/introduction/`,
+		href: `${basePath}${prefix}/getting-started/introduction/`,
 	},
 ];
 ---
