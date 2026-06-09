@@ -4,7 +4,7 @@
 
 # numax
 
-[![Docs](https://img.shields.io/badge/docs-gianiac.github.io%2Fnumax-blue)](https://gianiac.github.io/numax/)
+[![Docs](https://img.shields.io/badge/docs-gianiac.github.io%2Fnumax-blue)](site)
 [![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](https://gianiac.github.io/numax/whitepaper/)
 [![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](https://gianiac.github.io/numax/roadmap/)
 
