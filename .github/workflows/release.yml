@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require version-like v* tag
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]; then
+            echo "Release tag must look like v0.1.0 or v0.1.0-rc.2, got: $tag"
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Require tag version to match nx-cli crate version
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          tag_version="${tag#v}"
+          tag_base_version="${tag_version%%-*}"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/nx-cli/Cargo.toml | head -n1)"
+
+          if [[ "$tag_base_version" != "$crate_version" ]]; then
+            echo "Release tag base version ($tag_base_version) does not match crates/nx-cli version ($crate_version)"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: true
+            native_smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: true
+            native_smoke: false
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: false
+            native_smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            exe: nx
+            use_zigbuild: false
+            native_smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe: nx.exe
+            use_zigbuild: false
+            native_smoke: true
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        shell: bash
+        run: |
+          cargo install cargo-zigbuild --locked
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            cargo zigbuild --release --locked -p nx-cli --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked -p nx-cli --target "${{ matrix.target }}"
+          fi
+
+      - name: Smoke test native binary
+        if: matrix.native_smoke
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/${{ matrix.exe }}" --version
+
+      - name: Static binary check
+        if: ${{ !matrix.native_smoke }}
+        shell: bash
+        run: |
+          file "target/${{ matrix.target }}/release/${{ matrix.exe }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.event.release.tag_name }}"
+          target="${{ matrix.target }}"
+          package="numax-${tag}-${target}"
+          staging="dist/${package}"
+          mkdir -p "$staging" release-assets
+
+          cp "target/${target}/release/${{ matrix.exe }}" "$staging/"
+          cp LICENSE README.md "$staging/"
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${package}.zip"
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'release-assets/${asset}' -Force"
+          else
+            asset="${package}.tar.gz"
+            tar -C dist -czf "release-assets/${asset}" "$package"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-assets:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: downloaded
+
+      - name: Create aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+          find downloaded -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
+
+          (
+            cd release-assets
+            : > SHA256SUMS
+            for asset in *.tar.gz *.zip; do
+              [[ -e "$asset" ]] || continue
+              sha256sum "$asset" >> SHA256SUMS
+            done
+            test -s SHA256SUMS
+          )
+
+      - name: Upload assets to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" release-assets/* --clobber

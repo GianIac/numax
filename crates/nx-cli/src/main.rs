@@ -1,19 +1,21 @@
-use std::collections::HashSet;
+mod config;
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use config::*;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
-use nx_core::{ObservabilityConfig, SerializationFormat, SyncConfig, TlsConfig};
-use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(name = "nx")]
 #[command(version)]
 #[command(about = "Numax CLI - distributed WASM runtime", long_about = None)]
+// Parsed once at process startup; keeping variants inline preserves clap readability.
+#[allow(clippy::large_enum_variant)]
 enum Cli {
     /// Execute a WebAssembly module
     Run {
@@ -112,6 +114,44 @@ enum Cli {
         #[arg(long)]
         debug_protocol: bool,
     },
+
+    /// Inspect and validate Numax configuration files
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Generate a commented Numax TOML configuration file
+    Init {
+        /// Path where the Numax TOML configuration file will be written.
+        #[arg(long, value_name = "PATH", default_value = "numax.toml")]
+        output: PathBuf,
+
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Validate a Numax TOML configuration file without running a module
+    Validate {
+        /// Path to the Numax TOML configuration file.
+        #[arg(long, value_name = "PATH", default_value = "numax.toml")]
+        config: PathBuf,
+    },
+
+    /// Show resolved configuration after applying CLI/env/file/default precedence
+    Show {
+        /// Path to the Numax TOML configuration file.
+        #[arg(long, value_name = "PATH", default_value = "numax.toml")]
+        config: PathBuf,
+
+        /// Show the effective configuration.
+        #[arg(long)]
+        effective: bool,
+    },
 }
 
 fn main() {
@@ -157,52 +197,45 @@ async fn real_main() -> Result<()> {
             debug_protocol,
         } => {
             let file_config = load_run_config(config.as_ref())?;
-
-            // Setup logging
-            let log_level =
-                resolve_log_level(verbose, log_level, file_config.observability.as_ref())?;
-            let log_format = resolve_log_format(log_format, file_config.observability.as_ref());
-            init_logging(&log_level, log_format);
-
-            // Validate TLS flag combinations
-            validate_tls_flags(&tls_cert, &tls_key, &tls_ca, &allowed_peers, tls_insecure)?;
-
-            // Build TlsConfig (if any TLS-related flag was provided)
-            let tls = build_tls_config(tls_cert, tls_key, tls_ca, allowed_peers, tls_insecure);
-
-            // Build SyncConfig (if sync flags were provided)
-            let sync = build_sync_config(
+            let cli = RunCliOptions {
+                datastore_path,
                 listen,
                 peers,
-                tls,
-                file_config.limits.is_some(),
-                debug_protocol,
-            )?
-            .map(|sync| apply_limit_config(sync, file_config.limits.as_ref()))
-            .transpose()?;
-            validate_settle_mode(&sync, settle_for)?;
-            validate_wait_before_run(&sync, wait_before_run)?;
-            validate_print_gcounter(&sync, &print_gcounter)?;
-            validate_print_pncounter(&sync, &print_pncounter)?;
-            validate_print_lww_register(&sync, &print_lww_register)?;
-            validate_print_lww_map(&sync, &print_lww_map)?;
-            validate_print_orset(&sync, &print_orset)?;
-            validate_print_rga(&sync, &print_rga)?;
-            let observability = build_observability_config(
                 observability_listen,
-                file_config.observability.as_ref(),
-            )?;
+                tls_cert,
+                tls_key,
+                tls_ca,
+                allowed_peers,
+                tls_insecure,
+                debug_protocol,
+                verbose,
+                log_level,
+                log_format,
+            };
+            let effective = EffectiveRunConfig::resolve(cli, &file_config)?;
+
+            // Setup logging
+            init_logging(&effective.log_level, effective.log_format);
+
+            validate_settle_mode(&effective.sync, settle_for)?;
+            validate_wait_before_run(&effective.sync, wait_before_run)?;
+            validate_print_gcounter(&effective.sync, &print_gcounter)?;
+            validate_print_pncounter(&effective.sync, &print_pncounter)?;
+            validate_print_lww_register(&effective.sync, &print_lww_register)?;
+            validate_print_lww_map(&effective.sync, &print_lww_map)?;
+            validate_print_orset(&effective.sync, &print_orset)?;
+            validate_print_rga(&effective.sync, &print_rga)?;
 
             // Read the wasm module
             let bytes = fs::read(&module)?;
 
             // Build the runtime config
             let mut cfg = RuntimeConfig::default();
-            if let Some(p) = datastore_path {
+            if let Some(p) = effective.datastore_path {
                 cfg.datastore_path = p;
             }
             cfg.module_id = module.to_string_lossy().into_owned();
-            if let Some(s) = sync {
+            if let Some(s) = effective.sync {
                 info!(
                     listen = ?s.listen_addr,
                     peers = ?s.peers,
@@ -212,7 +245,7 @@ async fn real_main() -> Result<()> {
                 );
                 cfg.sync = Some(s);
             }
-            cfg.observability = observability;
+            cfg.observability = effective.observability;
 
             let mut rt = Runtime::new(cfg)?;
             let run_result: Result<()> = async {
@@ -293,388 +326,34 @@ async fn real_main() -> Result<()> {
             run_result?;
             shutdown_result?;
         }
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-enum LogFormat {
-    Text,
-    Json,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RunFileConfig {
-    limits: Option<LimitsFileConfig>,
-    observability: Option<ObservabilityFileConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LimitsFileConfig {
-    max_peers: Option<usize>,
-    queued_ops_limit: Option<usize>,
-    max_message_size: Option<String>,
-    socket_timeout_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObservabilityFileConfig {
-    listen: Option<String>,
-    log_level: Option<String>,
-    log_format: Option<LogFormat>,
-    request_timeout_secs: Option<u64>,
-}
-
-fn load_run_config(path: Option<&PathBuf>) -> Result<RunFileConfig> {
-    let Some(path) = path else {
-        return Ok(RunFileConfig::default());
-    };
-
-    let text = fs::read_to_string(path)?;
-    toml::from_str(&text).map_err(Into::into)
-}
-
-fn init_logging(log_level: &str, log_format: LogFormat) {
-    match log_format {
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-            )
-            .init(),
-        LogFormat::Json => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-            )
-            .init(),
-    }
-}
-
-fn resolve_log_level(
-    verbose: bool,
-    cli_log_level: Option<String>,
-    observability: Option<&ObservabilityFileConfig>,
-) -> Result<String> {
-    let level = cli_log_level
-        .or_else(|| observability.and_then(|cfg| cfg.log_level.clone()))
-        .unwrap_or_else(|| {
-            if verbose {
-                "debug".to_string()
-            } else {
-                "info".to_string()
+        Cli::Config { command } => match command {
+            ConfigCommand::Init { output, force } => {
+                init_config_file(&output, force)?;
+                println!("configuration written: {}", output.display());
             }
-        });
-
-    match level.as_str() {
-        "trace" | "debug" | "info" | "warn" | "error" => Ok(level),
-        _ => bail!("log level must be one of trace, debug, info, warn, error"),
-    }
-}
-
-fn resolve_log_format(
-    cli_log_format: Option<LogFormat>,
-    observability: Option<&ObservabilityFileConfig>,
-) -> LogFormat {
-    cli_log_format
-        .or_else(|| observability.and_then(|cfg| cfg.log_format))
-        .unwrap_or(LogFormat::Text)
-}
-
-fn build_observability_config(
-    listen: Option<String>,
-    observability: Option<&ObservabilityFileConfig>,
-) -> Result<Option<ObservabilityConfig>> {
-    let Some(listen_addr) = listen.or_else(|| observability.and_then(|cfg| cfg.listen.clone()))
-    else {
-        return Ok(None);
-    };
-
-    let mut config = ObservabilityConfig::new(listen_addr);
-    if let Some(request_timeout_secs) = observability.and_then(|cfg| cfg.request_timeout_secs) {
-        if request_timeout_secs == 0 {
-            bail!("observability.request_timeout_secs must be greater than zero");
-        }
-        config = config.with_request_timeout(Duration::from_secs(request_timeout_secs));
-    }
-
-    Ok(Some(config))
-}
-
-fn apply_limit_config(
-    mut sync: SyncConfig,
-    limits: Option<&LimitsFileConfig>,
-) -> Result<SyncConfig> {
-    let Some(limits) = limits else {
-        return Ok(sync);
-    };
-
-    if let Some(max_peers) = limits.max_peers {
-        sync = sync.with_max_peers(max_peers);
-    }
-    if let Some(queued_ops_limit) = limits.queued_ops_limit {
-        if queued_ops_limit == 0 {
-            bail!("limits.queued_ops_limit must be greater than zero");
-        }
-        sync = sync.with_queued_ops_limit(queued_ops_limit);
-    }
-    if let Some(max_message_size) = &limits.max_message_size {
-        sync = sync.with_max_message_size(parse_byte_size(max_message_size)?);
-    }
-    if let Some(socket_timeout_secs) = limits.socket_timeout_secs {
-        if socket_timeout_secs == 0 {
-            bail!("limits.socket_timeout_secs must be greater than zero");
-        }
-        sync = sync.with_socket_timeout(Duration::from_secs(socket_timeout_secs));
-    }
-
-    Ok(sync)
-}
-
-fn parse_byte_size(input: &str) -> Result<usize> {
-    let input = input.trim();
-    if input.is_empty() {
-        bail!("expected byte size like 16MiB");
-    }
-
-    let compact = input.replace(' ', "");
-    let (number, multiplier) = if let Some(n) = compact.strip_suffix("MiB") {
-        (n, 1024usize * 1024)
-    } else if let Some(n) = compact.strip_suffix("KiB") {
-        (n, 1024usize)
-    } else if let Some(n) = compact.strip_suffix('B') {
-        (n, 1usize)
-    } else {
-        (compact.as_str(), 1usize)
-    };
-
-    let amount = number
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("expected byte size like 16MiB"))?;
-    if amount == 0 {
-        bail!("byte size must be greater than zero");
-    }
-
-    amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| anyhow::anyhow!("byte size is too large"))
-}
-
-/// Validate that the TLS-related CLI flags form a coherent combination.
-fn validate_tls_flags(
-    tls_cert: &Option<PathBuf>,
-    tls_key: &Option<PathBuf>,
-    tls_ca: &Option<PathBuf>,
-    allowed_peers: &Option<String>,
-    tls_insecure: bool,
-) -> Result<()> {
-    if tls_cert.is_some() ^ tls_key.is_some() {
-        bail!("--tls-cert and --tls-key must be provided together");
-    }
-    if tls_insecure && (tls_ca.is_some() || allowed_peers.is_some()) {
-        bail!("--tls-insecure is mutually exclusive with --tls-ca and --allowed-peers");
-    }
-    if allowed_peers.is_some() && tls_ca.is_none() && !tls_insecure {
-        bail!("--allowed-peers requires --tls-ca (peers must be authenticated via mTLS)");
-    }
-    Ok(())
-}
-
-fn parse_duration(input: &str) -> Result<Duration, String> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("expected duration like 500ms, 5s, or 2m".to_string());
-    }
-
-    let (number, multiplier) = if let Some(number) = input.strip_suffix("ms") {
-        (number, 1)
-    } else if let Some(number) = input.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = input.strip_suffix('m') {
-        (number, 60_000)
-    } else {
-        (input, 1_000)
-    };
-
-    let amount = number
-        .parse::<u64>()
-        .map_err(|_| "expected duration like 500ms, 5s, or 2m".to_string())?;
-    if amount == 0 {
-        return Err("duration must be greater than zero".to_string());
-    }
-
-    let millis = amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| "duration is too large".to_string())?;
-
-    Ok(Duration::from_millis(millis))
-}
-
-fn validate_settle_mode(sync: &Option<SyncConfig>, settle_for: Option<Duration>) -> Result<()> {
-    if settle_for.is_some() && sync.is_none() {
-        bail!("--settle-for requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_wait_before_run(
-    sync: &Option<SyncConfig>,
-    wait_before_run: Option<Duration>,
-) -> Result<()> {
-    if wait_before_run.is_some() && sync.is_none() {
-        bail!("--wait-before-run requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_gcounter(
-    sync: &Option<SyncConfig>,
-    print_gcounter: &Option<String>,
-) -> Result<()> {
-    if print_gcounter.is_some() && sync.is_none() {
-        bail!("--print-gcounter requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_pncounter(
-    sync: &Option<SyncConfig>,
-    print_pncounter: &Option<String>,
-) -> Result<()> {
-    if print_pncounter.is_some() && sync.is_none() {
-        bail!("--print-pncounter requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_lww_register(
-    sync: &Option<SyncConfig>,
-    print_lww_register: &Option<String>,
-) -> Result<()> {
-    if print_lww_register.is_some() && sync.is_none() {
-        bail!("--print-lww-register requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_lww_map(sync: &Option<SyncConfig>, print_lww_map: &Option<String>) -> Result<()> {
-    if print_lww_map.is_some() && sync.is_none() {
-        bail!("--print-lww-map requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_orset(sync: &Option<SyncConfig>, print_orset: &Option<String>) -> Result<()> {
-    if print_orset.is_some() && sync.is_none() {
-        bail!("--print-orset requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-fn validate_print_rga(sync: &Option<SyncConfig>, print_rga: &Option<String>) -> Result<()> {
-    if print_rga.is_some() && sync.is_none() {
-        bail!("--print-rga requires sync to be enabled with --listen");
-    }
-
-    Ok(())
-}
-
-/// Build TlsConfig from CLI flags.
-fn build_tls_config(
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-    tls_ca: Option<PathBuf>,
-    allowed_peers: Option<String>,
-    tls_insecure: bool,
-) -> Option<TlsConfig> {
-    if tls_insecure {
-        warn!("--tls-insecure enabled: peer verification disabled, DO NOT USE IN PRODUCTION");
-        return Some(TlsConfig::insecure_dev());
-    }
-
-    let (cert, key) = match (tls_cert, tls_key) {
-        (Some(c), Some(k)) => (c, k),
-        _ => return None,
-    };
-
-    let cert_s = cert.to_string_lossy().into_owned();
-    let key_s = key.to_string_lossy().into_owned();
-
-    let mut cfg = match tls_ca {
-        Some(ca) => TlsConfig::new(cert_s, key_s, ca.to_string_lossy().into_owned()),
-        None => TlsConfig {
-            cert_path: Some(cert_s),
-            key_path: Some(key_s),
-            ca_path: None,
-            allowed_peers: None,
-            insecure: false,
+            ConfigCommand::Validate { config } => {
+                load_run_config(Some(&config))?;
+                println!("configuration is valid: {}", config.display());
+            }
+            ConfigCommand::Show { config, effective } => {
+                if !effective {
+                    anyhow::bail!("nx config show currently requires --effective");
+                }
+                let file_config = load_run_config_or_default(Some(&config))?;
+                let effective =
+                    EffectiveRunConfig::resolve(RunCliOptions::default(), &file_config)?;
+                print!("{}", effective.render_effective_toml());
+            }
         },
-    };
-
-    if let Some(list) = allowed_peers {
-        let set: HashSet<String> = list
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !set.is_empty() {
-            cfg = cfg.with_allowed_peers(set);
-        }
     }
 
-    Some(cfg)
-}
-
-/// Build a SyncConfig from CLI flags.
-fn build_sync_config(
-    listen: Option<String>,
-    peers: Vec<String>,
-    tls: Option<TlsConfig>,
-    force_enabled: bool,
-    debug_protocol: bool,
-) -> Result<Option<SyncConfig>> {
-    if listen.is_none() && peers.is_empty() && !force_enabled && !debug_protocol {
-        return Ok(None);
-    }
-
-    if listen.is_none() {
-        bail!(
-            "sync configuration requires --listen: dialer-only mode is not yet supported. \
-             Pass --listen <addr> to enable sync."
-        );
-    }
-
-    let mut cfg = SyncConfig::new();
-    if let Some(addr) = listen {
-        cfg = cfg.with_listen_addr(addr);
-    }
-    for p in peers {
-        cfg = cfg.with_peer(p);
-    }
-    if let Some(t) = tls {
-        cfg = cfg.with_tls(t);
-    }
-    if debug_protocol {
-        cfg = cfg.with_serialization_format(SerializationFormat::Json);
-    }
-
-    debug_assert!(cfg.is_enabled());
-    Ok(Some(cfg))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nx_core::{SerializationFormat, SyncConfig, TlsConfig};
     use std::path::PathBuf;
 
     fn p(s: &str) -> Option<PathBuf> {
@@ -742,6 +421,24 @@ mod tests {
     mod file_config {
         use super::*;
 
+        fn cli_defaults() -> RunCliOptions {
+            RunCliOptions {
+                datastore_path: None,
+                listen: None,
+                peers: Vec::new(),
+                observability_listen: None,
+                tls_cert: None,
+                tls_key: None,
+                tls_ca: None,
+                allowed_peers: None,
+                tls_insecure: false,
+                debug_protocol: false,
+                verbose: false,
+                log_level: None,
+                log_format: None,
+            }
+        }
+
         #[test]
         fn parses_limits_toml() {
             let cfg: RunFileConfig = toml::from_str(
@@ -749,8 +446,14 @@ mod tests {
                 [limits]
                 max_peers = 64
                 queued_ops_limit = 10000
+                op_log_limit = 20000
+                seen_ops_limit = 100000
                 max_message_size = "16MiB"
                 socket_timeout_secs = 30
+                reconnect_initial_delay = "500ms"
+                reconnect_max_delay = "30s"
+                peer_dead_after_failures = 3
+                anti_entropy_interval = "30s"
                 "#,
             )
             .unwrap();
@@ -758,8 +461,181 @@ mod tests {
             let limits = cfg.limits.unwrap();
             assert_eq!(limits.max_peers, Some(64));
             assert_eq!(limits.queued_ops_limit, Some(10_000));
+            assert_eq!(limits.op_log_limit, Some(20_000));
+            assert_eq!(limits.seen_ops_limit, Some(100_000));
             assert_eq!(limits.max_message_size.as_deref(), Some("16MiB"));
             assert_eq!(limits.socket_timeout_secs, Some(30));
+            assert_eq!(limits.reconnect_initial_delay.as_deref(), Some("500ms"));
+            assert_eq!(limits.reconnect_max_delay.as_deref(), Some("30s"));
+            assert_eq!(limits.peer_dead_after_failures, Some(3));
+            assert_eq!(limits.anti_entropy_interval.as_deref(), Some("30s"));
+        }
+
+        #[test]
+        fn parses_network_tls_storage_and_discovery_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "0.0.0.0:9000"
+                peers = ["127.0.0.1:9001", "127.0.0.1:9002"]
+                serialization_format = "bincode"
+
+                [tls]
+                cert = "./certs/node.pem"
+                key = "./certs/node-key.pem"
+                ca = "./certs/ca.pem"
+                allowed_peers = ["node-a", "node-b"]
+                insecure = false
+
+                [storage]
+                datastore_path = "./data/node-a"
+
+                [discovery]
+                mode = "static"
+                "#,
+            )
+            .unwrap();
+
+            let network = cfg.network.unwrap();
+            assert_eq!(network.listen.as_deref(), Some("0.0.0.0:9000"));
+            assert_eq!(
+                network.peers.as_deref(),
+                Some(["127.0.0.1:9001".to_string(), "127.0.0.1:9002".to_string()].as_slice())
+            );
+            assert_eq!(
+                network.serialization_format,
+                Some(WireSerializationFormat::Bincode)
+            );
+
+            let tls = cfg.tls.unwrap();
+            assert_eq!(
+                tls.cert.as_deref(),
+                Some(std::path::Path::new("./certs/node.pem"))
+            );
+            assert_eq!(
+                tls.key.as_deref(),
+                Some(std::path::Path::new("./certs/node-key.pem"))
+            );
+            assert_eq!(
+                tls.ca.as_deref(),
+                Some(std::path::Path::new("./certs/ca.pem"))
+            );
+            assert_eq!(
+                tls.allowed_peers.as_deref(),
+                Some(["node-a".to_string(), "node-b".to_string()].as_slice())
+            );
+            assert_eq!(tls.insecure, Some(false));
+
+            let storage = cfg.storage.unwrap();
+            assert_eq!(
+                storage.datastore_path.as_deref(),
+                Some(std::path::Path::new("./data/node-a"))
+            );
+
+            let discovery = cfg.discovery.unwrap();
+            assert_eq!(discovery.mode, Some(DiscoveryMode::Static));
+        }
+
+        #[test]
+        fn rejects_unknown_file_config_fields() {
+            let err = toml::from_str::<RunFileConfig>(
+                r#"
+                [network]
+                listen = "0.0.0.0:9000"
+                typo = true
+                "#,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("unknown field"), "got: {err}");
+        }
+
+        #[test]
+        fn effective_config_uses_file_when_cli_and_env_are_absent() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "0.0.0.0:9000"
+                peers = ["127.0.0.1:9001"]
+                serialization_format = "json"
+
+                [storage]
+                datastore_path = "./data/file"
+
+                [observability]
+                listen = "127.0.0.1:9100"
+                log_level = "warn"
+                log_format = "json"
+
+                [limits]
+                queued_ops_limit = 123
+                "#,
+            )
+            .unwrap();
+
+            let effective = EffectiveRunConfig::resolve_with_env(
+                cli_defaults(),
+                EnvRunConfig::default(),
+                &file_config,
+            )
+            .unwrap();
+
+            assert_eq!(
+                effective.datastore_path.as_deref(),
+                Some(std::path::Path::new("./data/file"))
+            );
+            assert_eq!(effective.log_level, "warn");
+            assert_eq!(effective.log_format, LogFormat::Json);
+            assert_eq!(
+                effective
+                    .observability
+                    .as_ref()
+                    .map(|cfg| cfg.listen_addr.as_str()),
+                Some("127.0.0.1:9100")
+            );
+
+            let sync = effective.sync.unwrap();
+            assert_eq!(sync.listen_addr.as_deref(), Some("0.0.0.0:9000"));
+            assert_eq!(sync.peers, vec!["127.0.0.1:9001".to_string()]);
+            assert_eq!(sync.serialization_format, SerializationFormat::Json);
+            assert_eq!(sync.queued_ops_limit, 123);
+        }
+
+        #[test]
+        fn effective_config_precedence_is_cli_then_env_then_file() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "0.0.0.0:9000"
+                peers = ["file:1"]
+
+                [storage]
+                datastore_path = "./data/file"
+                "#,
+            )
+            .unwrap();
+            let mut cli = cli_defaults();
+            cli.datastore_path = Some(PathBuf::from("./data/cli"));
+            cli.listen = Some("0.0.0.0:9100".into());
+            cli.peers = vec!["cli:1".into()];
+            let env_config = EnvRunConfig {
+                datastore_path: Some(PathBuf::from("./data/env")),
+                listen: Some("0.0.0.0:9200".into()),
+                peers: Some(vec!["env:1".into()]),
+                ..EnvRunConfig::default()
+            };
+
+            let effective =
+                EffectiveRunConfig::resolve_with_env(cli, env_config, &file_config).unwrap();
+
+            assert_eq!(
+                effective.datastore_path.as_deref(),
+                Some(std::path::Path::new("./data/cli"))
+            );
+            let sync = effective.sync.unwrap();
+            assert_eq!(sync.listen_addr.as_deref(), Some("0.0.0.0:9100"));
+            assert_eq!(sync.peers, vec!["cli:1".to_string()]);
         }
 
         #[test]
@@ -787,16 +663,28 @@ mod tests {
             let limits = LimitsFileConfig {
                 max_peers: Some(8),
                 queued_ops_limit: Some(256),
+                op_log_limit: Some(512),
+                seen_ops_limit: Some(1024),
                 max_message_size: Some("2MiB".into()),
                 socket_timeout_secs: Some(5),
+                reconnect_initial_delay: Some("250ms".into()),
+                reconnect_max_delay: Some("5s".into()),
+                peer_dead_after_failures: Some(4),
+                anti_entropy_interval: Some("2s".into()),
             };
 
             let cfg = apply_limit_config(SyncConfig::new(), Some(&limits)).unwrap();
 
             assert_eq!(cfg.max_peers, 8);
             assert_eq!(cfg.queued_ops_limit, 256);
+            assert_eq!(cfg.op_log_limit, 512);
+            assert_eq!(cfg.seen_ops_limit, 1024);
             assert_eq!(cfg.max_message_size, 2 * 1024 * 1024);
             assert_eq!(cfg.socket_timeout, Duration::from_secs(5));
+            assert_eq!(cfg.reconnect_initial_delay, Duration::from_millis(250));
+            assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(5));
+            assert_eq!(cfg.peer_dead_after_failures, 4);
+            assert_eq!(cfg.anti_entropy_interval, Duration::from_secs(2));
         }
 
         #[test]
@@ -804,8 +692,14 @@ mod tests {
             let limits = LimitsFileConfig {
                 max_peers: None,
                 queued_ops_limit: Some(0),
+                op_log_limit: None,
+                seen_ops_limit: None,
                 max_message_size: None,
                 socket_timeout_secs: None,
+                reconnect_initial_delay: None,
+                reconnect_max_delay: None,
+                peer_dead_after_failures: None,
+                anti_entropy_interval: None,
             };
 
             assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());
@@ -1132,13 +1026,13 @@ mod tests {
 
         #[test]
         fn no_flags_is_none() {
-            let r = build_sync_config(None, vec![], None, false, false).unwrap();
+            let r = build_sync_config(None, vec![], None, false, None).unwrap();
             assert!(r.is_none());
         }
 
         #[test]
         fn listen_alone_is_some() {
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false, false)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false, None)
                 .unwrap()
                 .expect("sync should be enabled with --listen alone");
             assert!(cfg.is_enabled());
@@ -1149,7 +1043,7 @@ mod tests {
 
         #[test]
         fn peer_without_listen_is_error() {
-            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false, false);
+            let r = build_sync_config(None, vec!["127.0.0.1:9000".into()], None, false, None);
             assert!(r.is_err(), "peers without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
             assert!(err.contains("requires --listen"), "got: {err}");
@@ -1157,7 +1051,7 @@ mod tests {
 
         #[test]
         fn limits_config_without_listen_is_error() {
-            let r = build_sync_config(None, vec![], None, true, false);
+            let r = build_sync_config(None, vec![], None, true, None);
             assert!(r.is_err(), "limits without --listen must fail loudly");
             let err = r.unwrap_err().to_string();
             assert!(err.contains("requires --listen"), "got: {err}");
@@ -1165,7 +1059,7 @@ mod tests {
 
         #[test]
         fn debug_protocol_without_listen_is_error() {
-            let r = build_sync_config(None, vec![], None, false, true);
+            let r = build_sync_config(None, vec![], None, false, Some(SerializationFormat::Json));
             assert!(
                 r.is_err(),
                 "--debug-protocol without --listen must fail loudly"
@@ -1176,9 +1070,15 @@ mod tests {
 
         #[test]
         fn debug_protocol_uses_json_wire_format() {
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], None, false, true)
-                .unwrap()
-                .unwrap();
+            let cfg = build_sync_config(
+                Some("0.0.0.0:9000".into()),
+                vec![],
+                None,
+                false,
+                Some(SerializationFormat::Json),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(cfg.serialization_format, SerializationFormat::Json);
         }
 
@@ -1189,7 +1089,7 @@ mod tests {
                 vec!["a:1".into(), "b:2".into()],
                 None,
                 false,
-                false,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -1201,7 +1101,7 @@ mod tests {
         #[test]
         fn tls_is_propagated() {
             let tls = Some(TlsConfig::insecure_dev());
-            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false, false)
+            let cfg = build_sync_config(Some("0.0.0.0:9000".into()), vec![], tls, false, None)
                 .unwrap()
                 .unwrap();
             assert!(cfg.tls.is_some());
@@ -1229,6 +1129,7 @@ mod tests {
                     assert!(!verbose);
                     assert!(!tls_insecure);
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1294,6 +1195,7 @@ mod tests {
             .unwrap();
             match cli {
                 Cli::Run { peers, .. } => assert_eq!(peers, vec!["a:1", "b:2", "c:3"]),
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1302,6 +1204,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "-v"]).unwrap();
             match cli {
                 Cli::Run { verbose, .. } => assert!(verbose),
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1310,6 +1213,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--verbose"]).unwrap();
             match cli {
                 Cli::Run { verbose, .. } => assert!(verbose),
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1321,6 +1225,7 @@ mod tests {
                 Cli::Run { datastore_path, .. } => {
                     assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1332,6 +1237,87 @@ mod tests {
                 Cli::Run { config, .. } => {
                     assert_eq!(config, Some(PathBuf::from("numax.toml")));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
+            }
+        }
+
+        #[test]
+        fn config_validate_default_path_parsed() {
+            let cli = Cli::try_parse_from(["nx", "config", "validate"]).unwrap();
+            match cli {
+                Cli::Config {
+                    command: ConfigCommand::Validate { config },
+                } => assert_eq!(config, PathBuf::from("numax.toml")),
+                Cli::Run { .. } => panic!("expected config command"),
+                Cli::Config { .. } => panic!("expected config validate command"),
+            }
+        }
+
+        #[test]
+        fn config_validate_custom_path_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "config", "validate", "--config", "prod.toml"]).unwrap();
+            match cli {
+                Cli::Config {
+                    command: ConfigCommand::Validate { config },
+                } => assert_eq!(config, PathBuf::from("prod.toml")),
+                Cli::Run { .. } => panic!("expected config command"),
+                Cli::Config { .. } => panic!("expected config validate command"),
+            }
+        }
+
+        #[test]
+        fn config_init_default_output_parsed() {
+            let cli = Cli::try_parse_from(["nx", "config", "init"]).unwrap();
+            match cli {
+                Cli::Config {
+                    command: ConfigCommand::Init { output, force },
+                } => {
+                    assert_eq!(output, PathBuf::from("numax.toml"));
+                    assert!(!force);
+                }
+                Cli::Run { .. } => panic!("expected config command"),
+                Cli::Config { .. } => panic!("expected config init command"),
+            }
+        }
+
+        #[test]
+        fn config_init_custom_output_and_force_parsed() {
+            let cli =
+                Cli::try_parse_from(["nx", "config", "init", "--output", "prod.toml", "--force"])
+                    .unwrap();
+            match cli {
+                Cli::Config {
+                    command: ConfigCommand::Init { output, force },
+                } => {
+                    assert_eq!(output, PathBuf::from("prod.toml"));
+                    assert!(force);
+                }
+                Cli::Run { .. } => panic!("expected config command"),
+                Cli::Config { .. } => panic!("expected config init command"),
+            }
+        }
+
+        #[test]
+        fn config_show_effective_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "config",
+                "show",
+                "--config",
+                "prod.toml",
+                "--effective",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Config {
+                    command: ConfigCommand::Show { config, effective },
+                } => {
+                    assert_eq!(config, PathBuf::from("prod.toml"));
+                    assert!(effective);
+                }
+                Cli::Run { .. } => panic!("expected config command"),
+                Cli::Config { .. } => panic!("expected config show command"),
             }
         }
 
@@ -1360,6 +1346,7 @@ mod tests {
                     assert_eq!(log_level.as_deref(), Some("debug"));
                     assert_eq!(log_format, Some(LogFormat::Json));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1371,6 +1358,7 @@ mod tests {
                 Cli::Run { listen, .. } => {
                     assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1379,6 +1367,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--debug-protocol"]).unwrap();
             match cli {
                 Cli::Run { debug_protocol, .. } => assert!(debug_protocol),
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1389,6 +1378,7 @@ mod tests {
                 Cli::Run { settle_for, .. } => {
                     assert_eq!(settle_for, Some(Duration::from_secs(5)));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1407,6 +1397,7 @@ mod tests {
                 } => {
                     assert_eq!(wait_before_run, Some(Duration::from_millis(500)));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1419,6 +1410,7 @@ mod tests {
                 Cli::Run { print_gcounter, .. } => {
                     assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1438,6 +1430,7 @@ mod tests {
                 } => {
                     assert_eq!(print_pncounter.as_deref(), Some("inventory:sku-1"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1457,6 +1450,7 @@ mod tests {
                 } => {
                     assert_eq!(print_lww_register.as_deref(), Some("status:service-a"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1474,6 +1468,7 @@ mod tests {
                 Cli::Run { print_lww_map, .. } => {
                     assert_eq!(print_lww_map.as_deref(), Some("settings:service-a"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1485,6 +1480,7 @@ mod tests {
                 Cli::Run { print_orset, .. } => {
                     assert_eq!(print_orset.as_deref(), Some("tags:doc-1"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1496,6 +1492,7 @@ mod tests {
                 Cli::Run { print_rga, .. } => {
                     assert_eq!(print_rga.as_deref(), Some("comments:doc-1"));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1509,6 +1506,7 @@ mod tests {
                 } => {
                     assert_eq!(shutdown_timeout, Some(Duration::from_secs(10)));
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1551,6 +1549,7 @@ mod tests {
                     assert_eq!(allowed_peers.as_deref(), Some("abc,def"));
                     assert!(!tls_insecure);
                 }
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
 
@@ -1559,6 +1558,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
             match cli {
                 Cli::Run { tls_insecure, .. } => assert!(tls_insecure),
+                Cli::Config { .. } => panic!("expected run command"),
             }
         }
     }

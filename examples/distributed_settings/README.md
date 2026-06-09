@@ -64,6 +64,64 @@ rollout.percent
 Run these from the repository root after building the WASM module. Start both
 commands in separate terminals.
 
+### TOML config alternative
+
+Use one file per node for stable network/storage settings:
+
+```bash
+cat > examples/distributed_settings/node-a.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_settings/data-a"
+
+[network]
+listen = "127.0.0.1:9401"
+peers = ["127.0.0.1:9402"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > examples/distributed_settings/node-b.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_settings/data-b"
+
+[network]
+listen = "127.0.0.1:9402"
+peers = ["127.0.0.1:9401"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cargo run -p nx-cli -- config validate --config examples/distributed_settings/node-a.toml
+```
+
+Then run the independent-field scenario with shorter commands:
+
+```bash
+NX_SETTING_ACTION=set NX_SETTING_FIELD=theme NX_SETTING_VALUE=dark cargo run -p nx-cli -- run \
+  examples/distributed_settings/target/wasm32-unknown-unknown/release/distributed_settings.wasm \
+  --config examples/distributed_settings/node-a.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-lww-map settings:service-a \
+  -v
+```
+
+```bash
+NX_SETTING_ACTION=set NX_SETTING_FIELD=region NX_SETTING_VALUE=eu cargo run -p nx-cli -- run \
+  examples/distributed_settings/target/wasm32-unknown-unknown/release/distributed_settings.wasm \
+  --config examples/distributed_settings/node-b.toml \
+  --wait-before-run 1500ms \
+  --settle-for 4s \
+  --print-lww-map settings:service-a \
+  -v
+```
+
+CLI flags and `NX_*` variables override the file when both are present.
+
 ### Node A: set theme
 
 ```bash

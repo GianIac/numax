@@ -62,6 +62,65 @@ Run these from the repository root after building the WASM module. Start both
 commands in separate terminals. Node B waits slightly longer before running the
 module, so its `away` write should be the latest value and win.
 
+### TOML config alternative
+
+Use one file per node for network and storage:
+
+```bash
+cat > examples/distributed_status/node-a.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_status/data-a"
+
+[network]
+listen = "127.0.0.1:9201"
+peers = ["127.0.0.1:9202"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > examples/distributed_status/node-b.toml <<'EOF'
+[storage]
+datastore_path = "examples/distributed_status/data-b"
+
+[network]
+listen = "127.0.0.1:9202"
+peers = ["127.0.0.1:9201"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+EOF
+
+cargo run -p nx-cli -- config validate --config examples/distributed_status/node-a.toml
+cargo run -p nx-cli -- config show --config examples/distributed_status/node-a.toml --effective
+```
+
+Then keep only scenario-specific values on the command line:
+
+```bash
+NX_STATUS_VALUE=online cargo run -p nx-cli -- run \
+  examples/distributed_status/target/wasm32-unknown-unknown/release/distributed_status.wasm \
+  --config examples/distributed_status/node-a.toml \
+  --wait-before-run 1000ms \
+  --settle-for 4s \
+  --print-lww-register status:service-a \
+  -v
+```
+
+```bash
+NX_STATUS_VALUE=away cargo run -p nx-cli -- run \
+  examples/distributed_status/target/wasm32-unknown-unknown/release/distributed_status.wasm \
+  --config examples/distributed_status/node-b.toml \
+  --wait-before-run 2000ms \
+  --settle-for 4s \
+  --print-lww-register status:service-a \
+  -v
+```
+
+CLI flags and `NX_*` variables override the file when both are present.
+
 ### Node A: online
 
 ```bash

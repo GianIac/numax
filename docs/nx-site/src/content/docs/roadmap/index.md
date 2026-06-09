@@ -1,4 +1,8 @@
-# Numax Roadmap - towards `v0.2.0`
+---
+title: Roadmap
+description: Current status and planned versions.
+---
+
 
 > **Note on the mutability of this roadmap:**
 >
@@ -8,7 +12,7 @@
 > - external dependencies (Wasmtime, sled, the WASM/WASI ecosystem, Component Model standard),
 > - new ideas, opportunities, or simply how one wakes up in the morning with a better intuition.
 >
-> **Proposing changes**: anyone can open a **Pull Request against `ROADMAP.md`** to:
+> **Proposing changes**: anyone can open a **Pull Request against this roadmap page** to:
 > - suggest a new item in a future version,
 > - move an item between versions with motivation,
 > - flag a risk or dependency that justifies a change in priority,
@@ -20,7 +24,7 @@
 
 ## Status and goal
 
-- **Upcoming version**: `v0.1.0` ⏳ (in progress - includes documentation, distribution & configuration)
+- **Current release line**: `v0.1.0` (active - includes documentation, distribution & configuration)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -39,26 +43,26 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 | Version | Theme | Status |
 |---|---|---|
-| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | ⏳ |
-| `v0.1.1` | Architectural Cleanup & Versioning | 📋 |
-| `v0.1.2` | Performance & Profiling | 📋 |
-| `v0.1.3` | Supply Chain & Fuzzing | 📋 |
-| `v0.1.4` | Management API | 📋 |
-| `v0.1.5` | Peer Discovery - Foundations | 📋 |
-| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | 📋 |
-| `v0.1.7` | Reactive Module Model - Events | 📋 |
-| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | 📋 |
-| `v0.1.9` | Capability-Based Security | 📋 |
-| `v0.1.10` | Resource Quotas & Multi-tenant | 📋 |
-| `v0.1.11` | Op-log Compaction & Snapshots | 📋 |
-| `v0.1.12` | Operability Tools | 📋 |
-| `v0.1.13` | Built-in Dashboard | 📋 |
-| `v0.1.14` | TUI & Advanced CRDTs | 📋 |
-| `v0.1.15` | WIT & Component Model | 📋 |
-| `v0.2.0-rc.1` | Release Candidate hardening | 📋 |
-| `v0.2.0` | **Stable - production-ready, any criticality** | 🎯 |
+| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | active |
+| `v0.1.1` | Architectural Cleanup & Versioning | planned |
+| `v0.1.2` | Performance & Profiling | planned |
+| `v0.1.3` | Supply Chain & Fuzzing | planned |
+| `v0.1.4` | Management API | planned |
+| `v0.1.5` | Peer Discovery - Foundations | planned |
+| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
+| `v0.1.7` | Reactive Module Model - Events | planned |
+| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | planned |
+| `v0.1.9` | Capability-Based Security | planned |
+| `v0.1.10` | Resource Quotas & Multi-tenant | planned |
+| `v0.1.11` | Op-log Compaction & Snapshots | planned |
+| `v0.1.12` | Operability Tools | planned |
+| `v0.1.13` | Built-in Dashboard | planned |
+| `v0.1.14` | TUI & Advanced CRDTs | planned |
+| `v0.1.15` | WIT & Component Model | planned |
+| `v0.2.0-rc.1` | Release Candidate hardening | planned |
+| `v0.2.0` | **Stable - production-ready, any criticality** | final goal |
 
-> **Legend**: ✅ released · ⏳ in progress · 📋 planned · 🎯 final goal of the cycle.
+> **Legend**: active = current release line; planned = future work; final goal = end of the cycle.
 
 ---
 
@@ -68,31 +72,37 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 Add the configuration file as the first alternative to the CLI.
 
 **Documentation**:
-- [ ] Dedicated documentation site
-- [ ] Dedicated domain (`numax.dev` or `numax.run`)
-- [ ] Tutorial: "Distributed Hello World in 5 minutes"
-- [ ] Tutorial: "Deploy 3 nodes with real mTLS"
-- [ ] Tutorial: "Your first collaborative CRDT module"
-- [ ] Guide: production configuration
-- [ ] Guide: troubleshooting divergences
+- [x] Dedicated documentation site scaffold in `docs/nx-site` (Astro Starlight)
+- [x] Host API available in the documentation site
+- [x] Roadmap available in the documentation site
+- [x] Whitepaper available in the documentation site
+- [ ] Versioned docs (`latest`, `v0.1`, future `v0.2`)
+- [ ] Full Sitemap
 
 **Distribution**:
-- [ ] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
-- [ ] Automated release from tag on GitHub
-- [ ] SHA256 checksum for each asset
+- [x] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
+- [x] Automated release from tag on GitHub
+- [x] SHA256 checksum for each asset
 
 **Configuration (alternative to the CLI)**:
-- [ ] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
-- [ ] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
-- [ ] Explicit precedence: **CLI flags > env > file > default**
-- [ ] `nx config init` - generates a commented `numax.toml`
-- [ ] `nx config validate` - validates a file without running it
-- [ ] `nx config show --effective` - shows the resulting effective configuration
+- [x] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
+- [x] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
+- [x] Explicit precedence: **CLI flags > env > file > default**
+- [x] `nx config init` - generates a commented `numax.toml`
+- [x] `nx config validate` - validates a file without running it
+- [x] `nx config show --effective` - shows the resulting effective configuration
 
 **Ready-made observability**:
+<<<<<<< HEAD:docs/nx-site/src/content/docs/roadmap/index.md
+- [x] `docs/dashboards/numax.json` - official Grafana dashboard
+- [x] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
+- [x] PromQL alert examples in the docs site
+- [x] `docs/scripts/check-observability.sh` - lightweight endpoint smoke check
+=======
 - [ ] `docs/dashboards/numax.json` - official Grafana dashboard
 - [ ] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
 - [ ] PromQL alert examples in the docs site
+>>>>>>> 6e25fbf2294cfe6fac72347ed6d3a69c9a7bed7a:ROADMAP.md
 
 **Closing criterion**:
 > A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.
@@ -142,7 +152,7 @@ Add the configuration file as the first alternative to the CLI.
 - [ ] Per-WASM-module profiling (CPU time, bytes allocated)
 
 **Regression gate**:
-- [ ] Phase 13 benchmarks extended with automatic JSON report
+- [ ] Load benchmarks extended with automatic JSON report
 - [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
 - [ ] Baseline history committed in `crates/*/reports/baselines/`
 
@@ -442,7 +452,7 @@ time = true
 
 **The 6 views**:
 - [ ] **Cluster view**: nodes, status (alive/suspect/dead), RTT latency, topology
-- [ ] **CRDT browser**: list of keys, CRDT family, current value, last modification, author
+- [ ] **CRDT explorer**: list of keys, CRDT family, current value, last modification, author
 - [ ] **Op flow**: live stream of incoming/outgoing ops (filterable by key/peer/family)
 - [ ] **Convergence health**: per-node vector clock, highlights lag and suspected divergences
 - [ ] **Throughput/latency**: ops/sec, p50/p95/p99, error rate
@@ -512,7 +522,7 @@ time = true
 
 ---
 
-## v0.2.0-rc.1 - Release Candidate Hardening 🔧
+## v0.2.0-rc.1 - Release Candidate Hardening
 
 **Goal**: everything built in `0.1.0`–`0.1.15` is put under stress, integrated, documented and finished.
 
@@ -536,7 +546,7 @@ time = true
 
 ---
 
-## v0.2.0 - Stable 🎯
+## v0.2.0 - Stable
 
 **Final goal**: distributed runtime **production-ready for any criticality**.
 
@@ -549,7 +559,7 @@ time = true
 
 ## Beyond `v0.2.0` - candidate directions for `0.3.x`
 
-> ⚠️ Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
+> Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
 
 - **NAT traversal and WAN gossip** (STUN, relay, possibly libp2p)
 - **User-defined CRDTs** complete and production-ready
@@ -558,13 +568,17 @@ time = true
 - **Pluggable storage backends**: redb, fjall, custom
 - **GPU/ML guests**: WASI-NN integration
 - **Edge orchestration**: optional integration with existing edge runtimes
+- **Tiny embedded runtimes**: evaluate interpreter-based WASM engines such as
+  `wasmi` or WAMR for Cortex-M / RISC-V devices with RAM measured in kilobytes.
+  Wasmtime is the right native engine for the current runtime, but it is not a
+  microcontroller-class target.
 
 ---
 
 ## How to contribute to the roadmap
 
 1. **Open an issue** with the `roadmap-proposal` label if you want to discuss before writing code or a document.
-2. **Open a PR against `ROADMAP.md`** if you want to propose directly:
+2. **Open a PR against this roadmap page** if you want to propose directly:
    - a new item in a future version,
    - moving an item between versions,
    - a new intermediate version,

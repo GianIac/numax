@@ -4,8 +4,8 @@
 
 # numax
 
-[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./WHITEPAPER.md)
-[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./ROADMAP.md)
+[![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](./docs/nx-site/src/content/docs/whitepaper/)
+[![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](./docs/nx-site/src/content/docs/roadmap/)
 
 A portable runtime for distributed apps. Written in Rust.
 
@@ -17,8 +17,8 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
-> **Status:** `v0.1.0-rc.1` - release candidate for the first v0.1.0 line.
-> It works, it's tested, and the remaining limits are documented. See [`ROADMAP.md`](./ROADMAP.md).
+> **Status:** `v0.1.0` - first stable Numax release line for controlled, non-critical workloads.
+> It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/).
 
 ---
 
@@ -59,6 +59,38 @@ nx run distributed_counter.wasm \
 
 The two nodes find each other, sync, and converge. You don't have to do anything else.
 
+You can also move the node settings into TOML files and keep the command line
+focused on run-specific options:
+
+```toml
+# node-a.toml
+[storage]
+datastore_path = "./data-a"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["127.0.0.1:9001"]
+serialization_format = "bincode"
+
+[discovery]
+mode = "static"
+```
+
+```bash
+nx config validate --config node-a.toml
+nx config show --config node-a.toml --effective
+
+nx run distributed_counter.wasm \
+    --config node-a.toml \
+    --settle-for 5s \
+    --print-gcounter counter:visits
+```
+
+Runtime precedence is explicit: CLI flags override `NX_*` environment
+variables, environment variables override the TOML file, and the file overrides
+runtime defaults. The distributed examples below include full two-node TOML
+setups.
+
 ---
 
 ## Writing a guest module
@@ -94,9 +126,9 @@ Same module, any node. State stays local. Sync happens through the runtime.
 
 ## Learn more
 
-- [`WHITEPAPER.md`](./WHITEPAPER.md) - the vision, the architecture, the principles.
-- [`ROADMAP.md`](./ROADMAP.md) - where we are, where we're going, what's still missing.
-- [`HOST_API.md`](./HOST_API.md) - the host API available to WASM modules.
+- [`Whitepaper`](./docs/nx-site/src/content/docs/whitepaper/) - the vision, the architecture, the principles.
+- [`Roadmap`](./docs/nx-site/src/content/docs/roadmap/) - where we are, where we're going, what's still missing.
+- [`Host API`](./docs/nx-site/src/content/docs/reference/host-api.md) - the host API available to WASM modules.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.
@@ -115,7 +147,7 @@ Right now it's pretty much the only signal I have to understand whether this is 
 
 ## Try it. Break it. Tell me.
 
-numax is in release-candidate mode. It's the moment where focused feedback matters most.
+numax is in its first stable release line. It is usable, but still early: focused feedback matters a lot.
 
 - Clone it, run the examples, see if the two nodes really converge on your machine.
 - Write a tiny module of your own and try to break the sandbox or the sync.

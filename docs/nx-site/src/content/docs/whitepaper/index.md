@@ -1,7 +1,11 @@
-# Numax Runtime - Technical Whitepaper
+---
+title: Whitepaper
+description: Numax vision, architecture and principles.
+---
+
 
 > **Note**
-> This whitepaper is aligned with **v0.1.0-rc.1**, the current release candidate of Numax.
+> This whitepaper is aligned with **v0.1.0**, the first stable Numax release line.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -9,10 +13,9 @@
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.0-rc.1` - release candidate, API and wire format may still change before the final v0.1.0.
+> **Version reference**: `v0.1.0` - stable release line for controlled, non-critical workloads. API and wire compatibility are documented, but future `0.1.x` releases may still introduce explicit versioned changes.
 >
-> > 📍 **Reference roadmap:** the phases cited in this document (Phase 7, Phase 8, …) are defined in [`ROADMAP.md`](./ROADMAP.md).
-> Whenever you read *Phase N*, you can consult the roadmap for details, completion criteria and progress status :)
+> **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/roadmap/).
 
 ---
 
@@ -57,7 +60,7 @@ The principles that guide every technical choice:
 
 - **State and code in the same environment.** The datastore is not a remote service: it is part of the runtime. Zero latency between computation and state, local ACID consistency, offline resilience as the default.
 
-- **WASM as a portable unit of computation.** A single `.wasm` artifact can run on server, edge, browser, embedded devices, without conditional branching and without multiple codebases.
+- **WASM as a portable unit of computation.** A single guest `.wasm` artifact can run on Numax nodes across server, edge and embedded environments without multiple application codebases.
 
 - **CRDT instead of locks or distributed transactions.** Synchronization does not require centralized coordination: CRDTs guarantee automatic convergence even with latency, partitions and concurrent updates.
 
@@ -119,15 +122,14 @@ Everything else belongs to upper layers or external tools. The runtime stays int
 
 ### 3.2 Radical portability
 
-A WASM module must be able to run without modifications:
+A WASM guest module should be able to run without modifications on Numax nodes:
 
 - on premise,
 - in cloud,
 - on edge nodes,
-- on embedded devices,
-- in the browser.
+- on embedded devices.
 
-This reduces environment-specific configurations, platform dependencies and conditional branching in the application code to zero.
+This reduces environment-specific configurations, platform dependencies and conditional branching in the application code.
 
 ### 3.3 State close to computation
 
@@ -169,11 +171,10 @@ The separation keeps responsibilities clear and allows components to evolve inde
 
 ### 4.2 Supported environments
 
-Numax is designed to run on:
+Numax `v0.1.0` is designed to run as a native runtime on:
 
 - servers (x86_64, ARM64),
 - edge nodes,
-- browsers (via WASM),
 - mobile (via native integration),
 - IoT (ARM / RISC-V).
 
@@ -357,7 +358,7 @@ The SDK automatically handles serialization, buffers and retries in case of `ERR
 
 ### 5.3 Numax Sync - Distributed replication *(Implemented core, Prototype end-to-end)*
 
-Numax Sync is responsible for replicating state between nodes. The fundamental primitives are implemented and covered by tests (including the end-to-end wiring of the SyncManager). The full multi-process CLI cycle is tracked as Phase 7 of the roadmap.
+Numax Sync is responsible for replicating state between nodes. The fundamental primitives are implemented and covered by tests, including the end-to-end wiring of the SyncManager and multi-process CLI flows.
 
 **Components:**
 
@@ -416,7 +417,7 @@ pub fn merge(&mut self, other: &GCounter) {
 
 **Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from durable CRDT state/op-log data, with materialized sled totals retained as a fallback. Dedup metadata is also persisted so recent duplicate remote operations after restart do not double count.
 
-**CRDTs (Phase 14):**
+**CRDTs available in `v0.1.0`:**
 
 | Type | Description | Status |
 |------|-------------|--------|
@@ -484,7 +485,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0-rc.1:**
+**Out of scope for v0.1.0:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -538,6 +539,11 @@ nx run <module.wasm> --datastore-path ./my-data
 
 # Runs with a TOML configuration file
 nx run <module.wasm> --config ./numax.toml
+
+# Generates, validates and inspects a TOML configuration file
+nx config init --output numax.toml
+nx config validate --config numax.toml
+nx config show --config numax.toml --effective
 
 # Runs with the observability endpoint enabled
 nx run <module.wasm> \
@@ -595,21 +601,52 @@ nx run <module.wasm> \
 | `--allowed-peers` | Allowlist of accepted peer NodeIDs |
 | `--tls-insecure` | Disables TLS (local dev only) |
 
-The implemented `limits` section is intentionally small:
+The configuration file is the production-friendly alternative to long CLI
+commands. It supports the runtime sections that are usually stable per node:
 
 ```toml
+[storage]
+datastore_path = "./node-data"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["192.168.1.10:9000", "192.168.1.11:9000"]
+serialization_format = "bincode"
+
+[tls]
+cert = "./certs/node.crt"
+key = "./certs/node.key"
+ca = "./certs/ca.crt"
+allowed_peers = ["node-id-1", "node-id-2"]
+insecure = false
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
+reconnect_initial_delay = "500ms"
+reconnect_max_delay = "30s"
+peer_dead_after_failures = 3
+anti_entropy_interval = "30s"
 
 [observability]
 listen = "127.0.0.1:9100"
 log_level = "info"
 log_format = "text"
 request_timeout_secs = 5
+
+[discovery]
+mode = "static"
 ```
+
+The supported sections are `[network]`, `[tls]`, `[storage]`,
+`[observability]`, `[limits]` and `[discovery]`. Runtime precedence is:
+CLI flags, then `NX_*` environment variables, then the TOML file, then runtime
+defaults. This keeps configuration reproducible without preventing local
+overrides during development or tests.
 
 The same limit values are the runtime defaults when no config file is provided.
 The observability endpoint is opt-in: without `--observability-listen` or
@@ -640,7 +677,7 @@ The model is **peer-to-peer with gossip**:
 
 The approach scales better than full-mesh and remains resilient in the presence of temporary disconnections. Full integration of dynamic fanout is in progress.
 
-### 5.9 Resilience: node down, intermittent network, reconnection *(Prototype - Phase 10)*
+### 5.9 Resilience: node down, intermittent network, reconnection *(Implemented in `v0.1.0`)*
 
 The network is considered fallible by nature. The implemented countermeasures
 for configured peers are:
@@ -693,11 +730,11 @@ pub extern "C" fn run() {
 | `db_get` | `(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 | `db_set` | `(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) -> i32` | *Implemented* |
 | `db_delete` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
-| `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
-| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented (Phase 12)* |
+| `db_exists` | `(key_ptr: u32, key_len: u32) -> i32` | *Implemented* |
+| `db_scan` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_scan_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_keys` | `(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
+| `db_keys_after` | `(prefix_ptr: u32, prefix_len: u32, start_after_ptr: u32, start_after_len: u32, limit: u32, out_ptr: u32, out_cap: u32) -> i32` | *Implemented* |
 
 **Logging** - *(Implemented)*
 
@@ -716,50 +753,76 @@ Log levels: 0 = trace, 1 = debug, 2 = info, 3 = warn, 4 = error.
 
 Increment operations are persisted as CRDT state/op-log metadata, materialized on sled and propagated to peers through the SyncManager. In the absence of sync enabled, the functions return `ERR_SYNC_DISABLED` (-5).
 
-**Extended Host API** - *(Implemented, Phase 12)*
+**Extended Host API** - *(Implemented)*
 
 | Function | Description | Status |
 |----------|-------------|--------|
-| `time_now` | Current Unix timestamp in milliseconds | *Implemented (Phase 12)* |
-| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented (Phase 12)* |
-| `random_bytes` | Cryptographically secure random bytes | *Implemented (Phase 12)* |
-| `hash_sha256` | SHA-256 digest | *Implemented (Phase 12)* |
-| `hash_blake3` | BLAKE3 digest | *Implemented (Phase 12)* |
-| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented (Phase 12)* |
-| `module_id` | Current module identifier | *Implemented (Phase 12)* |
-| `abort` | Terminate guest execution with an error message | *Implemented (Phase 12)* |
-| `host_capabilities` | Query exposed host APIs | *Implemented (Phase 12)* |
-| `event_emit` | Emit a named runtime event | *Implemented (Phase 12)* |
-| `net_node_id` | Local sync NodeId | *Implemented (Phase 12)* |
-| `net_peers` | Connected sync peers | *Implemented (Phase 12)* |
+| `time_now` | Current Unix timestamp in milliseconds | *Implemented* |
+| `time_monotonic` | Monotonic milliseconds for elapsed-time measurements | *Implemented* |
+| `random_bytes` | Cryptographically secure random bytes | *Implemented* |
+| `hash_sha256` | SHA-256 digest | *Implemented* |
+| `hash_blake3` | BLAKE3 digest | *Implemented* |
+| `env_get` | Filtered environment variable reading (`NX_*`, `NUMAX_*`) | *Implemented* |
+| `module_id` | Current module identifier | *Implemented* |
+| `abort` | Terminate guest execution with an error message | *Implemented* |
+| `host_capabilities` | Query exposed host APIs | *Implemented* |
+| `event_emit` | Emit a named runtime event | *Implemented* |
+| `net_node_id` | Local sync NodeId | *Implemented* |
+| `net_peers` | Connected sync peers | *Implemented* |
 | `http_fetch` | HTTP request with whitelist | *Planned* |
 
 ### 6.3 Configuration and Deployment *(Prototype)*
 
-Deployment will consist in shipping a `.wasm` file and a minimal configuration.
-
-The `limits` section below is implemented today. Observability can also be
-configured from file. The other deployment sections remain planned work.
+Deployment consists in shipping a `.wasm` file and one node configuration file.
+The CLI still accepts flags for local overrides, but stable node settings can
+live in TOML and be validated before launch.
 
 ```toml
+[storage]
+datastore_path = "./node-data"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["10.0.0.2:9000", "10.0.0.3:9000"]
+serialization_format = "bincode"
+
+[tls]
+cert = "./certs/node.crt"
+key = "./certs/node.key"
+ca = "./certs/ca.crt"
+allowed_peers = ["node-id-1", "node-id-2", "node-id-3"]
+insecure = false
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
 max_message_size = "16MiB"
 socket_timeout_secs = 30
+reconnect_initial_delay = "500ms"
+reconnect_max_delay = "30s"
+peer_dead_after_failures = 3
+anti_entropy_interval = "30s"
 
-[module]
-name = "cart_handler"
-path = "cart_handler.wasm"
+[observability]
+listen = "127.0.0.1:9100"
+log_level = "info"
+log_format = "text"
+request_timeout_secs = 5
 
-[permissions]
-db = true
-network = ["https://api.example.com"]
-
-[sync]
-enabled = true
-keys = ["cart:", "user:"]
+[discovery]
+mode = "static"
 ```
+
+```bash
+nx config validate --config node.toml
+nx config show --config node.toml --effective
+nx run app.wasm --config node.toml
+```
+
+Runtime precedence is deterministic: CLI flags > `NX_*` environment variables
+> TOML file > defaults.
 
 ---
 
@@ -786,7 +849,7 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 4. `test` - full test suite execution
 5. `build-wasm` - compilation of WASM examples
 
-**Load testing** - Phase 13 added reproducible load gates with JSON reports:
+**Load testing** - `v0.1.0` includes reproducible load gates with JSON reports:
 
 - single-node store throughput: 10k ops/sec for 1 hour
 - 3-node continuous sync: 1k ops/sec per node
@@ -802,7 +865,7 @@ gates.
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of v0.1.0-rc.1. They do not describe visions: they describe what the runtime already knows how to do with the release-candidate feature set.
+The use cases below are **concretely achievable today** with the primitives of v0.1.0. They do not describe visions: they describe what the runtime already knows how to do with the current stable feature set.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -826,13 +889,13 @@ The use cases below are **concretely achievable today** with the primitives of v
 
 **Why Numax.** State lives in the sled store of the edge node, always available locally. Operations are replicated to peers (other edge nodes or backhaul nodes) as soon as the network is available. CRDT properties guarantee that, once reconnected, the node loses or duplicates nothing.
 
-The compute is portable: the same `.wasm` module runs on an ARM gateway, on a cloud server for central rollup and - prospectively - on the browser for local dashboards.
+The compute is portable across Numax nodes: the same `.wasm` module can run on an ARM gateway and on a cloud server for central rollup.
 
 ### 8.4 Offline-first and collaborative applications
 
 **Problem.** Applications that must work without a connection (collaborative notes, distributed configurations, field applications, maritime/aerial/rural devices) and reconcile when they come back online, without imposing manual conflict resolution.
 
-**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available in Phase 14, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
+**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available in `v0.1.0`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
 
 The `distributed_chat` example (today in local-only mode) represents the skeleton of this use case.
 
@@ -868,19 +931,19 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-v0.1.0-rc.1 is a release candidate. We recognize its limits, explicitly:
+v0.1.0 is the first stable release line. We recognize its limits, explicitly:
 
 - **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
-- **Minimal observability.** Structured logs, Prometheus-compatible metrics and health checks are available as an opt-in endpoint; richer dashboards and alerting remain outside the current preview.
-- **Wire format and Host API can change.** Before the stable v0.1.0, we expect non-backward-compatible changes. The current wire protocol is versioned (`PROTOCOL_VERSION = 2`) and supports bincode by default with JSON debug mode.
+- **Observability is operational but intentionally small.** Structured logs, Prometheus-compatible metrics, health checks, a ready-made Prometheus/Grafana stack, a Grafana dashboard and PromQL examples are available. Deeper tracing and richer built-in dashboards remain future work.
+- **Wire format and Host API are versioned but still young.** The current wire protocol is versioned (`PROTOCOL_VERSION = 2`) and supports bincode by default with JSON debug mode. Future incompatible changes must be explicit and versioned.
 - **Available CRDTs are still expanding.** GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA are implemented; additional CRDT families remain future work.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
 - **Not optimized for CPU-bound workloads.** The focus is I/O and coordination, not intensive computation.
 - **Data models must be compatible with CRDTs.** Patterns based on locks or strong distributed transactions do not map directly.
 
-These limits are not hidden weaknesses: they are the **honest perimeter** of a preview that aims to show the trajectory, not to sell a finished product.
+These limits are not hidden weaknesses: they are the **honest perimeter** of a first stable release line that is useful today and still explicit about what remains future work.
 
 ---
 
@@ -895,11 +958,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-v0.1.0-rc.1 is a release candidate. What it contains is real, tested, working: WASM runtime, sled store, GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA CRDTs, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, extended host API for database, time, crypto, system and network introspection, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, reproducible load/chaos gates, multi-OS CI, release-candidate network/runtime hardening and end-to-end examples.
+v0.1.0 is the first stable Numax release line. What it contains is real, tested, working: WASM runtime, sled store, GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA CRDTs, async SyncManager, TCP networking, TLS 1.3 + mTLS with identity derived from the key, extended host API for database, time, crypto, system and network introspection, lifecycle/backpressure hardening, network resilience for configured peers, dual-mode JSON/bincode serialization, opt-in observability, reproducible load/chaos gates, multi-OS CI, network/runtime hardening and end-to-end examples.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**v0.1.0-rc.1 is the first release candidate.** It is built on code, tests and documented limits rather than promises.
+**v0.1.0 is the first stable release line.** It is built on code, tests and documented limits rather than promises.
 
 In closing, I love software and I love numax.
 
@@ -925,9 +988,11 @@ numax/
 │   ├── distributed_settings/
 │   ├── distributed_comments/
 │   └── vote_tally_tls/
-├── HOST_API.md
-├── WHITEPAPER.md
-├── ROADMAP.md
+├── docs/
+│   ├── nx-site/src/content/docs/reference/host-api.md
+│   ├── nx-site/src/content/docs/whitepaper/index.md
+│   ├── nx-site/src/content/docs/roadmap/index.md
+│   └── nx-site/            # Starlight documentation site
 └── LICENSE
 ```
 

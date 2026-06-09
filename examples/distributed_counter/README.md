@@ -21,6 +21,83 @@ rm -rf ./data-a ./data-b
 
 ## Run
 
+### With TOML config
+
+Create one config file per node:
+
+```bash
+cat > node-a.toml <<'EOF'
+[storage]
+datastore_path = "./data-a"
+
+[network]
+listen = "0.0.0.0:9000"
+peers = ["127.0.0.1:9001"]
+serialization_format = "bincode"
+
+[limits]
+queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
+anti_entropy_interval = "30s"
+
+[discovery]
+mode = "static"
+EOF
+
+cat > node-b.toml <<'EOF'
+[storage]
+datastore_path = "./data-b"
+
+[network]
+listen = "0.0.0.0:9001"
+peers = ["127.0.0.1:9000"]
+serialization_format = "bincode"
+
+[limits]
+queued_ops_limit = 10000
+op_log_limit = 10000
+seen_ops_limit = 100000
+anti_entropy_interval = "30s"
+
+[discovery]
+mode = "static"
+EOF
+```
+
+Validate and inspect them before running:
+
+```bash
+nx config validate --config node-a.toml
+nx config validate --config node-b.toml
+nx config show --config node-a.toml --effective
+```
+
+Then start the two nodes in separate terminals:
+
+```bash
+nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
+    --config node-a.toml \
+    --wait-before-run 1500ms \
+    --settle-for 5s \
+    --print-gcounter counter:visits \
+    -v
+```
+
+```bash
+nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
+    --config node-b.toml \
+    --wait-before-run 1500ms \
+    --settle-for 5s \
+    --print-gcounter counter:visits \
+    -v
+```
+
+CLI flags still override the file. For example, adding
+`--datastore-path ./tmp-a` overrides `[storage].datastore_path`.
+
+### With CLI flags
+
 ### Node A (first node)
 
 ```bash
@@ -72,11 +149,9 @@ same `--settle-for` window on all terminals when manually checking convergence.
 
 ## Notes
 
-- The same run can use a TOML config file with `--config ./numax.toml`.
-  Today the implemented sections are `[limits]` and `[observability]`.
-  Limits cover `max_peers`, `queued_ops_limit`, `max_message_size`, and
-  `socket_timeout_secs`; observability can enable `/metrics`, `/health` and
-  `/ready`.
+- A TOML config file can provide `[network]`, `[tls]`, `[storage]`,
+  `[observability]`, `[limits]` and `[discovery]`. Runtime precedence is:
+  CLI flags > `NX_*` environment variables > config file > defaults.
 - No `--sync-prefix` flag exists anymore: replication is driven by the API
   surface (`nx_sdk::crdt::*`), not by key prefix. Everything written via
   `nx_sdk::db::*` is purely local.

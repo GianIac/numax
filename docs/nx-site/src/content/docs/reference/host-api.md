@@ -1,4 +1,8 @@
-# Numax Host API
+---
+title: Host API
+description: Reference for host functions exposed to WASM modules.
+---
+
 
 This document describes the host functions available to WASM modules running in
 the Numax runtime.
@@ -1029,7 +1033,7 @@ pub extern "C" fn run() {
 ## Roadmap
 
 This section is only a compact API-surface tracker. The authoritative project
-roadmap lives in [ROADMAP.md](./ROADMAP.md).
+roadmap lives in [Roadmap](/roadmap/).
 
 ### Implemented
 
