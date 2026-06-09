@@ -93,16 +93,10 @@ Add the configuration file as the first alternative to the CLI.
 - [x] `nx config show --effective` - shows the resulting effective configuration
 
 **Ready-made observability**:
-<<<<<<< HEAD:docs/nx-site/src/content/docs/roadmap/index.md
 - [x] `docs/dashboards/numax.json` - official Grafana dashboard
 - [x] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
 - [x] PromQL alert examples in the docs site
 - [x] `docs/scripts/check-observability.sh` - lightweight endpoint smoke check
-=======
-- [ ] `docs/dashboards/numax.json` - official Grafana dashboard
-- [ ] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
-- [ ] PromQL alert examples in the docs site
->>>>>>> 6e25fbf2294cfe6fac72347ed6d3a69c9a7bed7a:ROADMAP.md
 
 **Closing criterion**:
 > A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.
