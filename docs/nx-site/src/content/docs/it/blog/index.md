@@ -1,6 +1,6 @@
 ---
 title: Blog
-description: Release note, deep dive e discussioni RFC.
+description: Note di rilascio, approfondimenti e discussioni RFC.
 ---
 
-TODO: indice blog.
+Il blog è in arrivo.
