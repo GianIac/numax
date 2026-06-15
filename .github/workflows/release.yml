@@ -94,6 +94,8 @@ jobs:
       - name: Install Zig
         if: matrix.use_zigbuild
         uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
+        with:
+          version: 0.14.1
 
       - name: Verify Zig
         if: matrix.use_zigbuild
