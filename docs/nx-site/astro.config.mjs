@@ -97,11 +97,6 @@ export default defineConfig({
               slug: 'guides/build-a-kv-store',
             },
             {
-              label: 'Deploy on edge',
-              translations: { it: 'Deploy su edge' },
-              slug: 'guides/deploy-on-edge',
-            },
-            {
               label: 'Writing host functions',
               translations: { it: 'Scrivere host function' },
               slug: 'guides/writing-host-functions',
