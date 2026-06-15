@@ -55,31 +55,26 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             exe: nx
-            use_zigbuild: true
             native_smoke: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             archive: tar.gz
             exe: nx
-            use_zigbuild: true
             native_smoke: false
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
             exe: nx
-            use_zigbuild: false
             native_smoke: true
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
             exe: nx
-            use_zigbuild: false
             native_smoke: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
             exe: nx.exe
-            use_zigbuild: false
             native_smoke: true
 
     steps:
@@ -91,32 +86,10 @@ jobs:
           target: ${{ matrix.target }}
           rustflags: ""
 
-      - name: Install Zig
-        if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
-        with:
-          version: 0.14.1
-
-      - name: Verify Zig
-        if: matrix.use_zigbuild
-        shell: bash
-        run: |
-          zig version
-
-      - name: Install cargo-zigbuild
-        if: matrix.use_zigbuild
-        shell: bash
-        run: |
-          cargo install cargo-zigbuild --locked
-
       - name: Build
         shell: bash
         run: |
-          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
-            cargo zigbuild --release --locked -p nx-cli --target "${{ matrix.target }}"
-          else
-            cargo build --release --locked -p nx-cli --target "${{ matrix.target }}"
-          fi
+          cargo build --release --locked -p nx-cli --target "${{ matrix.target }}"
 
       - name: Smoke test native binary
         if: matrix.native_smoke
