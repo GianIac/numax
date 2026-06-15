@@ -56,26 +56,31 @@ jobs:
             archive: tar.gz
             exe: nx
             native_smoke: true
+            musl: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             archive: tar.gz
             exe: nx
             native_smoke: false
+            musl: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
             exe: nx
             native_smoke: true
+            musl: false
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
             exe: nx
             native_smoke: true
+            musl: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
             exe: nx.exe
             native_smoke: true
+            musl: false
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -86,8 +91,18 @@ jobs:
           target: ${{ matrix.target }}
           rustflags: ""
 
+      - name: Install musl toolchain
+        if: matrix.musl
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Build
         shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release --locked -p nx-cli --target "${{ matrix.target }}"
 
