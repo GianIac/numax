@@ -35,6 +35,8 @@ The hard parts of distributed systems don't disappear, but you stop paying for t
 
 ## Quickstart
 
+[`Quickstart in 5 Minutes`](https://gianiac.github.io/numax/getting-started/quickstart-5-min/).
+
 For now, build from source:
 
 ```bash
@@ -95,6 +97,8 @@ setups.
 ---
 
 ## Writing a guest module
+
+[`Your first module`](https://gianiac.github.io/numax/getting-started/your-first-module/)
 
 A minimal module using the local datastore:
 
