@@ -3,12 +3,6 @@ title: Debugging WASM Modules
 description: Debug module execution, host API calls and sync behavior.
 ---
 
-TODO: tutorial.
----
-title: Debugging WASM modules
-description: Debug module execution, host API calls and sync behavior.
----
-
 This guide covers the tools and techniques for understanding what a Numax module is doing, diagnosing errors, inspecting CRDT state and observing sync behavior. There is no symbolic debugger that attaches to the WASM module, but the runtime exposes enough to make every problem diagnosable.
 
 ---
