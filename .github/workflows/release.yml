@@ -91,15 +91,21 @@ jobs:
           target: ${{ matrix.target }}
           rustflags: ""
 
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
+
+      - name: Verify Zig
+        if: matrix.use_zigbuild
+        shell: bash
+        run: |
+          zig version
+
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
         shell: bash
         run: |
           cargo install cargo-zigbuild --locked
-
-      - name: Install Zig
-        if: matrix.use_zigbuild
-        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7
 
       - name: Build
         shell: bash
