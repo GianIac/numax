@@ -64,7 +64,7 @@ jobs:
             use_zigbuild: true
             native_smoke: false
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             archive: tar.gz
             exe: nx
             use_zigbuild: false
