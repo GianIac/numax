@@ -66,43 +66,6 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 ---
 
-## v0.1.0 - First production-ready + Documentation
-
-**Goal**: initial release of the runtime + Deployment & Docs.
-Add the configuration file as the first alternative to the CLI.
-
-**Documentation**:
-- [x] Dedicated documentation site scaffold in `docs/nx-site` (Astro Starlight)
-- [x] Host API available in the documentation site
-- [x] Roadmap available in the documentation site
-- [x] Whitepaper available in the documentation site
-- [ ] Versioned docs (`latest`, `v0.1`, future `v0.2`)
-- [ ] Full Sitemap
-
-**Distribution**:
-- [x] Precompiled binaries (Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, Windows)
-- [x] Automated release from tag on GitHub
-- [x] SHA256 checksum for each asset
-
-**Configuration (alternative to the CLI)**:
-- [x] Support for `numax.toml` with sections: `[network]`, `[tls]`, `[storage]`, `[observability]`, `[limits]`, `[discovery]`
-- [x] Environment variables with `NX_` prefix (e.g. `NX_LISTEN`, `NX_DATASTORE_PATH`)
-- [x] Explicit precedence: **CLI flags > env > file > default**
-- [x] `nx config init` - generates a commented `numax.toml`
-- [x] `nx config validate` - validates a file without running it
-- [x] `nx config show --effective` - shows the resulting effective configuration
-
-**Ready-made observability**:
-- [x] `docs/dashboards/numax.json` - official Grafana dashboard
-- [x] `docs/compose/observability.yml` - preconfigured Prometheus + Grafana
-- [x] PromQL alert examples in the docs site
-- [x] `docs/scripts/check-observability.sh` - lightweight endpoint smoke check
-
-**Closing criterion**:
-> A new user, starting from zero, can deploy 3 nodes with mTLS in under 10 minutes by following the documentation, without asking anyone.
-
----
-
 ## v0.1.1 - Architectural Cleanup & Versioning 🧹
 
 **Goal**: clean up the architectural debt of `0.1.0` and introduce wire/schema versioning.
