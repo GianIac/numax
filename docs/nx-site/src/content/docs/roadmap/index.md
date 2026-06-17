@@ -72,7 +72,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 **Split of `sync_manager.rs`** (I created a monster):
 - [x] Turn the single file into a `sync_manager/` module with various sub-modules
-- [ ] `OpApplier` trait for each CRDT family
+- [x] `OpApplier` trait for each CRDT family
 - [ ] E2E tests split per CRDT family
 - [ ] **Constraint**: the split PR is **only move + re-export**, zero logic changes
 

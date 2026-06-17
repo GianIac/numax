@@ -142,13 +142,20 @@ pub(super) async fn apply_remote_ops(
     Ok(())
 }
 
-pub(super) fn apply_remote_op_to_crdt_updates(
-    op: &Op,
-    registries: &RemoteCrdtRegistries<'_>,
-    updates: &mut RemoteCrdtUpdates<'_>,
-) {
-    match &op.kind {
-        OpKind::GCounterIncrement { key, increment } => {
+trait OpApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>);
+}
+
+struct GCounterApplier;
+struct PNCounterApplier;
+struct LwwRegisterApplier;
+struct LwwMapApplier;
+struct ORSetApplier;
+struct RgaApplier;
+
+impl OpApplier for GCounterApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        if let OpKind::GCounterIncrement { key, increment } = &op.kind {
             apply_remote_gcounter_increment(
                 op,
                 key,
@@ -157,14 +164,28 @@ pub(super) fn apply_remote_op_to_crdt_updates(
                 updates.counters,
             );
         }
-        OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
-            apply_remote_pncounter_op(op, key, registries.pncounters, updates.pncounters);
+    }
+}
+
+impl OpApplier for PNCounterApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        match &op.kind {
+            OpKind::PNCounterIncrement { key, .. } | OpKind::PNCounterDecrement { key, .. } => {
+                apply_remote_pncounter_op(op, key, registries.pncounters, updates.pncounters);
+            }
+            _ => {}
         }
-        OpKind::LwwRegisterSet {
+    }
+}
+
+impl OpApplier for LwwRegisterApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        if let OpKind::LwwRegisterSet {
             key,
             value,
             timestamp_ms,
-        } => {
+        } = &op.kind
+        {
             apply_remote_lww_register_set(
                 op,
                 key,
@@ -174,69 +195,116 @@ pub(super) fn apply_remote_op_to_crdt_updates(
                 updates.lww_registers,
             );
         }
-        OpKind::LwwMapSet {
-            key,
-            field,
-            value,
-            timestamp_ms,
-        } => {
-            apply_remote_lww_map_set(
-                op,
+    }
+}
+
+impl OpApplier for LwwMapApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        match &op.kind {
+            OpKind::LwwMapSet {
                 key,
                 field,
                 value,
-                *timestamp_ms,
-                registries.lww_maps,
-                updates.lww_maps,
-            );
-        }
-        OpKind::LwwMapRemove {
-            key,
-            field,
-            timestamp_ms,
-        } => {
-            apply_remote_lww_map_remove(
-                op,
+                timestamp_ms,
+            } => {
+                apply_remote_lww_map_set(
+                    op,
+                    key,
+                    field,
+                    value,
+                    *timestamp_ms,
+                    registries.lww_maps,
+                    updates.lww_maps,
+                );
+            }
+            OpKind::LwwMapRemove {
                 key,
                 field,
-                *timestamp_ms,
-                registries.lww_maps,
-                updates.lww_maps,
-            );
+                timestamp_ms,
+            } => {
+                apply_remote_lww_map_remove(
+                    op,
+                    key,
+                    field,
+                    *timestamp_ms,
+                    registries.lww_maps,
+                    updates.lww_maps,
+                );
+            }
+            _ => {}
         }
-        OpKind::ORSetAdd { key, element, tag } => {
-            apply_remote_orset_add(key, element, tag, registries.orsets, updates.orsets);
-        }
-        OpKind::ORSetRemove {
-            key,
-            element,
-            observed_tags,
-        } => {
-            apply_remote_orset_remove(
+    }
+}
+
+impl OpApplier for ORSetApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        match &op.kind {
+            OpKind::ORSetAdd { key, element, tag } => {
+                apply_remote_orset_add(key, element, tag, registries.orsets, updates.orsets);
+            }
+            OpKind::ORSetRemove {
                 key,
                 element,
                 observed_tags,
-                registries.orsets,
-                updates.orsets,
-            );
+            } => {
+                apply_remote_orset_remove(
+                    key,
+                    element,
+                    observed_tags,
+                    registries.orsets,
+                    updates.orsets,
+                );
+            }
+            _ => {}
         }
-        OpKind::RgaInsert {
-            key,
-            id,
-            parent,
-            value,
-        } => {
-            apply_remote_rga_insert(
+    }
+}
+
+impl OpApplier for RgaApplier {
+    fn apply(op: &Op, registries: &RemoteCrdtRegistries<'_>, updates: &mut RemoteCrdtUpdates<'_>) {
+        match &op.kind {
+            OpKind::RgaInsert {
                 key,
                 id,
-                parent.as_deref(),
+                parent,
                 value,
-                registries.rgas,
-                updates.rgas,
-            );
+            } => {
+                apply_remote_rga_insert(
+                    key,
+                    id,
+                    parent.as_deref(),
+                    value,
+                    registries.rgas,
+                    updates.rgas,
+                );
+            }
+            OpKind::RgaDelete { key, id } => {
+                apply_remote_rga_delete(key, id, registries.rgas, updates.rgas);
+            }
+            _ => {}
         }
-        OpKind::RgaDelete { key, id } => {
-            apply_remote_rga_delete(key, id, registries.rgas, updates.rgas);
+    }
+}
+
+pub(super) fn apply_remote_op_to_crdt_updates(
+    op: &Op,
+    registries: &RemoteCrdtRegistries<'_>,
+    updates: &mut RemoteCrdtUpdates<'_>,
+) {
+    match &op.kind {
+        OpKind::GCounterIncrement { .. } => GCounterApplier::apply(op, registries, updates),
+        OpKind::PNCounterIncrement { .. } | OpKind::PNCounterDecrement { .. } => {
+            PNCounterApplier::apply(op, registries, updates);
+        }
+        OpKind::LwwRegisterSet { .. } => LwwRegisterApplier::apply(op, registries, updates),
+        OpKind::LwwMapSet { .. } | OpKind::LwwMapRemove { .. } => {
+            LwwMapApplier::apply(op, registries, updates);
+        }
+        OpKind::ORSetAdd { .. } | OpKind::ORSetRemove { .. } => {
+            ORSetApplier::apply(op, registries, updates);
+        }
+        OpKind::RgaInsert { .. } | OpKind::RgaDelete { .. } => {
+            RgaApplier::apply(op, registries, updates);
         }
     }
 }
