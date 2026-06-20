@@ -80,7 +80,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 - [x] Explicit `protocol_version` field in `Hello`
 - [x] Documented compatibility matrix: N vs N-1, N vs N+1
 - [x] E2E test with two binaries of different versions in the same cluster
-- [ ] Document `docs/design/wire-versioning.md`
+- [x] Document [wire versioning](/numax/design/wire-versioning/)
 
 **Schema Persistence Versioning**:
 - [ ] Magic number + version in every sled "table"

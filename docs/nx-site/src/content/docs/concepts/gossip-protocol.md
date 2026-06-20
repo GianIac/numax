@@ -99,6 +99,8 @@ forward or backward compatibility:
 Both `Hello` and `HelloAck` carry an explicit `protocol_version`, a mismatch is
 rejected before the peer is registered or CRDT operations are exchanged.
 Serialization-format negotiation does not override protocol compatibility.
+The rules for evolving this contract are defined in
+[Wire Versioning](/numax/design/wire-versioning/).
 
 ---
 

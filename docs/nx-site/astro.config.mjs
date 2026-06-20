@@ -62,6 +62,12 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Design',
+          items: [
+            { label: 'Wire versioning', slug: 'design/wire-versioning' },
+          ],
+        },
+        {
           label: 'Reference',
           items: [
             { label: 'Host API', slug: 'reference/host-api' },
