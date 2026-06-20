@@ -79,7 +79,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 **Wire Protocol Versioning**:
 - [x] Explicit `protocol_version` field in `Hello`
 - [x] Documented compatibility matrix: N vs N-1, N vs N+1
-- [ ] E2E test with two binaries of different versions in the same cluster
+- [x] E2E test with two binaries of different versions in the same cluster
 - [ ] Document `docs/design/wire-versioning.md`
 
 **Schema Persistence Versioning**:
