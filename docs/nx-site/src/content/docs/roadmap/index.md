@@ -73,8 +73,8 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 **Split of `sync_manager.rs`** (I created a monster):
 - [x] Turn the single file into a `sync_manager/` module with various sub-modules
 - [x] `OpApplier` trait for each CRDT family
-- [ ] E2E tests split per CRDT family
-- [ ] **Constraint**: the split PR is **only move + re-export**, zero logic changes
+- [x] E2E tests split per CRDT family ([test organization](https://github.com/GianIac/numax/blob/main/crates/nx-core/src/sync_manager/tests/README.md))
+- [x] **Constraint**: behavior-preserving refactor with no changes to runtime behavior, public APIs, or test semantics
 
 **Wire Protocol Versioning**:
 - [ ] Explicit `protocol_version` field in `Hello`
