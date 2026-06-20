@@ -68,7 +68,7 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 | `PullSince` | Ask a peer for retained operations. Today this is usually sent with `None`. |
 | `Ping` / `Pong` | Keepalive message types. A received `Ping` is answered with `Pong`. |
 
-The protocol version is currently `2`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
+The protocol version is currently `3`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
 
 ---
 
@@ -77,13 +77,28 @@ The protocol version is currently `2`. Peers negotiate either `Bincode` or `Json
 When a node connects to a peer, the first exchange is:
 
 ```
-client -> server: Hello(node_id, version, supported_formats, preferred_format)
-server -> client: HelloAck(node_id, version, selected_format)
+client -> server: Hello(node_id, protocol_version, supported_formats, preferred_format)
+server -> client: HelloAck(node_id, protocol_version, selected_format)
 ```
 
 After that, both sides know the peer `NodeId` and the selected serialization format.
 
 If TLS is enabled, the claimed `NodeId` is checked against the peer certificate. This prevents a node from claiming an identity that does not match its certificate. Optional allowlists can further restrict which peer ids are accepted.
+
+### Protocol compatibility
+
+Numax currently requires an exact protocol-version match, there is no implicit
+forward or backward compatibility:
+
+| Local node | Peer node | Result |
+|---|---|---|
+| `N` | `N` | Compatible; continue the handshake |
+| `N` | `N - 1` | Incompatible; reject the handshake |
+| `N` | `N + 1` | Incompatible; reject the handshake |
+
+Both `Hello` and `HelloAck` carry an explicit `protocol_version`, a mismatch is
+rejected before the peer is registered or CRDT operations are exchanged.
+Serialization-format negotiation does not override protocol compatibility.
 
 ---
 

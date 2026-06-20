@@ -3,7 +3,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -43,7 +43,8 @@ pub enum MessageKind {
     /// Initial handshake.
     Hello {
         node_id: NodeId,
-        version: u32,
+        #[serde(alias = "version")]
+        protocol_version: u32,
         supported_formats: Vec<SerializationFormat>,
         preferred_format: SerializationFormat,
     },
@@ -51,7 +52,8 @@ pub enum MessageKind {
     /// Response to Hello.
     HelloAck {
         node_id: NodeId,
-        version: u32,
+        #[serde(alias = "version")]
+        protocol_version: u32,
         selected_format: SerializationFormat,
     },
 
@@ -95,7 +97,7 @@ impl Message {
         Self {
             kind: MessageKind::Hello {
                 node_id,
-                version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
                 supported_formats,
                 preferred_format,
             },
@@ -110,7 +112,7 @@ impl Message {
         Self {
             kind: MessageKind::HelloAck {
                 node_id,
-                version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
                 selected_format,
             },
         }
@@ -212,17 +214,26 @@ mod tests {
         match &msg.kind {
             MessageKind::Hello {
                 node_id: id,
-                version,
+                protocol_version,
                 supported_formats,
                 preferred_format,
             } => {
                 assert_eq!(id, &node_id);
-                assert_eq!(*version, PROTOCOL_VERSION);
+                assert_eq!(*protocol_version, PROTOCOL_VERSION);
                 assert_eq!(supported_formats, DEFAULT_SUPPORTED_FORMATS);
                 assert_eq!(*preferred_format, SerializationFormat::Bincode);
             }
             _ => panic!("wrong message kind"),
         }
+    }
+
+    #[test]
+    fn hello_json_uses_explicit_protocol_version_field() {
+        let value = serde_json::to_value(Message::hello(NodeId::new("test-node"))).unwrap();
+        let hello = &value["kind"]["Hello"];
+
+        assert_eq!(hello["protocol_version"], PROTOCOL_VERSION);
+        assert!(hello.get("version").is_none());
     }
 
     #[test]

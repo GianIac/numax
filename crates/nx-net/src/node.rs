@@ -368,11 +368,11 @@ impl Node {
         let (peer_node_id, negotiated_format) = match response.kind {
             MessageKind::HelloAck {
                 node_id,
-                version,
+                protocol_version,
                 selected_format,
             } => {
-                if version != PROTOCOL_VERSION {
-                    return Err(protocol_version_mismatch(version));
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(protocol_version_mismatch(protocol_version));
                 }
                 if !supported_formats_for(self.config.serialization_format)
                     .contains(&selected_format)
@@ -715,12 +715,12 @@ async fn handle_incoming(
     let (peer_node_id, negotiated_format) = match msg.kind {
         MessageKind::Hello {
             node_id,
-            version,
+            protocol_version,
             supported_formats,
             preferred_format,
         } => {
-            if version != PROTOCOL_VERSION {
-                return Err(protocol_version_mismatch(version));
+            if !is_protocol_version_compatible(protocol_version) {
+                return Err(protocol_version_mismatch(protocol_version));
             }
             let negotiated_format =
                 negotiate_serialization_format(limits.serialization_format, &supported_formats)
@@ -910,6 +910,10 @@ fn protocol_version_mismatch(their_version: u32) -> NetError {
     NetError::InvalidMessage(format!(
         "protocol version mismatch: expected {PROTOCOL_VERSION}, got {their_version}"
     ))
+}
+
+fn is_protocol_version_compatible(peer_version: u32) -> bool {
+    peer_version == PROTOCOL_VERSION
 }
 
 async fn send_node_event(
@@ -1375,7 +1379,7 @@ mod tests {
             let ack = Message {
                 kind: MessageKind::HelloAck {
                     node_id: NodeId::new("old-peer"),
-                    version: PROTOCOL_VERSION - 1,
+                    protocol_version: PROTOCOL_VERSION - 1,
                     selected_format: SerializationFormat::Bincode,
                 },
             };
@@ -1397,6 +1401,13 @@ mod tests {
         accept_task.await.unwrap();
     }
 
+    #[test]
+    fn protocol_compatibility_requires_an_exact_version_match() {
+        assert!(is_protocol_version_compatible(PROTOCOL_VERSION));
+        assert!(!is_protocol_version_compatible(PROTOCOL_VERSION - 1));
+        assert!(!is_protocol_version_compatible(PROTOCOL_VERSION + 1));
+    }
+
     #[tokio::test]
     async fn incoming_rejects_protocol_version_mismatch() {
         let mut node = Node::new(
@@ -1410,7 +1421,7 @@ mod tests {
         let hello = Message {
             kind: MessageKind::Hello {
                 node_id: NodeId::new("old-peer"),
-                version: PROTOCOL_VERSION - 1,
+                protocol_version: PROTOCOL_VERSION - 1,
                 supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
                 preferred_format: SerializationFormat::Bincode,
             },

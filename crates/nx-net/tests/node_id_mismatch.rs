@@ -42,7 +42,7 @@ async fn node_id_mismatch_disconnects_immediately() {
         let hello = Message {
             kind: MessageKind::Hello {
                 node_id: forged,
-                version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
                 supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
                 preferred_format: SerializationFormat::Bincode,
             },

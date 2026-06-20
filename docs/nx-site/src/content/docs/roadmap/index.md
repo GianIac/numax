@@ -77,8 +77,8 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 - [x] **Constraint**: behavior-preserving refactor with no changes to runtime behavior, public APIs, or test semantics
 
 **Wire Protocol Versioning**:
-- [ ] Explicit `protocol_version` field in `Hello`
-- [ ] Documented compatibility matrix: N vs N-1, N vs N+1
+- [x] Explicit `protocol_version` field in `Hello`
+- [x] Documented compatibility matrix: N vs N-1, N vs N+1
 - [ ] E2E test with two binaries of different versions in the same cluster
 - [ ] Document `docs/design/wire-versioning.md`
 

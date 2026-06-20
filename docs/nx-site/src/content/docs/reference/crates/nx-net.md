@@ -103,9 +103,9 @@ connect_to_peer(addr)
   2. TCP connect with socket_timeout
   3. TLS handshake (if configured)
   4. capture peer_cert DER bytes
-  5. send Hello { node_id, version, supported_formats, preferred_format }
-  6. receive HelloAck { node_id, version, selected_format }
-  7. validate protocol version == PROTOCOL_VERSION (2)
+  5. send Hello { node_id, protocol_version, supported_formats, preferred_format }
+  6. receive HelloAck { node_id, protocol_version, selected_format }
+  7. validate protocol version == PROTOCOL_VERSION (3)
   8. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
   9. if allowlist configured: verify peer_node_id in allowed_peers
   10. insert PeerConnection into peers map
@@ -122,7 +122,7 @@ handle_incoming(stream, addr, context)
   3. validate protocol version
   4. negotiate_serialization_format
   5. TLS identity binding (same as outbound)
-  6. send HelloAck { node_id, version, selected_format }
+  6. send HelloAck { node_id, protocol_version, selected_format }
   7. insert PeerConnection into peers map
   8. emit PeerConnected event
   9. run read_loop inline (not spawned - task already spawned by listener)
@@ -142,14 +142,14 @@ Every message is framed as:
 - Format byte: `0x01` = JSON, `0x02` = bincode.
 - Payload is the serialized `Message` struct.
 
-`PROTOCOL_VERSION = 2`. Version mismatch during handshake causes immediate disconnect.
+`PROTOCOL_VERSION = 3`. Version mismatch during handshake causes immediate disconnect.
 
 ### MessageKind variants
 
 | Variant | Direction | Purpose |
 |---|---|---|
-| `Hello` | dialer -> listener | Open handshake: node identity, version, supported formats |
-| `HelloAck` | listener -> dialer | Accept handshake: selected format confirmed |
+| `Hello` | dialer -> listener | Open handshake: node identity, protocol version, supported formats |
+| `HelloAck` | listener -> dialer | Accept handshake: protocol version and selected format |
 | `PushOps` | both | Carry a batch of CRDT ops |
 | `PushOpsAck` | both | Acknowledge reception count |
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
