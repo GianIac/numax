@@ -104,3 +104,8 @@ The engine does not perform implicit migration during `Runtime::new`.
 
 If validation fails, the checkpoint is not advanced and the schema header is
 not written. Existing payload bytes remain unchanged.
+
+Compatibility with the legacy layout is covered by a committed logical-store
+fixture generated from tag `v0.1.0`. The test reconstructs the sled records,
+migrates them with the current engine, verifies every payload byte is
+unchanged, and validates the resulting CRDT state and operation log.

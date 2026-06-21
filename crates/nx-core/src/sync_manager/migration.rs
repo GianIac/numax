@@ -587,6 +587,141 @@ mod tests {
     }
 
     #[test]
+    fn migrates_fixture_generated_by_v0_1_0_without_changing_payloads() {
+        let records = parse_fixture(include_str!("fixtures/v0_1_0/records.hex"));
+        assert_eq!(records.len(), StoreTable::ALL.len());
+        assert!(
+            records
+                .iter()
+                .all(|(key, _)| !key.starts_with(b"__nx/schema/"))
+        );
+
+        let store = temp_store();
+        for (key, value) in &records {
+            store.set(key, value).unwrap();
+        }
+
+        migrate_sync_schema(&store, options(2)).unwrap();
+
+        for (key, expected_value) in &records {
+            assert_eq!(
+                store.get(key).unwrap().as_deref(),
+                Some(expected_value.as_slice())
+            );
+        }
+        for table in StoreTable::ALL {
+            let header = store.get(&table.schema_key()).unwrap().unwrap();
+            assert_eq!(
+                SchemaHeader::decode(table, &header).unwrap(),
+                SchemaHeader::current(table)
+            );
+        }
+
+        let gcounter = parse_durable_gcounter_state(
+            &store
+                .get(b"__nx/crdt/state/gcounter/visits")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gcounter.value(), 12);
+
+        let pncounter = parse_durable_pncounter_state(
+            &store
+                .get(b"__nx/crdt/state/pncounter/stock")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pncounter.value(), 6);
+
+        let register = parse_durable_lww_register_state(
+            &store
+                .get(b"__nx/crdt/state/lww-register/status")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(register.value(), b"online");
+
+        let map = parse_durable_lww_map_state(
+            &store
+                .get(b"__nx/crdt/state/lww-map/settings")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(map.get("region"), Some(b"eu".as_slice()));
+        assert!(!map.contains("obsolete"));
+
+        let set =
+            parse_durable_orset_state(&store.get(b"__nx/crdt/state/orset/tags").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(set.elements(), vec!["blue"]);
+
+        let rga =
+            parse_durable_rga_state(&store.get(b"__nx/crdt/state/rga/document").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(rga.values(), vec![b"hello".to_vec()]);
+
+        assert_eq!(
+            parse_seen_op_sequence(
+                &store
+                    .get(b"__nx/crdt/seen-op/fixture-op-1")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            7
+        );
+        let (sequence, op) = parse_durable_op_log_value(
+            &store
+                .get(b"__nx/crdt/op-log/fixture-op-1")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sequence, 9);
+        assert_eq!(op.id.as_str(), "fixture-op-1");
+    }
+
+    fn parse_fixture(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        fixture
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let (key, value) = line
+                    .split_once('\t')
+                    .expect("fixture record must contain a tab separator");
+                (decode_hex(key), decode_hex(value))
+            })
+            .collect()
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert!(
+            hex.len().is_multiple_of(2),
+            "hex input must have even length"
+        );
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = decode_nibble(pair[0]);
+                let low = decode_nibble(pair[1]);
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    fn decode_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("fixture contains non-lowercase-hex byte"),
+        }
+    }
+
+    #[test]
     fn migrates_explicit_v0_header_to_v1() {
         let store = temp_store();
         let table = StoreTable::SeenOps;
