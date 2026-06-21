@@ -1,0 +1,761 @@
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+
+use nx_store::{Store as NxStore, StoreWriteLease};
+
+use super::schema::{SchemaError, SchemaHeader, StoreTable, validate_header};
+use super::storage::{
+    logical_key_for_prefix, parse_durable_gcounter_state, parse_durable_lww_map_state,
+    parse_durable_lww_register_state, parse_durable_op_log_value, parse_durable_orset_state,
+    parse_durable_pncounter_state, parse_durable_rga_state, parse_materialized_gcounter_value,
+    parse_materialized_pncounter_value, parse_seen_op_sequence,
+};
+
+const MIGRATION_MAGIC: [u8; 4] = *b"NXMG";
+const CHECKPOINT_FORMAT_VERSION: u16 = 1;
+const CHECKPOINT_FIXED_LEN: usize = 16;
+const MIGRATION_KEY_PREFIX: &str = "__nx/migration/";
+pub const DEFAULT_MIGRATION_BATCH_SIZE: NonZeroU32 =
+    NonZeroU32::new(512).expect("migration batch size must be non-zero");
+pub const DEFAULT_MIGRATION_BATCH_BYTES: NonZeroUsize =
+    NonZeroUsize::new(4 * 1024 * 1024).expect("migration byte limit must be non-zero");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationOptions {
+    pub max_records: NonZeroU32,
+    pub max_bytes: NonZeroUsize,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> Self {
+        Self {
+            max_records: DEFAULT_MIGRATION_BATCH_SIZE,
+            max_bytes: DEFAULT_MIGRATION_BATCH_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationProgress {
+    BatchValidated {
+        table: &'static str,
+        records: usize,
+    },
+    TableCompleted {
+        table: &'static str,
+        from_version: u16,
+        to_version: u16,
+    },
+    Complete,
+}
+
+pub struct SyncSchemaMigration<'a> {
+    store: StoreWriteLease<'a>,
+    options: MigrationOptions,
+}
+
+#[derive(Debug)]
+pub enum MigrationError {
+    Store(nx_store::StoreError),
+    Schema(String),
+    InvalidCheckpoint {
+        table: &'static str,
+        reason: &'static str,
+    },
+    CheckpointTableMismatch {
+        expected: &'static str,
+        actual: u16,
+    },
+    UnsupportedPath {
+        table: &'static str,
+        from_version: u16,
+        to_version: u16,
+    },
+    InvalidRecord {
+        table: &'static str,
+        key: Vec<u8>,
+        reason: String,
+    },
+    StaleCheckpoint {
+        table: &'static str,
+    },
+}
+
+impl fmt::Display for MigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "migration store error: {error}"),
+            Self::Schema(error) => write!(formatter, "{error}"),
+            Self::InvalidCheckpoint { table, reason } => {
+                write!(
+                    formatter,
+                    "invalid migration checkpoint for {table}: {reason}"
+                )
+            }
+            Self::CheckpointTableMismatch { expected, actual } => write!(
+                formatter,
+                "migration checkpoint table mismatch: expected {expected}, got table id {actual}"
+            ),
+            Self::UnsupportedPath {
+                table,
+                from_version,
+                to_version,
+            } => write!(
+                formatter,
+                "unsupported migration path for {table}: {from_version} -> {to_version}"
+            ),
+            Self::InvalidRecord { table, key, reason } => write!(
+                formatter,
+                "invalid legacy record in {table} at key {:?}: {reason}",
+                String::from_utf8_lossy(key)
+            ),
+            Self::StaleCheckpoint { table } => {
+                write!(formatter, "stale migration checkpoint found for {table}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MigrationError {}
+
+impl From<nx_store::StoreError> for MigrationError {
+    fn from(error: nx_store::StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<SchemaError> for MigrationError {
+    fn from(error: SchemaError) -> Self {
+        Self::Schema(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrationCheckpoint {
+    table: StoreTable,
+    from_version: u16,
+    to_version: u16,
+    last_processed_key: Option<Vec<u8>>,
+}
+
+impl MigrationCheckpoint {
+    fn new(table: StoreTable, from_version: u16, to_version: u16) -> Self {
+        Self {
+            table,
+            from_version,
+            to_version,
+            last_processed_key: None,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, MigrationError> {
+        let key = self.last_processed_key.as_deref().unwrap_or_default();
+        let key_len = u32::try_from(key.len()).map_err(|_| MigrationError::InvalidCheckpoint {
+            table: self.table.name(),
+            reason: "cursor key exceeds u32",
+        })?;
+        let mut bytes = Vec::with_capacity(CHECKPOINT_FIXED_LEN + key.len());
+        bytes.extend_from_slice(&MIGRATION_MAGIC);
+        bytes.extend_from_slice(&CHECKPOINT_FORMAT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&(self.table as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.from_version.to_be_bytes());
+        bytes.extend_from_slice(&self.to_version.to_be_bytes());
+        bytes.extend_from_slice(&key_len.to_be_bytes());
+        bytes.extend_from_slice(key);
+        Ok(bytes)
+    }
+
+    fn decode(table: StoreTable, bytes: &[u8]) -> Result<Self, MigrationError> {
+        if bytes.len() < CHECKPOINT_FIXED_LEN {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "checkpoint is truncated",
+            });
+        }
+        if bytes[..4] != MIGRATION_MAGIC {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "invalid magic",
+            });
+        }
+        let format_version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if format_version != CHECKPOINT_FORMAT_VERSION {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "unsupported checkpoint format version",
+            });
+        }
+        let actual_table = u16::from_be_bytes([bytes[6], bytes[7]]);
+        if actual_table != table as u16 {
+            return Err(MigrationError::CheckpointTableMismatch {
+                expected: table.name(),
+                actual: actual_table,
+            });
+        }
+        let from_version = u16::from_be_bytes([bytes[8], bytes[9]]);
+        let to_version = u16::from_be_bytes([bytes[10], bytes[11]]);
+        let key_len = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        let expected_len =
+            CHECKPOINT_FIXED_LEN
+                .checked_add(key_len)
+                .ok_or(MigrationError::InvalidCheckpoint {
+                    table: table.name(),
+                    reason: "cursor length overflow",
+                })?;
+        if bytes.len() != expected_len {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "cursor length does not match checkpoint",
+            });
+        }
+
+        Ok(Self {
+            table,
+            from_version,
+            to_version,
+            last_processed_key: (key_len > 0).then(|| bytes[CHECKPOINT_FIXED_LEN..].to_vec()),
+        })
+    }
+}
+
+pub fn migrate_sync_schema(
+    store: &NxStore,
+    options: MigrationOptions,
+) -> Result<(), MigrationError> {
+    let mut migration = SyncSchemaMigration::new(store, options)?;
+    loop {
+        if matches!(migration.step()?, MigrationProgress::Complete) {
+            return Ok(());
+        }
+    }
+}
+
+impl<'a> SyncSchemaMigration<'a> {
+    pub fn new(store: &'a NxStore, options: MigrationOptions) -> Result<Self, MigrationError> {
+        Ok(Self {
+            store: store.acquire_write_lease()?,
+            options,
+        })
+    }
+
+    pub fn step(&mut self) -> Result<MigrationProgress, MigrationError> {
+        migrate_sync_schema_batch(&self.store, self.options)
+    }
+}
+
+fn migrate_sync_schema_batch(
+    lease: &StoreWriteLease<'_>,
+    options: MigrationOptions,
+) -> Result<MigrationProgress, MigrationError> {
+    let store = lease.store();
+    preflight_checkpoints(store)?;
+
+    for table in StoreTable::ALL {
+        let checkpoint_key = checkpoint_key(table);
+        let checkpoint_bytes = store.get(&checkpoint_key)?;
+        let schema_bytes = store.get(&table.schema_key())?;
+
+        let from_version = match schema_bytes {
+            Some(bytes) => {
+                let header = SchemaHeader::decode(table, &bytes)?;
+                if header.version == table.current_version() {
+                    if checkpoint_bytes.is_some() {
+                        return Err(MigrationError::StaleCheckpoint {
+                            table: table.name(),
+                        });
+                    }
+                    continue;
+                }
+                if header.version > table.current_version() {
+                    validate_header(table, &bytes)?;
+                    unreachable!("future schema validation must fail");
+                }
+                header.version
+            }
+            None => 0,
+        };
+        let to_version = from_version.saturating_add(1);
+        if from_version != 0 || to_version != table.current_version() {
+            return Err(MigrationError::UnsupportedPath {
+                table: table.name(),
+                from_version,
+                to_version,
+            });
+        }
+
+        let mut checkpoint = match checkpoint_bytes {
+            Some(bytes) => MigrationCheckpoint::decode(table, &bytes)?,
+            None => MigrationCheckpoint::new(table, from_version, to_version),
+        };
+        if checkpoint.from_version != from_version || checkpoint.to_version != to_version {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "checkpoint migration path does not match table schema",
+            });
+        }
+
+        let entries = store.scan_prefix_page_after_bounded(
+            table.data_prefix().as_bytes(),
+            checkpoint.last_processed_key.as_deref(),
+            options.max_records.get(),
+            options.max_bytes.get(),
+        )?;
+        if entries.is_empty() {
+            let schema_key = table.schema_key();
+            let schema_header = SchemaHeader::current(table).encode();
+            lease.apply_batch(
+                &[(schema_key.as_slice(), schema_header.as_slice())],
+                &[checkpoint_key.as_slice()],
+            )?;
+            return Ok(MigrationProgress::TableCompleted {
+                table: table.name(),
+                from_version,
+                to_version,
+            });
+        }
+
+        for (key, value) in &entries {
+            validate_legacy_record(table, key, value)?;
+        }
+        checkpoint.last_processed_key = entries.last().map(|(key, _)| key.clone());
+        let encoded_checkpoint = checkpoint.encode()?;
+        lease.set(&checkpoint_key, &encoded_checkpoint)?;
+
+        return Ok(MigrationProgress::BatchValidated {
+            table: table.name(),
+            records: entries.len(),
+        });
+    }
+
+    Ok(MigrationProgress::Complete)
+}
+
+fn preflight_checkpoints(store: &NxStore) -> Result<(), MigrationError> {
+    for table in StoreTable::ALL {
+        let Some(bytes) = store.get(&checkpoint_key(table))? else {
+            continue;
+        };
+        let checkpoint = MigrationCheckpoint::decode(table, &bytes)?;
+        if checkpoint
+            .last_processed_key
+            .as_deref()
+            .is_some_and(|key| !key.starts_with(table.data_prefix().as_bytes()))
+        {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "cursor is outside the table prefix",
+            });
+        }
+        let schema_bytes = store.get(&table.schema_key())?;
+        let schema_version = match schema_bytes {
+            Some(bytes) => SchemaHeader::decode(table, &bytes)?.version,
+            None => 0,
+        };
+        if schema_version == table.current_version() {
+            return Err(MigrationError::StaleCheckpoint {
+                table: table.name(),
+            });
+        }
+        if checkpoint.from_version != schema_version
+            || checkpoint.to_version != schema_version.saturating_add(1)
+        {
+            return Err(MigrationError::InvalidCheckpoint {
+                table: table.name(),
+                reason: "checkpoint migration path does not match table schema",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_key(table: StoreTable) -> Vec<u8> {
+    format!("{MIGRATION_KEY_PREFIX}{}", table.name()).into_bytes()
+}
+
+fn validate_legacy_record(
+    table: StoreTable,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), MigrationError> {
+    logical_key_for_prefix(key, table.data_prefix(), table.name())
+        .and_then(|_| match table {
+            StoreTable::GCounterMaterialized => {
+                parse_materialized_gcounter_value(value).map(|_| ())
+            }
+            StoreTable::GCounterState => parse_durable_gcounter_state(value).map(|_| ()),
+            StoreTable::PNCounterMaterialized => {
+                parse_materialized_pncounter_value(value).map(|_| ())
+            }
+            StoreTable::PNCounterState => parse_durable_pncounter_state(value).map(|_| ()),
+            StoreTable::LwwRegisterMaterialized => Ok(()),
+            StoreTable::LwwRegisterState => parse_durable_lww_register_state(value).map(|_| ()),
+            StoreTable::LwwMapMaterialized => {
+                serde_json::from_slice::<Vec<(String, Vec<u8>)>>(value)
+                    .map(|_| ())
+                    .map_err(Into::into)
+            }
+            StoreTable::LwwMapState => parse_durable_lww_map_state(value).map(|_| ()),
+            StoreTable::ORSetMaterialized => serde_json::from_slice::<Vec<String>>(value)
+                .map(|_| ())
+                .map_err(Into::into),
+            StoreTable::ORSetState => parse_durable_orset_state(value).map(|_| ()),
+            StoreTable::RgaMaterialized => serde_json::from_slice::<Vec<Vec<u8>>>(value)
+                .map(|_| ())
+                .map_err(Into::into),
+            StoreTable::RgaState => parse_durable_rga_state(value).map(|_| ()),
+            StoreTable::SeenOps => parse_seen_op_sequence(value).map(|_| ()),
+            StoreTable::OpLog => parse_durable_op_log_value(value).and_then(|(_, op)| {
+                let key_op_id = logical_key_for_prefix(key, table.data_prefix(), table.name())?;
+                if op.id.as_str() != key_op_id {
+                    anyhow::bail!(
+                        "op id mismatch: key contains {key_op_id}, value contains {}",
+                        op.id
+                    );
+                }
+                Ok(())
+            }),
+        })
+        .map_err(|error| MigrationError::InvalidRecord {
+            table: table.name(),
+            key: key.to_vec(),
+            reason: error.to_string(),
+        })
+}
+
+// End of main code. Test below:
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use nx_sync::{GCounter, NodeId, Op};
+
+    use super::*;
+    use crate::sync_manager::storage::{
+        durable_gcounter_state_key, encode_durable_op_log_value, materialized_gcounter_key,
+        op_log_store_key,
+    };
+
+    fn temp_store() -> Arc<NxStore> {
+        Arc::new(NxStore::open(tempfile::tempdir().unwrap().keep()).unwrap())
+    }
+
+    fn options(max_records: u32) -> MigrationOptions {
+        MigrationOptions {
+            max_records: NonZeroU32::new(max_records).unwrap(),
+            ..MigrationOptions::default()
+        }
+    }
+
+    #[test]
+    fn checkpoint_roundtrips_with_binary_cursor() {
+        let checkpoint = MigrationCheckpoint {
+            table: StoreTable::OpLog,
+            from_version: 0,
+            to_version: 1,
+            last_processed_key: Some(vec![0, 1, 2, 255]),
+        };
+
+        assert_eq!(
+            MigrationCheckpoint::decode(StoreTable::OpLog, &checkpoint.encode().unwrap()).unwrap(),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn migrates_empty_store_to_v1() {
+        let store = temp_store();
+        migrate_sync_schema(&store, options(2)).unwrap();
+
+        for table in StoreTable::ALL {
+            let header = store.get(&table.schema_key()).unwrap().unwrap();
+            assert_eq!(
+                SchemaHeader::decode(table, &header).unwrap(),
+                SchemaHeader::current(table)
+            );
+            assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn validates_legacy_records_in_bounded_batches_and_resumes() {
+        let path = tempfile::tempdir().unwrap().keep();
+        let store = NxStore::open(&path).unwrap();
+        let mut original_records = Vec::new();
+        for index in 0..5 {
+            let key = materialized_gcounter_key(&format!("counter:{index}"));
+            let value = (index as u64).to_le_bytes().to_vec();
+            store.set(&key, &value).unwrap();
+            original_records.push((key, value));
+        }
+
+        assert_eq!(
+            SyncSchemaMigration::new(&store, options(2))
+                .unwrap()
+                .step()
+                .unwrap(),
+            MigrationProgress::BatchValidated {
+                table: "gcounter-materialized",
+                records: 2
+            }
+        );
+        let checkpoint = store
+            .get(&checkpoint_key(StoreTable::GCounterMaterialized))
+            .unwrap()
+            .unwrap();
+        let checkpoint =
+            MigrationCheckpoint::decode(StoreTable::GCounterMaterialized, &checkpoint).unwrap();
+        assert!(checkpoint.last_processed_key.is_some());
+
+        drop(store);
+        let store = NxStore::open(&path).unwrap();
+        migrate_sync_schema(&store, options(2)).unwrap();
+        assert!(
+            store
+                .get(&checkpoint_key(StoreTable::GCounterMaterialized))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&StoreTable::GCounterMaterialized.schema_key())
+                .unwrap()
+                .is_some()
+        );
+        for (key, value) in original_records {
+            assert_eq!(store.get(&key).unwrap(), Some(value));
+        }
+    }
+
+    #[test]
+    fn migration_session_blocks_writes_between_steps() {
+        let store = temp_store();
+        for index in 0..3 {
+            store
+                .set(
+                    &materialized_gcounter_key(&format!("counter:{index}")),
+                    &(index as u64).to_le_bytes(),
+                )
+                .unwrap();
+        }
+
+        let mut migration = SyncSchemaMigration::new(&store, options(1)).unwrap();
+        assert!(matches!(
+            migration.step().unwrap(),
+            MigrationProgress::BatchValidated { records: 1, .. }
+        ));
+
+        let writer_store = Arc::clone(&store);
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            writer_store
+                .set(
+                    &materialized_gcounter_key("counter:new"),
+                    &9u64.to_le_bytes(),
+                )
+                .unwrap();
+            completed_sender.send(()).unwrap();
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            completed_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        assert!(matches!(
+            migration.step().unwrap(),
+            MigrationProgress::BatchValidated { records: 1, .. }
+        ));
+        assert!(
+            completed_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
+        drop(migration);
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn migrates_explicit_v0_header_to_v1() {
+        let store = temp_store();
+        let table = StoreTable::SeenOps;
+        let v0_header = SchemaHeader { version: 0, table }.encode();
+        store.set(&table.schema_key(), &v0_header).unwrap();
+        store
+            .set(b"__nx/crdt/seen-op/op-a", &7u64.to_be_bytes())
+            .unwrap();
+
+        migrate_sync_schema(&store, options(1)).unwrap();
+
+        let header = store.get(&table.schema_key()).unwrap().unwrap();
+        assert_eq!(
+            SchemaHeader::decode(table, &header).unwrap(),
+            SchemaHeader::current(table)
+        );
+    }
+
+    #[test]
+    fn invalid_record_does_not_advance_checkpoint_or_write_schema() {
+        let store = temp_store();
+        store
+            .set(&materialized_gcounter_key("counter:bad"), b"bad")
+            .unwrap();
+
+        assert!(matches!(
+            SyncSchemaMigration::new(&store, MigrationOptions::default())
+                .unwrap()
+                .step(),
+            Err(MigrationError::InvalidRecord {
+                table: "gcounter-materialized",
+                ..
+            })
+        ));
+        assert!(
+            store
+                .get(&checkpoint_key(StoreTable::GCounterMaterialized))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&StoreTable::GCounterMaterialized.schema_key())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_record_larger_than_batch_byte_limit() {
+        let store = temp_store();
+        store
+            .set(b"__nx/crdt/lww-register/status:user-1", &[7; 128])
+            .unwrap();
+        let options = MigrationOptions {
+            max_records: NonZeroU32::new(10).unwrap(),
+            max_bytes: NonZeroUsize::new(64).unwrap(),
+        };
+
+        assert!(matches!(
+            migrate_sync_schema(&store, options),
+            Err(MigrationError::Store(
+                nx_store::StoreError::ScanBatchByteLimitExceeded { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn validates_durable_state_and_op_log() {
+        let store = temp_store();
+        let node_id = NodeId::new("node-a");
+        let mut counter = GCounter::new();
+        counter.increment(&node_id, 3);
+        store
+            .set(
+                &durable_gcounter_state_key("counter:visits"),
+                counter.to_json().unwrap().as_bytes(),
+            )
+            .unwrap();
+
+        let op = Op::gcounter_increment(node_id, "counter:visits", 1);
+        store
+            .set(
+                &op_log_store_key(op.id.as_str()),
+                &encode_durable_op_log_value(1, &op).unwrap(),
+            )
+            .unwrap();
+
+        migrate_sync_schema(&store, options(1)).unwrap();
+    }
+
+    #[test]
+    fn rejects_op_log_key_value_mismatch() {
+        let store = temp_store();
+        let op = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
+        store
+            .set(
+                &op_log_store_key("different-id"),
+                &encode_durable_op_log_value(1, &op).unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate_sync_schema(&store, MigrationOptions::default()),
+            Err(MigrationError::InvalidRecord {
+                table: "op-log",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_corrupted_checkpoint() {
+        let store = temp_store();
+        let table = StoreTable::SeenOps;
+        store.set(&checkpoint_key(table), b"bad").unwrap();
+
+        assert!(matches!(
+            SyncSchemaMigration::new(&store, MigrationOptions::default())
+                .unwrap()
+                .step(),
+            Err(MigrationError::InvalidCheckpoint {
+                table: "seen-ops",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_checkpoint_cursor_outside_table_prefix() {
+        let store = temp_store();
+        let table = StoreTable::SeenOps;
+        let checkpoint = MigrationCheckpoint {
+            table,
+            from_version: 0,
+            to_version: 1,
+            last_processed_key: Some(b"__nx/crdt/op-log/wrong-table".to_vec()),
+        };
+        store
+            .set(&checkpoint_key(table), &checkpoint.encode().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            SyncSchemaMigration::new(&store, MigrationOptions::default())
+                .unwrap()
+                .step(),
+            Err(MigrationError::InvalidCheckpoint {
+                table: "seen-ops",
+                reason: "cursor is outside the table prefix"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_stale_checkpoint_for_completed_table() {
+        let store = temp_store();
+        let table = StoreTable::GCounterMaterialized;
+        let header = SchemaHeader::current(table).encode();
+        let checkpoint = MigrationCheckpoint::new(table, 0, 1).encode().unwrap();
+        store.set(&table.schema_key(), &header).unwrap();
+        store.set(&checkpoint_key(table), &checkpoint).unwrap();
+
+        assert!(matches!(
+            SyncSchemaMigration::new(&store, MigrationOptions::default())
+                .unwrap()
+                .step(),
+            Err(MigrationError::StaleCheckpoint {
+                table: "gcounter-materialized"
+            })
+        ));
+    }
+}

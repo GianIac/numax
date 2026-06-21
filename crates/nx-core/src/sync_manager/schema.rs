@@ -10,10 +10,10 @@ use super::types::{
     SEEN_OP_STORE_PREFIX,
 };
 
-const SCHEMA_MAGIC: [u8; 4] = *b"NXDB";
-const SCHEMA_HEADER_LEN: usize = 8;
-const SCHEMA_KEY_PREFIX: &str = "__nx/schema/";
-const INITIAL_SCHEMA_VERSION: u16 = 1;
+pub(super) const SCHEMA_MAGIC: [u8; 4] = *b"NXDB";
+pub(super) const SCHEMA_HEADER_LEN: usize = 8;
+pub(super) const SCHEMA_KEY_PREFIX: &str = "__nx/schema/";
+pub(super) const INITIAL_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -35,7 +35,7 @@ pub(super) enum StoreTable {
 }
 
 impl StoreTable {
-    const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::GCounterMaterialized,
         Self::GCounterState,
         Self::PNCounterMaterialized,
@@ -52,7 +52,7 @@ impl StoreTable {
         Self::OpLog,
     ];
 
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::GCounterMaterialized => "gcounter-materialized",
             Self::GCounterState => "gcounter-state",
@@ -71,7 +71,7 @@ impl StoreTable {
         }
     }
 
-    fn data_prefix(self) -> &'static str {
+    pub(super) fn data_prefix(self) -> &'static str {
         match self {
             Self::GCounterMaterialized => GCOUNTER_STORE_PREFIX,
             Self::GCounterState => GCOUNTER_STATE_STORE_PREFIX,
@@ -90,11 +90,11 @@ impl StoreTable {
         }
     }
 
-    fn current_version(self) -> u16 {
+    pub(super) fn current_version(self) -> u16 {
         INITIAL_SCHEMA_VERSION
     }
 
-    fn schema_key(self) -> Vec<u8> {
+    pub(super) fn schema_key(self) -> Vec<u8> {
         format!("{SCHEMA_KEY_PREFIX}{}", self.name()).into_bytes()
     }
 }
@@ -106,20 +106,20 @@ impl fmt::Display for StoreTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SchemaHeader {
-    version: u16,
-    table: StoreTable,
+pub(super) struct SchemaHeader {
+    pub(super) version: u16,
+    pub(super) table: StoreTable,
 }
 
 impl SchemaHeader {
-    fn current(table: StoreTable) -> Self {
+    pub(super) fn current(table: StoreTable) -> Self {
         Self {
             version: table.current_version(),
             table,
         }
     }
 
-    fn encode(self) -> [u8; SCHEMA_HEADER_LEN] {
+    pub(super) fn encode(self) -> [u8; SCHEMA_HEADER_LEN] {
         let mut bytes = [0; SCHEMA_HEADER_LEN];
         bytes[..4].copy_from_slice(&SCHEMA_MAGIC);
         bytes[4..6].copy_from_slice(&self.version.to_be_bytes());
@@ -127,7 +127,7 @@ impl SchemaHeader {
         bytes
     }
 
-    fn decode(table: StoreTable, bytes: &[u8]) -> Result<Self, SchemaError> {
+    pub(super) fn decode(table: StoreTable, bytes: &[u8]) -> Result<Self, SchemaError> {
         if bytes.len() != SCHEMA_HEADER_LEN {
             return Err(SchemaError::InvalidHeaderLength {
                 table,
@@ -234,10 +234,7 @@ pub(super) fn ensure_sync_schema(store: &NxStore) -> Result<(), SchemaError> {
         match store.get(&schema_key)? {
             Some(bytes) => validate_header(table, &bytes)?,
             None => {
-                if !store
-                    .scan_prefix(table.data_prefix().as_bytes())?
-                    .is_empty()
-                {
+                if store.prefix_exists(table.data_prefix().as_bytes())? {
                     return Err(SchemaError::LegacyTable { table });
                 }
                 missing_tables.push(table);
@@ -266,7 +263,7 @@ pub(super) fn ensure_sync_schema(store: &NxStore) -> Result<(), SchemaError> {
     Ok(())
 }
 
-fn validate_header(table: StoreTable, bytes: &[u8]) -> Result<(), SchemaError> {
+pub(super) fn validate_header(table: StoreTable, bytes: &[u8]) -> Result<(), SchemaError> {
     let header = SchemaHeader::decode(table, bytes)?;
     let current = table.current_version();
     if header.version < current {

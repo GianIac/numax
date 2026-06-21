@@ -69,3 +69,38 @@ A migration must:
 4. be safe to retry;
 5. reject unknown future versions;
 6. have fixture-based tests for both successful and interrupted migration.
+
+## Legacy migration
+
+The migration engine currently supports `v0 -> v1`. Version `0` means either
+legacy data without metadata or an explicit version-zero header.
+
+This migration certifies existing payloads without rewriting them:
+
+1. process at most a configured number of records per batch;
+2. validate each key and payload with its table-specific decoder;
+3. persist the last validated key under `__nx/migration/<table-name>`;
+4. resume after that key when restarted;
+5. write the version-one schema header and remove the checkpoint atomically
+   after the whole table has been validated.
+
+The default limits are 512 records and 4 MiB per batch. Both limits apply:
+
+- the record limit prevents unbounded table scans;
+- the byte limit prevents a batch of large values from consuming excessive
+  memory;
+- a single record larger than the byte limit is rejected before its payload is
+  cloned into the migration batch.
+
+Memory use is bounded by the configured batch limits rather than the total
+table size.
+
+Migration acquires an exclusive in-process write lease for its entire
+execution. Store clones may continue reading, but their mutations wait until
+the migration session ends. The sled database lock separately prevents another
+process from opening the same datastore.
+
+The engine does not perform implicit migration during `Runtime::new`.
+
+If validation fails, the checkpoint is not advanced and the schema header is
+not written. Existing payload bytes remain unchanged.

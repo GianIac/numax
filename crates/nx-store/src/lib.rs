@@ -2,7 +2,7 @@ mod error;
 mod store;
 
 pub use error::StoreError;
-pub use store::{Store, StoreStats};
+pub use store::{Store, StoreStats, StoreWriteLease};
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +41,54 @@ mod tests {
 
         store.delete(b"key1").unwrap();
         assert!(!store.exists(b"key1").unwrap());
+    }
+
+    #[test]
+    fn test_prefix_exists_reads_at_most_the_first_matching_record() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:a", b"1").unwrap();
+        store.set(b"app:b", b"2").unwrap();
+
+        assert!(store.prefix_exists(b"app:").unwrap());
+        assert!(!store.prefix_exists(b"missing:").unwrap());
+    }
+
+    #[test]
+    fn test_write_lease_blocks_mutations_from_store_clones() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let writer = store.clone();
+        let lease = store.acquire_write_lease().unwrap();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (completed_sender, completed_receiver) = mpsc::channel();
+
+        let writer_thread = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            writer.set(b"concurrent", b"value").unwrap();
+            completed_sender.send(()).unwrap();
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            completed_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        lease.set(b"migration", b"value").unwrap();
+        drop(lease);
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        writer_thread.join().unwrap();
+
+        assert_eq!(store.get(b"migration").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.get(b"concurrent").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]
@@ -179,6 +227,35 @@ mod tests {
             .scan_prefix_page_after(b"app:", Some(b"app:b"), 10, None)
             .unwrap();
         assert_eq!(second, vec![(b"app:c".to_vec(), b"3".to_vec())]);
+    }
+
+    #[test]
+    fn test_scan_prefix_page_after_bounded_respects_record_and_byte_limits() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:a", b"1111").unwrap();
+        store.set(b"app:b", b"2222").unwrap();
+        store.set(b"app:c", b"3333").unwrap();
+
+        let rows = store
+            .scan_prefix_page_after_bounded(b"app:", None, 10, 18)
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b"app:a");
+        assert_eq!(rows[1].0, b"app:b");
+    }
+
+    #[test]
+    fn test_scan_prefix_page_after_bounded_rejects_oversized_record() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:large", b"0123456789").unwrap();
+
+        assert!(matches!(
+            store.scan_prefix_page_after_bounded(b"app:", None, 10, 8),
+            Err(StoreError::ScanBatchByteLimitExceeded { .. })
+        ));
     }
 
     #[test]
