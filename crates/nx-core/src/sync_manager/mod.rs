@@ -2,6 +2,7 @@ mod apply;
 mod manager;
 mod peer;
 mod replication;
+mod schema;
 mod storage;
 mod types;
 

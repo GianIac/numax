@@ -920,7 +920,121 @@ pub(super) fn persist_local_ops_batch(
     Ok(())
 }
 
+pub(super) fn persist_remote_ops_batch(
+    store: &NxStore,
+    plans: &[OpPersistencePlan],
+    updates: RemoteCrdtUpdateBatch<'_>,
+) -> anyhow::Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let mut set_keys = Vec::new();
+    let mut set_values = Vec::new();
+    let mut delete_keys = Vec::new();
+    let mut changed_counter_keys = updates.counters.keys().collect::<Vec<_>>();
+    changed_counter_keys.sort();
+
+    for key in changed_counter_keys {
+        let Some(counter) = updates.counters.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_gcounter_state_key(key));
+        set_values.push(counter.to_json()?.into_bytes());
+        set_keys.push(materialized_gcounter_key(key));
+        set_values.push(counter.value().to_le_bytes().to_vec());
+    }
+
+    let mut changed_pncounter_keys = updates.pncounters.keys().collect::<Vec<_>>();
+    changed_pncounter_keys.sort();
+
+    for key in changed_pncounter_keys {
+        let Some(counter) = updates.pncounters.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_pncounter_state_key(key));
+        set_values.push(counter.to_json()?.into_bytes());
+        set_keys.push(materialized_pncounter_key(key));
+        set_values.push(counter.value().to_le_bytes().to_vec());
+    }
+
+    let mut changed_lww_register_keys = updates.lww_registers.keys().collect::<Vec<_>>();
+    changed_lww_register_keys.sort();
+
+    for key in changed_lww_register_keys {
+        let Some(register) = updates.lww_registers.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_lww_register_state_key(key));
+        set_values.push(register.to_json()?.into_bytes());
+        set_keys.push(materialized_lww_register_key(key));
+        set_values.push(register.value_bytes());
+    }
+
+    let mut changed_lww_map_keys = updates.lww_maps.keys().collect::<Vec<_>>();
+    changed_lww_map_keys.sort();
+
+    for key in changed_lww_map_keys {
+        let Some(map) = updates.lww_maps.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_lww_map_state_key(key));
+        set_values.push(map.to_json()?.into_bytes());
+        set_keys.push(materialized_lww_map_key(key));
+        set_values.push(serde_json::to_vec(&map.entries())?);
+    }
+
+    let mut changed_orset_keys = updates.orsets.keys().collect::<Vec<_>>();
+    changed_orset_keys.sort();
+
+    for key in changed_orset_keys {
+        let Some(set) = updates.orsets.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_orset_state_key(key));
+        set_values.push(set.to_json()?.into_bytes());
+        set_keys.push(materialized_orset_key(key));
+        set_values.push(serde_json::to_vec(&set.elements())?);
+    }
+
+    let mut changed_rga_keys = updates.rgas.keys().collect::<Vec<_>>();
+    changed_rga_keys.sort();
+
+    for key in changed_rga_keys {
+        let Some(rga) = updates.rgas.get(key.as_str()) else {
+            continue;
+        };
+        set_keys.push(durable_rga_state_key(key));
+        set_values.push(rga.to_json()?.into_bytes());
+        set_keys.push(materialized_rga_key(key));
+        set_values.push(serde_json::to_vec(&rga.values())?);
+    }
+
+    for plan in plans {
+        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
+        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
+        set_keys.push(op_log_store_key(plan.op.id.as_str()));
+        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
+        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
+        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    }
+
+    let sets = set_keys
+        .iter()
+        .zip(set_values.iter())
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    store.apply_batch(&sets, &deletes)?;
+    Ok(())
+}
+
 // End of main code. Test below:
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,117 +1148,4 @@ mod tests {
         assert_eq!(op_log, vec![op_a]);
         assert_eq!(next_sequence, 2);
     }
-}
-
-pub(super) fn persist_remote_ops_batch(
-    store: &NxStore,
-    plans: &[OpPersistencePlan],
-    updates: RemoteCrdtUpdateBatch<'_>,
-) -> anyhow::Result<()> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-
-    let mut set_keys = Vec::new();
-    let mut set_values = Vec::new();
-    let mut delete_keys = Vec::new();
-    let mut changed_counter_keys = updates.counters.keys().collect::<Vec<_>>();
-    changed_counter_keys.sort();
-
-    for key in changed_counter_keys {
-        let Some(counter) = updates.counters.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_gcounter_state_key(key));
-        set_values.push(counter.to_json()?.into_bytes());
-        set_keys.push(materialized_gcounter_key(key));
-        set_values.push(counter.value().to_le_bytes().to_vec());
-    }
-
-    let mut changed_pncounter_keys = updates.pncounters.keys().collect::<Vec<_>>();
-    changed_pncounter_keys.sort();
-
-    for key in changed_pncounter_keys {
-        let Some(counter) = updates.pncounters.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_pncounter_state_key(key));
-        set_values.push(counter.to_json()?.into_bytes());
-        set_keys.push(materialized_pncounter_key(key));
-        set_values.push(counter.value().to_le_bytes().to_vec());
-    }
-
-    let mut changed_lww_register_keys = updates.lww_registers.keys().collect::<Vec<_>>();
-    changed_lww_register_keys.sort();
-
-    for key in changed_lww_register_keys {
-        let Some(register) = updates.lww_registers.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_lww_register_state_key(key));
-        set_values.push(register.to_json()?.into_bytes());
-        set_keys.push(materialized_lww_register_key(key));
-        set_values.push(register.value_bytes());
-    }
-
-    let mut changed_lww_map_keys = updates.lww_maps.keys().collect::<Vec<_>>();
-    changed_lww_map_keys.sort();
-
-    for key in changed_lww_map_keys {
-        let Some(map) = updates.lww_maps.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_lww_map_state_key(key));
-        set_values.push(map.to_json()?.into_bytes());
-        set_keys.push(materialized_lww_map_key(key));
-        set_values.push(serde_json::to_vec(&map.entries())?);
-    }
-
-    let mut changed_orset_keys = updates.orsets.keys().collect::<Vec<_>>();
-    changed_orset_keys.sort();
-
-    for key in changed_orset_keys {
-        let Some(set) = updates.orsets.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_orset_state_key(key));
-        set_values.push(set.to_json()?.into_bytes());
-        set_keys.push(materialized_orset_key(key));
-        set_values.push(serde_json::to_vec(&set.elements())?);
-    }
-
-    let mut changed_rga_keys = updates.rgas.keys().collect::<Vec<_>>();
-    changed_rga_keys.sort();
-
-    for key in changed_rga_keys {
-        let Some(rga) = updates.rgas.get(key.as_str()) else {
-            continue;
-        };
-        set_keys.push(durable_rga_state_key(key));
-        set_values.push(rga.to_json()?.into_bytes());
-        set_keys.push(materialized_rga_key(key));
-        set_values.push(serde_json::to_vec(&rga.values())?);
-    }
-
-    for plan in plans {
-        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
-        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
-        set_keys.push(op_log_store_key(plan.op.id.as_str()));
-        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
-        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
-        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
-    }
-
-    let sets = set_keys
-        .iter()
-        .zip(set_values.iter())
-        .map(|(key, value)| (key.as_slice(), value.as_slice()))
-        .collect::<Vec<_>>();
-    let deletes = delete_keys
-        .iter()
-        .map(|key| key.as_slice())
-        .collect::<Vec<_>>();
-
-    store.apply_batch(&sets, &deletes)?;
-    Ok(())
 }

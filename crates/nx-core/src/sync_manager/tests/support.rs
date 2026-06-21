@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync_manager::schema::ensure_sync_schema;
 
 pub(super) fn temp_store() -> Arc<NxStore> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,9 @@ pub(super) fn temp_store() -> Arc<NxStore> {
         .as_nanos();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     path.push(format!("numax-core-sync-test-{nanos}-{seq}"));
-    Arc::new(NxStore::open(path).unwrap())
+    let store = Arc::new(NxStore::open(path).unwrap());
+    ensure_sync_schema(&store).unwrap();
+    store
 }
 
 pub(super) fn metrics() -> Arc<RuntimeMetrics> {

@@ -83,7 +83,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 - [x] Document [wire versioning](/numax/design/wire-versioning/)
 
 **Schema Persistence Versioning**:
-- [ ] Magic number + version in every sled "table"
+- [x] Magic number + version in every sled "table"
 - [ ] Explicit migrations version N → N+1
 - [ ] "Rolling upgrade" test: old node + new node in the same cluster
 - [ ] CLI `nx migrate` for offline migration

@@ -137,12 +137,12 @@ impl Runtime {
         // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
         let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
             let node_id = load_or_create_node_id(&store)?;
-            let manager = SyncManager::new(
+            let manager = SyncManager::try_new(
                 node_id,
                 sync_config.clone(),
                 Arc::clone(&store),
                 Arc::clone(&metrics),
-            );
+            )?;
             let handle = manager.handle();
             (Some(manager), Some(handle))
         } else {
@@ -691,6 +691,29 @@ mod tests {
         assert_eq!(
             second.sync_manager.as_ref().unwrap().node_id(),
             &first_node_id
+        );
+    }
+
+    #[test]
+    fn sync_runtime_rejects_legacy_unversioned_data() {
+        let datastore_path = temp_datastore_path("numax-runtime-legacy-schema-test");
+        let store = NxStore::open(&datastore_path).unwrap();
+        store
+            .set(b"__nx/crdt/op-log/legacy-op", b"legacy-value")
+            .unwrap();
+        drop(store);
+
+        let config = RuntimeConfig {
+            datastore_path,
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        };
+
+        let error = Runtime::new(config).err().expect("legacy schema must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy unversioned data found in op-log")
         );
     }
 }

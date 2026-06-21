@@ -64,6 +64,7 @@ export default defineConfig({
         {
           label: 'Design',
           items: [
+            { label: 'Schema versioning', slug: 'design/schema-versioning' },
             { label: 'Wire versioning', slug: 'design/wire-versioning' },
           ],
         },

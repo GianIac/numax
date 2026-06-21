@@ -20,6 +20,7 @@ use super::replication::{
     spawn_anti_entropy_loop, spawn_broadcast_loop, spawn_reconnect_loop,
     try_connect_configured_peer,
 };
+use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
@@ -185,13 +186,29 @@ pub struct SyncManager {
 }
 
 impl SyncManager {
-    /// new SyncManager.
+    /// Create a SyncManager, panicking if the persisted schema is invalid.
+    ///
+    /// Runtime integrations should prefer [`Self::try_new`] so schema errors
+    /// can be reported without terminating the process.
     pub fn new(
         node_id: NodeId,
         config: SyncConfig,
         store: Arc<NxStore>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        Self::try_new(node_id, config, store, metrics)
+            .expect("failed to initialize SyncManager persistence")
+    }
+
+    /// Create a SyncManager after validating all managed persistence schemas.
+    pub fn try_new(
+        node_id: NodeId,
+        config: SyncConfig,
+        store: Arc<NxStore>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> anyhow::Result<Self> {
+        ensure_sync_schema(&store)?;
+
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let op_log_limit = normalize_op_log_limit(config.op_log_limit);
         let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
@@ -202,45 +219,21 @@ impl SyncManager {
         let mut lww_maps = HashMap::new();
         let mut orsets = HashMap::new();
         let mut rgas = HashMap::new();
-        let (op_log, op_log_next_sequence) = match hydrate_op_log(&store, op_log_limit) {
-            Ok(hydrated) => hydrated,
-            Err(e) => {
-                warn!(error = %e, "failed to hydrate operation log");
-                (Vec::with_capacity(op_log_limit.min(1024)), 0)
-            }
-        };
+        let (op_log, op_log_next_sequence) = hydrate_op_log(&store, op_log_limit)?;
         let peer_health = config
             .peers
             .iter()
             .map(|peer| (peer.clone(), PeerHealth::default()))
             .collect::<HashMap<_, _>>();
 
-        let (seen_ops, seen_ops_next_sequence) = match hydrate_seen_ops(&store, seen_ops_limit) {
-            Ok(hydrated) => hydrated,
-            Err(e) => {
-                warn!(error = %e, "failed to hydrate seen OpIds");
-                (SeenOps::new(seen_ops_limit), 0)
-            }
-        };
+        let (seen_ops, seen_ops_next_sequence) = hydrate_seen_ops(&store, seen_ops_limit)?;
 
-        if let Err(e) = hydrate_gcounter_registry(&store, &node_id, &mut counters) {
-            warn!(error = %e, "failed to hydrate GCounter registry");
-        }
-        if let Err(e) = hydrate_pncounter_registry(&store, &node_id, &mut pncounters) {
-            warn!(error = %e, "failed to hydrate PNCounter registry");
-        }
-        if let Err(e) = hydrate_lww_register_registry(&store, &mut lww_registers) {
-            warn!(error = %e, "failed to hydrate LWW-Register registry");
-        }
-        if let Err(e) = hydrate_lww_map_registry(&store, &mut lww_maps) {
-            warn!(error = %e, "failed to hydrate LWW-Map registry");
-        }
-        if let Err(e) = hydrate_orset_registry(&store, &mut orsets) {
-            warn!(error = %e, "failed to hydrate ORSet registry");
-        }
-        if let Err(e) = hydrate_rga_registry(&store, &mut rgas) {
-            warn!(error = %e, "failed to hydrate RGA registry");
-        }
+        hydrate_gcounter_registry(&store, &node_id, &mut counters)?;
+        hydrate_pncounter_registry(&store, &node_id, &mut pncounters)?;
+        hydrate_lww_register_registry(&store, &mut lww_registers)?;
+        hydrate_lww_map_registry(&store, &mut lww_maps)?;
+        hydrate_orset_registry(&store, &mut orsets)?;
+        hydrate_rga_registry(&store, &mut rgas)?;
         let counters = Arc::new(RwLock::new(counters));
         let pncounters = Arc::new(RwLock::new(pncounters));
         let lww_registers = Arc::new(RwLock::new(lww_registers));
@@ -248,7 +241,7 @@ impl SyncManager {
         let orsets = Arc::new(RwLock::new(orsets));
         let rgas = Arc::new(RwLock::new(rgas));
 
-        Self {
+        Ok(Self {
             node_id,
             config,
             node: None,
@@ -274,7 +267,7 @@ impl SyncManager {
             broadcast_task: None,
             reconnect_task: None,
             anti_entropy_task: None,
-        }
+        })
     }
 
     /// Return  NodeId.
