@@ -77,8 +77,9 @@ may replace, create, move, or delete records. Its mutations and checkpoint
 advancement use the same atomic sled batch. Every completed step writes its
 schema version before the next step starts.
 
-Keys created inside the table being scanned cannot sort after their source
-key, preventing generated records from being processed twice.
+Inside the table being scanned, a record step may only mutate its own source
+key. New keys and moves must target a different namespace, preventing checkpoint
+gaps and double-processing.
 
 ## Legacy migration
 

@@ -483,14 +483,7 @@ fn collect_record_migration(
     max_bytes: usize,
 ) -> Result<(), MigrationError> {
     for (key, value) in migration.sets {
-        validate_mutation_key(table, &key)?;
-        if key.starts_with(table.data_prefix().as_bytes()) && key.as_slice() > source_key {
-            return Err(MigrationError::InvalidMutation {
-                table: table.name(),
-                key,
-                reason: "new keys in the source namespace must not sort after the source key",
-            });
-        }
+        validate_record_mutation_key(table, source_key, &key)?;
         if deletes.contains(&key) || sets.contains_key(&key) {
             return Err(MigrationError::InvalidMutation {
                 table: table.name(),
@@ -511,7 +504,7 @@ fn collect_record_migration(
         sets.insert(key, value);
     }
     for key in migration.deletes {
-        validate_mutation_key(table, &key)?;
+        validate_record_mutation_key(table, source_key, &key)?;
         if sets.contains_key(&key) || !deletes.insert(key.clone()) {
             return Err(MigrationError::InvalidMutation {
                 table: table.name(),
@@ -527,6 +520,22 @@ fn collect_record_migration(
                 max_bytes,
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_record_mutation_key(
+    table: StoreTable,
+    source_key: &[u8],
+    key: &[u8],
+) -> Result<(), MigrationError> {
+    validate_mutation_key(table, key)?;
+    if key.starts_with(table.data_prefix().as_bytes()) && key != source_key {
+        return Err(MigrationError::InvalidMutation {
+            table: table.name(),
+            key: key.to_vec(),
+            reason: "record migrations can only mutate their source key inside the source namespace",
+        });
     }
     Ok(())
 }
@@ -1047,6 +1056,99 @@ mod tests {
         ));
         assert!(store.get(&table.schema_key()).unwrap().is_none());
         assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+    }
+
+    #[test]
+    fn structured_migrations_cannot_write_sibling_keys_in_source_namespace() {
+        fn write_sibling(
+            table: StoreTable,
+            _key: &[u8],
+            _value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            Ok(RecordMigration::unchanged().with_set(
+                format!("{}aaa", table.data_prefix()).into_bytes(),
+                b"bad".to_vec(),
+            ))
+        }
+
+        let steps = [MigrationStep {
+            from_version: 0,
+            to_version: 1,
+            migrate_record: write_sibling,
+        }];
+        let table = StoreTable::LwwRegisterMaterialized;
+        let store = temp_store();
+        store
+            .set(
+                format!("{}middle", table.data_prefix()).as_bytes(),
+                b"value",
+            )
+            .unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+
+        assert!(matches!(
+            migrate_table_batch(&lease, table, 1, &steps, options(1)),
+            Err(MigrationError::InvalidMutation {
+                reason: "record migrations can only mutate their source key inside the source namespace",
+                ..
+            })
+        ));
+        assert!(
+            store
+                .get(format!("{}aaa", table.data_prefix()).as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+        assert!(store.get(&table.schema_key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn structured_migrations_cannot_delete_sibling_keys_in_source_namespace() {
+        fn delete_sibling(
+            table: StoreTable,
+            _key: &[u8],
+            _value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            Ok(RecordMigration::delete(
+                format!("{}zzz", table.data_prefix()).as_bytes(),
+            ))
+        }
+
+        let steps = [MigrationStep {
+            from_version: 0,
+            to_version: 1,
+            migrate_record: delete_sibling,
+        }];
+        let table = StoreTable::LwwRegisterMaterialized;
+        let store = temp_store();
+        store
+            .set(
+                format!("{}middle", table.data_prefix()).as_bytes(),
+                b"value",
+            )
+            .unwrap();
+        store
+            .set(format!("{}zzz", table.data_prefix()).as_bytes(), b"future")
+            .unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+
+        assert!(matches!(
+            migrate_table_batch(&lease, table, 1, &steps, options(1)),
+            Err(MigrationError::InvalidMutation {
+                reason: "record migrations can only mutate their source key inside the source namespace",
+                ..
+            })
+        ));
+        assert_eq!(
+            store
+                .get(format!("{}zzz", table.data_prefix()).as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(b"future".as_slice())
+        );
+        assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+        assert!(store.get(&table.schema_key()).unwrap().is_none());
     }
 
     #[test]
