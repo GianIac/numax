@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::Path;
 
 use nx_store::{Store as NxStore, StoreWriteLease};
 
@@ -56,6 +57,7 @@ pub struct SyncSchemaMigration<'a> {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MigrationError {
     Store(nx_store::StoreError),
     Schema(String),
@@ -229,18 +231,25 @@ const LEGACY_TO_V1: MigrationStep = MigrationStep {
     migrate_record: migrate_legacy_record,
 };
 
+// GCOUNTER
 const GCOUNTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const GCOUNTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// PNCOUNTER
 const PNCOUNTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const PNCOUNTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// LWW REGISTER
 const LWW_REGISTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const LWW_REGISTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// LWW MAP
 const LWW_MAP_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const LWW_MAP_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// ORSET
 const ORSET_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const ORSET_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// RGA
 const RGA_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const RGA_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+// SEEN OPS AND OP LOG
 const SEEN_OPS_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const OP_LOG_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 
@@ -334,6 +343,16 @@ pub fn migrate_sync_schema(
             return Ok(());
         }
     }
+}
+
+pub fn migrate_sync_schema_at_path(
+    datastore_path: impl AsRef<Path>,
+    options: MigrationOptions,
+) -> Result<(), MigrationError> {
+    let store = NxStore::open(datastore_path)?;
+    migrate_sync_schema(&store, options)?;
+    store.flush()?;
+    Ok(())
 }
 
 impl<'a> SyncSchemaMigration<'a> {
@@ -1163,6 +1182,21 @@ mod tests {
                 SchemaHeader::current(table)
             );
             assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn migrates_datastore_opened_by_path() {
+        let path = tempfile::tempdir().unwrap().keep();
+        migrate_sync_schema_at_path(&path, options(2)).unwrap();
+
+        let store = NxStore::open(&path).unwrap();
+        for table in StoreTable::ALL {
+            let header = store.get(&table.schema_key()).unwrap().unwrap();
+            assert_eq!(
+                SchemaHeader::decode(table, &header).unwrap(),
+                SchemaHeader::current(table)
+            );
         }
     }
 

@@ -28,7 +28,7 @@ nx-sdk          (standalone — targets wasm32, no internal deps)
 **Produces:** the `nx` executable.
 
 **Key files:**
-- `src/main.rs` - command definitions (`nx run`, `nx config`), flag parsing via clap, runtime wiring
+- `src/main.rs` - command definitions (`nx run`, `nx config`, `nx migrate`), flag parsing via clap, runtime wiring
 - `src/config.rs` - TOML file structs, environment variable resolution, effective config builder, `nx config init` template
 
 **External dependencies:** `clap`, `tokio`, `tracing`, `tracing-subscriber`, `toml`, `serde`

@@ -10,7 +10,7 @@ mod types;
 pub use manager::{SyncHandle, SyncManager};
 pub use migration::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationError, MigrationOptions,
-    MigrationProgress, SyncSchemaMigration, migrate_sync_schema,
+    MigrationProgress, SyncSchemaMigration, migrate_sync_schema, migrate_sync_schema_at_path,
 };
 pub use peer::PeerHealthState;
 pub(crate) use storage::{
