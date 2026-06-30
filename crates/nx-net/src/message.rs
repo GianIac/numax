@@ -3,7 +3,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -36,6 +36,48 @@ impl SerializationFormat {
 
 pub const DEFAULT_SUPPORTED_FORMATS: &[SerializationFormat] =
     &[SerializationFormat::Bincode, SerializationFormat::Json];
+
+/// Structured error sent over the wire before closing or rejecting a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireError {
+    ProtocolMismatch { expected: u32, got: u32 },
+    OpRejected { reason: String },
+    RateLimited { retry_after_ms: Option<u64> },
+    NotAuthorized { reason: String },
+    Internal { reason: String },
+}
+
+impl WireError {
+    pub fn protocol_mismatch(got: u32) -> Self {
+        Self::ProtocolMismatch {
+            expected: PROTOCOL_VERSION,
+            got,
+        }
+    }
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolMismatch { expected, got } => {
+                write!(
+                    formatter,
+                    "protocol version mismatch: expected {expected}, got {got}"
+                )
+            }
+            Self::OpRejected { reason } => write!(formatter, "op rejected: {reason}"),
+            Self::RateLimited { retry_after_ms } => match retry_after_ms {
+                Some(retry_after_ms) => write!(
+                    formatter,
+                    "rate limited: retry after {retry_after_ms} milliseconds"
+                ),
+                None => formatter.write_str("rate limited"),
+            },
+            Self::NotAuthorized { reason } => write!(formatter, "not authorized: {reason}"),
+            Self::Internal { reason } => write!(formatter, "internal wire error: {reason}"),
+        }
+    }
+}
 
 /// Message type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +114,9 @@ pub enum MessageKind {
 
     /// Response to Ping.
     Pong,
+
+    /// Structured protocol error.
+    Error { error: WireError },
 }
 
 /// Complete message with metadata.
@@ -147,6 +192,12 @@ impl Message {
     pub fn pong() -> Self {
         Self {
             kind: MessageKind::Pong,
+        }
+    }
+
+    pub fn wire_error(error: WireError) -> Self {
+        Self {
+            kind: MessageKind::Error { error },
         }
     }
 
@@ -286,5 +337,20 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn wire_error_roundtrips() {
+        let msg = Message::wire_error(WireError::ProtocolMismatch {
+            expected: PROTOCOL_VERSION,
+            got: PROTOCOL_VERSION - 1,
+        });
+
+        let bytes = msg
+            .to_bytes_with_format(SerializationFormat::Bincode)
+            .unwrap();
+        let (_, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
+
+        assert_eq!(parsed, msg);
     }
 }

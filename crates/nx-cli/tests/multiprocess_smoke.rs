@@ -253,14 +253,14 @@ fn different_protocol_versions_reject_connection_without_exchanging_ops() {
     let previous_stdout = String::from_utf8_lossy(&previous_output.stdout);
     let previous_stderr = String::from_utf8_lossy(&previous_output.stderr);
     let protocol_mismatch_reported = current_stdout
-        .contains("protocol version mismatch: expected 3, got 2")
-        || current_stdout.contains("protocol version mismatch: expected 2, got 3")
-        || current_stderr.contains("protocol version mismatch: expected 2, got 3")
-        || current_stderr.contains("protocol version mismatch: expected 3, got 2")
-        || previous_stdout.contains("protocol version mismatch: expected 3, got 2")
-        || previous_stdout.contains("protocol version mismatch: expected 2, got 3")
-        || previous_stderr.contains("protocol version mismatch: expected 3, got 2")
-        || previous_stderr.contains("protocol version mismatch: expected 2, got 3");
+        .contains("protocol version mismatch: expected 4, got 2")
+        || current_stdout.contains("protocol version mismatch: expected 2, got 4")
+        || current_stderr.contains("protocol version mismatch: expected 2, got 4")
+        || current_stderr.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stdout.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stdout.contains("protocol version mismatch: expected 2, got 4")
+        || previous_stderr.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stderr.contains("protocol version mismatch: expected 2, got 4");
     assert!(
         protocol_mismatch_reported,
         "neither node reported the protocol mismatch\ncurrent stdout:\n{current_stdout}\ncurrent stderr:\n{current_stderr}\nprevious stdout:\n{previous_stdout}\nprevious stderr:\n{previous_stderr}"

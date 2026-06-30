@@ -91,7 +91,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 - [x] CLI `nx migrate` for offline migration
 
 **Typed Error Frames**:
-- [ ] Enum `WireError`: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal`
+- [x] Enum `WireError`: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal`
 - [ ] Documented retry vs fatal semantics
 - [ ] Backoff differentiated by error type
 

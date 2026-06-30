@@ -103,7 +103,7 @@ This is the one crate that can be reasoned about and tested without any runtime.
 
 **Key files:**
 - `src/node.rs` - `SyncNode`: listens for incoming connections, dials peers, manages reconnect backoff, runs broadcast and anti-entropy loops
-- `src/message.rs` - `Message` and `MessageKind` wire types: `Hello`, `HelloAck`, `PushOps`, `PushOpsAck`, `PullSince`, `Ping`, `Pong`
+- `src/message.rs` - `Message`, `MessageKind`, and `WireError` wire types: `Hello`, `HelloAck`, `PushOps`, `PushOpsAck`, `PullSince`, `Ping`, `Pong`, `Error`
 - `src/tls.rs` - TLS acceptor/connector setup, certificate parsing, mTLS peer identity extraction, allowlist enforcement
 - `src/peer.rs` - `PeerInfo`: address, NodeId, connection state
 - `src/error.rs` - `NetError`

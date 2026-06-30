@@ -105,7 +105,7 @@ connect_to_peer(addr)
   4. capture peer_cert DER bytes
   5. send Hello { node_id, protocol_version, supported_formats, preferred_format }
   6. receive HelloAck { node_id, protocol_version, selected_format }
-  7. validate protocol version == PROTOCOL_VERSION (3)
+  7. validate protocol version == PROTOCOL_VERSION (4)
   8. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
   9. if allowlist configured: verify peer_node_id in allowed_peers
   10. insert PeerConnection into peers map
@@ -142,7 +142,8 @@ Every message is framed as:
 - Format byte: `0x01` = JSON, `0x02` = bincode.
 - Payload is the serialized `Message` struct.
 
-`PROTOCOL_VERSION = 3`. Version mismatch during handshake causes immediate disconnect.
+`PROTOCOL_VERSION = 4`. Version mismatch during handshake causes a structured
+`WireError::ProtocolMismatch` and immediate disconnect.
 
 ### MessageKind variants
 
@@ -154,6 +155,7 @@ Every message is framed as:
 | `PushOpsAck` | both | Acknowledge reception count |
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
 | `Ping` / `Pong` | both | Keepalive |
+| `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
 
 ### Serialization format negotiation
 

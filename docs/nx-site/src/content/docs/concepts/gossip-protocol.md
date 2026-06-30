@@ -67,8 +67,9 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 | `PushOpsAck` | Acknowledgement message for received operations. The current sync path does not rely on it as a causal frontier. |
 | `PullSince` | Ask a peer for retained operations. Today this is usually sent with `None`. |
 | `Ping` / `Pong` | Keepalive message types. A received `Ping` is answered with `Pong`. |
+| `Error` | Structured wire error sent before rejecting a request or closing a connection. |
 
-The protocol version is currently `3`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
+The protocol version is currently `4`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
 
 ---
 
@@ -98,6 +99,7 @@ forward or backward compatibility:
 
 Both `Hello` and `HelloAck` carry an explicit `protocol_version`, a mismatch is
 rejected before the peer is registered or CRDT operations are exchanged.
+When possible, the rejecting peer sends `Error(ProtocolMismatch)` before closing.
 Serialization-format negotiation does not override protocol compatibility.
 The rules for evolving this contract are defined in
 [Wire Versioning](/numax/design/wire-versioning/).
