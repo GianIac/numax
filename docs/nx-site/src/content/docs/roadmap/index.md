@@ -92,7 +92,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 **Typed Error Frames**:
 - [x] Enum `WireError`: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal`
-- [ ] Documented retry vs fatal semantics
+- [x] Document `WireError` retry/fatal semantics
 - [ ] Backoff differentiated by error type
 
 **Closing criterion**:

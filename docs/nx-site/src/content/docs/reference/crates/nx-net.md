@@ -157,6 +157,16 @@ Every message is framed as:
 | `Ping` / `Pong` | both | Keepalive |
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
 
+### WireError semantics
+
+| Error | Retry policy | Meaning |
+|---|---|---|
+| `ProtocolMismatch` | Fatal | Different wire contracts. Upgrade/downgrade one side before reconnecting. |
+| `NotAuthorized` | Fatal for that peer/config | Credentials, certificate identity, or allowlist must change before retrying. |
+| `RateLimited` | Retryable | Back off. Use `retry_after_ms` when present, otherwise use normal reconnect backoff. |
+| `OpRejected` | Fatal for those ops | Do not resend the same rejected ops unchanged. Current generic error handling closes the peer connection. |
+| `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
+
 ### Serialization format negotiation
 
 When a bincode node connects to a JSON-only debug node:
