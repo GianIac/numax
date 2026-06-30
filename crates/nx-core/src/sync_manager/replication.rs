@@ -136,6 +136,10 @@ fn connect_failure_outcome(error: &NetError) -> ConfiguredPeerConnectOutcome {
     }
 }
 
+fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
+    normalize_reconnect_delay(delay).min(max_delay)
+}
+
 pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
     let ReconnectLoopContext {
         node,
@@ -212,7 +216,10 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         );
                     }
                     ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
-                        let retry_after = peer.record_retry_after(delay, StdInstant::now());
+                        let retry_after = peer.record_retry_after(
+                            bounded_retry_after(delay, max_delay),
+                            StdInstant::now(),
+                        );
                         sleep_for =
                             Some(sleep_for.map_or(retry_after, |current| current.min(retry_after)));
                     }
@@ -687,6 +694,18 @@ mod tests {
     #[test]
     fn seen_ops_limit_is_never_zero() {
         assert_eq!(normalize_seen_ops_limit(0), 1);
+    }
+
+    #[test]
+    fn retry_after_is_bounded_by_configured_max_delay() {
+        assert_eq!(
+            bounded_retry_after(Duration::from_secs(60), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            bounded_retry_after(Duration::ZERO, Duration::from_secs(5)),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

@@ -61,7 +61,7 @@ impl PeerReconnectState {
 
     pub(super) fn record_retry_after(&mut self, delay: Duration, now: StdInstant) -> Duration {
         let delay = normalize_reconnect_delay(delay);
-        self.next_attempt_at = now + delay;
+        self.next_attempt_at = now.checked_add(delay).unwrap_or(now);
         delay
     }
 
@@ -234,6 +234,18 @@ mod tests {
         assert_eq!(delay, Duration::from_secs(3));
         assert_eq!(state.delay, Duration::from_millis(500));
         assert_eq!(state.next_attempt_at, now + Duration::from_secs(3));
+    }
+
+    #[test]
+    fn peer_reconnect_state_retry_after_does_not_panic_on_unrepresentable_deadline() {
+        let now = StdInstant::now();
+        let mut state =
+            PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
+
+        let delay = state.record_retry_after(Duration::MAX, now);
+
+        assert_eq!(delay, Duration::MAX);
+        assert_eq!(state.next_attempt_at, now);
     }
 
     #[test]

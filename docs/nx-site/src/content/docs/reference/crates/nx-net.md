@@ -168,8 +168,9 @@ Every message is framed as:
 | `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
 
 The configured-peer reconnect loop uses this policy: fatal wire errors stop
-automatic reconnect for that peer, `RateLimited.retry_after_ms` is honored when
-present, and retryable errors keep the normal exponential backoff.
+automatic reconnect for that peer, `RateLimited.retry_after_ms` is honored up to
+the configured reconnect max delay, and retryable errors keep the normal
+exponential backoff.
 
 ### Serialization format negotiation
 
