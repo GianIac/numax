@@ -33,6 +33,7 @@ pub(super) struct PeerReconnectState {
     pub(super) addr: String,
     pub(super) delay: Duration,
     pub(super) next_attempt_at: StdInstant,
+    pub(super) stopped: bool,
 }
 
 impl PeerReconnectState {
@@ -41,12 +42,14 @@ impl PeerReconnectState {
             addr,
             delay: initial_delay,
             next_attempt_at: now,
+            stopped: false,
         }
     }
 
     pub(super) fn reset(&mut self, initial_delay: Duration, now: StdInstant) {
         self.delay = initial_delay;
         self.next_attempt_at = now;
+        self.stopped = false;
     }
 
     pub(super) fn record_failure(&mut self, max_delay: Duration, now: StdInstant) -> Duration {
@@ -54,6 +57,16 @@ impl PeerReconnectState {
         self.next_attempt_at = now + attempt_delay;
         self.delay = next_reconnect_delay(attempt_delay, max_delay);
         attempt_delay
+    }
+
+    pub(super) fn record_retry_after(&mut self, delay: Duration, now: StdInstant) -> Duration {
+        let delay = normalize_reconnect_delay(delay);
+        self.next_attempt_at = now + delay;
+        delay
+    }
+
+    pub(super) fn stop(&mut self) {
+        self.stopped = true;
     }
 }
 
@@ -65,11 +78,14 @@ pub(super) struct ConfiguredPeerConnectContext<'a> {
     pub(super) peer_health: &'a Arc<RwLock<HashMap<String, PeerHealth>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConfiguredPeerConnectOutcome {
     Connected,
     AlreadyConnected,
     SlotLimitReached,
     Failed,
+    RetryAfter(Duration),
+    Fatal,
 }
 
 pub(super) fn normalize_reconnect_delay(delay: Duration) -> Duration {
@@ -184,10 +200,12 @@ mod tests {
         assert_eq!(first_delay, Duration::from_millis(500));
         assert_eq!(state.delay, Duration::from_secs(1));
         assert_eq!(state.next_attempt_at, now + Duration::from_millis(500));
+        assert!(!state.stopped);
 
         state.reset(Duration::from_millis(500), now);
         assert_eq!(state.delay, Duration::from_millis(500));
         assert_eq!(state.next_attempt_at, now);
+        assert!(!state.stopped);
     }
 
     #[test]
@@ -203,6 +221,30 @@ mod tests {
             state.next_attempt_at,
             failed_at + Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn peer_reconnect_state_schedules_retry_after_without_growing_backoff() {
+        let now = StdInstant::now();
+        let mut state =
+            PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
+
+        let delay = state.record_retry_after(Duration::from_secs(3), now);
+
+        assert_eq!(delay, Duration::from_secs(3));
+        assert_eq!(state.delay, Duration::from_millis(500));
+        assert_eq!(state.next_attempt_at, now + Duration::from_secs(3));
+    }
+
+    #[test]
+    fn peer_reconnect_state_can_be_stopped_after_fatal_error() {
+        let now = StdInstant::now();
+        let mut state =
+            PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
+
+        state.stop();
+
+        assert!(state.stopped);
     }
 
     #[test]

@@ -167,6 +167,10 @@ Every message is framed as:
 | `OpRejected` | Fatal for those ops | Do not resend the same rejected ops unchanged. Current generic error handling closes the peer connection. |
 | `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
 
+The configured-peer reconnect loop uses this policy: fatal wire errors stop
+automatic reconnect for that peer, `RateLimited.retry_after_ms` is honored when
+present, and retryable errors keep the normal exponential backoff.
+
 ### Serialization format negotiation
 
 When a bincode node connects to a JSON-only debug node:

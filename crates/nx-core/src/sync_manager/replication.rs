@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant as StdInstant};
 
-use nx_net::{NetError, NodeEvent};
+use nx_net::{NetError, NodeEvent, WireRetryPolicy};
 use nx_store::Store as NxStore;
 use nx_sync::Op;
 use tokio::sync::{RwLock, mpsc, watch};
@@ -93,9 +93,46 @@ pub(super) async fn try_connect_configured_peer(
                 context.peer_dead_after_failures,
             )
             .await;
-            debug!(peer = %peer_addr, error = %e, "configured peer connect failed");
-            ConfiguredPeerConnectOutcome::Failed
+
+            let outcome = connect_failure_outcome(&e);
+            match outcome {
+                ConfiguredPeerConnectOutcome::Fatal => {
+                    debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        "configured peer connect failed with fatal wire error"
+                    );
+                }
+                ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
+                    debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        retry_after_ms = delay.as_millis(),
+                        "configured peer connect rate limited"
+                    );
+                }
+                ConfiguredPeerConnectOutcome::Failed => {
+                    debug!(peer = %peer_addr, error = %e, "configured peer connect failed");
+                }
+                ConfiguredPeerConnectOutcome::Connected
+                | ConfiguredPeerConnectOutcome::AlreadyConnected
+                | ConfiguredPeerConnectOutcome::SlotLimitReached => {}
+            }
+            outcome
         }
+    }
+}
+
+fn connect_failure_outcome(error: &NetError) -> ConfiguredPeerConnectOutcome {
+    match error {
+        NetError::Wire(wire_error) => match wire_error.retry_policy() {
+            WireRetryPolicy::Fatal => ConfiguredPeerConnectOutcome::Fatal,
+            WireRetryPolicy::RetryAfter(delay) => ConfiguredPeerConnectOutcome::RetryAfter(delay),
+            WireRetryPolicy::Retry | WireRetryPolicy::RequestFatal => {
+                ConfiguredPeerConnectOutcome::Failed
+            }
+        },
+        _ => ConfiguredPeerConnectOutcome::Failed,
     }
 }
 
@@ -140,6 +177,10 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
             for peer in state.iter_mut() {
                 let peer_addr = peer.addr.as_str();
 
+                if peer.stopped {
+                    continue;
+                }
+
                 if node.is_connected_addr(peer_addr).await {
                     mark_peer_success(&peer_health, peer_addr).await;
                     peer.reset(initial_delay, StdInstant::now());
@@ -169,6 +210,18 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
                         );
+                    }
+                    ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
+                        let retry_after = peer.record_retry_after(delay, StdInstant::now());
+                        sleep_for =
+                            Some(sleep_for.map_or(retry_after, |current| current.min(retry_after)));
+                    }
+                    ConfiguredPeerConnectOutcome::Fatal => {
+                        warn!(
+                            peer = %peer_addr,
+                            "stopping automatic reconnect for configured peer after fatal wire error"
+                        );
+                        peer.stop();
                     }
                 }
             }
@@ -526,7 +579,7 @@ mod tests {
     use crate::observability::RuntimeMetrics;
     use crate::sync_manager::peer::{PeerHealth, PeerHealthState};
     use crate::sync_manager::storage::materialized_gcounter_key;
-    use nx_net::{Node, NodeConfig};
+    use nx_net::{Node, NodeConfig, PROTOCOL_VERSION, WireError};
     use nx_sync::{GCounter, NodeId};
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -634,6 +687,39 @@ mod tests {
     #[test]
     fn seen_ops_limit_is_never_zero() {
         assert_eq!(normalize_seen_ops_limit(0), 1);
+    }
+
+    #[test]
+    fn connect_failure_outcome_follows_wire_retry_policy() {
+        assert_eq!(
+            connect_failure_outcome(&NetError::Wire(WireError::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                got: PROTOCOL_VERSION - 1,
+            })),
+            ConfiguredPeerConnectOutcome::Fatal
+        );
+        assert_eq!(
+            connect_failure_outcome(&NetError::Wire(WireError::RateLimited {
+                retry_after_ms: Some(250),
+            })),
+            ConfiguredPeerConnectOutcome::RetryAfter(Duration::from_millis(250))
+        );
+        assert_eq!(
+            connect_failure_outcome(&NetError::Wire(WireError::Internal {
+                reason: "temporary".into(),
+            })),
+            ConfiguredPeerConnectOutcome::Failed
+        );
+        assert_eq!(
+            connect_failure_outcome(&NetError::Wire(WireError::OpRejected {
+                reason: "bad op".into(),
+            })),
+            ConfiguredPeerConnectOutcome::Failed
+        );
+        assert_eq!(
+            connect_failure_outcome(&NetError::Timeout),
+            ConfiguredPeerConnectOutcome::Failed
+        );
     }
 
     #[tokio::test]

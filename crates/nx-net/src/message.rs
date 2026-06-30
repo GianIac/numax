@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{NetError, NetResult};
 use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
@@ -47,11 +49,34 @@ pub enum WireError {
     Internal { reason: String },
 }
 
+/// Reconnect behavior implied by a structured wire error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireRetryPolicy {
+    Fatal,
+    Retry,
+    RetryAfter(Duration),
+    RequestFatal,
+}
+
 impl WireError {
     pub fn protocol_mismatch(got: u32) -> Self {
         Self::ProtocolMismatch {
             expected: PROTOCOL_VERSION,
             got,
+        }
+    }
+
+    pub fn retry_policy(&self) -> WireRetryPolicy {
+        match self {
+            Self::ProtocolMismatch { .. } | Self::NotAuthorized { .. } => WireRetryPolicy::Fatal,
+            Self::RateLimited {
+                retry_after_ms: Some(retry_after_ms),
+            } => WireRetryPolicy::RetryAfter(Duration::from_millis(*retry_after_ms)),
+            Self::RateLimited {
+                retry_after_ms: None,
+            }
+            | Self::Internal { .. } => WireRetryPolicy::Retry,
+            Self::OpRejected { .. } => WireRetryPolicy::RequestFatal,
         }
     }
 }
@@ -352,5 +377,52 @@ mod tests {
         let (_, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
 
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn wire_error_retry_policy_matches_semantics() {
+        assert_eq!(
+            WireError::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                got: PROTOCOL_VERSION - 1,
+            }
+            .retry_policy(),
+            WireRetryPolicy::Fatal
+        );
+        assert_eq!(
+            WireError::NotAuthorized {
+                reason: "denied".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::Fatal
+        );
+        assert_eq!(
+            WireError::RateLimited {
+                retry_after_ms: Some(250),
+            }
+            .retry_policy(),
+            WireRetryPolicy::RetryAfter(Duration::from_millis(250))
+        );
+        assert_eq!(
+            WireError::RateLimited {
+                retry_after_ms: None,
+            }
+            .retry_policy(),
+            WireRetryPolicy::Retry
+        );
+        assert_eq!(
+            WireError::Internal {
+                reason: "temporary".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::Retry
+        );
+        assert_eq!(
+            WireError::OpRejected {
+                reason: "bad op".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::RequestFatal
+        );
     }
 }

@@ -93,7 +93,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 **Typed Error Frames**:
 - [x] Enum `WireError`: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal`
 - [x] Document `WireError` retry/fatal semantics
-- [ ] Backoff differentiated by error type
+- [x] Backoff differentiated by error type
 
 **Closing criterion**:
 > `sync_manager.rs` no longer exists as a single file. A cluster with a `0.1.1` node and a `0.1.0` node refuses the connection with a clear, versioned error, not with a crash.
