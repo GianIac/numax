@@ -6,6 +6,7 @@
 
 [![Docs](https://img.shields.io/badge/docs-site-blue)](https://gianiac.github.io/numax/)
 [![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](https://gianiac.github.io/numax/whitepaper/)
+[![Good First Issues](https://img.shields.io/github/issues/GianIac/numax/good%20first%20issue?label=good%20first%20issues&color=7057ff)](https://github.com/GianIac/numax/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
 [![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](https://gianiac.github.io/numax/roadmap/)
 
 A portable runtime for distributed apps. Written in Rust.
