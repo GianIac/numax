@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand};
 use config::*;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
-    DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions, migrate_sync_schema_at_path,
+    DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
+    migrate_sync_schema_at_path,
 };
 use tracing::info;
 
@@ -136,7 +137,7 @@ enum Cli {
         max_records: NonZeroU32,
 
         /// Maximum bytes processed per migration batch, including generated mutations.
-        #[arg(long, value_name = "BYTES", default_value = "4MiB", value_parser = parse_nonzero_byte_size)]
+        #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MIGRATION_BATCH_BYTES, value_parser = parse_nonzero_byte_size)]
         max_bytes: NonZeroUsize,
     },
 }
@@ -373,12 +374,6 @@ async fn real_main() -> Result<()> {
                 max_records,
                 max_bytes,
             };
-            if !datastore_path.exists() {
-                anyhow::bail!(
-                    "datastore path does not exist: {}",
-                    datastore_path.display()
-                );
-            }
             migrate_sync_schema_at_path(&datastore_path, options)?;
             println!("datastore migrated: {}", datastore_path.display());
         }
@@ -1299,7 +1294,7 @@ mod tests {
                 } => {
                     assert_eq!(datastore_path, PathBuf::from("./nx-data"));
                     assert_eq!(max_records, DEFAULT_MIGRATION_BATCH_SIZE);
-                    assert_eq!(max_bytes.get(), 4 * 1024 * 1024);
+                    assert_eq!(max_bytes, DEFAULT_MIGRATION_BATCH_BYTES);
                 }
                 _ => panic!("expected migrate command"),
             }

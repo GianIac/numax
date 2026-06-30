@@ -96,6 +96,9 @@ pub enum MigrationError {
         key: Vec<u8>,
         reason: &'static str,
     },
+    MissingDatastore {
+        path: String,
+    },
 }
 
 impl fmt::Display for MigrationError {
@@ -148,6 +151,9 @@ impl fmt::Display for MigrationError {
                 "invalid migration mutation for {table} at key {:?}: {reason}",
                 String::from_utf8_lossy(key)
             ),
+            Self::MissingDatastore { path } => {
+                write!(formatter, "datastore path does not exist: {path}")
+            }
         }
     }
 }
@@ -349,6 +355,12 @@ pub fn migrate_sync_schema_at_path(
     datastore_path: impl AsRef<Path>,
     options: MigrationOptions,
 ) -> Result<(), MigrationError> {
+    let datastore_path = datastore_path.as_ref();
+    if !datastore_path.exists() {
+        return Err(MigrationError::MissingDatastore {
+            path: datastore_path.display().to_string(),
+        });
+    }
     let store = NxStore::open(datastore_path)?;
     migrate_sync_schema(&store, options)?;
     store.flush()?;
@@ -1198,6 +1210,20 @@ mod tests {
                 SchemaHeader::current(table)
             );
         }
+    }
+
+    #[test]
+    fn migration_by_path_rejects_missing_datastore() {
+        let path = tempfile::tempdir()
+            .unwrap()
+            .keep()
+            .join("missing-datastore");
+
+        assert!(matches!(
+            migrate_sync_schema_at_path(&path, options(2)),
+            Err(MigrationError::MissingDatastore { .. })
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
