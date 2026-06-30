@@ -70,6 +70,16 @@ A migration must:
 5. reject unknown future versions;
 6. have fixture-based tests for both successful and interrupted migration.
 
+## Migration registry
+
+Each table owns an independent ordered registry of `N -> N+1` steps. A step
+may replace, create, move, or delete records. Its mutations and checkpoint
+advancement use the same atomic sled batch. Every completed step writes its
+schema version before the next step starts.
+
+Keys created inside the table being scanned cannot sort after their source
+key, preventing generated records from being processed twice.
+
 ## Legacy migration
 
 The migration engine currently supports `v0 -> v1`. Version `0` means either
@@ -87,8 +97,7 @@ This migration certifies existing payloads without rewriting them:
 The default limits are 512 records and 4 MiB per batch. Both limits apply:
 
 - the record limit prevents unbounded table scans;
-- the byte limit prevents a batch of large values from consuming excessive
-  memory;
+- one shared byte budget covers scanned input and generated mutations;
 - a single record larger than the byte limit is rejected before its payload is
   cloned into the migration batch.
 

@@ -1,9 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use nx_store::{Store as NxStore, StoreWriteLease};
 
-use super::schema::{SchemaError, SchemaHeader, StoreTable, validate_header};
+use super::schema::{SCHEMA_KEY_PREFIX, SchemaError, SchemaHeader, StoreTable, validate_header};
 use super::storage::{
     logical_key_for_prefix, parse_durable_gcounter_state, parse_durable_lww_map_state,
     parse_durable_lww_register_state, parse_durable_op_log_value, parse_durable_orset_state,
@@ -79,6 +80,20 @@ pub enum MigrationError {
     StaleCheckpoint {
         table: &'static str,
     },
+    InvalidRegistry {
+        table: &'static str,
+        reason: &'static str,
+    },
+    BatchMemoryLimitExceeded {
+        table: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
+    InvalidMutation {
+        table: &'static str,
+        key: Vec<u8>,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for MigrationError {
@@ -112,6 +127,25 @@ impl fmt::Display for MigrationError {
             Self::StaleCheckpoint { table } => {
                 write!(formatter, "stale migration checkpoint found for {table}")
             }
+            Self::InvalidRegistry { table, reason } => {
+                write!(
+                    formatter,
+                    "invalid migration registry for {table}: {reason}"
+                )
+            }
+            Self::BatchMemoryLimitExceeded {
+                table,
+                bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "migration batch for {table} uses {bytes} bytes, exceeding limit {max_bytes}"
+            ),
+            Self::InvalidMutation { table, key, reason } => write!(
+                formatter,
+                "invalid migration mutation for {table} at key {:?}: {reason}",
+                String::from_utf8_lossy(key)
+            ),
         }
     }
 }
@@ -137,6 +171,78 @@ struct MigrationCheckpoint {
     to_version: u16,
     last_processed_key: Option<Vec<u8>>,
 }
+
+#[derive(Clone, Copy)]
+struct MigrationStep {
+    from_version: u16,
+    to_version: u16,
+    migrate_record: RecordMigrator,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RecordMigration {
+    sets: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+}
+
+impl RecordMigration {
+    fn unchanged() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn replace_value(key: &[u8], value: Vec<u8>) -> Self {
+        Self {
+            sets: vec![(key.to_vec(), value)],
+            deletes: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn delete(key: &[u8]) -> Self {
+        Self {
+            sets: Vec::new(),
+            deletes: vec![key.to_vec()],
+        }
+    }
+
+    #[cfg(test)]
+    fn move_to(source_key: &[u8], target_key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            sets: vec![(target_key, value)],
+            deletes: vec![source_key.to_vec()],
+        }
+    }
+
+    #[cfg(test)]
+    fn with_set(mut self, key: Vec<u8>, value: Vec<u8>) -> Self {
+        self.sets.push((key, value));
+        self
+    }
+}
+
+type RecordMigrator = fn(StoreTable, &[u8], &[u8]) -> Result<RecordMigration, MigrationError>;
+
+const LEGACY_TO_V1: MigrationStep = MigrationStep {
+    from_version: 0,
+    to_version: 1,
+    migrate_record: migrate_legacy_record,
+};
+
+const GCOUNTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const GCOUNTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const PNCOUNTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const PNCOUNTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const LWW_REGISTER_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const LWW_REGISTER_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const LWW_MAP_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const LWW_MAP_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const ORSET_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const ORSET_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const RGA_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const RGA_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const SEEN_OPS_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const OP_LOG_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 
 impl MigrationCheckpoint {
     fn new(table: StoreTable, from_version: u16, to_version: u16) -> Self {
@@ -232,6 +338,7 @@ pub fn migrate_sync_schema(
 
 impl<'a> SyncSchemaMigration<'a> {
     pub fn new(store: &'a NxStore, options: MigrationOptions) -> Result<Self, MigrationError> {
+        validate_migration_registries()?;
         Ok(Self {
             store: store.acquire_write_lease()?,
             options,
@@ -251,83 +358,279 @@ fn migrate_sync_schema_batch(
     preflight_checkpoints(store)?;
 
     for table in StoreTable::ALL {
-        let checkpoint_key = checkpoint_key(table);
-        let checkpoint_bytes = store.get(&checkpoint_key)?;
-        let schema_bytes = store.get(&table.schema_key())?;
-
-        let from_version = match schema_bytes {
-            Some(bytes) => {
-                let header = SchemaHeader::decode(table, &bytes)?;
-                if header.version == table.current_version() {
-                    if checkpoint_bytes.is_some() {
-                        return Err(MigrationError::StaleCheckpoint {
-                            table: table.name(),
-                        });
-                    }
-                    continue;
-                }
-                if header.version > table.current_version() {
-                    validate_header(table, &bytes)?;
-                    unreachable!("future schema validation must fail");
-                }
-                header.version
-            }
-            None => 0,
-        };
-        let to_version = from_version.saturating_add(1);
-        if from_version != 0 || to_version != table.current_version() {
-            return Err(MigrationError::UnsupportedPath {
-                table: table.name(),
-                from_version,
-                to_version,
-            });
+        if let Some(progress) = migrate_table_batch(
+            lease,
+            table,
+            table.current_version(),
+            migration_steps(table),
+            options,
+        )? {
+            return Ok(progress);
         }
-
-        let mut checkpoint = match checkpoint_bytes {
-            Some(bytes) => MigrationCheckpoint::decode(table, &bytes)?,
-            None => MigrationCheckpoint::new(table, from_version, to_version),
-        };
-        if checkpoint.from_version != from_version || checkpoint.to_version != to_version {
-            return Err(MigrationError::InvalidCheckpoint {
-                table: table.name(),
-                reason: "checkpoint migration path does not match table schema",
-            });
-        }
-
-        let entries = store.scan_prefix_page_after_bounded(
-            table.data_prefix().as_bytes(),
-            checkpoint.last_processed_key.as_deref(),
-            options.max_records.get(),
-            options.max_bytes.get(),
-        )?;
-        if entries.is_empty() {
-            let schema_key = table.schema_key();
-            let schema_header = SchemaHeader::current(table).encode();
-            lease.apply_batch(
-                &[(schema_key.as_slice(), schema_header.as_slice())],
-                &[checkpoint_key.as_slice()],
-            )?;
-            return Ok(MigrationProgress::TableCompleted {
-                table: table.name(),
-                from_version,
-                to_version,
-            });
-        }
-
-        for (key, value) in &entries {
-            validate_legacy_record(table, key, value)?;
-        }
-        checkpoint.last_processed_key = entries.last().map(|(key, _)| key.clone());
-        let encoded_checkpoint = checkpoint.encode()?;
-        lease.set(&checkpoint_key, &encoded_checkpoint)?;
-
-        return Ok(MigrationProgress::BatchValidated {
-            table: table.name(),
-            records: entries.len(),
-        });
     }
 
     Ok(MigrationProgress::Complete)
+}
+
+fn migrate_table_batch(
+    lease: &StoreWriteLease<'_>,
+    table: StoreTable,
+    target_version: u16,
+    steps: &[MigrationStep],
+    options: MigrationOptions,
+) -> Result<Option<MigrationProgress>, MigrationError> {
+    let store = lease.store();
+    let checkpoint_key = checkpoint_key(table);
+    let checkpoint_bytes = store.get(&checkpoint_key)?;
+    let schema_bytes = store.get(&table.schema_key())?;
+    let from_version = match schema_bytes {
+        Some(bytes) => {
+            let header = SchemaHeader::decode(table, &bytes)?;
+            if header.version == target_version {
+                if checkpoint_bytes.is_some() {
+                    return Err(MigrationError::StaleCheckpoint {
+                        table: table.name(),
+                    });
+                }
+                return Ok(None);
+            }
+            if header.version > target_version {
+                validate_header(table, &bytes)?;
+                unreachable!("future schema validation must fail");
+            }
+            header.version
+        }
+        None => 0,
+    };
+    let step = next_migration_step(table, from_version, target_version, steps)?;
+    let mut checkpoint = match checkpoint_bytes {
+        Some(bytes) => MigrationCheckpoint::decode(table, &bytes)?,
+        None => MigrationCheckpoint::new(table, step.from_version, step.to_version),
+    };
+    if checkpoint.from_version != step.from_version || checkpoint.to_version != step.to_version {
+        return Err(MigrationError::InvalidCheckpoint {
+            table: table.name(),
+            reason: "checkpoint migration path does not match registered step",
+        });
+    }
+
+    let entries = store.scan_prefix_page_after_bounded(
+        table.data_prefix().as_bytes(),
+        checkpoint.last_processed_key.as_deref(),
+        options.max_records.get(),
+        options.max_bytes.get(),
+    )?;
+    if entries.is_empty() {
+        let schema_key = table.schema_key();
+        let schema_header = SchemaHeader {
+            version: step.to_version,
+            table,
+        }
+        .encode();
+        lease.apply_batch(
+            &[(schema_key.as_slice(), schema_header.as_slice())],
+            &[checkpoint_key.as_slice()],
+        )?;
+        return Ok(Some(MigrationProgress::TableCompleted {
+            table: table.name(),
+            from_version: step.from_version,
+            to_version: step.to_version,
+        }));
+    }
+
+    let mut batch_bytes = entries.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    let mut sets = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    let mut deletes = BTreeSet::<Vec<u8>>::new();
+    for (key, value) in &entries {
+        let migration = (step.migrate_record)(table, key, value)?;
+        collect_record_migration(
+            table,
+            key,
+            migration,
+            &mut sets,
+            &mut deletes,
+            &mut batch_bytes,
+            options.max_bytes.get(),
+        )?;
+    }
+    checkpoint.last_processed_key = entries.last().map(|(key, _)| key.clone());
+    sets.insert(checkpoint_key, checkpoint.encode()?);
+    let set_entries = sets.into_iter().collect::<Vec<_>>();
+    let delete_entries = deletes.into_iter().collect::<Vec<_>>();
+    let set_refs = set_entries
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    let delete_refs = delete_entries.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    lease.apply_batch(&set_refs, &delete_refs)?;
+
+    Ok(Some(MigrationProgress::BatchValidated {
+        table: table.name(),
+        records: entries.len(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_record_migration(
+    table: StoreTable,
+    source_key: &[u8],
+    migration: RecordMigration,
+    sets: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    deletes: &mut BTreeSet<Vec<u8>>,
+    batch_bytes: &mut usize,
+    max_bytes: usize,
+) -> Result<(), MigrationError> {
+    for (key, value) in migration.sets {
+        validate_mutation_key(table, &key)?;
+        if key.starts_with(table.data_prefix().as_bytes()) && key.as_slice() > source_key {
+            return Err(MigrationError::InvalidMutation {
+                table: table.name(),
+                key,
+                reason: "new keys in the source namespace must not sort after the source key",
+            });
+        }
+        if deletes.contains(&key) || sets.contains_key(&key) {
+            return Err(MigrationError::InvalidMutation {
+                table: table.name(),
+                key,
+                reason: "duplicate or conflicting mutation",
+            });
+        }
+        *batch_bytes = batch_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+        if *batch_bytes > max_bytes {
+            return Err(MigrationError::BatchMemoryLimitExceeded {
+                table: table.name(),
+                bytes: *batch_bytes,
+                max_bytes,
+            });
+        }
+        sets.insert(key, value);
+    }
+    for key in migration.deletes {
+        validate_mutation_key(table, &key)?;
+        if sets.contains_key(&key) || !deletes.insert(key.clone()) {
+            return Err(MigrationError::InvalidMutation {
+                table: table.name(),
+                key,
+                reason: "duplicate or conflicting mutation",
+            });
+        }
+        *batch_bytes = batch_bytes.saturating_add(key.len());
+        if *batch_bytes > max_bytes {
+            return Err(MigrationError::BatchMemoryLimitExceeded {
+                table: table.name(),
+                bytes: *batch_bytes,
+                max_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_mutation_key(table: StoreTable, key: &[u8]) -> Result<(), MigrationError> {
+    if key.starts_with(SCHEMA_KEY_PREFIX.as_bytes())
+        || key.starts_with(MIGRATION_KEY_PREFIX.as_bytes())
+    {
+        return Err(MigrationError::InvalidMutation {
+            table: table.name(),
+            key: key.to_vec(),
+            reason: "schema and migration metadata are managed by the engine",
+        });
+    }
+    Ok(())
+}
+
+fn migration_steps(table: StoreTable) -> &'static [MigrationStep] {
+    match table {
+        StoreTable::GCounterMaterialized => GCOUNTER_MATERIALIZED_STEPS,
+        StoreTable::GCounterState => GCOUNTER_STATE_STEPS,
+        StoreTable::PNCounterMaterialized => PNCOUNTER_MATERIALIZED_STEPS,
+        StoreTable::PNCounterState => PNCOUNTER_STATE_STEPS,
+        StoreTable::LwwRegisterMaterialized => LWW_REGISTER_MATERIALIZED_STEPS,
+        StoreTable::LwwRegisterState => LWW_REGISTER_STATE_STEPS,
+        StoreTable::LwwMapMaterialized => LWW_MAP_MATERIALIZED_STEPS,
+        StoreTable::LwwMapState => LWW_MAP_STATE_STEPS,
+        StoreTable::ORSetMaterialized => ORSET_MATERIALIZED_STEPS,
+        StoreTable::ORSetState => ORSET_STATE_STEPS,
+        StoreTable::RgaMaterialized => RGA_MATERIALIZED_STEPS,
+        StoreTable::RgaState => RGA_STATE_STEPS,
+        StoreTable::SeenOps => SEEN_OPS_STEPS,
+        StoreTable::OpLog => OP_LOG_STEPS,
+    }
+}
+
+fn validate_migration_registries() -> Result<(), MigrationError> {
+    for table in StoreTable::ALL {
+        validate_migration_path(table, table.current_version(), migration_steps(table))?;
+    }
+    Ok(())
+}
+
+fn validate_migration_path(
+    table: StoreTable,
+    target_version: u16,
+    steps: &[MigrationStep],
+) -> Result<(), MigrationError> {
+    let mut expected_from = 0u16;
+    for step in steps {
+        if expected_from == target_version {
+            return Err(MigrationError::InvalidRegistry {
+                table: table.name(),
+                reason: "registry contains steps beyond the current schema",
+            });
+        }
+        if step.from_version != expected_from {
+            return Err(MigrationError::InvalidRegistry {
+                table: table.name(),
+                reason: "registry contains a gap or unordered step",
+            });
+        }
+        if step.to_version != expected_from.saturating_add(1) {
+            return Err(MigrationError::InvalidRegistry {
+                table: table.name(),
+                reason: "steps must advance exactly one schema version",
+            });
+        }
+        expected_from = step.to_version;
+    }
+    if expected_from != target_version {
+        return Err(MigrationError::InvalidRegistry {
+            table: table.name(),
+            reason: "registry does not reach the current schema",
+        });
+    }
+    Ok(())
+}
+
+fn next_migration_step(
+    table: StoreTable,
+    from_version: u16,
+    target_version: u16,
+    steps: &[MigrationStep],
+) -> Result<MigrationStep, MigrationError> {
+    let Some(step) = steps
+        .iter()
+        .find(|step| step.from_version == from_version)
+        .copied()
+    else {
+        return Err(MigrationError::UnsupportedPath {
+            table: table.name(),
+            from_version,
+            to_version: target_version,
+        });
+    };
+    if step.to_version != from_version.saturating_add(1) || step.to_version > target_version {
+        return Err(MigrationError::UnsupportedPath {
+            table: table.name(),
+            from_version,
+            to_version: target_version,
+        });
+    }
+    Ok(step)
 }
 
 fn preflight_checkpoints(store: &NxStore) -> Result<(), MigrationError> {
@@ -356,12 +659,17 @@ fn preflight_checkpoints(store: &NxStore) -> Result<(), MigrationError> {
                 table: table.name(),
             });
         }
-        if checkpoint.from_version != schema_version
-            || checkpoint.to_version != schema_version.saturating_add(1)
+        let step = next_migration_step(
+            table,
+            schema_version,
+            table.current_version(),
+            migration_steps(table),
+        )?;
+        if checkpoint.from_version != step.from_version || checkpoint.to_version != step.to_version
         {
             return Err(MigrationError::InvalidCheckpoint {
                 table: table.name(),
-                reason: "checkpoint migration path does not match table schema",
+                reason: "checkpoint migration path does not match registered step",
             });
         }
     }
@@ -372,11 +680,11 @@ fn checkpoint_key(table: StoreTable) -> Vec<u8> {
     format!("{MIGRATION_KEY_PREFIX}{}", table.name()).into_bytes()
 }
 
-fn validate_legacy_record(
+fn migrate_legacy_record(
     table: StoreTable,
     key: &[u8],
     value: &[u8],
-) -> Result<(), MigrationError> {
+) -> Result<RecordMigration, MigrationError> {
     logical_key_for_prefix(key, table.data_prefix(), table.name())
         .and_then(|_| match table {
             StoreTable::GCounterMaterialized => {
@@ -419,7 +727,8 @@ fn validate_legacy_record(
             table: table.name(),
             key: key.to_vec(),
             reason: error.to_string(),
-        })
+        })?;
+    Ok(RecordMigration::unchanged())
 }
 
 // End of main code. Test below:
@@ -465,6 +774,282 @@ mod tests {
     }
 
     #[test]
+    fn registry_applies_sequential_steps_and_intermediate_schema_headers() {
+        fn append_one(
+            _table: StoreTable,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            let mut migrated = value.to_vec();
+            migrated.push(b'1');
+            Ok(RecordMigration::replace_value(key, migrated))
+        }
+
+        fn append_two(
+            _table: StoreTable,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            let mut migrated = value.to_vec();
+            migrated.push(b'2');
+            Ok(RecordMigration::replace_value(key, migrated))
+        }
+
+        let steps = [
+            MigrationStep {
+                from_version: 0,
+                to_version: 1,
+                migrate_record: append_one,
+            },
+            MigrationStep {
+                from_version: 1,
+                to_version: 2,
+                migrate_record: append_two,
+            },
+        ];
+        let table = StoreTable::LwwRegisterMaterialized;
+        validate_migration_path(table, 2, &steps).unwrap();
+        let path = tempfile::tempdir().unwrap().keep();
+        let store = NxStore::open(&path).unwrap();
+        let key = b"__nx/crdt/lww-register/registry-test";
+        store.set(key, b"value").unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+
+        assert_eq!(
+            migrate_table_batch(&lease, table, 2, &steps, options(1)).unwrap(),
+            Some(MigrationProgress::BatchValidated {
+                table: "lww-register-materialized",
+                records: 1,
+            })
+        );
+        assert_eq!(store.get(key).unwrap().unwrap(), b"value1");
+        assert!(store.get(&table.schema_key()).unwrap().is_none());
+        drop(lease);
+        drop(store);
+
+        let store = NxStore::open(&path).unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+        assert_eq!(
+            migrate_table_batch(&lease, table, 2, &steps, options(1)).unwrap(),
+            Some(MigrationProgress::TableCompleted {
+                table: "lww-register-materialized",
+                from_version: 0,
+                to_version: 1,
+            })
+        );
+        let v1_header = store.get(&table.schema_key()).unwrap().unwrap();
+        assert_eq!(SchemaHeader::decode(table, &v1_header).unwrap().version, 1);
+
+        assert!(matches!(
+            migrate_table_batch(&lease, table, 2, &steps, options(1)).unwrap(),
+            Some(MigrationProgress::BatchValidated { records: 1, .. })
+        ));
+        assert_eq!(store.get(key).unwrap().unwrap(), b"value12");
+
+        assert_eq!(
+            migrate_table_batch(&lease, table, 2, &steps, options(1)).unwrap(),
+            Some(MigrationProgress::TableCompleted {
+                table: "lww-register-materialized",
+                from_version: 1,
+                to_version: 2,
+            })
+        );
+        let v2_header = store.get(&table.schema_key()).unwrap().unwrap();
+        assert_eq!(SchemaHeader::decode(table, &v2_header).unwrap().version, 2);
+        assert_eq!(
+            migrate_table_batch(&lease, table, 2, &steps, options(1)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_rejects_gaps_and_non_sequential_steps() {
+        let gap = [
+            LEGACY_TO_V1,
+            MigrationStep {
+                from_version: 2,
+                to_version: 3,
+                migrate_record: migrate_legacy_record,
+            },
+        ];
+        assert!(matches!(
+            validate_migration_path(StoreTable::SeenOps, 3, &gap),
+            Err(MigrationError::InvalidRegistry {
+                reason: "registry contains a gap or unordered step",
+                ..
+            })
+        ));
+
+        let jump = [MigrationStep {
+            from_version: 0,
+            to_version: 2,
+            migrate_record: migrate_legacy_record,
+        }];
+        assert!(matches!(
+            validate_migration_path(StoreTable::SeenOps, 2, &jump),
+            Err(MigrationError::InvalidRegistry {
+                reason: "steps must advance exactly one schema version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn table_registries_can_advance_independently() {
+        let op_log_v2_steps = [
+            LEGACY_TO_V1,
+            MigrationStep {
+                from_version: 1,
+                to_version: 2,
+                migrate_record: migrate_legacy_record,
+            },
+        ];
+
+        validate_migration_path(StoreTable::OpLog, 2, &op_log_v2_steps).unwrap();
+        validate_migration_path(StoreTable::SeenOps, 1, migration_steps(StoreTable::SeenOps))
+            .unwrap();
+    }
+
+    #[test]
+    fn structured_migrations_support_replace_delete_move_and_additional_sets() {
+        fn mutate(
+            _table: StoreTable,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            if key.ends_with(b"/replace") {
+                return Ok(RecordMigration::replace_value(key, b"replaced".to_vec()));
+            }
+            if key.ends_with(b"/delete") {
+                return Ok(RecordMigration::delete(key));
+            }
+            if key.ends_with(b"/move") {
+                return Ok(RecordMigration::move_to(
+                    key,
+                    b"__nx/archive/moved".to_vec(),
+                    value.to_vec(),
+                ));
+            }
+            Ok(RecordMigration::unchanged()
+                .with_set(b"__nx/archive/additional".to_vec(), b"created".to_vec()))
+        }
+
+        let steps = [MigrationStep {
+            from_version: 0,
+            to_version: 1,
+            migrate_record: mutate,
+        }];
+        let table = StoreTable::LwwRegisterMaterialized;
+        let store = temp_store();
+        let prefix = table.data_prefix();
+        for suffix in ["replace", "delete", "move", "set"] {
+            store
+                .set(format!("{prefix}{suffix}").as_bytes(), suffix.as_bytes())
+                .unwrap();
+        }
+        let lease = store.acquire_write_lease().unwrap();
+
+        assert_eq!(
+            migrate_table_batch(&lease, table, 1, &steps, options(10)).unwrap(),
+            Some(MigrationProgress::BatchValidated {
+                table: "lww-register-materialized",
+                records: 4,
+            })
+        );
+        assert_eq!(
+            store
+                .get(format!("{prefix}replace").as_bytes())
+                .unwrap()
+                .unwrap(),
+            b"replaced"
+        );
+        assert!(
+            store
+                .get(format!("{prefix}delete").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(format!("{prefix}move").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.get(b"__nx/archive/moved").unwrap().unwrap(), b"move");
+        assert_eq!(
+            store.get(b"__nx/archive/additional").unwrap().unwrap(),
+            b"created"
+        );
+    }
+
+    #[test]
+    fn transformed_batch_limit_failure_preserves_payload_and_checkpoint() {
+        fn expand_value(
+            _table: StoreTable,
+            key: &[u8],
+            _value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            Ok(RecordMigration::replace_value(key, vec![b'x'; 128]))
+        }
+
+        let steps = [MigrationStep {
+            from_version: 0,
+            to_version: 1,
+            migrate_record: expand_value,
+        }];
+        let table = StoreTable::LwwRegisterMaterialized;
+        let store = temp_store();
+        let key = b"__nx/crdt/lww-register/output-limit";
+        store.set(key, b"x").unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+        let options = MigrationOptions {
+            max_records: NonZeroU32::new(1).unwrap(),
+            max_bytes: NonZeroUsize::new(64).unwrap(),
+        };
+
+        assert!(matches!(
+            migrate_table_batch(&lease, table, 1, &steps, options),
+            Err(MigrationError::BatchMemoryLimitExceeded { .. })
+        ));
+        assert_eq!(store.get(key).unwrap().unwrap(), b"x");
+        assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+        assert!(store.get(&table.schema_key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn structured_migrations_cannot_modify_engine_metadata() {
+        fn overwrite_schema(
+            table: StoreTable,
+            _key: &[u8],
+            _value: &[u8],
+        ) -> Result<RecordMigration, MigrationError> {
+            Ok(RecordMigration::unchanged().with_set(table.schema_key(), b"bad".to_vec()))
+        }
+
+        let steps = [MigrationStep {
+            from_version: 0,
+            to_version: 1,
+            migrate_record: overwrite_schema,
+        }];
+        let table = StoreTable::LwwRegisterMaterialized;
+        let store = temp_store();
+        store
+            .set(b"__nx/crdt/lww-register/metadata-test", b"value")
+            .unwrap();
+        let lease = store.acquire_write_lease().unwrap();
+
+        assert!(matches!(
+            migrate_table_batch(&lease, table, 1, &steps, options(1)),
+            Err(MigrationError::InvalidMutation {
+                reason: "schema and migration metadata are managed by the engine",
+                ..
+            })
+        ));
+        assert!(store.get(&table.schema_key()).unwrap().is_none());
+        assert!(store.get(&checkpoint_key(table)).unwrap().is_none());
+    }
+
+    #[test]
     fn migrates_empty_store_to_v1() {
         let store = temp_store();
         migrate_sync_schema(&store, options(2)).unwrap();
@@ -498,7 +1083,7 @@ mod tests {
                 .unwrap(),
             MigrationProgress::BatchValidated {
                 table: "gcounter-materialized",
-                records: 2
+                records: 2,
             }
         );
         let checkpoint = store
