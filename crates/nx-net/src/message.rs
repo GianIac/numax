@@ -51,6 +51,7 @@ pub enum WireError {
 
 /// Reconnect behavior implied by a structured wire error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WireRetryPolicy {
     Fatal,
     Retry,

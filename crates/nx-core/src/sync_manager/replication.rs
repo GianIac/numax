@@ -131,6 +131,7 @@ fn connect_failure_outcome(error: &NetError) -> ConfiguredPeerConnectOutcome {
             WireRetryPolicy::Retry | WireRetryPolicy::RequestFatal => {
                 ConfiguredPeerConnectOutcome::Failed
             }
+            _ => ConfiguredPeerConnectOutcome::Failed,
         },
         _ => ConfiguredPeerConnectOutcome::Failed,
     }
