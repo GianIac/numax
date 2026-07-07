@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "nx-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "nx-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "nx-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "hex",
@@ -1559,11 +1559,11 @@ dependencies = [
 
 [[package]]
 name = "nx-sdk"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "nx-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sled",
  "tempfile",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "nx-sync"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

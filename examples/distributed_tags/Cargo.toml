@@ -1,13 +1,13 @@
 [package]
 name = "distributed_tags"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-nx-sdk = { path = "../../crates/nx-sdk" }
+nx-sdk = { version = "0.1.1", path = "../../crates/nx-sdk" }
 
 [profile.release]
 lto = true

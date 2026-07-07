@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{NetError, NetResult};
 use crate::message::{
     DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
+    WireError,
 };
 use crate::peer::{PeerInfo, PeerState};
 use crate::tls::{NetStream, TlsConfig};
@@ -368,11 +369,11 @@ impl Node {
         let (peer_node_id, negotiated_format) = match response.kind {
             MessageKind::HelloAck {
                 node_id,
-                version,
+                protocol_version,
                 selected_format,
             } => {
-                if version != PROTOCOL_VERSION {
-                    return Err(protocol_version_mismatch(version));
+                if !is_protocol_version_compatible(protocol_version) {
+                    return Err(protocol_version_mismatch(protocol_version));
                 }
                 if !supported_formats_for(self.config.serialization_format)
                     .contains(&selected_format)
@@ -383,6 +384,9 @@ impl Node {
                 }
                 info!(peer = %node_id, serialization_format = ?selected_format, "handshake complete");
                 (node_id, selected_format)
+            }
+            MessageKind::Error { error } => {
+                return Err(NetError::Wire(error));
             }
             _ => {
                 return Err(NetError::InvalidMessage("expected HelloAck".into()));
@@ -711,16 +715,26 @@ async fn handle_incoming(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Wait for HELLO
-    let msg = read_message(&mut reader, limits.max_message_size, limits.socket_timeout).await?;
+    let (hello_format, msg) =
+        read_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
+            .await?;
     let (peer_node_id, negotiated_format) = match msg.kind {
         MessageKind::Hello {
             node_id,
-            version,
+            protocol_version,
             supported_formats,
             preferred_format,
         } => {
-            if version != PROTOCOL_VERSION {
-                return Err(protocol_version_mismatch(version));
+            if !is_protocol_version_compatible(protocol_version) {
+                let error = WireError::protocol_mismatch(protocol_version);
+                let _ = write_message(
+                    &mut writer,
+                    &Message::wire_error(error),
+                    hello_format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(protocol_version_mismatch(protocol_version));
             }
             let negotiated_format =
                 negotiate_serialization_format(limits.serialization_format, &supported_formats)
@@ -738,6 +752,9 @@ async fn handle_incoming(
                 );
             }
             (node_id, negotiated_format)
+        }
+        MessageKind::Error { error } => {
+            return Err(NetError::Wire(error));
         }
         _ => {
             return Err(NetError::InvalidMessage("expected Hello".into()));
@@ -907,9 +924,11 @@ fn negotiate_serialization_format(
 }
 
 fn protocol_version_mismatch(their_version: u32) -> NetError {
-    NetError::InvalidMessage(format!(
-        "protocol version mismatch: expected {PROTOCOL_VERSION}, got {their_version}"
-    ))
+    NetError::Wire(WireError::protocol_mismatch(their_version))
+}
+
+fn is_protocol_version_compatible(peer_version: u32) -> bool {
+    peer_version == PROTOCOL_VERSION
 }
 
 async fn send_node_event(
@@ -1018,6 +1037,9 @@ async fn read_loop(
             MessageKind::Pong => {
                 debug!(peer = %peer_node_id, "received pong");
             }
+            MessageKind::Error { error } => {
+                return Err(NetError::Wire(error));
+            }
             _ => {
                 debug!(peer = %peer_node_id, kind = ?msg.kind, "unhandled message");
             }
@@ -1059,6 +1081,15 @@ async fn read_message<R: AsyncReadExt + Unpin>(
     max_message_size: usize,
     socket_timeout: Duration,
 ) -> NetResult<Message> {
+    let (_, msg) = read_message_with_format(reader, max_message_size, socket_timeout).await?;
+    Ok(msg)
+}
+
+async fn read_message_with_format<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    max_message_size: usize,
+    socket_timeout: Duration,
+) -> NetResult<(SerializationFormat, Message)> {
     // Read length (4 bytes)
     let mut len_buf = [0u8; 4];
     timeout(socket_timeout, reader.read_exact(&mut len_buf))
@@ -1080,7 +1111,7 @@ async fn read_message<R: AsyncReadExt + Unpin>(
         .await
         .map_err(|_| NetError::Timeout)??;
 
-    Message::from_bytes(&buf)
+    Message::from_bytes_with_format(&buf)
 }
 
 #[cfg(test)]
@@ -1375,7 +1406,7 @@ mod tests {
             let ack = Message {
                 kind: MessageKind::HelloAck {
                     node_id: NodeId::new("old-peer"),
-                    version: PROTOCOL_VERSION - 1,
+                    protocol_version: PROTOCOL_VERSION - 1,
                     selected_format: SerializationFormat::Bincode,
                 },
             };
@@ -1391,10 +1422,21 @@ mod tests {
 
         let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
 
-        assert!(
-            matches!(err, NetError::InvalidMessage(msg) if msg.contains("protocol version mismatch"))
-        );
+        assert!(matches!(
+            err,
+            NetError::Wire(WireError::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                got
+            }) if got == PROTOCOL_VERSION - 1
+        ));
         accept_task.await.unwrap();
+    }
+
+    #[test]
+    fn protocol_compatibility_requires_an_exact_version_match() {
+        assert!(is_protocol_version_compatible(PROTOCOL_VERSION));
+        assert!(!is_protocol_version_compatible(PROTOCOL_VERSION - 1));
+        assert!(!is_protocol_version_compatible(PROTOCOL_VERSION + 1));
     }
 
     #[tokio::test]
@@ -1410,7 +1452,7 @@ mod tests {
         let hello = Message {
             kind: MessageKind::Hello {
                 node_id: NodeId::new("old-peer"),
-                version: PROTOCOL_VERSION - 1,
+                protocol_version: PROTOCOL_VERSION - 1,
                 supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
                 preferred_format: SerializationFormat::Bincode,
             },
@@ -1418,6 +1460,23 @@ mod tests {
         let bytes = hello.to_bytes().unwrap();
         stream.write_all(&bytes).await.unwrap();
         stream.flush().await.unwrap();
+
+        let reply = read_message(
+            &mut stream,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reply.kind,
+            MessageKind::Error {
+                error: WireError::ProtocolMismatch {
+                    expected: PROTOCOL_VERSION,
+                    got
+                }
+            } if got == PROTOCOL_VERSION - 1
+        ));
 
         let event = timeout(Duration::from_millis(200), events.recv()).await;
         assert!(event.is_err(), "old protocol peer must not connect");

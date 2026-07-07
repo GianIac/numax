@@ -1,6 +1,6 @@
 [package]
 name = "nx-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -11,9 +11,9 @@ sha2 = "0.11.0"
 serde_json = "1"
 wasmtime = "43.0.1"
 wasmtime-wasi = "43.0.1"
-nx-store = { path = "../nx-store" }
-nx-sync = { path = "../nx-sync" }
-nx-net = { path = "../nx-net" }
+nx-store = { version = "0.1.1", path = "../nx-store" }
+nx-sync = { version = "0.1.1", path = "../nx-sync" }
+nx-net = { version = "0.1.1", path = "../nx-net" }
 tokio = { version = "1", features = ["io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 

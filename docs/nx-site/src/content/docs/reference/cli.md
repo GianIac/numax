@@ -3,10 +3,11 @@ title: CLI
 description: Reference for the `nx` command line interface.
 ---
 
-`nx` is the Numax command line interface. It has two commands:
+`nx` is the Numax command line interface. It has three commands:
 
 - `nx run` - load and execute a WASM module
 - `nx config` - manage configuration files
+- `nx migrate` - migrate a datastore schema offline
 
 ---
 
@@ -113,6 +114,30 @@ the resolution order is:
 
 ```
 CLI flags > NX_* environment variables > TOML config file > runtime defaults
+```
+
+---
+
+## nx migrate
+
+```
+nx migrate [OPTIONS]
+```
+
+Opens an existing local datastore, runs the registered schema migrations,
+flushes the store, and exits. Run this while no `nx run` process is using the
+same datastore.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--datastore-path <PATH>` | `./nx-data` | Existing datastore directory to migrate |
+| `--max-records <COUNT>` | `512` | Maximum records processed per migration batch |
+| `--max-bytes <BYTES>` | `4MiB` | Maximum bytes processed per migration batch, including generated mutations |
+
+Example:
+
+```bash
+nx migrate --datastore-path ./node-a-data
 ```
 
 ---

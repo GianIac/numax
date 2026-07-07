@@ -103,9 +103,9 @@ connect_to_peer(addr)
   2. TCP connect with socket_timeout
   3. TLS handshake (if configured)
   4. capture peer_cert DER bytes
-  5. send Hello { node_id, version, supported_formats, preferred_format }
-  6. receive HelloAck { node_id, version, selected_format }
-  7. validate protocol version == PROTOCOL_VERSION (2)
+  5. send Hello { node_id, protocol_version, supported_formats, preferred_format }
+  6. receive HelloAck { node_id, protocol_version, selected_format }
+  7. validate protocol version == PROTOCOL_VERSION (4)
   8. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
   9. if allowlist configured: verify peer_node_id in allowed_peers
   10. insert PeerConnection into peers map
@@ -122,7 +122,7 @@ handle_incoming(stream, addr, context)
   3. validate protocol version
   4. negotiate_serialization_format
   5. TLS identity binding (same as outbound)
-  6. send HelloAck { node_id, version, selected_format }
+  6. send HelloAck { node_id, protocol_version, selected_format }
   7. insert PeerConnection into peers map
   8. emit PeerConnected event
   9. run read_loop inline (not spawned - task already spawned by listener)
@@ -142,18 +142,35 @@ Every message is framed as:
 - Format byte: `0x01` = JSON, `0x02` = bincode.
 - Payload is the serialized `Message` struct.
 
-`PROTOCOL_VERSION = 2`. Version mismatch during handshake causes immediate disconnect.
+`PROTOCOL_VERSION = 4`. Version mismatch during handshake causes a structured
+`WireError::ProtocolMismatch` and immediate disconnect.
 
 ### MessageKind variants
 
 | Variant | Direction | Purpose |
 |---|---|---|
-| `Hello` | dialer -> listener | Open handshake: node identity, version, supported formats |
-| `HelloAck` | listener -> dialer | Accept handshake: selected format confirmed |
+| `Hello` | dialer -> listener | Open handshake: node identity, protocol version, supported formats |
+| `HelloAck` | listener -> dialer | Accept handshake: protocol version and selected format |
 | `PushOps` | both | Carry a batch of CRDT ops |
 | `PushOpsAck` | both | Acknowledge reception count |
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
 | `Ping` / `Pong` | both | Keepalive |
+| `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
+
+### WireError semantics
+
+| Error | Retry policy | Meaning |
+|---|---|---|
+| `ProtocolMismatch` | Fatal | Different wire contracts. Upgrade/downgrade one side before reconnecting. |
+| `NotAuthorized` | Fatal for that peer/config | Credentials, certificate identity, or allowlist must change before retrying. |
+| `RateLimited` | Retryable | Back off. Use `retry_after_ms` when present, otherwise use normal reconnect backoff. |
+| `OpRejected` | Fatal for those ops | Do not resend the same rejected ops unchanged. Current generic error handling closes the peer connection. |
+| `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
+
+The configured-peer reconnect loop uses this policy: fatal wire errors stop
+automatic reconnect for that peer, `RateLimited.retry_after_ms` is honored up to
+the configured reconnect max delay, and retryable errors keep the normal
+exponential backoff.
 
 ### Serialization format negotiation
 

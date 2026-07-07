@@ -1,11 +1,18 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::StoreError;
 
 #[derive(Clone)]
 pub struct Store {
     db: sled::Db,
+    write_lock: Arc<RwLock<()>>,
+}
+
+pub struct StoreWriteLease<'a> {
+    store: &'a Store,
+    _guard: RwLockWriteGuard<'a, ()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +37,10 @@ impl Store {
 
         // open sled in a specific dir
         let db = sled::open(path)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            write_lock: Arc::new(RwLock::new(())),
+        })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
@@ -42,14 +52,66 @@ impl Store {
         Ok(self.db.contains_key(key)?)
     }
 
+    pub fn prefix_exists(&self, prefix: &[u8]) -> Result<bool, StoreError> {
+        match self.db.scan_prefix(prefix).next() {
+            Some(item) => {
+                item?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.db.insert(key, value)?;
-        // For now, there's no explicit flush; sled is safe. I expect a stronger "durability":
-        // self.db.flush()?;
-        Ok(())
+        let _guard = self
+            .write_lock
+            .read()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        self.set_unlocked(key, value)
     }
 
     pub fn apply_batch(
+        &self,
+        sets: &[(&[u8], &[u8])],
+        deletes: &[&[u8]],
+    ) -> Result<(), StoreError> {
+        let _guard = self
+            .write_lock
+            .read()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        self.apply_batch_unlocked(sets, deletes)
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        let _guard = self
+            .write_lock
+            .read()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        self.delete_unlocked(key)
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
+        let guard = self
+            .write_lock
+            .write()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        Ok(StoreWriteLease {
+            store: self,
+            _guard: guard,
+        })
+    }
+
+    fn set_unlocked(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.db.insert(key, value)?;
+        Ok(())
+    }
+
+    fn apply_batch_unlocked(
         &self,
         sets: &[(&[u8], &[u8])],
         deletes: &[&[u8]],
@@ -65,13 +127,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+    fn delete_unlocked(&self, key: &[u8]) -> Result<(), StoreError> {
         self.db.remove(key)?;
-        Ok(())
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.db.flush()?;
         Ok(())
     }
 
@@ -174,6 +231,65 @@ impl Store {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn scan_prefix_page_after_bounded(
+        &self,
+        prefix: &[u8],
+        start_after_key: Option<&[u8]>,
+        max_records: u32,
+        max_bytes: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let mut out = Vec::new();
+        let max_records = max_records as usize;
+        if max_records == 0 {
+            return Ok(out);
+        }
+        let mut accumulated_bytes = 0usize;
+
+        let mut push_item = |key: sled::IVec, value: sled::IVec| -> Result<bool, StoreError> {
+            let record_bytes = key.len().saturating_add(value.len());
+            if record_bytes > max_bytes {
+                return Err(StoreError::ScanBatchByteLimitExceeded {
+                    record_bytes,
+                    max_bytes,
+                });
+            }
+            if !out.is_empty() && accumulated_bytes.saturating_add(record_bytes) > max_bytes {
+                return Ok(false);
+            }
+            accumulated_bytes = accumulated_bytes.saturating_add(record_bytes);
+            out.push((key.to_vec(), value.to_vec()));
+            Ok(out.len() < max_records)
+        };
+
+        match start_after_key {
+            Some(start_after) => {
+                for item in self.db.range(start_after.to_vec()..) {
+                    let (key, value) = item?;
+                    if key.as_ref() <= start_after {
+                        continue;
+                    }
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    if !push_item(key, value)? {
+                        break;
+                    }
+                }
+            }
+            None => {
+                for item in self.db.scan_prefix(prefix) {
+                    let (key, value) = item?;
+                    if !push_item(key, value)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn keys_prefix_page(
         &self,
         prefix: &[u8],
@@ -247,5 +363,27 @@ impl Store {
         }
 
         Ok(out)
+    }
+}
+
+impl StoreWriteLease<'_> {
+    pub fn store(&self) -> &Store {
+        self.store
+    }
+
+    pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.store.set_unlocked(key, value)
+    }
+
+    pub fn apply_batch(
+        &self,
+        sets: &[(&[u8], &[u8])],
+        deletes: &[&[u8]],
+    ) -> Result<(), StoreError> {
+        self.store.apply_batch_unlocked(sets, deletes)
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.store.delete_unlocked(key)
     }
 }

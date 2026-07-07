@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use crate::{NetError, NetResult};
 use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -37,13 +39,80 @@ impl SerializationFormat {
 pub const DEFAULT_SUPPORTED_FORMATS: &[SerializationFormat] =
     &[SerializationFormat::Bincode, SerializationFormat::Json];
 
+/// Structured error sent over the wire before closing or rejecting a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireError {
+    ProtocolMismatch { expected: u32, got: u32 },
+    OpRejected { reason: String },
+    RateLimited { retry_after_ms: Option<u64> },
+    NotAuthorized { reason: String },
+    Internal { reason: String },
+}
+
+/// Reconnect behavior implied by a structured wire error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WireRetryPolicy {
+    Fatal,
+    Retry,
+    RetryAfter(Duration),
+    RequestFatal,
+}
+
+impl WireError {
+    pub fn protocol_mismatch(got: u32) -> Self {
+        Self::ProtocolMismatch {
+            expected: PROTOCOL_VERSION,
+            got,
+        }
+    }
+
+    pub fn retry_policy(&self) -> WireRetryPolicy {
+        match self {
+            Self::ProtocolMismatch { .. } | Self::NotAuthorized { .. } => WireRetryPolicy::Fatal,
+            Self::RateLimited {
+                retry_after_ms: Some(retry_after_ms),
+            } => WireRetryPolicy::RetryAfter(Duration::from_millis(*retry_after_ms)),
+            Self::RateLimited {
+                retry_after_ms: None,
+            }
+            | Self::Internal { .. } => WireRetryPolicy::Retry,
+            Self::OpRejected { .. } => WireRetryPolicy::RequestFatal,
+        }
+    }
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolMismatch { expected, got } => {
+                write!(
+                    formatter,
+                    "protocol version mismatch: expected {expected}, got {got}"
+                )
+            }
+            Self::OpRejected { reason } => write!(formatter, "op rejected: {reason}"),
+            Self::RateLimited { retry_after_ms } => match retry_after_ms {
+                Some(retry_after_ms) => write!(
+                    formatter,
+                    "rate limited: retry after {retry_after_ms} milliseconds"
+                ),
+                None => formatter.write_str("rate limited"),
+            },
+            Self::NotAuthorized { reason } => write!(formatter, "not authorized: {reason}"),
+            Self::Internal { reason } => write!(formatter, "internal wire error: {reason}"),
+        }
+    }
+}
+
 /// Message type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     /// Initial handshake.
     Hello {
         node_id: NodeId,
-        version: u32,
+        #[serde(alias = "version")]
+        protocol_version: u32,
         supported_formats: Vec<SerializationFormat>,
         preferred_format: SerializationFormat,
     },
@@ -51,7 +120,8 @@ pub enum MessageKind {
     /// Response to Hello.
     HelloAck {
         node_id: NodeId,
-        version: u32,
+        #[serde(alias = "version")]
+        protocol_version: u32,
         selected_format: SerializationFormat,
     },
 
@@ -70,6 +140,9 @@ pub enum MessageKind {
 
     /// Response to Ping.
     Pong,
+
+    /// Structured protocol error.
+    Error { error: WireError },
 }
 
 /// Complete message with metadata.
@@ -95,7 +168,7 @@ impl Message {
         Self {
             kind: MessageKind::Hello {
                 node_id,
-                version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
                 supported_formats,
                 preferred_format,
             },
@@ -110,7 +183,7 @@ impl Message {
         Self {
             kind: MessageKind::HelloAck {
                 node_id,
-                version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION,
                 selected_format,
             },
         }
@@ -145,6 +218,12 @@ impl Message {
     pub fn pong() -> Self {
         Self {
             kind: MessageKind::Pong,
+        }
+    }
+
+    pub fn wire_error(error: WireError) -> Self {
+        Self {
+            kind: MessageKind::Error { error },
         }
     }
 
@@ -212,17 +291,26 @@ mod tests {
         match &msg.kind {
             MessageKind::Hello {
                 node_id: id,
-                version,
+                protocol_version,
                 supported_formats,
                 preferred_format,
             } => {
                 assert_eq!(id, &node_id);
-                assert_eq!(*version, PROTOCOL_VERSION);
+                assert_eq!(*protocol_version, PROTOCOL_VERSION);
                 assert_eq!(supported_formats, DEFAULT_SUPPORTED_FORMATS);
                 assert_eq!(*preferred_format, SerializationFormat::Bincode);
             }
             _ => panic!("wrong message kind"),
         }
+    }
+
+    #[test]
+    fn hello_json_uses_explicit_protocol_version_field() {
+        let value = serde_json::to_value(Message::hello(NodeId::new("test-node"))).unwrap();
+        let hello = &value["kind"]["Hello"];
+
+        assert_eq!(hello["protocol_version"], PROTOCOL_VERSION);
+        assert!(hello.get("version").is_none());
     }
 
     #[test]
@@ -275,5 +363,67 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn wire_error_roundtrips() {
+        let msg = Message::wire_error(WireError::ProtocolMismatch {
+            expected: PROTOCOL_VERSION,
+            got: PROTOCOL_VERSION - 1,
+        });
+
+        let bytes = msg
+            .to_bytes_with_format(SerializationFormat::Bincode)
+            .unwrap();
+        let (_, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
+
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn wire_error_retry_policy_matches_semantics() {
+        assert_eq!(
+            WireError::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                got: PROTOCOL_VERSION - 1,
+            }
+            .retry_policy(),
+            WireRetryPolicy::Fatal
+        );
+        assert_eq!(
+            WireError::NotAuthorized {
+                reason: "denied".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::Fatal
+        );
+        assert_eq!(
+            WireError::RateLimited {
+                retry_after_ms: Some(250),
+            }
+            .retry_policy(),
+            WireRetryPolicy::RetryAfter(Duration::from_millis(250))
+        );
+        assert_eq!(
+            WireError::RateLimited {
+                retry_after_ms: None,
+            }
+            .retry_policy(),
+            WireRetryPolicy::Retry
+        );
+        assert_eq!(
+            WireError::Internal {
+                reason: "temporary".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::Retry
+        );
+        assert_eq!(
+            WireError::OpRejected {
+                reason: "bad op".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::RequestFatal
+        );
     }
 }

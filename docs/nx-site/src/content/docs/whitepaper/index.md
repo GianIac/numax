@@ -458,7 +458,7 @@ data. Bincode is the default production format; JSON is selected with
 | `Ping` | Bidirectional | Keepalive |
 | `Pong` | Bidirectional | Response to Ping |
 
-**Protocol versioning:** version number (`PROTOCOL_VERSION = 2`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity.
+**Protocol versioning:** version number (`PROTOCOL_VERSION = 4`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity.
 
 **Current status:**
 
@@ -937,7 +937,7 @@ v0.1.0 is the first stable release line. We recognize its limits, explicitly:
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Observability is operational but intentionally small.** Structured logs, Prometheus-compatible metrics, health checks, a ready-made Prometheus/Grafana stack, a Grafana dashboard and PromQL examples are available. Deeper tracing and richer built-in dashboards remain future work.
-- **Wire format and Host API are versioned but still young.** The current wire protocol is versioned (`PROTOCOL_VERSION = 2`) and supports bincode by default with JSON debug mode. Future incompatible changes must be explicit and versioned.
+- **Wire format and Host API are versioned but still young.** The current wire protocol is versioned (`PROTOCOL_VERSION = 4`) and supports bincode by default with JSON debug mode. Future incompatible changes must be explicit and versioned.
 - **Available CRDTs are still expanding.** GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA are implemented; additional CRDT families remain future work.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
 - **Not optimized for CPU-bound workloads.** The focus is I/O and coordination, not intensive computation.

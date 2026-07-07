@@ -32,6 +32,17 @@ fn nx_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_nx"))
 }
 
+fn previous_nx_bin() -> PathBuf {
+    let path = std::env::var_os("NUMAX_PREVIOUS_NX_BIN")
+        .map(PathBuf::from)
+        .expect("NUMAX_PREVIOUS_NX_BIN must point to the previous release binary");
+    assert!(
+        path.is_file(),
+        "NUMAX_PREVIOUS_NX_BIN does not point to a file: {path:?}"
+    );
+    path
+}
+
 fn distributed_counter_wasm() -> PathBuf {
     workspace_root().join(
         "examples/distributed_counter/target/wasm32-unknown-unknown/release/distributed_counter.wasm",
@@ -170,6 +181,90 @@ fn two_nx_run_processes_converge_distributed_counter() {
     assert_success(&output_b, "node B");
     assert_printed_counter(&output_a, "node A", 2);
     assert_printed_counter(&output_b, "node B", 2);
+}
+
+#[test]
+#[ignore = "requires v0.1.0 nx binary, built distributed_counter.wasm and local TCP sockets"]
+fn different_protocol_versions_reject_connection_without_exchanging_ops() {
+    let wasm = assert_counter_wasm_exists();
+
+    let current_addr = free_addr();
+    let previous_addr = free_addr();
+    let current_data = temp_path("protocol-v3");
+    let previous_data = temp_path("protocol-v2");
+    let current_nx = nx_bin();
+    let previous_nx = previous_nx_bin();
+
+    let current_node = Command::new(&current_nx)
+        .env("RUST_LOG", "nx_net=error")
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(&current_addr)
+        .arg("--peer")
+        .arg(&previous_addr)
+        .arg("--datastore-path")
+        .arg(&current_data)
+        .arg("--wait-before-run")
+        .arg("1500ms")
+        .arg("--settle-for")
+        .arg("1800ms")
+        .arg("--print-gcounter")
+        .arg(COUNTER_KEY)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn current protocol node");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let previous_output = Command::new(&previous_nx)
+        .env("RUST_LOG", "nx_net=error")
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(&previous_addr)
+        .arg("--peer")
+        .arg(&current_addr)
+        .arg("--datastore-path")
+        .arg(&previous_data)
+        .arg("--wait-before-run")
+        .arg("1500ms")
+        .arg("--settle-for")
+        .arg("1800ms")
+        .arg("--print-gcounter")
+        .arg(COUNTER_KEY)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run previous protocol node");
+
+    let current_output = current_node
+        .wait_with_output()
+        .expect("wait current protocol node");
+
+    assert_success(&current_output, "current protocol node");
+    assert_success(&previous_output, "previous protocol node");
+    assert_printed_counter(&current_output, "current protocol node", 1);
+    assert_printed_counter(&previous_output, "previous protocol node", 1);
+
+    let current_stdout = String::from_utf8_lossy(&current_output.stdout);
+    let current_stderr = String::from_utf8_lossy(&current_output.stderr);
+    let previous_stdout = String::from_utf8_lossy(&previous_output.stdout);
+    let previous_stderr = String::from_utf8_lossy(&previous_output.stderr);
+    let protocol_mismatch_reported = current_stdout
+        .contains("protocol version mismatch: expected 4, got 2")
+        || current_stdout.contains("protocol version mismatch: expected 2, got 4")
+        || current_stderr.contains("protocol version mismatch: expected 2, got 4")
+        || current_stderr.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stdout.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stdout.contains("protocol version mismatch: expected 2, got 4")
+        || previous_stderr.contains("protocol version mismatch: expected 4, got 2")
+        || previous_stderr.contains("protocol version mismatch: expected 2, got 4");
+    assert!(
+        protocol_mismatch_reported,
+        "neither node reported the protocol mismatch\ncurrent stdout:\n{current_stdout}\ncurrent stderr:\n{current_stderr}\nprevious stdout:\n{previous_stdout}\nprevious stderr:\n{previous_stderr}"
+    );
 }
 
 #[cfg(unix)]

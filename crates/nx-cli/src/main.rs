@@ -1,6 +1,7 @@
 mod config;
 
 use std::fs;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,6 +9,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::*;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
+use nx_core::sync_manager::{
+    DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
+    migrate_sync_schema_at_path,
+};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -119,6 +124,21 @@ enum Cli {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+
+    /// Migrate a datastore schema offline without running a module
+    Migrate {
+        /// Datastore directory path to migrate.
+        #[arg(long, value_name = "PATH", default_value = "./nx-data")]
+        datastore_path: PathBuf,
+
+        /// Maximum records processed per migration batch.
+        #[arg(long, value_name = "COUNT", default_value_t = DEFAULT_MIGRATION_BATCH_SIZE, value_parser = parse_nonzero_u32)]
+        max_records: NonZeroU32,
+
+        /// Maximum bytes processed per migration batch, including generated mutations.
+        #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MIGRATION_BATCH_BYTES, value_parser = parse_nonzero_byte_size)]
+        max_bytes: NonZeroUsize,
     },
 }
 
@@ -345,9 +365,31 @@ async fn real_main() -> Result<()> {
                 print!("{}", effective.render_effective_toml());
             }
         },
+        Cli::Migrate {
+            datastore_path,
+            max_records,
+            max_bytes,
+        } => {
+            let options = MigrationOptions {
+                max_records,
+                max_bytes,
+            };
+            migrate_sync_schema_at_path(&datastore_path, options)?;
+            println!("datastore migrated: {}", datastore_path.display());
+        }
     }
 
     Ok(())
+}
+
+fn parse_nonzero_u32(input: &str) -> Result<NonZeroU32> {
+    let value = input.parse::<u32>()?;
+    NonZeroU32::new(value).ok_or_else(|| anyhow::anyhow!("value must be greater than zero"))
+}
+
+fn parse_nonzero_byte_size(input: &str) -> Result<NonZeroUsize> {
+    let value = parse_byte_size(input)?;
+    NonZeroUsize::new(value).ok_or_else(|| anyhow::anyhow!("value must be greater than zero"))
 }
 
 #[cfg(test)]
@@ -1129,7 +1171,7 @@ mod tests {
                     assert!(!verbose);
                     assert!(!tls_insecure);
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1195,7 +1237,7 @@ mod tests {
             .unwrap();
             match cli {
                 Cli::Run { peers, .. } => assert_eq!(peers, vec!["a:1", "b:2", "c:3"]),
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1204,7 +1246,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "-v"]).unwrap();
             match cli {
                 Cli::Run { verbose, .. } => assert!(verbose),
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1213,7 +1255,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--verbose"]).unwrap();
             match cli {
                 Cli::Run { verbose, .. } => assert!(verbose),
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1225,7 +1267,7 @@ mod tests {
                 Cli::Run { datastore_path, .. } => {
                     assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1237,8 +1279,58 @@ mod tests {
                 Cli::Run { config, .. } => {
                     assert_eq!(config, Some(PathBuf::from("numax.toml")));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
+        }
+
+        #[test]
+        fn migrate_defaults_parsed() {
+            let cli = Cli::try_parse_from(["nx", "migrate"]).unwrap();
+            match cli {
+                Cli::Migrate {
+                    datastore_path,
+                    max_records,
+                    max_bytes,
+                } => {
+                    assert_eq!(datastore_path, PathBuf::from("./nx-data"));
+                    assert_eq!(max_records, DEFAULT_MIGRATION_BATCH_SIZE);
+                    assert_eq!(max_bytes, DEFAULT_MIGRATION_BATCH_BYTES);
+                }
+                _ => panic!("expected migrate command"),
+            }
+        }
+
+        #[test]
+        fn migrate_custom_limits_parsed() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "migrate",
+                "--datastore-path",
+                "/tmp/nx-data",
+                "--max-records",
+                "7",
+                "--max-bytes",
+                "8KiB",
+            ])
+            .unwrap();
+            match cli {
+                Cli::Migrate {
+                    datastore_path,
+                    max_records,
+                    max_bytes,
+                } => {
+                    assert_eq!(datastore_path, PathBuf::from("/tmp/nx-data"));
+                    assert_eq!(max_records.get(), 7);
+                    assert_eq!(max_bytes.get(), 8 * 1024);
+                }
+                _ => panic!("expected migrate command"),
+            }
+        }
+
+        #[test]
+        fn migrate_rejects_zero_limits() {
+            assert!(Cli::try_parse_from(["nx", "migrate", "--max-records", "0"]).is_err());
+            assert!(Cli::try_parse_from(["nx", "migrate", "--max-bytes", "0"]).is_err());
         }
 
         #[test]
@@ -1249,7 +1341,7 @@ mod tests {
                     command: ConfigCommand::Validate { config },
                 } => assert_eq!(config, PathBuf::from("numax.toml")),
                 Cli::Run { .. } => panic!("expected config command"),
-                Cli::Config { .. } => panic!("expected config validate command"),
+                _ => panic!("expected config validate command"),
             }
         }
 
@@ -1262,7 +1354,7 @@ mod tests {
                     command: ConfigCommand::Validate { config },
                 } => assert_eq!(config, PathBuf::from("prod.toml")),
                 Cli::Run { .. } => panic!("expected config command"),
-                Cli::Config { .. } => panic!("expected config validate command"),
+                _ => panic!("expected config validate command"),
             }
         }
 
@@ -1277,7 +1369,7 @@ mod tests {
                     assert!(!force);
                 }
                 Cli::Run { .. } => panic!("expected config command"),
-                Cli::Config { .. } => panic!("expected config init command"),
+                _ => panic!("expected config init command"),
             }
         }
 
@@ -1294,7 +1386,7 @@ mod tests {
                     assert!(force);
                 }
                 Cli::Run { .. } => panic!("expected config command"),
-                Cli::Config { .. } => panic!("expected config init command"),
+                _ => panic!("expected config init command"),
             }
         }
 
@@ -1317,7 +1409,7 @@ mod tests {
                     assert!(effective);
                 }
                 Cli::Run { .. } => panic!("expected config command"),
-                Cli::Config { .. } => panic!("expected config show command"),
+                _ => panic!("expected config show command"),
             }
         }
 
@@ -1346,7 +1438,7 @@ mod tests {
                     assert_eq!(log_level.as_deref(), Some("debug"));
                     assert_eq!(log_format, Some(LogFormat::Json));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1358,7 +1450,7 @@ mod tests {
                 Cli::Run { listen, .. } => {
                     assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1367,7 +1459,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--debug-protocol"]).unwrap();
             match cli {
                 Cli::Run { debug_protocol, .. } => assert!(debug_protocol),
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1378,7 +1470,7 @@ mod tests {
                 Cli::Run { settle_for, .. } => {
                     assert_eq!(settle_for, Some(Duration::from_secs(5)));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1397,7 +1489,7 @@ mod tests {
                 } => {
                     assert_eq!(wait_before_run, Some(Duration::from_millis(500)));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1410,7 +1502,7 @@ mod tests {
                 Cli::Run { print_gcounter, .. } => {
                     assert_eq!(print_gcounter.as_deref(), Some("counter:visits"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1430,7 +1522,7 @@ mod tests {
                 } => {
                     assert_eq!(print_pncounter.as_deref(), Some("inventory:sku-1"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1450,7 +1542,7 @@ mod tests {
                 } => {
                     assert_eq!(print_lww_register.as_deref(), Some("status:service-a"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1468,7 +1560,7 @@ mod tests {
                 Cli::Run { print_lww_map, .. } => {
                     assert_eq!(print_lww_map.as_deref(), Some("settings:service-a"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1480,7 +1572,7 @@ mod tests {
                 Cli::Run { print_orset, .. } => {
                     assert_eq!(print_orset.as_deref(), Some("tags:doc-1"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1492,7 +1584,7 @@ mod tests {
                 Cli::Run { print_rga, .. } => {
                     assert_eq!(print_rga.as_deref(), Some("comments:doc-1"));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1506,7 +1598,7 @@ mod tests {
                 } => {
                     assert_eq!(shutdown_timeout, Some(Duration::from_secs(10)));
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1549,7 +1641,7 @@ mod tests {
                     assert_eq!(allowed_peers.as_deref(), Some("abc,def"));
                     assert!(!tls_insecure);
                 }
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
 
@@ -1558,7 +1650,7 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
             match cli {
                 Cli::Run { tls_insecure, .. } => assert!(tls_insecure),
-                Cli::Config { .. } => panic!("expected run command"),
+                _ => panic!("expected run command"),
             }
         }
     }

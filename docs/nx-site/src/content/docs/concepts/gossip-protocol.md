@@ -67,8 +67,9 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 | `PushOpsAck` | Acknowledgement message for received operations. The current sync path does not rely on it as a causal frontier. |
 | `PullSince` | Ask a peer for retained operations. Today this is usually sent with `None`. |
 | `Ping` / `Pong` | Keepalive message types. A received `Ping` is answered with `Pong`. |
+| `Error` | Structured wire error sent before rejecting a request or closing a connection. |
 
-The protocol version is currently `2`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
+The protocol version is currently `4`. Peers negotiate either `Bincode` or `Json`, with `Bincode` as the production default and `Json` available for debug-style interoperability.
 
 ---
 
@@ -77,13 +78,31 @@ The protocol version is currently `2`. Peers negotiate either `Bincode` or `Json
 When a node connects to a peer, the first exchange is:
 
 ```
-client -> server: Hello(node_id, version, supported_formats, preferred_format)
-server -> client: HelloAck(node_id, version, selected_format)
+client -> server: Hello(node_id, protocol_version, supported_formats, preferred_format)
+server -> client: HelloAck(node_id, protocol_version, selected_format)
 ```
 
 After that, both sides know the peer `NodeId` and the selected serialization format.
 
 If TLS is enabled, the claimed `NodeId` is checked against the peer certificate. This prevents a node from claiming an identity that does not match its certificate. Optional allowlists can further restrict which peer ids are accepted.
+
+### Protocol compatibility
+
+Numax currently requires an exact protocol-version match, there is no implicit
+forward or backward compatibility:
+
+| Local node | Peer node | Result |
+|---|---|---|
+| `N` | `N` | Compatible; continue the handshake |
+| `N` | `N - 1` | Incompatible; reject the handshake |
+| `N` | `N + 1` | Incompatible; reject the handshake |
+
+Both `Hello` and `HelloAck` carry an explicit `protocol_version`, a mismatch is
+rejected before the peer is registered or CRDT operations are exchanged.
+When possible, the rejecting peer sends `Error(ProtocolMismatch)` before closing.
+Serialization-format negotiation does not override protocol compatibility.
+The rules for evolving this contract are defined in
+[Wire Versioning](/numax/design/wire-versioning/).
 
 ---
 

@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::message::WireError;
+
 pub type NetResult<T> = Result<T, NetError>;
 
 #[derive(Debug, Error)]
@@ -21,6 +23,9 @@ pub enum NetError {
 
     #[error("invalid message: {0}")]
     InvalidMessage(String),
+
+    #[error("wire error: {0}")]
+    Wire(WireError),
 
     #[error("message too large: {len} > {limit}")]
     MessageTooLarge { len: usize, limit: usize },
