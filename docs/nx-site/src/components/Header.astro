@@ -13,16 +13,20 @@ const shouldRenderSearch =
 const isItalian = Astro.currentLocale === 'it';
 const basePath = import.meta.env.BASE_URL.replace(/\/$/, '');
 const prefix = isItalian ? '/it' : '';
-const navLinks = [
+const topLevelLinks = [
 	{
 		label: isItalian ? 'Documentazione' : 'Documentation',
-		href: `${basePath}${prefix}/getting-started/introduction/`,
+		slug: 'getting-started/introduction',
 	},
 	{
 		label: 'Blog',
-		href: `${basePath}${prefix}/blog/`,
+		slug: 'blog',
 	},
 ];
+const navLinks = topLevelLinks.map((link) => ({
+	label: link.label,
+	href: `${basePath}${prefix}/${link.slug}/`,
+}));
 ---
 
 <div class="header sl-flex">
