@@ -1,0 +1,84 @@
+---
+const { entry } = Astro.locals.starlightRoute;
+const isBlogPost = entry.slug.startsWith('blog/');
+
+const repo = import.meta.env.PUBLIC_GISCUS_REPO || 'GianIac/numax';
+const repoId = import.meta.env.PUBLIC_GISCUS_REPO_ID || 'R_kgDOQV6bpQ';
+const category = import.meta.env.PUBLIC_GISCUS_CATEGORY || 'Ideas';
+const categoryId = import.meta.env.PUBLIC_GISCUS_CATEGORY_ID || 'DIC_kwDOQV6bpc4C1qk6';
+const enabled = Boolean(isBlogPost && repo && repoId && category && categoryId);
+const showSetupNotice = Boolean(isBlogPost && import.meta.env.DEV && !enabled);
+---
+
+{
+	enabled && (
+		<section class="giscus-comments" aria-labelledby="comments-title">
+			<h2 id="comments-title">Comments</h2>
+			<p>
+				Join the conversation on GitHub Discussions. A GitHub account is required to comment.
+			</p>
+			<script
+				src="https://giscus.app/client.js"
+				data-repo={repo}
+				data-repo-id={repoId}
+				data-category={category}
+				data-category-id={categoryId}
+				data-mapping="pathname"
+				data-strict="0"
+				data-reactions-enabled="1"
+				data-emit-metadata="0"
+				data-input-position="bottom"
+				data-theme="preferred_color_scheme"
+				data-lang="it"
+				data-loading="lazy"
+				crossorigin="anonymous"
+				async
+				is:inline
+			></script>
+		</section>
+	)
+}
+
+{
+	showSetupNotice && (
+		<aside class="giscus-setup" aria-label="Giscus setup notice">
+			<strong>Giscus comments are not configured yet.</strong>
+			<span>
+				Set PUBLIC_GISCUS_REPO_ID and PUBLIC_GISCUS_CATEGORY_ID to enable GitHub
+				Discussion comments for blog posts.
+			</span>
+		</aside>
+	)
+}
+
+<style>
+	.giscus-comments,
+	.giscus-setup {
+		margin-top: 3rem;
+		padding-top: 2rem;
+		border-top: 1px solid var(--sl-color-gray-5);
+	}
+
+	.giscus-comments h2 {
+		margin-top: 0;
+	}
+
+	.giscus-comments p,
+	.giscus-setup {
+		color: var(--sl-color-gray-3);
+		font-size: var(--sl-text-sm);
+	}
+
+	.giscus-setup {
+		display: grid;
+		gap: 0.35rem;
+		padding: 1rem;
+		border: 1px solid var(--sl-color-gray-5);
+		border-radius: 0.5rem;
+		background: var(--sl-color-gray-6);
+	}
+
+	.giscus-setup strong {
+		color: var(--sl-color-white);
+	}
+</style>
