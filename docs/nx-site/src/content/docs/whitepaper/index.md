@@ -424,7 +424,7 @@ same end-to-end flows.
 
 **Hydration** *(Implemented)* - on startup, the runtime rebuilds the in-memory GCounter registry from durable CRDT state/op-log data, with materialized sled totals retained as a fallback. Dedup metadata is also persisted so recent duplicate remote operations after restart do not double count.
 
-**CRDTs available in `v0.1.0`:**
+**CRDTs available in the actual last version:**
 
 | Type | Description | Status |
 |------|-------------|--------|
@@ -492,7 +492,7 @@ Numax assumes a hostile network: the transport can be observed, altered or redir
 
 **Dedicated CLI flags:** `--tls-cert`, `--tls-key`, `--tls-ca`, `--allowed-peers`, `--tls-insecure` (the latter only for local development).
 
-**Out of scope for v0.1.0:**
+**Out of scope for now:**
 
 - automatic certificate rotation;
 - advanced certificate pinning;
@@ -684,7 +684,7 @@ The model is **peer-to-peer with gossip**:
 
 The approach scales better than full-mesh and remains resilient in the presence of temporary disconnections. Full integration of dynamic fanout is in progress.
 
-### 5.9 Resilience: node down, intermittent network, reconnection *(Implemented in `v0.1.0`)*
+### 5.9 Resilience: node down, intermittent network, reconnection *(Implemented)*
 
 The network is considered fallible by nature. The implemented countermeasures
 for configured peers are:
