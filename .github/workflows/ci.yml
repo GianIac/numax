@@ -113,9 +113,44 @@ jobs:
           NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.0/target/release/nx
         run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
+  benchmark-regression:
+    name: Benchmark Regression Gate
+    runs-on: ubuntu-latest
+    env:
+      NUMAX_BENCH_GATE_MODE: ${{ vars.NUMAX_BENCH_GATE_MODE || 'shadow' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: Run sync load benchmark
+        run: |
+          mkdir -p reports/bench
+          cargo bench -p nx-core --bench three_node_sync_load -- \
+            --duration-secs 10 \
+            --target-ops-sec-per-node 1000 \
+            --settle-secs 10 \
+            --report reports/bench/three-node-sync-smoke.json
+      - name: Compare against baseline
+        run: |
+          node scripts/compare-benchmark-report.mjs \
+            --baseline crates/nx-core/reports/baselines/three-node-sync-smoke.json \
+            --current reports/bench/three-node-sync-smoke.json \
+            --mode "${NUMAX_BENCH_GATE_MODE}" \
+            --p99-threshold 5 \
+            --throughput-threshold 5 \
+            --rss-threshold 5
+      - name: Upload benchmark report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-regression-report
+          path: reports/bench/three-node-sync-smoke.json
+
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, build-wasm, cli-smoke]
+    needs: [check, fmt, clippy, test, build-wasm, cli-smoke, benchmark-regression]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -126,7 +161,8 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.build-wasm.result }}" != "success" ]] || \
-             [[ "${{ needs.cli-smoke.result }}" != "success" ]]; then
+             [[ "${{ needs.cli-smoke.result }}" != "success" ]] || \
+             [[ "${{ needs.benchmark-regression.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi
