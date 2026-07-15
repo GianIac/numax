@@ -19,9 +19,6 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
-> **Status:** `v0.1.0` - first stable Numax release line for controlled, non-critical workloads.
-> It works, it's tested, and the remaining limits are documented. See the [`Roadmap`](https://gianiac.github.io/numax/roadmap/).
-
 ---
 
 ## Why
