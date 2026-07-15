@@ -21,7 +21,7 @@ and hands a fully-built `RuntimeConfig` to `nx-core`. It never contains runtime 
 | Resolve precedence (CLI > env > file > defaults) | `config.rs` - `EffectiveRunConfig::resolve` |
 | Validate flag combinations (TLS, sync, settle) | `config.rs` - `validate_tls_flags`, `validate_settle_mode`, etc. |
 | Build `SyncConfig`, `TlsConfig`, `ObservabilityConfig` | `config.rs` - `build_sync_config`, `build_tls_config`, `build_observability_config` |
-| Initialize logging | `config.rs` - `init_logging` |
+| Initialize logging and optional Tokio Console diagnostics | `config.rs` - `init_logging` |
 | Generate `numax.toml` template | `config.rs` - `CONFIG_TEMPLATE`, `init_config_file` |
 | Print effective resolved config | `config.rs` - `EffectiveRunConfig::render_effective_toml` |
 
@@ -206,7 +206,7 @@ parse_byte_size("0MiB")     // Err - zero is rejected
 
 ## Logging setup
 
-`init_logging(log_level, log_format)` initializes `tracing_subscriber` once, before the runtime starts.
+`init_logging(log_level, log_format, tokio_console)` initializes `tracing_subscriber` once, before Numax starts its application and sync tasks. Builds compiled with the optional `tokio-console` feature can add the console subscriber as a layer without replacing text or JSON logging. Runtime activation additionally requires `nx run --tokio-console`.
 
 Log level resolution order:
 1. `--log-level` CLI flag

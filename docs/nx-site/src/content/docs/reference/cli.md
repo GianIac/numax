@@ -82,6 +82,16 @@ All of them require `--listen`.
 | Flag | Env | Description |
 |---|---|---|
 | `--observability-listen <ADDR>` | `NX_OBSERVABILITY_LISTEN` | Expose a local HTTP metrics endpoint (e.g. `127.0.0.1:9100`) |
+| `--tokio-console` | — | Expose opt-in Tokio task diagnostics from an instrumented build |
+
+`tokio-console` support is excluded from normal builds. Build and run the CLI explicitly with Tokio's experimental instrumentation enabled:
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo run -p nx-cli \
+  --features tokio-console -- run module.wasm --tokio-console
+```
+
+Then connect from another terminal with `tokio-console`. The subscriber listens on `127.0.0.1:6669` by default; use `TOKIO_CONSOLE_BIND` to select another address. Keep this diagnostic endpoint bound to a trusted interface.
 
 ### TLS / mTLS
 

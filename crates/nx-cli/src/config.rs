@@ -9,6 +9,8 @@ use nx_core::runtime::RuntimeConfig;
 use nx_core::{ObservabilityConfig, SerializationFormat, SyncConfig, TlsConfig};
 use serde::Deserialize;
 use tracing::warn;
+#[cfg(feature = "tokio-console")]
+use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -758,22 +760,58 @@ fn validate_optional_duration(name: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn init_logging(log_level: &str, log_format: LogFormat) {
+pub(crate) fn init_logging(
+    log_level: &str,
+    log_format: LogFormat,
+    tokio_console: bool,
+) -> Result<()> {
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level))
+    };
+
+    #[cfg(feature = "tokio-console")]
+    if tokio_console {
+        let console_layer = console_subscriber::spawn();
+        match log_format {
+            LogFormat::Text => tracing_subscriber::registry()
+                .with(console_layer)
+                .with(tracing_subscriber::fmt::layer().with_filter(env_filter()))
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("initialize tracing subscriber: {e}"))?,
+            LogFormat::Json => tracing_subscriber::registry()
+                .with(console_layer)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_filter(env_filter()),
+                )
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("initialize tracing subscriber: {e}"))?,
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "tokio-console"))]
+    if tokio_console {
+        bail!(
+            "--tokio-console requires a binary built with --features tokio-console and RUSTFLAGS=\"--cfg tokio_unstable\""
+        );
+    }
+
     match log_format {
         LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-            )
-            .init(),
+            .with_env_filter(env_filter())
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("initialize tracing subscriber: {e}"))?,
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-            )
-            .init(),
+            .with_env_filter(env_filter())
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("initialize tracing subscriber: {e}"))?,
     }
+
+    Ok(())
 }
 
 pub(crate) fn resolve_log_level(
