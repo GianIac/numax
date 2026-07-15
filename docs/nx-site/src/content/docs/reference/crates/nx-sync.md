@@ -369,11 +369,12 @@ pub enum SyncError {
 3. Add the new `OpKind` variants to `op.rs`.
 4. Add builder methods to `Op` in `op.rs`.
 5. Add `pub mod my_crdt` to `crdt/mod.rs` and re-export from `lib.rs`.
-6. Add the CRDT to the registry in `nx-core/src/sync_manager.rs`.
+6. Add the CRDT to the registry in `nx-core/src/sync_manager/manager.rs` and its
+   remote-op handling in `nx-core/src/sync_manager/apply.rs`.
 7. Add host API functions in `nx-core/src/host_api/crdt.rs`.
 8. Add SDK wrappers in `nx-sdk/src/crdt/my_crdt.rs`.
 9. Write tests: commutativity, associativity, idempotency, `apply_op`, JSON roundtrip.
-10. Write an E2E test in `sync_manager.rs`.
+10. Write an E2E test under `nx-core/src/sync_manager/tests/`.
 11. Write a distributed example in `examples/distributed_my_crdt/`.
 12. Check the completion rule from the Host API docs before marking it done.
 

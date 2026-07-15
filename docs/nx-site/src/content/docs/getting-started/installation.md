@@ -5,7 +5,7 @@ description: Install Numax on Linux, macOS, Windows or with Cargo.
 
 Numax installs the `nx` CLI.
 
-For `v0.1.0`, the recommended path is:
+For `v0.1.1`, the recommended path is:
 
 1. download a prebuilt binary from the GitHub Release;
 2. or build/install from source with Cargo.
@@ -38,7 +38,7 @@ rustup target add wasm32-unknown-unknown
 Use the Linux x86_64 musl build:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.1
 TARGET=x86_64-unknown-linux-musl
 ARCHIVE="numax-${VERSION}-${TARGET}.tar.gz"
 
@@ -61,7 +61,7 @@ For ARM64 Linux, use `TARGET=aarch64-unknown-linux-musl`.
 Apple Silicon:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.1
 TARGET=aarch64-apple-darwin
 ARCHIVE="numax-${VERSION}-${TARGET}.tar.gz"
 
@@ -78,7 +78,7 @@ nx --version
 Intel Mac:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.1
 TARGET=x86_64-apple-darwin
 ARCHIVE="numax-${VERSION}-${TARGET}.tar.gz"
 
@@ -99,7 +99,7 @@ nx --version
 Open PowerShell:
 
 ```powershell
-$Version = "v0.1.0"
+$Version = "v0.1.1"
 $Target = "x86_64-pc-windows-msvc"
 $Archive = "numax-$Version-$Target.zip"
 $Base = "https://github.com/GianIac/numax/releases/download/$Version"

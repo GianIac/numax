@@ -16,10 +16,12 @@ Everything below that boundary lives here or in the crates it composes.
 | WASM module loading, compilation, caching | `runtime.rs` - `Runtime::run_module`, `compile_or_get_cached_module` |
 | Host API surface (all `nx` namespace imports) | `host_api/` - one file per API group |
 | Lifecycle: start sync, run module, settle, serve, shutdown | `runtime.rs` - `Runtime` |
-| In-memory CRDT registry and op-log | `sync_manager.rs` - `SyncManager` |
-| Durable CRDT state on startup | `sync_manager.rs` - hydration from `nx-store` |
-| Anti-entropy scheduling | `sync_manager.rs` |
-| Peer broadcast | `sync_manager.rs` + `nx-net` |
+| Sync orchestration, in-memory CRDT registry and op-log | `sync_manager/manager.rs` - `SyncManager` |
+| Remote operation application | `sync_manager/apply.rs` |
+| Durable CRDT state and startup hydration | `sync_manager/storage.rs` |
+| Anti-entropy, peer broadcast and reconnect handling | `sync_manager/replication.rs` + `nx-net` |
+| Schema headers and offline migration support | `sync_manager/schema.rs`, `sync_manager/migration.rs` |
+| Peer health tracking | `sync_manager/peer.rs` |
 | NodeId persistence | `runtime.rs` - `load_or_create_node_id` |
 | Observability HTTP endpoint | `observability.rs` - `ObservabilityServer` |
 | Config types exposed to `nx-cli` | `sync_config.rs` - `SyncConfig`, re-exports `TlsConfig`, `ObservabilityConfig` |
@@ -163,6 +165,11 @@ Peers alone do not enable sync - a node must also listen.
 `SyncManager` owns the runtime side of replication. It is the bridge between host API calls
 from guest modules and the network layer in `nx-net`.
 
+Since `v0.1.1`, its implementation is split by responsibility under `sync_manager/`:
+orchestration in `manager.rs`, remote application in `apply.rs`, replication in
+`replication.rs`, persistence in `storage.rs`, peer health in `peer.rs`, and persisted
+schema evolution in `schema.rs` and `migration.rs`.
+
 **What it owns:**
 - In-memory CRDT registry (one state per CRDT key, all types)
 - Op-log (bounded by `op_log_limit`) for anti-entropy replay
@@ -244,7 +251,7 @@ For the full function signatures and behavior see [Host API](/numax/reference/ho
 4. Register it with `linker.func_wrap("nx", "function_name", ...)` inside `add_to_linker`.
 5. Call `add_to_linker` from `Runtime::new`.
 6. If it requires sync, check `state.sync_handle.is_some()` and return `ERR_SYNC_DISABLED` if not.
-7. Write tests. For CRDT functions, add an E2E test in `sync_manager.rs`.
+7. Write tests. For CRDT functions, add an E2E test under `sync_manager/tests/`.
 
 ---
 
@@ -261,7 +268,8 @@ It tracks readiness and basic counters accessible through the HTTP endpoint.
 
 ## Test coverage
 
-Tests live in `runtime.rs` (`#[cfg(test)]` at the bottom) and `sync_config.rs`.
+Tests live in `runtime.rs` (`#[cfg(test)]` at the bottom), `sync_config.rs`, and
+`sync_manager/tests/`.
 
 | Test | What it covers |
 |---|---|

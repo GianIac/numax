@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Current release line**: `v0.1.0` (active - includes documentation, distribution & configuration)
+- **Current release line**: `v0.1.1` (active - architectural cleanup & versioning)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -43,7 +43,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 | Version | Theme | Status |
 |---|---|---|
-| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | active |
+| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | active |
 | `v0.1.2` | Performance & Profiling | planned |
 | `v0.1.3` | Supply Chain & Fuzzing | planned |
@@ -62,14 +62,15 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.2.0-rc.1` | Release Candidate hardening | planned |
 | `v0.2.0` | **Stable - production-ready, any criticality** | final goal |
 
-> **Legend**: active = current release line; planned = future work; final goal = end of the cycle.
+> **Legend**: released = previous stable release; active = current release line; planned = future work; final goal = end of the cycle.
 
 ---
 
 ## v0.1.1 - Architectural Cleanup & Versioning 🧹
 
 `v0.1.1` paid down the architectural debt inherited from `v0.1.0` and made
-Numax able to evolve **without breaking clusters already running it**.
+version boundaries explicit, so clusters fail safely instead of mixing
+incompatible nodes.
 
 The monolithic `sync_manager.rs` was split into a proper `sync_manager/` module
 with an `OpApplier` trait per CRDT family, under a strict behavior-preserving

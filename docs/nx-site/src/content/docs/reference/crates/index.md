@@ -43,7 +43,12 @@ nx-sdk          (standalone — targets wasm32, no internal deps)
 
 **Key files:**
 - `src/runtime.rs` - `Runtime` struct: starts/stops sync, runs the WASM module, exposes `settle_for`, `serve`, `shutdown_with_timeout`
-- `src/sync_manager.rs` - owns the in-memory CRDT registry, op-log, anti-entropy scheduling, peer broadcast, durable state hydration on startup
+- `src/sync_manager/manager.rs` - `SyncManager` orchestration, in-memory CRDT registry and op-log
+- `src/sync_manager/apply.rs` - application of remote CRDT operations
+- `src/sync_manager/replication.rs` - anti-entropy, peer broadcast and reconnect handling
+- `src/sync_manager/storage.rs` - durable state persistence and startup hydration
+- `src/sync_manager/schema.rs`, `migration.rs` - schema headers and offline datastore migrations
+- `src/sync_manager/tests/` - sync-manager unit and end-to-end tests
 - `src/sync_config.rs` - `SyncConfig` builder, `TlsConfig`, `ObservabilityConfig`
 - `src/observability.rs` - HTTP metrics endpoint
 - `src/host_api/db.rs` - `db_get`, `db_set`, `db_delete`, `db_exists`, `db_scan`, `db_scan_after`, `db_keys`, `db_keys_after`
