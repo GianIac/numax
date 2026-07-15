@@ -13,6 +13,7 @@ const DEFAULT_VALUE_SIZE: usize = 256;
 const DEFAULT_KEY_SPACE: u64 = 1_000_000;
 const TICK: Duration = Duration::from_millis(100);
 const HISTOGRAM_MAX_MICROS: usize = 1_000_000;
+const REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug)]
 struct Config {
@@ -27,6 +28,7 @@ struct Config {
 #[derive(Debug)]
 struct Report {
     scenario: &'static str,
+    requested_duration_secs: u64,
     duration_secs: f64,
     target_ops_sec: u64,
     ops_total: u64,
@@ -35,6 +37,7 @@ struct Report {
     value_size: usize,
     key_space: u64,
     data_dir: String,
+    rss_bytes: Option<u64>,
     latency: LatencySnapshot,
 }
 
@@ -161,6 +164,7 @@ fn run() -> Result<(), String> {
     let elapsed = started.elapsed();
     let report = Report {
         scenario: "single-node-store-write",
+        requested_duration_secs: config.duration.as_secs(),
         duration_secs: elapsed.as_secs_f64(),
         target_ops_sec: config.target_ops_sec,
         ops_total: op_index,
@@ -169,6 +173,7 @@ fn run() -> Result<(), String> {
         value_size: config.value_size,
         key_space: config.key_space,
         data_dir: data_dir.display().to_string(),
+        rss_bytes: current_rss_bytes(),
         latency: latencies.snapshot(),
     };
     let json = report.to_json();
@@ -247,7 +252,16 @@ impl Report {
         format!(
             concat!(
                 "{{\n",
+                "  \"report_schema_version\": {},\n",
+                "  \"crate\": \"nx-store\",\n",
+                "  \"benchmark\": \"single_node_load\",\n",
                 "  \"scenario\": \"{}\",\n",
+                "  \"profile\": {{\n",
+                "    \"duration_secs\": {},\n",
+                "    \"target_ops_sec\": {},\n",
+                "    \"value_size\": {},\n",
+                "    \"key_space\": {}\n",
+                "  }},\n",
                 "  \"duration_secs\": {:.3},\n",
                 "  \"target_ops_sec\": {},\n",
                 "  \"ops_total\": {},\n",
@@ -256,6 +270,9 @@ impl Report {
                 "  \"value_size\": {},\n",
                 "  \"key_space\": {},\n",
                 "  \"data_dir\": \"{}\",\n",
+                "  \"resources\": {{\n",
+                "    \"rss_bytes\": {}\n",
+                "  }},\n",
                 "  \"latency_ms\": {{\n",
                 "    \"p50\": {:.3},\n",
                 "    \"p95\": {:.3},\n",
@@ -265,7 +282,12 @@ impl Report {
                 "  }}\n",
                 "}}"
             ),
+            REPORT_SCHEMA_VERSION,
             self.scenario,
+            self.requested_duration_secs,
+            self.target_ops_sec,
+            self.value_size,
+            self.key_space,
             self.duration_secs,
             self.target_ops_sec,
             self.ops_total,
@@ -274,6 +296,7 @@ impl Report {
             self.value_size,
             self.key_space,
             json_escape(&self.data_dir),
+            json_option_u64(self.rss_bytes),
             self.latency.p50_ms,
             self.latency.p95_ms,
             self.latency.p99_ms,
@@ -308,6 +331,31 @@ fn micros_to_ms(micros: u64) -> f64 {
 
 fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn json_option_u64(value: Option<u64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kb.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn print_help() {

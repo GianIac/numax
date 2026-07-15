@@ -100,9 +100,10 @@ instead of crashing.
 - [ ] Per-WASM-module profiling (CPU time, bytes allocated)
 
 **Regression gate**:
-- [ ] Load benchmarks extended with automatic JSON report
+- [x] Load benchmarks extended with automatic JSON report
 - [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
-- [ ] Baseline history committed in `crates/*/reports/baselines/`
+  - [ ] Run `scripts/compare-benchmark-report.test.mjs` in CI
+- [x] Baseline history committed in `crates/*/reports/baselines/`
 
 **Additional metrics**:
 - [ ] `numax_module_cpu_ms` per module
