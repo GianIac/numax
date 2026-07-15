@@ -105,7 +105,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 **Goal**: make performance observation automatic and visible, prevent silent regressions.
 
 **Profiling tools**:
-- [ ] `tokio-console` integration (visibility into tasks)
+- [x] `tokio-console` integration (visibility into tasks)
 - [ ] CPU flamegraph in CI with `pprof-rs` or `samply`
 - [ ] Heap profiling with `dhat` integrated into benchmarks
 - [ ] Per-WASM-module profiling (CPU time, bytes allocated)

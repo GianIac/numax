@@ -95,6 +95,10 @@ enum Cli {
         #[arg(long, value_name = "ADDR")]
         observability_listen: Option<String>,
 
+        /// Expose Tokio task diagnostics to tokio-console (requires the tokio-console feature).
+        #[arg(long)]
+        tokio_console: bool,
+
         /// Path to this node's TLS certificate (PEM)
         #[arg(long, value_name = "PATH")]
         tls_cert: Option<PathBuf>,
@@ -209,6 +213,7 @@ async fn real_main() -> Result<()> {
             log_level,
             log_format,
             observability_listen,
+            tokio_console,
             tls_cert,
             tls_key,
             tls_ca,
@@ -235,7 +240,7 @@ async fn real_main() -> Result<()> {
             let effective = EffectiveRunConfig::resolve(cli, &file_config)?;
 
             // Setup logging
-            init_logging(&effective.log_level, effective.log_format);
+            init_logging(&effective.log_level, effective.log_format, tokio_console)?;
 
             validate_settle_mode(&effective.sync, settle_for)?;
             validate_wait_before_run(&effective.sync, wait_before_run)?;
@@ -1438,6 +1443,15 @@ mod tests {
                     assert_eq!(log_level.as_deref(), Some("debug"));
                     assert_eq!(log_format, Some(LogFormat::Json));
                 }
+                _ => panic!("expected run command"),
+            }
+        }
+
+        #[test]
+        fn tokio_console_flag_parsed() {
+            let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tokio-console"]).unwrap();
+            match cli {
+                Cli::Run { tokio_console, .. } => assert!(tokio_console),
                 _ => panic!("expected run command"),
             }
         }

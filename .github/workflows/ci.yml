@@ -28,6 +28,11 @@ jobs:
           cargo --version
       - name: Check
         run: cargo check --workspace --all-targets
+      - name: Check tokio-console integration
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+        run: cargo check -p nx-cli --features tokio-console
 
   fmt:
     name: Format
