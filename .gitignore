@@ -25,3 +25,7 @@ docs/nx-site/.astro/
 docs/nx-site/.npm/
 docs/nx-site/.yarn/
 docs/nx-site/.pnpm-store/
+
+# Local benchmark and profiling output (committed baselines live under crates/*/reports/baselines)
+/reports/bench/
+/reports/profiling/

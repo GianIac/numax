@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+use std::fs::File;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process;
@@ -25,6 +27,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_LIMIT_HEADROOM_OPS: u64 = 100_000;
 const LOAD_TEST_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 const REPORT_SCHEMA_VERSION: u32 = 1;
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+const CPU_PROFILE_FREQUENCY_HZ: i32 = 100;
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+const CPU_PROFILE_BLOCKLIST: &[&str] = &["libc", "libgcc", "pthread", "vdso"];
 
 #[derive(Debug)]
 struct Config {
@@ -34,7 +40,21 @@ struct Config {
     settle: Duration,
     anti_entropy_interval: Duration,
     report: Option<PathBuf>,
+    cpu_profile: Option<PathBuf>,
 }
+
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+enum CpuProfiler {
+    Disabled,
+    Enabled {
+        guard: pprof::ProfilerGuard<'static>,
+        output: PathBuf,
+        file: File,
+    },
+}
+
+#[cfg(not(all(feature = "cpu-profiling", target_os = "linux")))]
+struct CpuProfiler;
 
 #[derive(Debug)]
 struct Report {
@@ -167,6 +187,7 @@ async fn run_async(config: Config) -> Result<(), String> {
     let mut nodes = start_full_mesh(&addrs, limits, config.anti_entropy_interval).await?;
     wait_for_full_mesh(&nodes).await?;
 
+    let cpu_profiler = CpuProfiler::start(config.cpu_profile.clone())?;
     let started = Instant::now();
     let mut producers = Vec::new();
     for node in &nodes {
@@ -192,6 +213,7 @@ async fn run_async(config: Config) -> Result<(), String> {
     }
 
     let load_elapsed = started.elapsed();
+    cpu_profiler.finish()?;
     let expected_counter = ops_total - errors_total;
     let convergence_started = Instant::now();
     let converged = wait_for_convergence(&nodes, key, expected_counter, config.settle).await;
@@ -461,6 +483,7 @@ impl Config {
             settle: Duration::from_secs(DEFAULT_SETTLE_SECS),
             anti_entropy_interval: Duration::ZERO,
             report: None,
+            cpu_profile: None,
         };
 
         let mut args = args.peekable();
@@ -485,6 +508,9 @@ impl Config {
                 "--report" => {
                     config.report = Some(PathBuf::from(next_value(&mut args, &arg)?));
                 }
+                "--cpu-profile" => {
+                    config.cpu_profile = Some(PathBuf::from(next_value(&mut args, &arg)?));
+                }
                 "--bench" => {}
                 "--help" | "-h" => {
                     print_help();
@@ -503,6 +529,11 @@ impl Config {
         if config.target_ops_sec_per_node == 0 {
             return Err("--target-ops-sec-per-node must be greater than zero".to_string());
         }
+        if config.cpu_profile.is_some()
+            && !cfg!(all(feature = "cpu-profiling", target_os = "linux"))
+        {
+            return Err("--cpu-profile requires the cpu-profiling feature on Linux".to_string());
+        }
         if config.anti_entropy_interval.is_zero() {
             config.anti_entropy_interval = config
                 .duration
@@ -510,6 +541,67 @@ impl Config {
                 .saturating_add(Duration::from_secs(60));
         }
         Ok(config)
+    }
+}
+
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+impl CpuProfiler {
+    fn start(output: Option<PathBuf>) -> Result<Self, String> {
+        let Some(output) = output else {
+            return Ok(Self::Disabled);
+        };
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|e| format!("create CPU profile directory: {e}"))?;
+        }
+        let file = File::create(&output)
+            .map_err(|e| format!("create CPU profile {}: {e}", output.display()))?;
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(CPU_PROFILE_FREQUENCY_HZ)
+            .blocklist(CPU_PROFILE_BLOCKLIST)
+            .build()
+            .map_err(|e| format!("start CPU profiler: {e}"))?;
+        Ok(Self::Enabled {
+            guard,
+            output,
+            file,
+        })
+    }
+
+    fn finish(self) -> Result<(), String> {
+        let Self::Enabled {
+            guard,
+            output,
+            file,
+        } = self
+        else {
+            return Ok(());
+        };
+        let report = guard
+            .report()
+            .build()
+            .map_err(|e| format!("build CPU profile report: {e}"))?;
+        report
+            .flamegraph(file)
+            .map_err(|e| format!("write CPU flamegraph {}: {e}", output.display()))?;
+        println!("CPU flamegraph written to {}", output.display());
+        Ok(())
+    }
+}
+
+#[cfg(not(all(feature = "cpu-profiling", target_os = "linux")))]
+impl CpuProfiler {
+    fn start(output: Option<PathBuf>) -> Result<Self, String> {
+        if output.is_some() {
+            return Err("--cpu-profile requires the cpu-profiling feature on Linux".to_string());
+        }
+        Ok(Self)
+    }
+
+    fn finish(self) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -668,9 +760,13 @@ Options:
   --settle-secs N                   Time allowed for final convergence (default: {DEFAULT_SETTLE_SECS})
   --anti-entropy-secs N             Periodic pull interval; default keeps repair traffic outside the run window
   --report PATH                     Write JSON report to PATH
+  --cpu-profile PATH                Write a load-phase CPU flamegraph (Linux, requires feature cpu-profiling)
 
 Smoke example:
   cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 10 --target-ops-sec-per-node 1000
+
+CPU profiling example (Linux):
+  cargo bench --profile profiling -p nx-core --features cpu-profiling --bench three_node_sync_load -- --duration-secs 10 --target-ops-sec-per-node 1000 --cpu-profile reports/profiling/three-node-sync-load.svg
 "
     );
 }

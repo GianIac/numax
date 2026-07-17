@@ -146,12 +146,31 @@ jobs:
             --p99-threshold 5 \
             --throughput-threshold 5 \
             --rss-threshold 5
+      - name: Generate Ubuntu CPU flamegraph
+        run: |
+          mkdir -p reports/profiling
+          cargo bench --profile profiling -p nx-core \
+            --features cpu-profiling \
+            --bench three_node_sync_load -- \
+            --duration-secs 10 \
+            --target-ops-sec-per-node 1000 \
+            --settle-secs 10 \
+            --cpu-profile reports/profiling/three-node-sync-load.svg
+          test -s reports/profiling/three-node-sync-load.svg
+          grep -q '<svg' reports/profiling/three-node-sync-load.svg
       - name: Upload benchmark report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-regression-report
           path: reports/bench/three-node-sync-smoke.json
+      - name: Upload Ubuntu CPU flamegraph
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-flamegraph-ubuntu
+          path: reports/profiling/three-node-sync-load.svg
+          if-no-files-found: error
 
   ci-success:
     name: CI Success

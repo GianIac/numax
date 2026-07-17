@@ -12,3 +12,8 @@ members = [
 exclude = [
   "examples/*"
 ]
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

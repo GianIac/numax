@@ -140,3 +140,22 @@ Store size above 1 GiB:
 ```txt
 numax_store_bytes > 1073741824
 ```
+
+## CPU Flamegraphs On Ubuntu/Linux
+
+The `three_node_sync_load` benchmark can generate an opt-in CPU flamegraph for
+the load phase. Profiling starts after the three-node cluster is connected and
+stops before convergence and shutdown, keeping setup noise out of the report.
+
+```bash
+cargo bench --profile profiling -p nx-core \
+  --features cpu-profiling \
+  --bench three_node_sync_load -- \
+  --duration-secs 10 \
+  --target-ops-sec-per-node 1000 \
+  --settle-secs 10 \
+  --cpu-profile reports/profiling/three-node-sync-load.svg
+```
+
+The `cpu-profiling` feature and the `profiling` Cargo profile do not affect the default Numax runtime or the unprofiled regression benchmark. CI uses Ubuntu as the canonical profiling environment and uploads the SVG as `cpu-flamegraph-ubuntu`; cross-platform profiling remains a post-`v0.2.0`
+candidate.
