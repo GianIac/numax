@@ -16,6 +16,10 @@ use nx_sync::{GCounter, NodeId, Op};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
+#[cfg(all(feature = "heap-profiling", target_os = "linux"))]
+#[global_allocator]
+static HEAP_PROFILING_ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
 const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_TARGET_OPS_SEC_PER_NODE: u64 = 1_000;
 const DEFAULT_SETTLE_SECS: u64 = 10;
@@ -41,6 +45,7 @@ struct Config {
     anti_entropy_interval: Duration,
     report: Option<PathBuf>,
     cpu_profile: Option<PathBuf>,
+    heap_profile: Option<PathBuf>,
 }
 
 #[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
@@ -55,6 +60,18 @@ enum CpuProfiler {
 
 #[cfg(not(all(feature = "cpu-profiling", target_os = "linux")))]
 struct CpuProfiler;
+
+#[cfg(all(feature = "heap-profiling", target_os = "linux"))]
+enum HeapProfiler {
+    Disabled,
+    Enabled {
+        profiler: dhat::Profiler,
+        output: PathBuf,
+    },
+}
+
+#[cfg(not(all(feature = "heap-profiling", target_os = "linux")))]
+struct HeapProfiler;
 
 #[derive(Debug)]
 struct Report {
@@ -188,6 +205,7 @@ async fn run_async(config: Config) -> Result<(), String> {
     wait_for_full_mesh(&nodes).await?;
 
     let cpu_profiler = CpuProfiler::start(config.cpu_profile.clone())?;
+    let heap_profiler = HeapProfiler::start(config.heap_profile.clone())?;
     let started = Instant::now();
     let mut producers = Vec::new();
     for node in &nodes {
@@ -214,6 +232,7 @@ async fn run_async(config: Config) -> Result<(), String> {
 
     let load_elapsed = started.elapsed();
     cpu_profiler.finish()?;
+    heap_profiler.finish()?;
     let expected_counter = ops_total - errors_total;
     let convergence_started = Instant::now();
     let converged = wait_for_convergence(&nodes, key, expected_counter, config.settle).await;
@@ -484,6 +503,7 @@ impl Config {
             anti_entropy_interval: Duration::ZERO,
             report: None,
             cpu_profile: None,
+            heap_profile: None,
         };
 
         let mut args = args.peekable();
@@ -511,6 +531,9 @@ impl Config {
                 "--cpu-profile" => {
                     config.cpu_profile = Some(PathBuf::from(next_value(&mut args, &arg)?));
                 }
+                "--heap-profile" => {
+                    config.heap_profile = Some(PathBuf::from(next_value(&mut args, &arg)?));
+                }
                 "--bench" => {}
                 "--help" | "-h" => {
                     print_help();
@@ -529,10 +552,20 @@ impl Config {
         if config.target_ops_sec_per_node == 0 {
             return Err("--target-ops-sec-per-node must be greater than zero".to_string());
         }
+        if config.cpu_profile.is_some() && config.heap_profile.is_some() {
+            return Err(
+                "--cpu-profile and --heap-profile must run in separate processes".to_string(),
+            );
+        }
         if config.cpu_profile.is_some()
             && !cfg!(all(feature = "cpu-profiling", target_os = "linux"))
         {
             return Err("--cpu-profile requires the cpu-profiling feature on Linux".to_string());
+        }
+        if config.heap_profile.is_some()
+            && !cfg!(all(feature = "heap-profiling", target_os = "linux"))
+        {
+            return Err("--heap-profile requires the heap-profiling feature on Linux".to_string());
         }
         if config.anti_entropy_interval.is_zero() {
             config.anti_entropy_interval = config
@@ -587,6 +620,63 @@ impl CpuProfiler {
             .flamegraph(file)
             .map_err(|e| format!("write CPU flamegraph {}: {e}", output.display()))?;
         println!("CPU flamegraph written to {}", output.display());
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "heap-profiling", target_os = "linux"))]
+impl HeapProfiler {
+    fn start(output: Option<PathBuf>) -> Result<Self, String> {
+        let Some(output) = output else {
+            return Ok(Self::Disabled);
+        };
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create heap profile directory: {e}"))?;
+        }
+        let profiler = dhat::Profiler::builder().file_name(&output).build();
+        Ok(Self::Enabled { profiler, output })
+    }
+
+    fn finish(self) -> Result<(), String> {
+        let Self::Enabled { profiler, output } = self else {
+            return Ok(());
+        };
+        let stats = dhat::HeapStats::get();
+        drop(profiler);
+        let profile_size = fs::metadata(&output)
+            .map_err(|e| format!("read heap profile {}: {e}", output.display()))?
+            .len();
+        if profile_size == 0 {
+            return Err(format!("heap profile {} is empty", output.display()));
+        }
+        println!(
+            "Heap profile written to {} (total: {} bytes in {} allocations; peak: {} bytes in {} allocations; retained: {} bytes in {} allocations)",
+            output.display(),
+            stats.total_bytes,
+            stats.total_blocks,
+            stats.max_bytes,
+            stats.max_blocks,
+            stats.curr_bytes,
+            stats.curr_blocks
+        );
+        Ok(())
+    }
+}
+
+#[cfg(not(all(feature = "heap-profiling", target_os = "linux")))]
+impl HeapProfiler {
+    fn start(output: Option<PathBuf>) -> Result<Self, String> {
+        if output.is_some() {
+            return Err("--heap-profile requires the heap-profiling feature on Linux".to_string());
+        }
+        Ok(Self)
+    }
+
+    fn finish(self) -> Result<(), String> {
         Ok(())
     }
 }
@@ -761,12 +851,16 @@ Options:
   --anti-entropy-secs N             Periodic pull interval; default keeps repair traffic outside the run window
   --report PATH                     Write JSON report to PATH
   --cpu-profile PATH                Write a load-phase CPU flamegraph (Linux, requires feature cpu-profiling)
+  --heap-profile PATH               Write a load-phase DHAT heap profile (Linux, requires feature heap-profiling)
 
 Smoke example:
   cargo bench -p nx-core --bench three_node_sync_load -- --duration-secs 10 --target-ops-sec-per-node 1000
 
 CPU profiling example (Linux):
   cargo bench --profile profiling -p nx-core --features cpu-profiling --bench three_node_sync_load -- --duration-secs 10 --target-ops-sec-per-node 1000 --cpu-profile reports/profiling/three-node-sync-load.svg
+
+Heap profiling example (Linux):
+  cargo bench --profile profiling -p nx-core --features heap-profiling --bench three_node_sync_load -- --duration-secs 5 --target-ops-sec-per-node 250 --heap-profile reports/profiling/three-node-sync-load-heap.json
 "
     );
 }

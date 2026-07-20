@@ -158,6 +158,18 @@ jobs:
             --cpu-profile reports/profiling/three-node-sync-load.svg
           test -s reports/profiling/three-node-sync-load.svg
           grep -q '<svg' reports/profiling/three-node-sync-load.svg
+      - name: Generate Ubuntu heap profile
+        run: |
+          cargo bench --profile profiling -p nx-core \
+            --features heap-profiling \
+            --bench three_node_sync_load -- \
+            --duration-secs 5 \
+            --target-ops-sec-per-node 250 \
+            --settle-secs 5 \
+            --heap-profile reports/profiling/three-node-sync-load-heap.json
+          test -s reports/profiling/three-node-sync-load-heap.json
+          node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); if(p.mode!=='rust-heap'||!Array.isArray(p.pps))process.exit(1)" \
+            reports/profiling/three-node-sync-load-heap.json
       - name: Upload benchmark report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -170,6 +182,13 @@ jobs:
         with:
           name: cpu-flamegraph-ubuntu
           path: reports/profiling/three-node-sync-load.svg
+          if-no-files-found: error
+      - name: Upload Ubuntu heap profile
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: heap-profile-ubuntu
+          path: reports/profiling/three-node-sync-load-heap.json
           if-no-files-found: error
 
   ci-success:

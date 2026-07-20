@@ -96,7 +96,7 @@ instead of crashing.
 **Profiling tools**:
 - [x] `tokio-console` integration (visibility into tasks)
 - [x] CPU flamegraph artifact in Ubuntu CI with feature-gated `pprof-rs`
-- [ ] Heap profiling with `dhat` integrated into benchmarks
+- [x] Load-phase heap profile artifact in Ubuntu CI with feature-gated `dhat`
 - [ ] Per-WASM-module profiling (CPU time, bytes allocated)
 
 **Regression gate**:

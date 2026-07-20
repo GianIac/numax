@@ -62,20 +62,20 @@ The Numax dashboard is provisioned automatically from
 
 The dashboard uses only metrics currently emitted by Numax:
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `numax_ops_total` | counter | operations processed by the runtime |
-| `numax_peers_connected` | gauge | currently connected peers |
-| `numax_sync_latency_ms` | gauge | last recorded sync latency in milliseconds |
-| `numax_sync_errors_total` | counter | sync-related errors |
-| `numax_observability_requests_total` | counter | observability endpoint requests |
-| `numax_observability_errors_total` | counter | observability endpoint errors |
-| `numax_peer_connects_total` | counter | peer connection events |
-| `numax_peer_disconnects_total` | counter | peer disconnection events |
-| `numax_broadcast_batches_total` | counter | broadcast batches sent |
-| `numax_broadcast_ops_total` | counter | operations broadcast to peers |
-| `numax_store_keys` | gauge | key count in the local store |
-| `numax_store_bytes` | gauge | approximate store payload bytes |
+| Metric                               | Type    | Meaning                                    |
+| ------------------------------------ | ------- | ------------------------------------------ |
+| `numax_ops_total`                    | counter | operations processed by the runtime        |
+| `numax_peers_connected`              | gauge   | currently connected peers                  |
+| `numax_sync_latency_ms`              | gauge   | last recorded sync latency in milliseconds |
+| `numax_sync_errors_total`            | counter | sync-related errors                        |
+| `numax_observability_requests_total` | counter | observability endpoint requests            |
+| `numax_observability_errors_total`   | counter | observability endpoint errors              |
+| `numax_peer_connects_total`          | counter | peer connection events                     |
+| `numax_peer_disconnects_total`       | counter | peer disconnection events                  |
+| `numax_broadcast_batches_total`      | counter | broadcast batches sent                     |
+| `numax_broadcast_ops_total`          | counter | operations broadcast to peers              |
+| `numax_store_keys`                   | gauge   | key count in the local store               |
+| `numax_store_bytes`                  | gauge   | approximate store payload bytes            |
 
 ## Useful PromQL
 
@@ -157,5 +157,24 @@ cargo bench --profile profiling -p nx-core \
   --cpu-profile reports/profiling/three-node-sync-load.svg
 ```
 
-The `cpu-profiling` feature and the `profiling` Cargo profile do not affect the default Numax runtime or the unprofiled regression benchmark. CI uses Ubuntu as the canonical profiling environment and uploads the SVG as `cpu-flamegraph-ubuntu`; cross-platform profiling remains a post-`v0.2.0`
-candidate.
+The `cpu-profiling` feature and the `profiling` Cargo profile do not affect the default Numax runtime or the unprofiled regression benchmark. CI uses Ubuntu as the canonical profiling environment and uploads the SVG as `cpu-flamegraph-ubuntu`; cross-platform profiling remains a post-`v0.2.0` candidate.
+
+## Heap Profiles On Ubuntu/Linux
+
+The same benchmark can generate an opt-in DHAT profile for allocations made during the load phase. Run it separately from CPU profiling so that the DHAT allocator does not distort CPU samples:
+
+```bash
+cargo bench --profile profiling -p nx-core \
+  --features heap-profiling \
+  --bench three_node_sync_load -- \
+  --duration-secs 5 \
+  --target-ops-sec-per-node 250 \
+  --settle-secs 5 \
+  --heap-profile reports/profiling/three-node-sync-load-heap.json
+```
+
+Open the resulting JSON in the DHAT viewer to inspect allocation sites, peak
+memory, and memory still live when the load phase ends. CI validates the JSON
+and uploads it as `heap-profile-ubuntu`; it is a diagnostic artifact, not a
+regression threshold. The feature is disabled in normal builds and does not
+change the default allocator or the unprofiled regression benchmark.
