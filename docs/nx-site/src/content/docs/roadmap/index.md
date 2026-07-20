@@ -97,7 +97,8 @@ instead of crashing.
 - [x] `tokio-console` integration (visibility into tasks)
 - [x] CPU flamegraph artifact in Ubuntu CI with feature-gated `pprof-rs`
 - [x] Load-phase heap profile artifact in Ubuntu CI with feature-gated `dhat`
-- [ ] Per-WASM-module profiling (CPU time, bytes allocated)
+- [x] Per-WASM-module execution metrics (duration, outcomes, cache and linear-memory usage)
+- [ ] Opt-in guest allocator instrumentation for exact allocated/freed bytes
 
 **Regression gate**:
 - [x] Load benchmarks extended with automatic JSON report
@@ -106,8 +107,8 @@ instead of crashing.
 - [x] Baseline history committed in `crates/*/reports/baselines/`
 
 **Additional metrics**:
-- [ ] `numax_module_cpu_ms` per module
-- [ ] `numax_module_memory_bytes` per module
+- [x] `numax_wasm_execution_duration_seconds_total` per module
+- [x] `numax_wasm_linear_memory_*_bytes` per module
 - [ ] `numax_op_apply_duration_ms` distribution
 
 **Closing criterion**:

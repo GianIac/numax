@@ -76,6 +76,17 @@ The dashboard uses only metrics currently emitted by Numax:
 | `numax_broadcast_ops_total`          | counter | operations broadcast to peers              |
 | `numax_store_keys`                   | gauge   | key count in the local store               |
 | `numax_store_bytes`                  | gauge   | approximate store payload bytes            |
+| `numax_wasm_invocations_total`       | counter | module invocations by outcome              |
+| `numax_wasm_module_cache_lookups_total` | counter | compiled-module cache hits and misses    |
+| `numax_wasm_*_duration_seconds_total` | counter | compilation, instantiation and execution time |
+| `numax_wasm_linear_memory_*_bytes`   | gauge/counter | current, peak and cumulative growth bytes |
+
+WASM metrics use the module's BLAKE3 digest as the `module` label. 
+This keeps the identity stable without exposing local paths. 
+
+Numax bounds the registry to 128 labels and aggregates additional modules under `module="overflow"`.
+
+Execution duration is wall-clock time and can include asynchronous host-call waits; it is not raw CPU time. Linear-memory metrics describe the guest memory exported as `memory`, not individual `malloc` and `free` operations inside the guest allocator.
 
 ## Useful PromQL
 

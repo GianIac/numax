@@ -345,6 +345,9 @@ impl Runtime {
     }
 
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+        let module_hash = blake3::hash(wasm_bytes);
+        let module_key = module_hash.to_hex().to_string();
+
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
         let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
@@ -386,33 +389,76 @@ impl Runtime {
         // Form completion / validation. Compiled modules are cached in-memory
         // so embedded runtimes can call run_module repeatedly without paying
         // Wasmtime compilation cost for identical bytes.
-        let module = self.compile_or_get_cached_module(wasm_bytes)?;
+        let compilation_started = Instant::now();
+        let (module, cache_hit) =
+            match self.compile_or_get_cached_module(wasm_bytes, *module_hash.as_bytes()) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.metrics.record_wasm_cache_lookup(&module_key, false);
+                    self.metrics
+                        .record_wasm_compilation(&module_key, compilation_started.elapsed());
+                    self.metrics.record_wasm_invocation(&module_key, false);
+                    return Err(error);
+                }
+            };
+        self.metrics
+            .record_wasm_cache_lookup(&module_key, cache_hit);
+        if !cache_hit {
+            self.metrics
+                .record_wasm_compilation(&module_key, compilation_started.elapsed());
+        }
 
         // Instantiation
-        let instance = self
-            .linker
-            .instantiate_async(&mut store, &module)
-            .await
-            .map_err(|e| anyhow!("Link error while instantiating module: {e}"))?;
+        let instantiation_started = Instant::now();
+        let instance = match self.linker.instantiate_async(&mut store, &module).await {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.metrics
+                    .record_wasm_instantiation(&module_key, instantiation_started.elapsed());
+                self.metrics.record_wasm_invocation(&module_key, false);
+                return Err(anyhow!("Link error while instantiating module: {error}"));
+            }
+        };
+        self.metrics
+            .record_wasm_instantiation(&module_key, instantiation_started.elapsed());
 
         // Entrypoint: run / _start
-        let run = instance
+        let run = match instance
             .get_typed_func::<(), ()>(&mut store, "run")
             .or_else(|_| instance.get_typed_func::<(), ()>(&mut store, "_start"))
-            .map_err(|e| anyhow!("No entrypoint found (expected `run` or `_start`): {e}"))?;
+        {
+            Ok(run) => run,
+            Err(error) => {
+                self.metrics.record_wasm_invocation(&module_key, false);
+                return Err(anyhow!(
+                    "No entrypoint found (expected `run` or `_start`): {error}"
+                ));
+            }
+        };
 
         // Execution
-        run.call_async(&mut store, ())
-            .await
-            .map_err(|e| anyhow!("Error while executing module: {e}"))?;
+        let initial_memory_bytes = exported_linear_memory_bytes(&instance, &mut store);
+        let execution_started = Instant::now();
+        let result = run.call_async(&mut store, ()).await;
+        let execution_duration = execution_started.elapsed();
+        let final_memory_bytes = exported_linear_memory_bytes(&instance, &mut store);
+        self.metrics.record_wasm_execution(
+            &module_key,
+            execution_duration,
+            initial_memory_bytes,
+            final_memory_bytes,
+        );
+        self.metrics
+            .record_wasm_invocation(&module_key, result.is_ok());
 
-        Ok(())
+        result.map_err(|error| anyhow!("Error while executing module: {error}"))
     }
 
-    fn compile_or_get_cached_module(&self, wasm_bytes: &[u8]) -> Result<Module> {
-        let hash = blake3::hash(wasm_bytes);
-        let cache_key = *hash.as_bytes();
-
+    fn compile_or_get_cached_module(
+        &self,
+        wasm_bytes: &[u8],
+        cache_key: [u8; 32],
+    ) -> Result<(Module, bool)> {
         if let Some(module) = self
             .module_cache
             .lock()
@@ -420,7 +466,7 @@ impl Runtime {
             .get(&cache_key)
             .cloned()
         {
-            return Ok(module);
+            return Ok((module, true));
         }
 
         let module = Module::new(&self.engine, wasm_bytes)
@@ -430,13 +476,23 @@ impl Runtime {
             .map_err(|_| anyhow!("module cache lock poisoned"))?
             .insert(cache_key, module.clone());
 
-        Ok(module)
+        Ok((module, false))
     }
 
     #[cfg(test)]
     fn cached_module_count(&self) -> usize {
         self.module_cache.lock().unwrap().len()
     }
+}
+
+fn exported_linear_memory_bytes(
+    instance: &wasmtime::Instance,
+    store: &mut Store<HostState>,
+) -> u64 {
+    instance
+        .get_memory(&mut *store, "memory")
+        .map(|memory| u64::try_from(memory.data_size(&*store)).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn load_or_create_node_id(store: &NxStore) -> Result<NodeId> {
@@ -531,6 +587,17 @@ mod tests {
             0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00, // export run
             0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
         ]
+    }
+
+    fn memory_growing_module() -> &'static [u8] {
+        br#"(module
+            (memory (export "memory") 1)
+            (func (export "run")
+                (drop (memory.grow (i32.const 1)))))"#
+    }
+
+    fn trapping_module() -> &'static [u8] {
+        br#"(module (func (export "run") unreachable))"#
     }
 
     #[tokio::test]
@@ -666,6 +733,67 @@ mod tests {
         runtime.run_module(&wasm).await.unwrap();
 
         assert_eq!(runtime.cached_module_count(), 1);
+        let module = blake3::hash(&wasm).to_hex().to_string();
+        let rendered = runtime.metrics.render_for_test(&runtime.store);
+        assert!(rendered.contains(&format!(
+            "numax_wasm_module_cache_lookups_total{{module=\"{module}\",result=\"hit\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_module_cache_lookups_total{{module=\"{module}\",result=\"miss\"}} 1"
+        )));
+    }
+
+    #[tokio::test]
+    async fn run_module_records_execution_and_linear_memory_growth() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-module-metrics-test"),
+            enable_wasi: false,
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let wasm = memory_growing_module();
+        let module = blake3::hash(wasm).to_hex().to_string();
+
+        runtime.run_module(wasm).await.unwrap();
+
+        let rendered = runtime.metrics.render_for_test(&runtime.store);
+        assert!(rendered.contains(&format!(
+            "numax_wasm_invocations_total{{module=\"{module}\",status=\"ok\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_executions_total{{module=\"{module}\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_linear_memory_current_bytes{{module=\"{module}\"}} 131072"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_linear_memory_peak_bytes{{module=\"{module}\"}} 131072"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_linear_memory_growth_bytes_total{{module=\"{module}\"}} 65536"
+        )));
+    }
+
+    #[tokio::test]
+    async fn run_module_records_traps_as_failed_invocations() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-module-error-metrics-test"),
+            enable_wasi: false,
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let wasm = trapping_module();
+        let module = blake3::hash(wasm).to_hex().to_string();
+
+        assert!(runtime.run_module(wasm).await.is_err());
+
+        let rendered = runtime.metrics.render_for_test(&runtime.store);
+        assert!(rendered.contains(&format!(
+            "numax_wasm_invocations_total{{module=\"{module}\",status=\"error\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_executions_total{{module=\"{module}\"}} 1"
+        )));
     }
 
     #[test]

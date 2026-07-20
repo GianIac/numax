@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -13,6 +14,8 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 pub const DEFAULT_OBSERVABILITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WASM_MODULE_METRIC_LABELS: usize = 128;
+const WASM_MODULE_OVERFLOW_LABEL: &str = "overflow";
 
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
@@ -46,7 +49,24 @@ pub struct RuntimeMetrics {
     peer_disconnects_total: AtomicU64,
     broadcast_batches_total: AtomicU64,
     broadcast_ops_total: AtomicU64,
+    wasm_modules: Mutex<BTreeMap<String, WasmModuleMetrics>>,
     ready: AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct WasmModuleMetrics {
+    invocations_ok: u64,
+    invocations_error: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    compilation_duration_ns: u64,
+    instantiations: u64,
+    instantiation_duration_ns: u64,
+    executions: u64,
+    execution_duration_ns: u64,
+    linear_memory_current_bytes: u64,
+    linear_memory_peak_bytes: u64,
+    linear_memory_growth_bytes: u64,
 }
 
 impl RuntimeMetrics {
@@ -91,6 +111,85 @@ impl RuntimeMetrics {
             .fetch_add(ops as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_wasm_cache_lookup(&self, module: &str, hit: bool) {
+        self.update_wasm_module(module, |metrics| {
+            if hit {
+                metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+            } else {
+                metrics.cache_misses = metrics.cache_misses.saturating_add(1);
+            }
+        });
+    }
+
+    pub(crate) fn record_wasm_compilation(&self, module: &str, duration: Duration) {
+        self.update_wasm_module(module, |metrics| {
+            metrics.compilation_duration_ns = metrics
+                .compilation_duration_ns
+                .saturating_add(duration_ns(duration));
+        });
+    }
+
+    pub(crate) fn record_wasm_instantiation(&self, module: &str, duration: Duration) {
+        self.update_wasm_module(module, |metrics| {
+            metrics.instantiations = metrics.instantiations.saturating_add(1);
+            metrics.instantiation_duration_ns = metrics
+                .instantiation_duration_ns
+                .saturating_add(duration_ns(duration));
+        });
+    }
+
+    pub(crate) fn record_wasm_execution(
+        &self,
+        module: &str,
+        duration: Duration,
+        initial_memory_bytes: u64,
+        final_memory_bytes: u64,
+    ) {
+        self.update_wasm_module(module, |metrics| {
+            metrics.executions = metrics.executions.saturating_add(1);
+            metrics.execution_duration_ns = metrics
+                .execution_duration_ns
+                .saturating_add(duration_ns(duration));
+            metrics.linear_memory_current_bytes = final_memory_bytes;
+            metrics.linear_memory_peak_bytes =
+                metrics.linear_memory_peak_bytes.max(final_memory_bytes);
+            metrics.linear_memory_growth_bytes = metrics
+                .linear_memory_growth_bytes
+                .saturating_add(final_memory_bytes.saturating_sub(initial_memory_bytes));
+        });
+    }
+
+    pub(crate) fn record_wasm_invocation(&self, module: &str, success: bool) {
+        self.update_wasm_module(module, |metrics| {
+            if success {
+                metrics.invocations_ok = metrics.invocations_ok.saturating_add(1);
+            } else {
+                metrics.invocations_error = metrics.invocations_error.saturating_add(1);
+            }
+        });
+    }
+
+    fn update_wasm_module(&self, module: &str, update: impl FnOnce(&mut WasmModuleMetrics)) {
+        let mut modules = self
+            .wasm_modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let label =
+            if modules.contains_key(module) || modules.len() < MAX_WASM_MODULE_METRIC_LABELS - 1 {
+                module
+            } else {
+                WASM_MODULE_OVERFLOW_LABEL
+            };
+        if let Some(metrics) = modules.get_mut(label) {
+            update(metrics);
+            return;
+        }
+
+        let mut metrics = WasmModuleMetrics::default();
+        update(&mut metrics);
+        modules.insert(label.to_string(), metrics);
+    }
+
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::Relaxed);
     }
@@ -103,6 +202,12 @@ impl RuntimeMetrics {
                 nx_store::StoreStats { keys: 0, bytes: 0 }
             }
         };
+
+        let wasm_modules = self
+            .wasm_modules
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         MetricsSnapshot {
             ops_total: self.ops_total.load(Ordering::Relaxed),
@@ -117,12 +222,22 @@ impl RuntimeMetrics {
             broadcast_ops_total: self.broadcast_ops_total.load(Ordering::Relaxed),
             store_keys: store_stats.keys,
             store_bytes: store_stats.bytes,
+            wasm_modules,
         }
     }
 
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn render_for_test(&self, store: &NxStore) -> String {
+        render_metrics(self.snapshot(store))
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 struct MetricsSnapshot {
@@ -138,6 +253,7 @@ struct MetricsSnapshot {
     broadcast_ops_total: u64,
     store_keys: u64,
     store_bytes: u64,
+    wasm_modules: BTreeMap<String, WasmModuleMetrics>,
 }
 
 pub struct ObservabilityServer {
@@ -255,7 +371,7 @@ async fn handle_connection(
 }
 
 fn render_metrics(snapshot: MetricsSnapshot) -> String {
-    format!(
+    let mut rendered = format!(
         "# HELP numax_ops_total Operations processed\n\
          # TYPE numax_ops_total counter\n\
          numax_ops_total {}\n\
@@ -304,7 +420,65 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
         snapshot.broadcast_ops_total,
         snapshot.store_keys,
         snapshot.store_bytes
-    )
+    );
+
+    rendered.push_str(
+        "# HELP numax_wasm_invocations_total WASM module invocations by outcome\n\
+         # TYPE numax_wasm_invocations_total counter\n\
+         # HELP numax_wasm_module_cache_lookups_total WASM module cache lookups by result\n\
+         # TYPE numax_wasm_module_cache_lookups_total counter\n\
+         # HELP numax_wasm_compilation_duration_seconds_total Time spent compiling WASM modules\n\
+         # TYPE numax_wasm_compilation_duration_seconds_total counter\n\
+         # HELP numax_wasm_instantiation_duration_seconds_total Time spent instantiating WASM modules\n\
+         # TYPE numax_wasm_instantiation_duration_seconds_total counter\n\
+         # HELP numax_wasm_instantiations_total WASM module instantiations\n\
+         # TYPE numax_wasm_instantiations_total counter\n\
+         # HELP numax_wasm_execution_duration_seconds_total Time spent executing WASM entrypoints\n\
+         # TYPE numax_wasm_execution_duration_seconds_total counter\n\
+         # HELP numax_wasm_executions_total WASM entrypoint executions\n\
+         # TYPE numax_wasm_executions_total counter\n\
+         # HELP numax_wasm_linear_memory_current_bytes Linear memory after the latest WASM invocation\n\
+         # TYPE numax_wasm_linear_memory_current_bytes gauge\n\
+         # HELP numax_wasm_linear_memory_peak_bytes Highest observed WASM linear-memory size\n\
+         # TYPE numax_wasm_linear_memory_peak_bytes gauge\n\
+         # HELP numax_wasm_linear_memory_growth_bytes_total Cumulative WASM linear-memory growth\n\
+         # TYPE numax_wasm_linear_memory_growth_bytes_total counter\n",
+    );
+
+    for (module, metrics) in snapshot.wasm_modules {
+        rendered.push_str(&format!(
+            "numax_wasm_invocations_total{{module=\"{module}\",status=\"ok\"}} {}\n\
+             numax_wasm_invocations_total{{module=\"{module}\",status=\"error\"}} {}\n\
+             numax_wasm_module_cache_lookups_total{{module=\"{module}\",result=\"hit\"}} {}\n\
+             numax_wasm_module_cache_lookups_total{{module=\"{module}\",result=\"miss\"}} {}\n\
+             numax_wasm_compilation_duration_seconds_total{{module=\"{module}\"}} {:.9}\n\
+             numax_wasm_instantiation_duration_seconds_total{{module=\"{module}\"}} {:.9}\n\
+             numax_wasm_instantiations_total{{module=\"{module}\"}} {}\n\
+             numax_wasm_execution_duration_seconds_total{{module=\"{module}\"}} {:.9}\n\
+             numax_wasm_executions_total{{module=\"{module}\"}} {}\n\
+             numax_wasm_linear_memory_current_bytes{{module=\"{module}\"}} {}\n\
+             numax_wasm_linear_memory_peak_bytes{{module=\"{module}\"}} {}\n\
+             numax_wasm_linear_memory_growth_bytes_total{{module=\"{module}\"}} {}\n",
+            metrics.invocations_ok,
+            metrics.invocations_error,
+            metrics.cache_hits,
+            metrics.cache_misses,
+            seconds(metrics.compilation_duration_ns),
+            seconds(metrics.instantiation_duration_ns),
+            metrics.instantiations,
+            seconds(metrics.execution_duration_ns),
+            metrics.executions,
+            metrics.linear_memory_current_bytes,
+            metrics.linear_memory_peak_bytes,
+            metrics.linear_memory_growth_bytes,
+        ));
+    }
+
+    rendered
+}
+
+fn seconds(nanoseconds: u64) -> f64 {
+    nanoseconds as f64 / 1_000_000_000.0
 }
 
 #[cfg(test)]
@@ -336,6 +510,7 @@ mod tests {
             broadcast_ops_total: 8,
             store_keys: 3,
             store_bytes: 42,
+            wasm_modules: BTreeMap::new(),
         };
         let rendered = render_metrics(snapshot);
 
@@ -351,6 +526,63 @@ mod tests {
         assert!(rendered.contains("numax_broadcast_ops_total 8"));
         assert!(rendered.contains("numax_store_keys 3"));
         assert!(rendered.contains("numax_store_bytes 42"));
+    }
+
+    #[test]
+    fn wasm_module_metrics_are_rendered_with_a_stable_module_label() {
+        let metrics = RuntimeMetrics::default();
+        let store = temp_store();
+        let module = "0123456789abcdef";
+
+        metrics.record_wasm_cache_lookup(module, false);
+        metrics.record_wasm_cache_lookup(module, true);
+        metrics.record_wasm_compilation(module, Duration::from_millis(4));
+        metrics.record_wasm_instantiation(module, Duration::from_millis(2));
+        metrics.record_wasm_execution(module, Duration::from_millis(3), 65_536, 131_072);
+        metrics.record_wasm_invocation(module, true);
+        metrics.record_wasm_invocation(module, false);
+
+        let rendered = metrics.render_for_test(&store);
+
+        assert!(rendered.contains(&format!(
+            "numax_wasm_invocations_total{{module=\"{module}\",status=\"ok\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_invocations_total{{module=\"{module}\",status=\"error\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_module_cache_lookups_total{{module=\"{module}\",result=\"hit\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_execution_duration_seconds_total{{module=\"{module}\"}} 0.003000000"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_linear_memory_current_bytes{{module=\"{module}\"}} 131072"
+        )));
+        assert!(rendered.contains(&format!(
+            "numax_wasm_linear_memory_growth_bytes_total{{module=\"{module}\"}} 65536"
+        )));
+    }
+
+    #[test]
+    fn wasm_module_metrics_bound_label_cardinality() {
+        let metrics = RuntimeMetrics::default();
+        let store = temp_store();
+
+        for module in 0..MAX_WASM_MODULE_METRIC_LABELS + 10 {
+            metrics.record_wasm_invocation(&format!("module-{module}"), true);
+        }
+
+        let snapshot = metrics.snapshot(&store);
+        assert_eq!(snapshot.wasm_modules.len(), MAX_WASM_MODULE_METRIC_LABELS);
+        assert_eq!(
+            snapshot
+                .wasm_modules
+                .get(WASM_MODULE_OVERFLOW_LABEL)
+                .unwrap()
+                .invocations_ok,
+            11
+        );
     }
 
     #[tokio::test]
