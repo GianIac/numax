@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
 use tracing::debug;
@@ -18,6 +19,8 @@ pub(super) async fn apply_remote_ops(
     if ops.is_empty() {
         return Ok(());
     }
+
+    let apply_started = Instant::now();
 
     let mut seen = context.seen_ops.write().await;
     let mut log = context.op_log.write().await;
@@ -92,7 +95,8 @@ pub(super) async fn apply_remote_ops(
         next_op_log_sequence = next_op_log_sequence.saturating_add(1);
     }
 
-    persist_remote_ops_batch(
+    let duplicate_count = ops.len().saturating_sub(inserted_ops.len());
+    if let Err(error) = persist_remote_ops_batch(
         context.store,
         &plans,
         RemoteCrdtUpdateBatch {
@@ -103,9 +107,18 @@ pub(super) async fn apply_remote_ops(
             orsets: &orset_updates,
             rgas: &rga_updates,
         },
-    )?;
+    ) {
+        context.metrics.record_remote_op_batch(
+            ops.len(),
+            0,
+            duplicate_count,
+            apply_started.elapsed(),
+            true,
+        );
+        return Err(error);
+    }
 
-    let applied_count = plans.len() as u64;
+    let applied_count = plans.len();
     apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
     log.extend(inserted_ops);
     prune_op_log_and_return_evicted(&mut log, context.op_log_limit);
@@ -135,9 +148,16 @@ pub(super) async fn apply_remote_ops(
         .store(next_op_log_sequence, Ordering::Relaxed);
 
     if applied_count > 0 {
-        context.metrics.record_ops(applied_count);
+        context.metrics.record_ops(applied_count as u64);
         debug!(count = applied_count, "applied remote ops batch");
     }
+    context.metrics.record_remote_op_batch(
+        ops.len(),
+        applied_count,
+        duplicate_count,
+        apply_started.elapsed(),
+        false,
+    );
 
     Ok(())
 }
@@ -487,7 +507,7 @@ mod tests {
         op_log: &Arc<RwLock<Vec<Op>>>,
         op_log_next_sequence: &Arc<AtomicU64>,
         store: &Arc<NxStore>,
-    ) {
+    ) -> Arc<RuntimeMetrics> {
         let pncounters = Arc::new(RwLock::new(HashMap::new()));
         let lww_registers = Arc::new(RwLock::new(HashMap::new()));
         let lww_maps = Arc::new(RwLock::new(HashMap::new()));
@@ -512,6 +532,7 @@ mod tests {
         apply_remote_ops(std::slice::from_ref(op), &context)
             .await
             .unwrap();
+        metrics
     }
 
     #[tokio::test]
@@ -569,7 +590,7 @@ mod tests {
             &store,
         )
         .await;
-        apply_remote_gcounter_op_for_test(
+        let duplicate_metrics = apply_remote_gcounter_op_for_test(
             &op,
             &counters,
             &seen_ops,
@@ -586,5 +607,12 @@ mod tests {
         buf.copy_from_slice(&bytes);
 
         assert_eq!(u64::from_le_bytes(buf), 3);
+        let rendered = duplicate_metrics.render_for_test(&store);
+        assert!(rendered.contains("numax_remote_ops_received_total 1"));
+        assert!(rendered.contains("numax_remote_ops_applied_total 0"));
+        assert!(rendered.contains("numax_remote_ops_duplicate_total 1"));
+        assert!(rendered.contains("numax_remote_op_batches_total 1"));
+        assert!(rendered.contains("numax_remote_op_apply_errors_total 0"));
+        assert!(rendered.contains("numax_remote_op_batch_apply_duration_seconds_count 1"));
     }
 }

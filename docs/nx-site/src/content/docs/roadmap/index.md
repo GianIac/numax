@@ -98,7 +98,6 @@ instead of crashing.
 - [x] CPU flamegraph artifact in Ubuntu CI with feature-gated `pprof-rs`
 - [x] Load-phase heap profile artifact in Ubuntu CI with feature-gated `dhat`
 - [x] Per-WASM-module execution metrics (duration, outcomes, cache and linear-memory usage)
-- [ ] Opt-in guest allocator instrumentation for exact allocated/freed bytes
 
 **Regression gate**:
 - [x] Load benchmarks extended with automatic JSON report
@@ -109,7 +108,8 @@ instead of crashing.
 **Additional metrics**:
 - [x] `numax_wasm_execution_duration_seconds_total` per module
 - [x] `numax_wasm_linear_memory_*_bytes` per module
-- [ ] `numax_op_apply_duration_ms` distribution
+- [x] `numax_remote_op_batch_apply_duration_seconds` distribution
+- [x] Remote-op received, applied, duplicate, batch, and apply-error counters
 
 **Closing criterion**:
 > A PR that worsens sync p99 by > 5% is automatically blocked by CI with the regression details.
@@ -505,6 +505,9 @@ time = true
 ## v0.2.0 - Stable
 
 **Final goal**: distributed runtime **production-ready for any criticality**.
+
+**Public runtime API evolution**:
+- [ ] Introduce opt-in guest allocator instrumentation for exact allocated/freed bytes together with a `#[non_exhaustive]` `HostState`, a supported constructor/builder, and `0.1.x` migration guidance
 
 **Final release criteria**:
 - [ ] All `0.1.0`–`0.1.15` releases closed

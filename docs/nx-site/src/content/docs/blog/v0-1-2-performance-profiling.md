@@ -92,7 +92,7 @@ The roadmap calls out three new metrics:
 
 - `numax_module_cpu_ms` - per-WASM-module CPU time
 - `numax_module_memory_bytes` - per-WASM-module memory
-- `numax_op_apply_duration_ms` - CRDT op apply latency distribution
+- `numax_remote_op_batch_apply_duration_seconds` - remote CRDT batch apply latency distribution
 
 These aren't picked for aesthetics. They map exactly to the places where
 Numax's performance actually gets decided: **inside guest execution** and

@@ -74,6 +74,12 @@ The dashboard uses only metrics currently emitted by Numax:
 | `numax_peer_disconnects_total`       | counter | peer disconnection events                  |
 | `numax_broadcast_batches_total`      | counter | broadcast batches sent                     |
 | `numax_broadcast_ops_total`          | counter | operations broadcast to peers              |
+| `numax_remote_ops_received_total`    | counter | remote operations received before deduplication |
+| `numax_remote_ops_applied_total`     | counter | remote operations successfully applied     |
+| `numax_remote_ops_duplicate_total`   | counter | duplicate remote operations skipped        |
+| `numax_remote_op_batches_total`      | counter | non-empty remote operation batches processed |
+| `numax_remote_op_apply_errors_total` | counter | remote batches that failed during apply or persistence |
+| `numax_remote_op_batch_apply_duration_seconds` | histogram | end-to-end remote batch apply latency |
 | `numax_store_keys`                   | gauge   | key count in the local store               |
 | `numax_store_bytes`                  | gauge   | approximate store payload bytes            |
 | `numax_wasm_invocations_total`       | counter | module invocations by outcome              |
@@ -100,6 +106,20 @@ Broadcast throughput:
 
 ```txt
 rate(numax_broadcast_ops_total[1m])
+```
+
+Remote apply p95 latency:
+
+```txt
+histogram_quantile(0.95, rate(numax_remote_op_batch_apply_duration_seconds_bucket[5m]))
+```
+
+Remote duplicate ratio:
+
+```txt
+rate(numax_remote_ops_duplicate_total[5m])
+/
+rate(numax_remote_ops_received_total[5m])
 ```
 
 Recent sync errors:
