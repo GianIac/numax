@@ -102,7 +102,7 @@ instead of crashing.
 **Regression gate**:
 - [x] Load benchmarks extended with automatic JSON report
 - [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
-- [ ] Run `scripts/compare-benchmark-report.test.mjs` in CI
+- [x] Run `scripts/compare-benchmark-report.test.mjs` in CI
 - [x] Baseline history committed in `crates/*/reports/baselines/`
 
 **Additional metrics**:

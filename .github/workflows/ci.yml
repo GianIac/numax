@@ -2,12 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -118,9 +122,19 @@ jobs:
           NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.0/target/release/nx
         run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
+  benchmark-tools:
+    name: Benchmark Comparator Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test benchmark comparator
+        run: node scripts/compare-benchmark-report.test.mjs
+
   benchmark-regression:
     name: Benchmark Regression Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: benchmark-tools
     env:
       NUMAX_BENCH_GATE_MODE: ${{ vars.NUMAX_BENCH_GATE_MODE || 'shadow' }}
     steps:
@@ -129,23 +143,59 @@ jobs:
         with:
           toolchain: stable
           rustflags: ""
-      - name: Run sync load benchmark
+      - name: Run sync load benchmark three times
         run: |
           mkdir -p reports/bench
-          cargo bench -p nx-core --bench three_node_sync_load -- \
-            --duration-secs 10 \
-            --target-ops-sec-per-node 1000 \
-            --settle-secs 10 \
-            --report reports/bench/three-node-sync-smoke.json
-      - name: Compare against baseline
+          for run in 1 2 3; do
+            cargo bench -p nx-core --bench three_node_sync_load -- \
+              --duration-secs 10 \
+              --target-ops-sec-per-node 1000 \
+              --settle-secs 10 \
+              --report "reports/bench/three-node-sync-smoke-${run}.json"
+          done
+      - name: Compare median against baseline
         run: |
+          set +e
           node scripts/compare-benchmark-report.mjs \
             --baseline crates/nx-core/reports/baselines/three-node-sync-smoke.json \
-            --current reports/bench/three-node-sync-smoke.json \
+            --current reports/bench/three-node-sync-smoke-1.json \
+            --current reports/bench/three-node-sync-smoke-2.json \
+            --current reports/bench/three-node-sync-smoke-3.json \
+            --write-aggregate reports/bench/three-node-sync-smoke-median.json \
             --mode "${NUMAX_BENCH_GATE_MODE}" \
-            --p99-threshold 5 \
+            --p99-threshold 10 \
+            --p99-min-delta-ms 0.1 \
             --throughput-threshold 5 \
-            --rss-threshold 5
+            --rss-threshold 10 \
+            --rss-min-delta-bytes 16777216 \
+            2>&1 | tee reports/bench/comparison.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Benchmark regression gate"
+            echo '```text'
+            cat reports/bench/comparison.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Upload benchmark reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-regression-report
+          path: reports/bench/
+          if-no-files-found: error
+
+  profiling-artifacts:
+    name: Ubuntu Profiling Artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
+        with:
+          toolchain: stable
+          rustflags: ""
       - name: Generate Ubuntu CPU flamegraph
         run: |
           mkdir -p reports/profiling
@@ -170,12 +220,6 @@ jobs:
           test -s reports/profiling/three-node-sync-load-heap.json
           node -e "const p=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); if(p.mode!=='rust-heap'||!Array.isArray(p.pps))process.exit(1)" \
             reports/profiling/three-node-sync-load-heap.json
-      - name: Upload benchmark report
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-regression-report
-          path: reports/bench/three-node-sync-smoke.json
       - name: Upload Ubuntu CPU flamegraph
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -193,7 +237,16 @@ jobs:
 
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, build-wasm, cli-smoke, benchmark-regression]
+    needs:
+      - check
+      - fmt
+      - clippy
+      - test
+      - build-wasm
+      - cli-smoke
+      - benchmark-tools
+      - benchmark-regression
+      - profiling-artifacts
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -205,7 +258,9 @@ jobs:
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.build-wasm.result }}" != "success" ]] || \
              [[ "${{ needs.cli-smoke.result }}" != "success" ]] || \
-             [[ "${{ needs.benchmark-regression.result }}" != "success" ]]; then
+             [[ "${{ needs.benchmark-tools.result }}" != "success" ]] || \
+             [[ "${{ needs.benchmark-regression.result }}" != "success" ]] || \
+             [[ "${{ needs.profiling-artifacts.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

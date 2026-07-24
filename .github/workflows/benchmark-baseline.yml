@@ -1,0 +1,77 @@
+name: Benchmark Baseline Calibration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-baseline-calibration
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  calibrate:
+    name: Generate Ubuntu baseline candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: Test benchmark comparator
+        run: node scripts/compare-benchmark-report.test.mjs
+      - name: Run five calibration benchmarks
+        run: |
+          mkdir -p reports/baseline-candidate reports/baseline-runs
+          for run in 1 2 3 4 5; do
+            cargo bench -p nx-core --bench three_node_sync_load -- \
+              --duration-secs 10 \
+              --target-ops-sec-per-node 1000 \
+              --settle-secs 10 \
+              --report "reports/baseline-runs/three-node-sync-smoke-${run}.json"
+          done
+      - name: Generate median baseline candidate
+        run: |
+          set +e
+          node scripts/compare-benchmark-report.mjs \
+            --baseline crates/nx-core/reports/baselines/three-node-sync-smoke.json \
+            --current reports/baseline-runs/three-node-sync-smoke-1.json \
+            --current reports/baseline-runs/three-node-sync-smoke-2.json \
+            --current reports/baseline-runs/three-node-sync-smoke-3.json \
+            --current reports/baseline-runs/three-node-sync-smoke-4.json \
+            --current reports/baseline-runs/three-node-sync-smoke-5.json \
+            --write-aggregate reports/baseline-candidate/three-node-sync-smoke.json \
+            --mode shadow \
+            --p99-threshold 10 \
+            --p99-min-delta-ms 0.1 \
+            --throughput-threshold 5 \
+            --rss-threshold 10 \
+            --rss-min-delta-bytes 16777216 \
+            2>&1 | tee reports/baseline-candidate/comparison.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Benchmark baseline candidate"
+            echo '```text'
+            cat reports/baseline-candidate/comparison.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Validate candidate RSS
+        run: |
+          node -e "const r=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); if(!Number.isFinite(r.resources?.rss_bytes)) throw new Error('candidate rss_bytes is missing')" \
+            reports/baseline-candidate/three-node-sync-smoke.json
+      - name: Upload baseline candidate and raw reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline-candidate-ubuntu-24.04
+          path: |
+            reports/baseline-candidate/
+            reports/baseline-runs/
+          if-no-files-found: error
