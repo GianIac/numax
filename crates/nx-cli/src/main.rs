@@ -1,12 +1,14 @@
 mod config;
 
 use std::fs;
+use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use config::*;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
@@ -144,6 +146,13 @@ enum Cli {
         #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MIGRATION_BATCH_BYTES, value_parser = parse_nonzero_byte_size)]
         max_bytes: NonZeroUsize,
     },
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -178,21 +187,33 @@ enum ConfigCommand {
     },
 }
 
+fn generate_completions(shell: Shell, writer: &mut dyn Write) {
+    let mut command = Cli::command();
+    generate(shell, &mut command, "nx", writer);
+}
+
 fn main() {
+    let cli = match Cli::parse() {
+        Cli::Completions { shell } => {
+            let stdout = io::stdout();
+            generate_completions(shell, &mut stdout.lock());
+            return;
+        }
+        cli => cli,
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
 
-    if let Err(e) = rt.block_on(real_main()) {
+    if let Err(e) = rt.block_on(real_main(cli)) {
         eprintln!("[nx-cli] error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn real_main(cli: Cli) -> Result<()> {
     match cli {
         Cli::Run {
             module,
@@ -382,6 +403,9 @@ async fn real_main() -> Result<()> {
             migrate_sync_schema_at_path(&datastore_path, options)?;
             println!("datastore migrated: {}", datastore_path.display());
         }
+        Cli::Completions { .. } => {
+            unreachable!("completion generation returns before runtime initialization")
+        }
     }
 
     Ok(())
@@ -405,6 +429,62 @@ mod tests {
 
     fn p(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
+    }
+
+    mod completions {
+        use super::*;
+
+        #[test]
+        fn generates_nonempty_scripts_for_supported_shells() {
+            for shell in [
+                Shell::Bash,
+                Shell::Zsh,
+                Shell::Fish,
+                Shell::PowerShell,
+                Shell::Elvish,
+            ] {
+                let mut output = Vec::new();
+                generate_completions(shell, &mut output);
+
+                let output = String::from_utf8(output).unwrap();
+                assert!(!output.is_empty(), "empty completion output for {shell}");
+                assert!(
+                    output.contains("nx"),
+                    "completion output did not name nx for {shell}"
+                );
+            }
+        }
+
+        #[test]
+        fn parses_a_supported_shell() {
+            let cli = Cli::try_parse_from(["nx", "completions", "bash"]).unwrap();
+
+            assert!(matches!(
+                cli,
+                Cli::Completions { shell: Shell::Bash }
+            ));
+        }
+
+        #[test]
+        fn rejects_an_unsupported_shell() {
+            let error = Cli::try_parse_from(["nx", "completions", "nushell"]).unwrap_err();
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+            let rendered = error.to_string();
+            for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+                assert!(rendered.contains(shell), "missing {shell} in: {rendered}");
+            }
+        }
+
+        #[test]
+        fn rejects_a_missing_shell() {
+            let error = Cli::try_parse_from(["nx", "completions"]).unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
     }
 
     mod duration_parser {
