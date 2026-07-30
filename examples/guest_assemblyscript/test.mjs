@@ -20,7 +20,7 @@ assert.ok(
 
 let memory;
 const messages = [];
-const { instance } = await WebAssembly.instantiate(module, {
+const instance = await WebAssembly.instantiate(module, {
   nx: {
     host_log_v2(pointer, length) {
       messages.push(

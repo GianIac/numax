@@ -1,0 +1,13 @@
+{
+  "targets": {
+    "release": {
+      "outFile": "guest.wasm",
+      "textFile": "guest.wat",
+      "runtime": "stub",
+      "optimizeLevel": 3,
+      "shrinkLevel": 0,
+      "converge": false,
+      "noAssert": true
+    }
+  }
+}
