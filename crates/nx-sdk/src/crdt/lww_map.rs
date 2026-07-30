@@ -16,6 +16,7 @@ const MAX_LWW_MAP_BUFFER: usize = 1024 * 1024;
 ///
 /// The host assigns the timestamp and local writer NodeId.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn set(key: &str, field: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_map_set(
@@ -32,6 +33,7 @@ pub fn set(key: &str, field: &str, value: &[u8]) -> Result<()> {
 
 /// Remove `field` from the LWW-Map under `key`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn remove(key: &str, field: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_map_remove(
@@ -84,6 +86,7 @@ pub fn get(key: &str, field: &str) -> Result<Option<Vec<u8>>> {
 
 /// Return true when `field` currently has a visible value.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn contains(key: &str, field: &str) -> Result<bool> {
     let rc = unsafe {
         ffi::crdt_lww_map_contains(
