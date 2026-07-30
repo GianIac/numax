@@ -3,9 +3,14 @@ name = "nx-cli"
 version = "0.1.1"
 edition = "2024"
 
+[features]
+default = []
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+console-subscriber = { version = "0.5", optional = true }
 nx-core = { version = "0.1.1", path = "../nx-core" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
