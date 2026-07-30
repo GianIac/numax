@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,6 +17,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cargo-deny:
+    name: Dependency Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
+
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -236,6 +247,7 @@ jobs:
   ci-success:
     name: CI Success
     needs:
+      - cargo-deny
       - check
       - fmt
       - clippy
@@ -250,7 +262,8 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ needs.check.result }}" != "success" ]] || \
+          if [[ "${{ needs.cargo-deny.result }}" != "success" ]] || \
+             [[ "${{ needs.check.result }}" != "success" ]] || \
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
