@@ -23,6 +23,7 @@ const HISTOGRAM_MAX_MICROS: usize = 1_000_000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_LIMIT_HEADROOM_OPS: u64 = 100_000;
 const LOAD_TEST_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+const REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug)]
 struct Config {
@@ -38,6 +39,8 @@ struct Config {
 struct Report {
     scenario: &'static str,
     nodes: usize,
+    duration_secs: u64,
+    restart_every_secs: u64,
     load_duration_secs: f64,
     total_duration_secs: f64,
     target_ops_sec: u64,
@@ -52,6 +55,7 @@ struct Report {
     observed_counters: Vec<u64>,
     converged: bool,
     convergence_wait_secs: f64,
+    rss_bytes: Option<u64>,
     latency: LatencySnapshot,
 }
 
@@ -239,6 +243,8 @@ async fn run_async(config: Config) -> Result<(), String> {
     let report = Report {
         scenario: "chaos-sync-restart-gcounter",
         nodes: nodes.len(),
+        duration_secs: config.duration.as_secs(),
+        restart_every_secs: config.restart_every.as_secs(),
         load_duration_secs: load_elapsed.as_secs_f64(),
         total_duration_secs: started.elapsed().as_secs_f64(),
         target_ops_sec: config.target_ops_sec,
@@ -253,6 +259,7 @@ async fn run_async(config: Config) -> Result<(), String> {
         observed_counters,
         converged,
         convergence_wait_secs: convergence_started.elapsed().as_secs_f64(),
+        rss_bytes: current_rss_bytes(),
         latency: latencies.snapshot(),
     };
     let json = report.to_json();
@@ -499,7 +506,16 @@ impl Report {
         format!(
             concat!(
                 "{{\n",
+                "  \"report_schema_version\": {},\n",
+                "  \"crate\": \"nx-core\",\n",
+                "  \"benchmark\": \"chaos_sync_load\",\n",
                 "  \"scenario\": \"{}\",\n",
+                "  \"profile\": {{\n",
+                "    \"nodes\": {},\n",
+                "    \"duration_secs\": {},\n",
+                "    \"target_ops_sec\": {},\n",
+                "    \"restart_every_secs\": {}\n",
+                "  }},\n",
                 "  \"nodes\": {},\n",
                 "  \"load_duration_secs\": {:.3},\n",
                 "  \"total_duration_secs\": {:.3},\n",
@@ -515,6 +531,9 @@ impl Report {
                 "  \"observed_counters\": [{}],\n",
                 "  \"converged\": {},\n",
                 "  \"convergence_wait_secs\": {:.3},\n",
+                "  \"resources\": {{\n",
+                "    \"rss_bytes\": {}\n",
+                "  }},\n",
                 "  \"latency_ms\": {{\n",
                 "    \"p50\": {:.3},\n",
                 "    \"p95\": {:.3},\n",
@@ -524,7 +543,12 @@ impl Report {
                 "  }}\n",
                 "}}"
             ),
+            REPORT_SCHEMA_VERSION,
             self.scenario,
+            self.nodes,
+            self.duration_secs,
+            self.target_ops_sec,
+            self.restart_every_secs,
             self.nodes,
             self.load_duration_secs,
             self.total_duration_secs,
@@ -540,6 +564,7 @@ impl Report {
             join_u64s(&self.observed_counters),
             self.converged,
             self.convergence_wait_secs,
+            json_option_u64(self.rss_bytes),
             self.latency.p50_ms,
             self.latency.p95_ms,
             self.latency.p99_ms,
@@ -590,6 +615,31 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 fn micros_to_ms(micros: u64) -> f64 {
     micros as f64 / 1_000.0
+}
+
+fn json_option_u64(value: Option<u64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kb.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn print_help() {

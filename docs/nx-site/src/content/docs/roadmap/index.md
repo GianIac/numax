@@ -44,9 +44,9 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | Version | Theme | Status |
 |---|---|---|
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
-| `v0.1.1` | Architectural Cleanup & Versioning | active |
-| `v0.1.2` | Performance & Profiling | planned |
-| `v0.1.3` | Supply Chain & Fuzzing | planned |
+| `v0.1.1` | Architectural Cleanup & Versioning | released |
+| `v0.1.2` | Performance & Profiling | released |
+| `v0.1.3` | Supply Chain & Fuzzing | active |
 | `v0.1.4` | Management API | planned |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
@@ -94,20 +94,22 @@ instead of crashing.
 **Goal**: make performance observation automatic and visible, prevent silent regressions.
 
 **Profiling tools**:
-- [ ] `tokio-console` integration (visibility into tasks)
-- [ ] CPU flamegraph in CI with `pprof-rs` or `samply`
-- [ ] Heap profiling with `dhat` integrated into benchmarks
-- [ ] Per-WASM-module profiling (CPU time, bytes allocated)
+- [x] `tokio-console` integration (visibility into tasks)
+- [x] CPU flamegraph artifact in Ubuntu CI with feature-gated `pprof-rs`
+- [x] Load-phase heap profile artifact in Ubuntu CI with feature-gated `dhat`
+- [x] Per-WASM-module execution metrics (duration, outcomes, cache and linear-memory usage)
 
 **Regression gate**:
-- [ ] Load benchmarks extended with automatic JSON report
+- [x] Load benchmarks extended with automatic JSON report
 - [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
-- [ ] Baseline history committed in `crates/*/reports/baselines/`
+- [x] Run `scripts/compare-benchmark-report.test.mjs` in CI
+- [x] Baseline history committed in `crates/*/reports/baselines/`
 
 **Additional metrics**:
-- [ ] `numax_module_cpu_ms` per module
-- [ ] `numax_module_memory_bytes` per module
-- [ ] `numax_op_apply_duration_ms` distribution
+- [x] `numax_wasm_execution_duration_seconds_total` per module
+- [x] `numax_wasm_linear_memory_*_bytes` per module
+- [x] `numax_remote_op_batch_apply_duration_seconds` distribution
+- [x] Remote-op received, applied, duplicate, batch, and apply-error counters
 
 **Closing criterion**:
 > A PR that worsens sync p99 by > 5% is automatically blocked by CI with the regression details.
@@ -504,6 +506,9 @@ time = true
 
 **Final goal**: distributed runtime **production-ready for any criticality**.
 
+**Public runtime API evolution**:
+- [ ] Introduce opt-in guest allocator instrumentation for exact allocated/freed bytes together with a `#[non_exhaustive]` `HostState`, a supported constructor/builder, and `0.1.x` migration guidance
+
 **Final release criteria**:
 - [ ] All `0.1.0`–`0.1.15` releases closed
 - [ ] Complete and reviewed documentation
@@ -522,10 +527,8 @@ time = true
 - **Pluggable storage backends**: redb, fjall, custom
 - **GPU/ML guests**: WASI-NN integration
 - **Edge orchestration**: optional integration with existing edge runtimes
-- **Tiny embedded runtimes**: evaluate interpreter-based WASM engines such as
-  `wasmi` or WAMR for Cortex-M / RISC-V devices with RAM measured in kilobytes.
-  Wasmtime is the right native engine for the current runtime, but it is not a
-  microcontroller-class target.
+- **Cross-platform profiling CI**: extend the canonical Ubuntu/Linux CPU profile to scheduled macOS and Windows artifacts, keeping results separated by OS.
+- **Tiny embedded runtimes**: evaluate interpreter-based WASM engines such as `wasmi` or WAMR for Cortex-M / RISC-V devices with RAM measured in kilobytes. Wasmtime is the right native engine for the current runtime, but it is not a microcontroller-class target.
 
 ---
 
@@ -541,4 +544,4 @@ time = true
 
 ---
 
-*Last revision*: `2026-05-30`
+*Last revision*: `2026-07-22`
