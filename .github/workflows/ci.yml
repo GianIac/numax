@@ -135,8 +135,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: benchmark-tools
-    env:
-      NUMAX_BENCH_GATE_MODE: ${{ vars.NUMAX_BENCH_GATE_MODE || 'shadow' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
@@ -162,7 +160,7 @@ jobs:
             --current reports/bench/three-node-sync-smoke-2.json \
             --current reports/bench/three-node-sync-smoke-3.json \
             --write-aggregate reports/bench/three-node-sync-smoke-median.json \
-            --mode "${NUMAX_BENCH_GATE_MODE}" \
+            --mode blocking \
             --p99-threshold 10 \
             --p99-min-delta-ms 0.1 \
             --throughput-threshold 5 \

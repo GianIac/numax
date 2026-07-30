@@ -39,6 +39,7 @@ fn read_dynamic(mut call: impl FnMut(*mut u8, u32) -> i32) -> Result<Option<Vec<
 /// Read an allowed environment variable from the host.
 ///
 /// The host currently exposes only `NX_*` and `NUMAX_*` uppercase variables.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn env_get(key: &str) -> Result<Option<Vec<u8>>> {
     read_dynamic(|out_ptr, out_cap| unsafe {
         ffi::env_get(
@@ -51,6 +52,7 @@ pub fn env_get(key: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// Identifier of the current module as provided by the runtime.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn module_id() -> Result<String> {
     let bytes =
         read_dynamic(|out_ptr, out_cap| unsafe { ffi::module_id(out_ptr as u32, out_cap) })?
@@ -59,6 +61,7 @@ pub fn module_id() -> Result<String> {
 }
 
 /// Host API capabilities available in the current runtime.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn host_capabilities() -> Result<Vec<String>> {
     let bytes = read_dynamic(|out_ptr, out_cap| unsafe {
         ffi::host_capabilities(out_ptr as u32, out_cap)
@@ -74,6 +77,7 @@ pub fn host_capabilities() -> Result<Vec<String>> {
 }
 
 /// Emit a named event to the runtime.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn event_emit(name: &str, payload: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::event_emit(

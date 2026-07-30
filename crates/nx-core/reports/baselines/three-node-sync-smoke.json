@@ -10,12 +10,12 @@
     "anti_entropy_interval_secs": 80
   },
   "nodes": 3,
-  "load_duration_secs": 10.024,
-  "total_duration_secs": 10.024,
+  "load_duration_secs": 10.009,
+  "total_duration_secs": 10.112,
   "target_ops_sec_per_node": 1000,
   "target_ops_sec_total": 3000,
   "ops_total": 30000,
-  "ops_sec_avg": 2992.69,
+  "ops_sec_avg": 2997.27,
   "errors_total": 0,
   "queued_ops_limit": 110000,
   "op_log_limit": 110000,
@@ -24,15 +24,19 @@
   "expected_counter": 30000,
   "observed_counters": [30000, 30000, 30000],
   "converged": true,
-  "convergence_wait_secs": 0.000,
+  "convergence_wait_secs": 0.102,
   "resources": {
-    "rss_bytes": null
+    "rss_bytes": 136601600
   },
   "latency_ms": {
-    "p50": 0.004,
-    "p95": 0.008,
-    "p99": 0.226,
-    "max": 25.563,
-    "avg": 0.057
+    "p50": 0.001,
+    "p95": 0.002,
+    "p99": 0.031,
+    "max": 0.422,
+    "avg": 0.002
+  },
+  "aggregation": {
+    "method": "median",
+    "runs": 5
   }
 }
