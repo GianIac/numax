@@ -45,7 +45,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 |---|---|---|
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
-| `v0.1.2` | Performance & Profiling | active |
+| `v0.1.2` | Performance & Profiling | released |
 | `v0.1.3` | Supply Chain & Fuzzing | planned |
 | `v0.1.4` | Management API | planned |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
