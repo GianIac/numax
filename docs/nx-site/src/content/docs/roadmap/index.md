@@ -91,28 +91,24 @@ instead of crashing.
 
 ## v0.1.2 - Performance & Profiling 📊
 
-**Goal**: make performance observation automatic and visible, prevent silent regressions.
+`v0.1.2` made performance observation automatic and silent regressions
+impossible to merge.
 
-**Profiling tools**:
-- [x] `tokio-console` integration (visibility into tasks)
-- [x] CPU flamegraph artifact in Ubuntu CI with feature-gated `pprof-rs`
-- [x] Load-phase heap profile artifact in Ubuntu CI with feature-gated `dhat`
-- [x] Per-WASM-module execution metrics (duration, outcomes, cache and linear-memory usage)
+The runtime now profiles itself: `tokio-console` for live task visibility,
+feature-gated CPU flamegraphs (`pprof-rs`) and load-phase heap profiles
+(`dhat`) produced as Ubuntu CI artifacts, and per-WASM-module execution
+metrics covering duration, outcomes, compilation cache and linear-memory
+usage. On top of that, load benchmarks now emit a structured JSON report and
+CI compares every PR against a baseline committed under
+`crates/*/reports/baselines/`, failing automatically on p99 latency,
+throughput or RSS regressions.
 
-**Regression gate**:
-- [x] Load benchmarks extended with automatic JSON report
-- [x] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress beyond configured thresholds
-- [x] Run `scripts/compare-benchmark-report.test.mjs` in CI
-- [x] Baseline history committed in `crates/*/reports/baselines/`
+Net result: flamegraphs and heap profiles are one click away on every CI run,
+each module reports its own cost through Prometheus, and a PR that pushes
+sync p99, throughput or RSS past the configured budget is blocked
+automatically with the regression details.
 
-**Additional metrics**:
-- [x] `numax_wasm_execution_duration_seconds_total` per module
-- [x] `numax_wasm_linear_memory_*_bytes` per module
-- [x] `numax_remote_op_batch_apply_duration_seconds` distribution
-- [x] Remote-op received, applied, duplicate, batch, and apply-error counters
-
-**Closing criterion**:
-> A PR whose median sync benchmark exceeds the configured p99, throughput, or RSS regression thresholds is automatically blocked by CI with the regression details.
+📄 Full details in the [`v0.1.2` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.2).
 
 ---
 
