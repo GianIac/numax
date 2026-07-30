@@ -116,5 +116,12 @@ unsafe extern "C" {
     pub fn host_log(msg_ptr: u32, msg_len: u32);
 
     // Preferred: allows error codes.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "unit tests replace host logging with an in-memory sink"
+        )
+    )]
     pub fn host_log_v2(msg_ptr: u32, msg_len: u32) -> i32;
 }
