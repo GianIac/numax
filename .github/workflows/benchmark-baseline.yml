@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
         with:
           toolchain: stable
@@ -35,7 +35,7 @@ jobs:
               --duration-secs 10 \
               --target-ops-sec-per-node 1000 \
               --settle-secs 10 \
-              --report "reports/baseline-runs/three-node-sync-smoke-${run}.json"
+              --report "${GITHUB_WORKSPACE}/reports/baseline-runs/three-node-sync-smoke-${run}.json"
           done
       - name: Generate median baseline candidate
         run: |
@@ -70,7 +70,7 @@ jobs:
             reports/baseline-candidate/three-node-sync-smoke.json
       - name: Upload baseline candidate and raw reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-baseline-candidate-ubuntu-24.04
           path: |
