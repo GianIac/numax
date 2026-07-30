@@ -59,6 +59,7 @@ pub fn insert_after(key: &str, parent: Option<&str>, value: &[u8]) -> Result<Str
 
 /// Delete the element identified by `id`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn delete(key: &str, id: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_rga_delete(
