@@ -19,6 +19,10 @@ Three things, and only three:
 
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
+> **Status:** `v0.1.2` - current stable Numax release for controlled,
+> non-critical workloads. It adds opt-in runtime profiling, hot-path metrics,
+> and a blocking CI gate for p99 latency, throughput, and RSS regressions.
+
 ---
 
 ## Why

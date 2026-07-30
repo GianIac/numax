@@ -1,13 +1,13 @@
 [package]
 name = "hello_sdk"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-nx-sdk = { version = "0.1.1", path = "../../crates/nx-sdk" }
+nx-sdk = { version = "0.1.2", path = "../../crates/nx-sdk" }
 
 [profile.release]
 lto = true

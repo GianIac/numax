@@ -5,7 +5,7 @@ description: Numax vision, architecture and principles.
 
 
 > **Note**
-> This whitepaper is aligned with **v0.1.1**, the current stable Numax release.
+> This whitepaper is aligned with **v0.1.2**, the current stable Numax release.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -13,7 +13,7 @@ description: Numax vision, architecture and principles.
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.1` - stable release for controlled, non-critical workloads. Wire and persisted-schema versions are explicit: mixed `v0.1.0`/`v0.1.1` nodes reject the connection safely, while `v0.1.0` datastores can be upgraded offline with `nx migrate`.
+> **Version reference**: `v0.1.2` - stable release for controlled, non-critical workloads. It retains the explicit wire and persisted-schema versioning introduced in `v0.1.1`, and adds opt-in runtime profiling, hot-path metrics, and a blocking CI performance-regression gate.
 >
 > **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/numax/roadmap/).
 
@@ -171,7 +171,7 @@ The separation keeps responsibilities clear and allows components to evolve inde
 
 ### 4.2 Supported environments
 
-Numax `v0.1.1` is designed to run as a native runtime on:
+Numax `v0.1.2` is designed to run as a native runtime on:
 
 - servers (x86_64, ARM64),
 - edge nodes,
@@ -856,7 +856,8 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 4. `test` - full test suite execution
 5. `build-wasm` - compilation of WASM examples
 
-**Load testing** - `v0.1.0` includes reproducible load gates with JSON reports:
+**Load testing and profiling** - the reproducible load gates introduced in
+`v0.1.0` emit JSON reports for:
 
 - single-node store throughput: 10k ops/sec for 1 hour
 - 3-node continuous sync: 1k ops/sec per node
@@ -864,15 +865,18 @@ The project includes an automated test suite that covers runtime, store, CRDT, n
 - chaos restart runner: continuous load with follower restart every 60s
 
 The reports capture throughput, p50/p95/p99 latency, convergence time and
-restart count for chaos runs. RAM/CPU profiling is intentionally left as a
-future hardening extension rather than mixed into the current correctness/load
-gates.
+restart count for chaos runs. In `v0.1.2`, pull requests also run the 3-node
+sync benchmark three times and compare its median p99 latency, throughput, and
+RSS against a baseline calibrated on `main`. The comparison is blocking with
+relative thresholds and absolute floors to limit false positives from
+numerically irrelevant changes. A separate Ubuntu CI path produces opt-in CPU
+flamegraphs with `pprof-rs` and load-phase heap profiles with `dhat`.
 
 ---
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of `v0.1.1`. They do not describe visions: they describe what the runtime already knows how to do with the current stable feature set.
+The use cases below are **concretely achievable today** with the primitives of `v0.1.2`. They do not describe visions: they describe what the runtime already knows how to do with the current stable feature set.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -902,7 +906,7 @@ The compute is portable across Numax nodes: the same `.wasm` module can run on a
 
 **Problem.** Applications that must work without a connection (collaborative notes, distributed configurations, field applications, maritime/aerial/rural devices) and reconcile when they come back online, without imposing manual conflict resolution.
 
-**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available since `v0.1.0` and retained in `v0.1.1`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
+**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available since `v0.1.0` and retained in `v0.1.2`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
 
 The `distributed_chat` example (today in local-only mode) represents the skeleton of this use case.
 
@@ -938,7 +942,7 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-`v0.1.1` is the current stable release, building on the first stable `v0.1.0` line. We recognize its limits explicitly:
+`v0.1.2` is the current stable release, building on the first stable `v0.1.0` line. We recognize its limits explicitly:
 
 - **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
@@ -965,11 +969,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-`v0.1.1` is the current stable Numax release. It retains the real, tested foundation established by `v0.1.0` - WASM runtime, sled store, six CRDT families, async replication, TCP networking, TLS 1.3 + mTLS, extended host APIs, observability and reproducible test gates - and adds a modular SyncManager, explicit wire/schema versioning, typed protocol errors and offline datastore migration.
+`v0.1.2` is the current stable Numax release. It retains the real, tested foundation established by `v0.1.0` and hardened in `v0.1.1` - WASM runtime, sled store, six CRDT families, async replication, TCP networking, TLS 1.3 + mTLS, extended host APIs, modular SyncManager, explicit wire/schema versioning, typed protocol errors and offline datastore migration - and adds opt-in task, CPU and heap profiling, WASM and sync hot-path metrics, and a blocking performance-regression gate.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**`v0.1.1` is the current stable release.** It is built on code, tests and documented limits rather than promises; `v0.1.0` remains the first stable line it evolved from.
+**`v0.1.2` is the current stable release.** It is built on code, tests and documented limits rather than promises; `v0.1.0` remains the first stable line it evolved from.
 
 In closing, I love software and I love numax.
 
