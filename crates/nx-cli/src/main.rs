@@ -6,14 +6,102 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{
+    Arg, ColorChoice, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use config::*;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
     migrate_sync_schema_at_path,
 };
+use owo_colors::{OwoColorize, Stream};
 use tracing::info;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for ColorWhen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        })
+    }
+}
+
+fn colors_enabled(mode: ColorWhen, stdout_supports_color: bool, no_color: bool) -> bool {
+    if no_color {
+        return false;
+    }
+
+    match mode {
+        ColorWhen::Auto => stdout_supports_color,
+        ColorWhen::Always => true,
+        ColorWhen::Never => false,
+    }
+}
+
+fn requested_color() -> ColorWhen {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+
+        let value = if arg == "--color" {
+            args.next().and_then(|value| value.into_string().ok())
+        } else {
+            arg.strip_prefix("--color=").map(str::to_owned)
+        };
+
+        if let Some(value) = value {
+            return match value.as_str() {
+                "always" => ColorWhen::Always,
+                "never" => ColorWhen::Never,
+                _ => ColorWhen::Auto,
+            };
+        }
+    }
+
+    ColorWhen::Auto
+}
+
+fn stdout_supports_color() -> bool {
+    "color-probe"
+        .if_supports_color(Stream::Stdout, |text| text.green())
+        .to_string()
+        .contains('\u{1b}')
+}
+
+fn help_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::Yellow.on_default())
+}
+
+fn cli_command(color_choice: ColorChoice) -> Command {
+    Cli::command()
+        .arg(
+            Arg::new("color")
+                .long("color")
+                .global(true)
+                .value_name("WHEN")
+                .value_parser(clap::value_parser!(ColorWhen))
+                .default_value("auto")
+                .help("Control help colors: auto, always, or never"),
+        )
+        .styles(help_styles())
+        .color(color_choice)
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "nx")]
@@ -191,7 +279,19 @@ fn main() {
 }
 
 async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+    let use_color = colors_enabled(
+        requested_color(),
+        stdout_supports_color(),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
+    let color_choice = if use_color {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    };
+    let matches = cli_command(color_choice).get_matches();
+    let cli =
+        Cli::from_arg_matches(&matches).expect("clap matches should convert to CLI arguments");
 
     match cli {
         Cli::Run {
@@ -1158,7 +1258,44 @@ mod tests {
     // clap parsing
     mod clap_parsing {
         use super::*;
-        use clap::CommandFactory;
+        use clap::{ColorChoice, CommandFactory};
+
+        #[test]
+        fn color_policy_respects_mode_terminal_and_no_color() {
+            assert!(colors_enabled(ColorWhen::Always, false, false));
+            assert!(!colors_enabled(ColorWhen::Never, true, false));
+            assert!(colors_enabled(ColorWhen::Auto, true, false));
+            assert!(!colors_enabled(ColorWhen::Auto, false, false));
+            assert!(!colors_enabled(ColorWhen::Always, true, true));
+        }
+
+        #[test]
+        fn global_color_flag_accepts_all_modes() {
+            for value in ["auto", "always", "never"] {
+                let matches = cli_command(ColorChoice::Never)
+                    .try_get_matches_from(["nx", "--color", value, "run", "x.wasm"])
+                    .unwrap();
+                assert_eq!(
+                    matches.get_one::<ColorWhen>("color").unwrap().to_string(),
+                    value
+                );
+            }
+        }
+
+        #[test]
+        fn help_color_choice_controls_ansi_output() {
+            let colored_error = cli_command(ColorChoice::Always)
+                .try_get_matches_from(["nx", "--help"])
+                .unwrap_err();
+            let colored = colored_error.render().ansi().to_string();
+            assert!(colored.contains("\u{1b}["), "help output: {colored}");
+
+            let plain_error = cli_command(ColorChoice::Never)
+                .try_get_matches_from(["nx", "--help"])
+                .unwrap_err();
+            let plain = plain_error.render().to_string();
+            assert!(!plain.contains("\u{1b}["), "help output: {plain}");
+        }
 
         #[test]
         fn minimal_args() {
