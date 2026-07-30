@@ -12,6 +12,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 console-subscriber = { version = "0.5", optional = true }
 nx-core = { version = "0.1.2", path = "../nx-core" }
+owo-colors = { version = "4", features = ["supports-colors"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.9"
