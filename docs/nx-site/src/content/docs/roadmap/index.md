@@ -45,8 +45,8 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 |---|---|---|
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
-| `v0.1.2` | Performance & Profiling | released |
-| `v0.1.3` | Supply Chain & Fuzzing | active |
+| `v0.1.2` | Performance & Profiling | active |
+| `v0.1.3` | Supply Chain & Fuzzing | planned |
 | `v0.1.4` | Management API | planned |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
@@ -101,7 +101,7 @@ instead of crashing.
 
 **Regression gate**:
 - [x] Load benchmarks extended with automatic JSON report
-- [ ] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress > X%
+- [x] CI workflow that compares with baseline and fails if p99 latency, throughput or RSS regress beyond configured thresholds
 - [x] Run `scripts/compare-benchmark-report.test.mjs` in CI
 - [x] Baseline history committed in `crates/*/reports/baselines/`
 
@@ -112,7 +112,7 @@ instead of crashing.
 - [x] Remote-op received, applied, duplicate, batch, and apply-error counters
 
 **Closing criterion**:
-> A PR that worsens sync p99 by > 5% is automatically blocked by CI with the regression details.
+> A PR whose median sync benchmark exceeds the configured p99, throughput, or RSS regression thresholds is automatically blocked by CI with the regression details.
 
 ---
 
