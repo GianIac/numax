@@ -16,8 +16,7 @@ fn empty_working_directory() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("nx-completions-{}-{unique}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("nx-completions-{}-{unique}", std::process::id()));
     fs::create_dir(&path).unwrap();
     path
 }
@@ -68,4 +67,3 @@ fn invalid_shell_lists_supported_values() {
 
     fs::remove_dir(working_directory).unwrap();
 }
-

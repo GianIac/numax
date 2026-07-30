@@ -459,10 +459,7 @@ mod tests {
         fn parses_a_supported_shell() {
             let cli = Cli::try_parse_from(["nx", "completions", "bash"]).unwrap();
 
-            assert!(matches!(
-                cli,
-                Cli::Completions { shell: Shell::Bash }
-            ));
+            assert!(matches!(cli, Cli::Completions { shell: Shell::Bash }));
         }
 
         #[test]
