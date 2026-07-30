@@ -1,0 +1,11 @@
+{
+  "name": "numax-guest-assemblyscript",
+  "private": true,
+  "scripts": {
+    "build": "asc assembly/index.ts --config asconfig.json --target release",
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.8"
+  }
+}
