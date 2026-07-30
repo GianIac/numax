@@ -15,6 +15,7 @@ const MAX_RGA_BUFFER: usize = 1024 * 1024;
 ///
 /// Returns the generated element id. Keep this id if the element may need to be
 /// deleted later or used as parent for another insertion.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn insert_after(key: &str, parent: Option<&str>, value: &[u8]) -> Result<String> {
     let (parent_ptr, parent_len) = match parent {
         Some(parent) => (parent.as_ptr() as u32, parent.len() as u32),
@@ -57,6 +58,7 @@ pub fn insert_after(key: &str, parent: Option<&str>, value: &[u8]) -> Result<Str
 }
 
 /// Delete the element identified by `id`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn delete(key: &str, id: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_rga_delete(
@@ -70,6 +72,7 @@ pub fn delete(key: &str, id: &str) -> Result<()> {
 }
 
 /// Return the currently visible values in deterministic sequence order.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn values(key: &str) -> Result<Vec<Vec<u8>>> {
     let mut cap: usize = 256;
 
