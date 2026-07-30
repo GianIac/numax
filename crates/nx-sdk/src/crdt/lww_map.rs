@@ -15,6 +15,7 @@ const MAX_LWW_MAP_BUFFER: usize = 1024 * 1024;
 /// Set `field` in the LWW-Map under `key`.
 ///
 /// The host assigns the timestamp and local writer NodeId.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn set(key: &str, field: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_map_set(
@@ -30,6 +31,7 @@ pub fn set(key: &str, field: &str, value: &[u8]) -> Result<()> {
 }
 
 /// Remove `field` from the LWW-Map under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn remove(key: &str, field: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_map_remove(
@@ -43,6 +45,7 @@ pub fn remove(key: &str, field: &str) -> Result<()> {
 }
 
 /// Read the current winning value for `field` in the LWW-Map under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn get(key: &str, field: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 256;
 
@@ -80,6 +83,7 @@ pub fn get(key: &str, field: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// Return true when `field` currently has a visible value.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn contains(key: &str, field: &str) -> Result<bool> {
     let rc = unsafe {
         ffi::crdt_lww_map_contains(
@@ -102,6 +106,7 @@ pub fn contains(key: &str, field: &str) -> Result<bool> {
 }
 
 /// Return visible LWW-Map entries in deterministic field order.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn entries(key: &str) -> Result<Vec<(String, Vec<u8>)>> {
     let mut cap: usize = 256;
 

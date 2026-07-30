@@ -12,6 +12,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 const MAX_ORSET_BUFFER: usize = 1024 * 1024;
 
 /// Add `element` to the ORSet under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn add(key: &str, element: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_orset_add(
@@ -25,6 +26,7 @@ pub fn add(key: &str, element: &str) -> Result<()> {
 }
 
 /// Remove the locally observed add-tags for `element` from the ORSet under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn remove(key: &str, element: &str) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_orset_remove(
@@ -38,6 +40,7 @@ pub fn remove(key: &str, element: &str) -> Result<()> {
 }
 
 /// Return true when `element` is currently visible in the ORSet under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn contains(key: &str, element: &str) -> Result<bool> {
     let rc = unsafe {
         ffi::crdt_orset_contains(
@@ -60,6 +63,7 @@ pub fn contains(key: &str, element: &str) -> Result<bool> {
 }
 
 /// Return visible ORSet elements in deterministic order.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn elements(key: &str) -> Result<Vec<String>> {
     let mut cap: usize = 256;
 
