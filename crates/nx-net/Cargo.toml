@@ -2,6 +2,7 @@
 name = "nx-net"
 version = "0.1.2"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 nx-sync = { version = "0.1.2", path = "../nx-sync" }

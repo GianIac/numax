@@ -19,11 +19,19 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.93
+exceptions = [
+    # Optional pprof flamegraph renderer; CDDL applies only to this dependency.
+    { allow = ["CDDL-1.0"], crate = "inferno@0.11.21" },
+]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-deny = []
+deny = [
+    { crate = "native-tls", reason = "Numax uses Rustls to keep the TLS stack explicit and portable." },
+    { crate = "openssl", reason = "Numax uses Rustls and does not require the system OpenSSL library." },
+    { crate = "openssl-sys", reason = "Numax uses Rustls and does not require the system OpenSSL library." },
+]
 skip = []
 skip-tree = []
 

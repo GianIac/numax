@@ -2,6 +2,7 @@
 name = "nx-core"
 version = "0.1.2"
 edition = "2024"
+license.workspace = true
 
 [features]
 cpu-profiling = ["dep:pprof"]
