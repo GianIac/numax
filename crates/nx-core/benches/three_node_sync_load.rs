@@ -1,4 +1,6 @@
 use std::env;
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+use std::fmt::Write as _;
 use std::fs;
 #[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
 use std::fs::File;
@@ -616,12 +618,37 @@ impl CpuProfiler {
             .report()
             .build()
             .map_err(|e| format!("build CPU profile report: {e}"))?;
-        report
-            .flamegraph(file)
+        write_cpu_flamegraph(&report, file)
             .map_err(|e| format!("write CPU flamegraph {}: {e}", output.display()))?;
         println!("CPU flamegraph written to {}", output.display());
         Ok(())
     }
+}
+
+#[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
+fn write_cpu_flamegraph(report: &pprof::Report, file: File) -> std::io::Result<()> {
+    let lines: Vec<String> = report
+        .data
+        .iter()
+        .map(|(frames, samples)| {
+            let mut line = frames.thread_name_or_id();
+            line.push(';');
+            for frame in frames.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    let _ = write!(&mut line, "{symbol};");
+                }
+            }
+            line.pop();
+            let _ = write!(&mut line, " {samples}");
+            line
+        })
+        .collect();
+
+    inferno::flamegraph::from_lines(
+        &mut inferno::flamegraph::Options::default(),
+        lines.iter().map(String::as_str),
+        file,
+    )
 }
 
 #[cfg(all(feature = "heap-profiling", target_os = "linux"))]

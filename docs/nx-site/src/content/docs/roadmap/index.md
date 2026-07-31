@@ -121,7 +121,7 @@ instead of crashing.
 **Goal**: make numax adoptable by those with strict supply-chain policies.
 
 **Supply chain**:
-- [ ] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
+- [x] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
 - [ ] `cargo-audit` scheduled (daily workflow)
 - [ ] CycloneDX SBOM generated for every release
 - [ ] Releases signed with Sigstore / cosign

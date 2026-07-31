@@ -21,7 +21,7 @@ allow = [
 confidence-threshold = 0.93
 exceptions = [
     # Optional pprof flamegraph renderer; CDDL applies only to this dependency.
-    { allow = ["CDDL-1.0"], crate = "inferno@0.11.21" },
+    { allow = ["CDDL-1.0"], crate = "inferno@0.12.8" },
 ]
 
 [bans]

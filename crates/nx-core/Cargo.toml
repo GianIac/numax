@@ -5,7 +5,7 @@ edition = "2024"
 license.workspace = true
 
 [features]
-cpu-profiling = ["dep:pprof"]
+cpu-profiling = ["dep:inferno", "dep:pprof"]
 heap-profiling = ["dep:dhat"]
 
 [dependencies]
@@ -14,8 +14,8 @@ blake3 = "1"
 getrandom = "0.3"
 sha2 = "0.11.0"
 serde_json = "1"
-wasmtime = "43.0.1"
-wasmtime-wasi = "43.0.1"
+wasmtime = "46.0.1"
+wasmtime-wasi = "46.0.1"
 nx-store = { version = "0.1.2", path = "../nx-store" }
 nx-sync = { version = "0.1.2", path = "../nx-sync" }
 nx-net = { version = "0.1.2", path = "../nx-net" }
@@ -24,7 +24,8 @@ tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dhat = { version = "0.3.3", optional = true }
-pprof = { version = "0.15", optional = true, default-features = false, features = ["flamegraph"] }
+inferno = { version = "0.12.8", optional = true, default-features = false }
+pprof = { version = "0.15", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

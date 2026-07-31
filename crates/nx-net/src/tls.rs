@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::BufReader;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
@@ -194,11 +193,9 @@ impl TlsConfig {
 
     /// Load certificates from PEM file.
     pub fn load_certs(path: &Path) -> NetResult<Vec<CertificateDer<'static>>> {
-        let file = fs::File::open(path)
-            .map_err(|e| NetError::TlsError(format!("failed to open cert file: {}", e)))?;
-        let mut reader = BufReader::new(file);
-
-        let certs = rustls_pemfile::certs(&mut reader)
+        let pem = fs::read(path)
+            .map_err(|e| NetError::TlsError(format!("failed to read cert file: {}", e)))?;
+        let certs = CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| NetError::TlsError(format!("failed to parse certs: {}", e)))?;
 
@@ -211,11 +208,11 @@ impl TlsConfig {
 
     /// Load private key from PEM file.
     pub fn load_key(path: &Path) -> NetResult<PrivateKeyDer<'static>> {
-        let file = fs::File::open(path)
-            .map_err(|e| NetError::TlsError(format!("failed to open key file: {}", e)))?;
-        let mut reader = BufReader::new(file);
-
-        rustls_pemfile::private_key(&mut reader)
+        let pem = fs::read(path)
+            .map_err(|e| NetError::TlsError(format!("failed to read key file: {}", e)))?;
+        PrivateKeyDer::pem_slice_iter(&pem)
+            .next()
+            .transpose()
             .map_err(|e| NetError::TlsError(format!("failed to parse key: {}", e)))?
             .ok_or_else(|| NetError::TlsError("no private key found in file".into()))
     }
@@ -708,8 +705,7 @@ mod tests {
     fn test_node_id_deterministic() {
         let (cert_pem, _) = generate_self_signed("test").unwrap();
 
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
@@ -724,13 +720,11 @@ mod tests {
         let (cert1_pem, _) = generate_self_signed("node-1").unwrap();
         let (cert2_pem, _) = generate_self_signed("node-2").unwrap();
 
-        let mut reader1 = std::io::BufReader::new(cert1_pem.as_bytes());
-        let certs1: Vec<_> = rustls_pemfile::certs(&mut reader1)
+        let certs1: Vec<_> = CertificateDer::pem_slice_iter(cert1_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        let mut reader2 = std::io::BufReader::new(cert2_pem.as_bytes());
-        let certs2: Vec<_> = rustls_pemfile::certs(&mut reader2)
+        let certs2: Vec<_> = CertificateDer::pem_slice_iter(cert2_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 

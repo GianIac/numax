@@ -9,5 +9,6 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+wincode = { version = "0.6.0", features = ["derive"] }
 
 [dev-dependencies]
