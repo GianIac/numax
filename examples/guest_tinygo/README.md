@@ -66,9 +66,8 @@ guest.wasm
 
 In the `guest_tinygo` directory
 
-> Note: the scripts use the -opt=0 and the -no-debug arguments since TinyGo's default wasm target injects browser-oriented runtime hooks and missing imports in some cases 
->
-> [nx-cli] error: Link error while instantiating module: unknown import: `gojs::runtime.ticks` has not been defined
+> Note: The build scripts use `-target wasi` instead of the default `wasm` target since TinyGo's default `wasm` target injects runtime hooks (causing `gojs::runtime.ticks` missing import errors in Numax).
+> theres an additional `-opt=0` flag which is used to bypass the need for a system-wide `wasm-opt` (Binaryen) installation.
 
 ## Run
 
