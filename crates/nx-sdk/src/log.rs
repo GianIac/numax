@@ -2,6 +2,7 @@ use crate::ffi;
 
 const ERR_INTERNAL: i32 = -3;
 
+#[inline]
 pub fn log(s: &str) {
     unsafe {
         // If you exported only v2 on the host side, this must exist.
