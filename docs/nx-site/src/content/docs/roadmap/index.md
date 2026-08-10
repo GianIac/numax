@@ -122,7 +122,7 @@ instead of crashing.
 
 **Supply chain**:
 - [x] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
-- [ ] `cargo-audit` scheduled (daily workflow)
+- [x] `cargo-audit` scheduled (daily workflow)
 - [ ] CycloneDX SBOM generated for every release
 - [ ] Releases signed with Sigstore / cosign
 - [ ] GitHub workflows with minimal `permissions:`
