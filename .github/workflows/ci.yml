@@ -246,6 +246,7 @@ jobs:
 
   ci-success:
     name: CI Success
+    permissions: {}
     needs:
       - cargo-deny
       - check

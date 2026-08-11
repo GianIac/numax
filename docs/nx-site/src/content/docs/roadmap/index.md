@@ -125,7 +125,7 @@ instead of crashing.
 - [x] `cargo-audit` scheduled (daily workflow)
 - [x] CycloneDX SBOM generated for every release
 - [x] Releases signed with Sigstore / cosign
-- [ ] GitHub workflows with minimal `permissions:`
+- [x] GitHub workflows with minimal `permissions:`
 - [ ] Action SHA pinning (no `@v3` but `@<sha>`)
 
 **Fuzzing**:
