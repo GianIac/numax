@@ -87,6 +87,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/guest_assemblyscript/package-lock.json
       - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.10.1
         with:
           toolchain: stable
@@ -98,6 +103,12 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_chat/Cargo.toml
       - name: Build vote_tally_tls
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/vote_tally_tls/Cargo.toml
+      - name: Build and test AssemblyScript guest
+        working-directory: examples/guest_assemblyscript
+        run: |
+          npm ci
+          npm run build
+          npm test
 
   cli-smoke:
     name: CLI Multi-process Smoke
