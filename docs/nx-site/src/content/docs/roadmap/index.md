@@ -126,7 +126,7 @@ instead of crashing.
 - [x] CycloneDX SBOM generated for every release
 - [x] Releases signed with Sigstore / cosign
 - [x] GitHub workflows with minimal `permissions:`
-- [ ] Action SHA pinning (no `@v3` but `@<sha>`)
+- [x] Action SHA pinning (no `@v3` but `@<sha>`)
 
 **Fuzzing**:
 - [ ] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
