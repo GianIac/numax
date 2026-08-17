@@ -7,6 +7,7 @@ const ERR_RESERVED_KEY: i32 = -4;
 const ERR_SYNC_DISABLED: i32 = -5;
 
 /// Increment the GCounter under `key` by `delta` on the local node.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn inc(key: &str, delta: u64) -> Result<()> {
     let rc = unsafe { ffi::crdt_gcounter_inc(key.as_ptr() as u32, key.len() as u32, delta) };
     match rc {
@@ -20,6 +21,7 @@ pub fn inc(key: &str, delta: u64) -> Result<()> {
 }
 
 /// Read the current converged value of the GCounter under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn value(key: &str) -> Result<u64> {
     let mut buf = [0u8; 8];
     let n = unsafe {

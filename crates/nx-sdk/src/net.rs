@@ -89,6 +89,7 @@ fn parse_peers(buf: &[u8]) -> Result<Vec<Peer>> {
 }
 
 /// Local sync NodeId. Requires sync to be enabled.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn node_id() -> Result<String> {
     let bytes =
         read_dynamic(|out_ptr, out_cap| unsafe { ffi::net_node_id(out_ptr as u32, out_cap) })?;
@@ -96,6 +97,7 @@ pub fn node_id() -> Result<String> {
 }
 
 /// Currently connected sync peers. Requires sync to be enabled.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn peers() -> Result<Vec<Peer>> {
     let bytes =
         read_dynamic(|out_ptr, out_cap| unsafe { ffi::net_peers(out_ptr as u32, out_cap) })?;

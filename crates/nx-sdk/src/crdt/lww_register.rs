@@ -14,6 +14,7 @@ const MAX_LWW_BUFFER: usize = 1024 * 1024;
 /// Set the value of the LWW-Register under `key`.
 ///
 /// The host assigns the timestamp and local writer NodeId.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn set(key: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_set(
@@ -27,6 +28,7 @@ pub fn set(key: &str, value: &[u8]) -> Result<()> {
 }
 
 /// Read the current winning value of the LWW-Register under `key`.
+#[must_use = "this SDK call can fail; handle the Result"]
 pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
     let mut cap: usize = 256;
 
