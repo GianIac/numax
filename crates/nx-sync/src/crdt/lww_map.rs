@@ -67,7 +67,7 @@ impl LwwMap {
 
     /// Sets a field if the write wins the field-level LWW ordering.
     ///
-    /// Writes are ordered by timestamp and writer id. 
+    /// Writes are ordered by timestamp and writer id.
     /// On an exact tie, a tombstone wins over a value, while values use lexicographic byte order.
     /// This final tie-break keeps merges deterministic even when one writer emits multiple operations in the same millisecond.
     pub fn set(
