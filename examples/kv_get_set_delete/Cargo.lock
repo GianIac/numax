@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "kv_get_set_delete"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "nx-sdk",
 ]
 
 [[package]]
 name = "nx-sdk"
-version = "0.1.2"
+version = "0.1.3"

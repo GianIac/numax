@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Current release line**: `v0.1.2` (active - performance & profiling)
+- **Current release line**: `v0.1.3` (active - supply chain & fuzzing)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -46,7 +46,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
 | `v0.1.2` | Performance & Profiling | released |
-| `v0.1.3` | Supply Chain & Fuzzing | planned |
+| `v0.1.3` | Supply Chain & Fuzzing | active |
 | `v0.1.4` | Management API | planned |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |

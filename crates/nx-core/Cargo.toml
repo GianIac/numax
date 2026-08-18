@@ -1,6 +1,6 @@
 [package]
 name = "nx-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license.workspace = true
 
@@ -16,9 +16,9 @@ sha2 = "0.11.0"
 serde_json = "1"
 wasmtime = "47.0.3"
 wasmtime-wasi = "47.0.3"
-nx-store = { version = "0.1.2", path = "../nx-store" }
-nx-sync = { version = "0.1.2", path = "../nx-sync" }
-nx-net = { version = "0.1.2", path = "../nx-net" }
+nx-store = { version = "0.1.3", path = "../nx-store" }
+nx-sync = { version = "0.1.3", path = "../nx-sync" }
+nx-net = { version = "0.1.3", path = "../nx-net" }
 tokio = { version = "1", features = ["io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 
@@ -28,7 +28,7 @@ inferno = { version = "0.12.8", optional = true, default-features = false }
 pprof = { version = "0.15", optional = true, default-features = false }
 
 [dev-dependencies]
-nx-store = { version = "0.1.2", path = "../nx-store", features = ["test-utils"] }
+nx-store = { version = "0.1.3", path = "../nx-store", features = ["test-utils"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
