@@ -306,6 +306,32 @@ pub(crate) fn validate_payload_len(len: usize, limit: usize) -> NetResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryPreallocationLimit {
+    Limit4MiB,
+    Limit16MiB,
+    Limit64MiB,
+    Limit256MiB,
+    Limit1024MiB,
+    Disabled,
+}
+
+fn select_binary_preallocation_limit(declared_len: usize) -> BinaryPreallocationLimit {
+    if declared_len <= 4 * MIB {
+        BinaryPreallocationLimit::Limit4MiB
+    } else if declared_len <= 16 * MIB {
+        BinaryPreallocationLimit::Limit16MiB
+    } else if declared_len <= 64 * MIB {
+        BinaryPreallocationLimit::Limit64MiB
+    } else if declared_len <= 256 * MIB {
+        BinaryPreallocationLimit::Limit256MiB
+    } else if declared_len <= 1024 * MIB {
+        BinaryPreallocationLimit::Limit1024MiB
+    } else {
+        BinaryPreallocationLimit::Disabled
+    }
+}
+
 fn deserialize_binary(payload: &[u8]) -> Result<Message, wincode::ReadError> {
     fn with_limit<const LIMIT: usize>(payload: &[u8]) -> Result<Message, wincode::ReadError> {
         wincode::config::deserialize_exact(
@@ -314,21 +340,16 @@ fn deserialize_binary(payload: &[u8]) -> Result<Message, wincode::ReadError> {
         )
     }
 
-    if payload.len() <= 4 * MIB {
-        with_limit::<{ 4 * MIB }>(payload)
-    } else if payload.len() <= 16 * MIB {
-        with_limit::<{ 16 * MIB }>(payload)
-    } else if payload.len() <= 64 * MIB {
-        with_limit::<{ 64 * MIB }>(payload)
-    } else if payload.len() <= 256 * MIB {
-        with_limit::<{ 256 * MIB }>(payload)
-    } else if payload.len() <= 1024 * MIB {
-        with_limit::<{ 1024 * MIB }>(payload)
-    } else {
-        wincode::config::deserialize_exact(
+    match select_binary_preallocation_limit(payload.len()) {
+        BinaryPreallocationLimit::Limit4MiB => with_limit::<{ 4 * MIB }>(payload),
+        BinaryPreallocationLimit::Limit16MiB => with_limit::<{ 16 * MIB }>(payload),
+        BinaryPreallocationLimit::Limit64MiB => with_limit::<{ 64 * MIB }>(payload),
+        BinaryPreallocationLimit::Limit256MiB => with_limit::<{ 256 * MIB }>(payload),
+        BinaryPreallocationLimit::Limit1024MiB => with_limit::<{ 1024 * MIB }>(payload),
+        BinaryPreallocationLimit::Disabled => wincode::config::deserialize_exact(
             payload,
             wincode::config::Configuration::default().disable_preallocation_size_limit(),
-        )
+        ),
     }
 }
 
@@ -336,6 +357,34 @@ fn deserialize_binary(payload: &[u8]) -> Result<Message, wincode::ReadError> {
 mod tests {
     use super::*;
     use nx_sync::{OpId, OpKind};
+
+    #[test]
+    fn binary_preallocation_limit_boundaries() {
+        use BinaryPreallocationLimit::{
+            Disabled, Limit4MiB, Limit16MiB, Limit64MiB, Limit256MiB, Limit1024MiB,
+        };
+
+        let cases = [
+            (4 * MIB, Limit4MiB),
+            (4 * MIB + 1, Limit16MiB),
+            (16 * MIB, Limit16MiB),
+            (16 * MIB + 1, Limit64MiB),
+            (64 * MIB, Limit64MiB),
+            (64 * MIB + 1, Limit256MiB),
+            (256 * MIB, Limit256MiB),
+            (256 * MIB + 1, Limit1024MiB),
+            (1024 * MIB, Limit1024MiB),
+            (1024 * MIB + 1, Disabled),
+        ];
+
+        for (declared_len, expected) in cases {
+            assert_eq!(
+                select_binary_preallocation_limit(declared_len),
+                expected,
+                "unexpected pre-allocation limit for {declared_len} bytes"
+            );
+        }
+    }
 
     fn protocol_v4_messages() -> Vec<Message> {
         let origin = NodeId::new("node-a");
