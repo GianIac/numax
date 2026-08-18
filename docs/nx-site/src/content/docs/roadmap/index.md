@@ -112,29 +112,25 @@ automatically with the regression details.
 
 ---
 
-## v0.1.3 - Supply Chain & Fuzzing 🔐
+## v0.1.3 - Supply Chain & Fuzzing
 
-**Goal**: make numax adoptable by those with strict supply-chain policies.
+`v0.1.3` hardened the boundaries where Numax meets untrusted input and made
+release artifacts independently verifiable.
 
-**Supply chain**:
-- [x] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
-- [x] `cargo-audit` scheduled (daily workflow)
-- [x] CycloneDX SBOM generated for every release
-- [x] Releases signed with Sigstore / cosign
-- [x] GitHub workflows with minimal `permissions:`
-- [x] Action SHA pinning (no `@v3` but `@<sha>`)
+The supply chain is now checked continuously through `cargo-deny`, a daily
+`cargo-audit`, SHA-pinned GitHub Actions and minimal workflow permissions.
+Every release publishes validated, target-specific CycloneDX SBOMs together
+with checksums signed through Sigstore Cosign. On the runtime side, four
+`cargo-fuzz` targets exercise the production wire decoder and framing reader,
+property tests cover the merge laws of LWW-Map, ORSet and RGA, and the binary
+wire encoding is protected by bounded allocation limits and golden hashes.
 
-**Fuzzing**:
-- [x] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
-- [x] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
-- [x] Seed corpus committed in `fuzz/corpus/`
+Net result: dependencies and release artifacts can be audited without blind
+trust, malformed wire input is exercised automatically, and an invalid
+persisted CRDT record or rejected storage write cannot silently leave Numax in
+a partially updated state.
 
-**Sled hardening**:
-- [x] Test: corrupted persisted CRDT state is detected and startup fails safely
-- [x] Test: storage write failure (`ENOSPC`) → no partial state, no panic
-
-**Closing criterion**:
-> 24 hours of fuzzing on all targets without panic. Verifiable SBOM. Releases verifiable with `cosign verify`.
+📄 Full details in the [`v0.1.3` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.3).
 
 ---
 
