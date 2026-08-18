@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Current release line**: `v0.1.2` (active - performance & profiling)
+- **Current release line**: `v0.1.3` (active - supply chain & fuzzing)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -46,7 +46,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
 | `v0.1.2` | Performance & Profiling | released |
-| `v0.1.3` | Supply Chain & Fuzzing | planned |
+| `v0.1.3` | Supply Chain & Fuzzing | active |
 | `v0.1.4` | Management API | planned |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
@@ -117,22 +117,21 @@ automatically with the regression details.
 **Goal**: make numax adoptable by those with strict supply-chain policies.
 
 **Supply chain**:
-- [ ] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
-- [ ] `cargo-audit` scheduled (daily workflow)
-- [ ] CycloneDX SBOM generated for every release
-- [ ] Releases signed with Sigstore / cosign
-- [ ] GitHub workflows with minimal `permissions:`
-- [ ] Action SHA pinning (no `@v3` but `@<sha>`)
+- [x] `cargo-deny` in CI (licenses, advisories, dup deps, banned crates)
+- [x] `cargo-audit` scheduled (daily workflow)
+- [x] CycloneDX SBOM generated for every release
+- [x] Releases signed with Sigstore / cosign
+- [x] GitHub workflows with minimal `permissions:`
+- [x] Action SHA pinning (no `@v3` but `@<sha>`)
 
 **Fuzzing**:
-- [ ] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
-- [ ] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
-- [ ] **OSS-Fuzz** integration
-- [ ] Seed corpus committed in `fuzz/corpus/`
+- [x] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
+- [x] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
+- [x] Seed corpus committed in `fuzz/corpus/`
 
 **Sled hardening**:
-- [ ] Test: sled file corruption → recovery from op-log
-- [ ] Test: full disk → graceful degrade
+- [x] Test: corrupted persisted CRDT state is detected and startup fails safely
+- [x] Test: storage write failure (`ENOSPC`) → no partial state, no panic
 
 **Closing criterion**:
 > 24 hours of fuzzing on all targets without panic. Verifiable SBOM. Releases verifiable with `cosign verify`.
@@ -517,6 +516,7 @@ time = true
 > Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
 
 - **NAT traversal and WAN gossip** (STUN, relay, possibly libp2p)
+- **OSS-Fuzz integration**, once Numax has enough adoption to meet upstream eligibility requirements
 - **User-defined CRDTs** complete and production-ready
 - **Legacy ABI deprecated**: Component Model only
 - **Federated clusters**: clusters of clusters, with cross-cluster replication policies

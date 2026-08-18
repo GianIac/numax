@@ -10,8 +10,12 @@ members = [
 ]
 
 exclude = [
-  "examples/*"
+  "examples/*",
+  "fuzz",
 ]
+
+[workspace.package]
+license = "Apache-2.0"
 
 [profile.profiling]
 inherits = "release"

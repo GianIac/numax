@@ -1,0 +1,1 @@
+{"kind":{"PushOps":{"ops":[{"id":"op-1","origin":"node-a","kind":{"GCounterIncrement":{"key":"counter","increment":1}}}]}}}

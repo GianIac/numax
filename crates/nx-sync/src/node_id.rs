@@ -2,7 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaRead,
+    wincode::SchemaWrite,
+)]
 pub struct NodeId(String);
 
 impl NodeId {

@@ -837,7 +837,7 @@ Runtime precedence is deterministic: CLI flags > `NX_*` environment variables
 
 The project includes an automated test suite that covers runtime, store, CRDT, networking, host APIs, serialization and end-to-end sync flows.
 
-**Current coverage:** more than **220 test cases** across unit, integration and end-to-end flows, distributed across the workspace crates (`nx-core`, `nx-store`, `nx-sync`, `nx-net`, `nx-cli`) and the SyncManager E2E flows. Long-running smoke/load scenarios are kept behind ignored tests or Cargo bench runners so the default suite remains fast.
+**Current coverage:** more than **450 test cases** across unit, integration and end-to-end flows, distributed across the workspace crates (`nx-core`, `nx-store`, `nx-sync`, `nx-net`, `nx-sdk`, `nx-cli`) and the SyncManager E2E flows. Long-running smoke/load scenarios are kept behind ignored tests or Cargo bench runners so the default suite remains fast.
 
 **Specific CRDT tests** - explicitly verify the mathematical properties:
 

@@ -1,0 +1,41 @@
+[package]
+name = "numax-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nx-net = { path = "../crates/nx-net", features = ["fuzzing"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
+[[bin]]
+name = "wire_hello"
+path = "fuzz_targets/wire_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_push_ops"
+path = "fuzz_targets/wire_push_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_pull_since"
+path = "fuzz_targets/wire_pull_since.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_framing"
+path = "fuzz_targets/wire_framing.rs"
+test = false
+doc = false
+bench = false

@@ -200,6 +200,37 @@ nx run path/to/module.wasm \
   --peer 127.0.0.1:9001 \
   --datastore-path ./node-a
 ```
+---
+
+## Verify a release
+
+The latest Numax release signs `SHA256SUMS` with Sigstore Cosign. The manifest
+covers every binary archive and target-specific CycloneDX SBOM published with
+the release.
+
+Install [Cosign](https://docs.sigstore.dev/cosign/system_config/installation/),
+then verify the workflow identity before checking an artifact:
+
+```bash
+LATEST_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  https://github.com/GianIac/numax/releases/latest)"
+VERSION="${LATEST_URL##*/}"
+TARGET=x86_64-unknown-linux-musl
+ARCHIVE="numax-${VERSION}-${TARGET}.tar.gz"
+IDENTITY="https://github.com/GianIac/numax/.github/workflows/release.yml@refs/tags/${VERSION}"
+
+curl -LO "https://github.com/GianIac/numax/releases/download/${VERSION}/${ARCHIVE}"
+curl -LO "https://github.com/GianIac/numax/releases/download/${VERSION}/SHA256SUMS"
+curl -LO "https://github.com/GianIac/numax/releases/download/${VERSION}/SHA256SUMS.sigstore.json"
+
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "${IDENTITY}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+grep " ${ARCHIVE}$" SHA256SUMS | sha256sum -c -
+```
 
 ---
 

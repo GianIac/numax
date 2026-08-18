@@ -1310,6 +1310,79 @@ async fn duplicate_remote_op_after_restart_does_not_double_count() {
 }
 
 #[tokio::test]
+async fn disk_full_does_not_expose_partial_remote_state() {
+    let store = temp_store();
+    let counters = Arc::new(RwLock::new(HashMap::new()));
+    let pncounters = Arc::new(RwLock::new(HashMap::new()));
+    let lww_registers = Arc::new(RwLock::new(HashMap::new()));
+    let lww_maps = Arc::new(RwLock::new(HashMap::new()));
+    let orsets = Arc::new(RwLock::new(HashMap::new()));
+    let rgas = Arc::new(RwLock::new(HashMap::new()));
+    let seen_ops = Arc::new(RwLock::new(SeenOps::new(1024)));
+    let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
+    let op_log = Arc::new(RwLock::new(Vec::new()));
+    let op_log_next_sequence = Arc::new(AtomicU64::new(0));
+    let metrics = metrics();
+    let op = Op::gcounter_increment(NodeId::new("remote-a"), "counter:visits", 3);
+    let context = RemoteOpApplyContext {
+        counters: &counters,
+        pncounters: &pncounters,
+        lww_registers: &lww_registers,
+        lww_maps: &lww_maps,
+        orsets: &orsets,
+        rgas: &rgas,
+        seen_ops: &seen_ops,
+        seen_ops_next_sequence: &seen_ops_next_sequence,
+        op_log: &op_log,
+        op_log_next_sequence: &op_log_next_sequence,
+        op_log_limit: 1024,
+        store: &store,
+        metrics: &metrics,
+    };
+
+    store.inject_disk_full_on_writes(true);
+    let error = apply_remote_ops(std::slice::from_ref(&op), &context)
+        .await
+        .expect_err("disk-full persistence must reject the operation");
+
+    assert!(error.to_string().contains("no space left on device"));
+    assert!(counters.read().await.is_empty());
+    assert_eq!(seen_ops.read().await.len(), 0);
+    assert!(op_log.read().await.is_empty());
+    assert_eq!(
+        seen_ops_next_sequence.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        op_log_next_sequence.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        store
+            .get(&durable_gcounter_state_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        metrics
+            .render_for_test(&store)
+            .contains("numax_remote_op_apply_errors_total 1")
+    );
+
+    store.inject_disk_full_on_writes(false);
+    apply_remote_ops(std::slice::from_ref(&op), &context)
+        .await
+        .expect("the runtime must accept writes after storage recovers");
+    assert_eq!(counters.read().await["counter:visits"].value(), 3);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();
@@ -1349,6 +1422,44 @@ async fn manager_hydrates_gcounter_registry_from_durable_state() {
     let hydrated = counters.get("counter:visits").unwrap();
     assert_eq!(hydrated.value_for(&node_a), 5);
     assert_eq!(hydrated.value_for(&node_b), 7);
+}
+
+#[test]
+fn manager_rejects_corrupted_durable_crdt_state() {
+    let cases = [
+        (durable_gcounter_state_key("counter:visits"), "GCounter"),
+        (durable_pncounter_state_key("counter:visits"), "PNCounter"),
+        (
+            durable_lww_register_state_key("counter:visits"),
+            "LWW-Register",
+        ),
+        (durable_lww_map_state_key("counter:visits"), "LWW-Map"),
+        (durable_orset_state_key("counter:visits"), "ORSet"),
+        (durable_rga_state_key("counter:visits"), "RGA"),
+    ];
+
+    for (state_key, kind) in cases {
+        let store = temp_store();
+        store.set(&state_key, b"not-valid-crdt-json").unwrap();
+
+        let result = SyncManager::try_new(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            Arc::clone(&store),
+            metrics(),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("corrupted {kind} state must prevent startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&format!(
+                "corrupted durable {kind} state for key `counter:visits`"
+            )),
+            "unexpected startup error for {kind}: {error:#}"
+        );
+    }
 }
 
 #[tokio::test]

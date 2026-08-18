@@ -4,7 +4,17 @@ use uuid::Uuid;
 
 use crate::NodeId;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaRead,
+    wincode::SchemaWrite,
+)]
 pub struct OpId(String);
 
 impl OpId {
@@ -28,7 +38,9 @@ impl fmt::Display for OpId {
         write!(f, "{}", self.0)
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,
+)]
 pub enum OpKind {
     /// GCounter increment.
     GCounterIncrement { key: String, increment: u64 },
@@ -79,7 +91,9 @@ pub enum OpKind {
 }
 
 /// A complete CRDT operation, ready to be sent/received.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,
+)]
 pub struct Op {
     /// Unique identifier of the operation.
     pub id: OpId,

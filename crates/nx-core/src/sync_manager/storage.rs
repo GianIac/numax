@@ -397,20 +397,11 @@ pub(super) fn hydrate_durable_gcounter_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_gcounter_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable GCounter state key");
-                continue;
-            }
-        };
-        let counter = match parse_durable_gcounter_state(&value_bytes) {
-            Ok(counter) => counter,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable GCounter state");
-                continue;
-            }
-        };
+        let key = logical_gcounter_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable GCounter state key: {e}"))?;
+        let counter = parse_durable_gcounter_state(&value_bytes).map_err(|e| {
+            anyhow::anyhow!("corrupted durable GCounter state for key `{key}`: {e}")
+        })?;
 
         materialize_gcounter_value(store, &key, counter.value())?;
         counters.insert(key, counter);
@@ -428,20 +419,11 @@ pub(super) fn hydrate_durable_pncounter_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_pncounter_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable PNCounter state key");
-                continue;
-            }
-        };
-        let counter = match parse_durable_pncounter_state(&value_bytes) {
-            Ok(counter) => counter,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable PNCounter state");
-                continue;
-            }
-        };
+        let key = logical_pncounter_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable PNCounter state key: {e}"))?;
+        let counter = parse_durable_pncounter_state(&value_bytes).map_err(|e| {
+            anyhow::anyhow!("corrupted durable PNCounter state for key `{key}`: {e}")
+        })?;
 
         materialize_pncounter_value(store, &key, counter.value())?;
         counters.insert(key, counter);
@@ -459,20 +441,11 @@ pub(super) fn hydrate_durable_lww_register_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_lww_register_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable LWW-Register state key");
-                continue;
-            }
-        };
-        let register = match parse_durable_lww_register_state(&value_bytes) {
-            Ok(register) => register,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable LWW-Register state");
-                continue;
-            }
-        };
+        let key = logical_lww_register_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable LWW-Register state key: {e}"))?;
+        let register = parse_durable_lww_register_state(&value_bytes).map_err(|e| {
+            anyhow::anyhow!("corrupted durable LWW-Register state for key `{key}`: {e}")
+        })?;
 
         materialize_lww_register_value(store, &key, register.value())?;
         registers.insert(key, register);
@@ -490,20 +463,10 @@ pub(super) fn hydrate_durable_lww_map_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_lww_map_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable LWW-Map state key");
-                continue;
-            }
-        };
-        let map = match parse_durable_lww_map_state(&value_bytes) {
-            Ok(map) => map,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable LWW-Map state");
-                continue;
-            }
-        };
+        let key = logical_lww_map_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable LWW-Map state key: {e}"))?;
+        let map = parse_durable_lww_map_state(&value_bytes)
+            .map_err(|e| anyhow::anyhow!("corrupted durable LWW-Map state for key `{key}`: {e}"))?;
 
         materialize_lww_map_entries(store, &key, &map.entries())?;
         maps.insert(key, map);
@@ -521,20 +484,10 @@ pub(super) fn hydrate_durable_orset_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_orset_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable ORSet state key");
-                continue;
-            }
-        };
-        let set = match parse_durable_orset_state(&value_bytes) {
-            Ok(set) => set,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable ORSet state");
-                continue;
-            }
-        };
+        let key = logical_orset_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable ORSet state key: {e}"))?;
+        let set = parse_durable_orset_state(&value_bytes)
+            .map_err(|e| anyhow::anyhow!("corrupted durable ORSet state for key `{key}`: {e}"))?;
 
         materialize_orset_elements(store, &key, &set.elements())?;
         sets.insert(key, set);
@@ -552,20 +505,10 @@ pub(super) fn hydrate_durable_rga_state(
     let mut hydrated = 0;
 
     for (store_key, value_bytes) in entries {
-        let key = match logical_rga_state_key(&store_key) {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "skipping invalid durable RGA state key");
-                continue;
-            }
-        };
-        let rga = match parse_durable_rga_state(&value_bytes) {
-            Ok(rga) => rga,
-            Err(e) => {
-                warn!(key = %key, error = %e, "skipping invalid durable RGA state");
-                continue;
-            }
-        };
+        let key = logical_rga_state_key(&store_key)
+            .map_err(|e| anyhow::anyhow!("corrupted durable RGA state key: {e}"))?;
+        let rga = parse_durable_rga_state(&value_bytes)
+            .map_err(|e| anyhow::anyhow!("corrupted durable RGA state for key `{key}`: {e}"))?;
 
         materialize_rga_values(store, &key, &rga.values())?;
         rgas.insert(key, rga);
@@ -756,10 +699,17 @@ pub(crate) fn persist_gcounter_state(
     key: &str,
     counter: &GCounter,
 ) -> anyhow::Result<()> {
-    let store_key = durable_gcounter_state_key(key);
+    let state_key = durable_gcounter_state_key(key);
     let state_json = counter.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_gcounter_value(store, key, counter.value())?;
+    let materialized_key = materialized_gcounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
@@ -768,10 +718,17 @@ pub(crate) fn persist_pncounter_state(
     key: &str,
     counter: &PNCounter,
 ) -> anyhow::Result<()> {
-    let store_key = durable_pncounter_state_key(key);
+    let state_key = durable_pncounter_state_key(key);
     let state_json = counter.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_pncounter_value(store, key, counter.value())?;
+    let materialized_key = materialized_pncounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
@@ -780,10 +737,16 @@ pub(crate) fn persist_lww_register_state(
     key: &str,
     register: &LwwRegister,
 ) -> anyhow::Result<()> {
-    let store_key = durable_lww_register_state_key(key);
+    let state_key = durable_lww_register_state_key(key);
     let state_json = register.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_lww_register_value(store, key, register.value())?;
+    let materialized_key = materialized_lww_register_key(key);
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), register.value()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
@@ -792,26 +755,47 @@ pub(crate) fn persist_lww_map_state(
     key: &str,
     map: &LwwMap,
 ) -> anyhow::Result<()> {
-    let store_key = durable_lww_map_state_key(key);
+    let state_key = durable_lww_map_state_key(key);
     let state_json = map.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_lww_map_entries(store, key, &map.entries())?;
+    let materialized_key = materialized_lww_map_key(key);
+    let materialized_value = serde_json::to_vec(&map.entries())?;
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
 pub(crate) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> anyhow::Result<()> {
-    let store_key = durable_orset_state_key(key);
+    let state_key = durable_orset_state_key(key);
     let state_json = set.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_orset_elements(store, key, &set.elements())?;
+    let materialized_key = materialized_orset_key(key);
+    let materialized_value = serde_json::to_vec(&set.elements())?;
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
 pub(crate) fn persist_rga_state(store: &NxStore, key: &str, rga: &Rga) -> anyhow::Result<()> {
-    let store_key = durable_rga_state_key(key);
+    let state_key = durable_rga_state_key(key);
     let state_json = rga.to_json()?;
-    store.set(&store_key, state_json.as_bytes())?;
-    materialize_rga_values(store, key, &rga.values())?;
+    let materialized_key = materialized_rga_key(key);
+    let materialized_value = serde_json::to_vec(&rga.values())?;
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+        ],
+        &[],
+    )?;
     Ok(())
 }
 
@@ -1147,5 +1131,32 @@ mod tests {
 
         assert_eq!(op_log, vec![op_a]);
         assert_eq!(next_sequence, 2);
+    }
+
+    #[test]
+    fn disk_full_does_not_partially_persist_local_crdt_state() {
+        let store = temp_store();
+        let mut counter = GCounter::new();
+        counter.increment(&NodeId::new("node-a"), 3);
+        let state_key = durable_gcounter_state_key("counter:visits");
+        let materialized_key = materialized_gcounter_key("counter:visits");
+
+        store.inject_disk_full_on_writes(true);
+        let error = persist_gcounter_state(&store, "counter:visits", &counter)
+            .expect_err("disk-full persistence must reject the state update");
+
+        assert!(error.to_string().contains("no space left on device"));
+        assert!(store.get(&state_key).unwrap().is_none());
+        assert!(store.get(&materialized_key).unwrap().is_none());
+
+        store.inject_disk_full_on_writes(false);
+        persist_gcounter_state(&store, "counter:visits", &counter)
+            .expect("state persistence must recover after disk space is restored");
+        assert!(store.get(&state_key).unwrap().is_some());
+        assert_eq!(
+            parse_materialized_gcounter_value(&store.get(&materialized_key).unwrap().unwrap())
+                .unwrap(),
+            3
+        );
     }
 }
