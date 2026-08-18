@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "test-utils")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::StoreError;
@@ -8,6 +10,8 @@ use crate::StoreError;
 pub struct Store {
     db: sled::Db,
     write_lock: Arc<RwLock<()>>,
+    #[cfg(feature = "test-utils")]
+    fail_writes_with_disk_full: Arc<AtomicBool>,
 }
 
 pub struct StoreWriteLease<'a> {
@@ -40,6 +44,8 @@ impl Store {
         Ok(Self {
             db,
             write_lock: Arc::new(RwLock::new(())),
+            #[cfg(feature = "test-utils")]
+            fail_writes_with_disk_full: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -91,8 +97,19 @@ impl Store {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        self.check_injected_write_failure()?;
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Inject or clear a deterministic disk-full failure on every write.
+    ///
+    /// This hook is only available to tests through the `test-utils` feature.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn inject_disk_full_on_writes(&self, enabled: bool) {
+        self.fail_writes_with_disk_full
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
@@ -107,6 +124,7 @@ impl Store {
     }
 
     fn set_unlocked(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.check_injected_write_failure()?;
         self.db.insert(key, value)?;
         Ok(())
     }
@@ -116,6 +134,7 @@ impl Store {
         sets: &[(&[u8], &[u8])],
         deletes: &[&[u8]],
     ) -> Result<(), StoreError> {
+        self.check_injected_write_failure()?;
         let mut batch = sled::Batch::default();
         for (key, value) in sets {
             batch.insert(*key, *value);
@@ -128,7 +147,21 @@ impl Store {
     }
 
     fn delete_unlocked(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.check_injected_write_failure()?;
         self.db.remove(key)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_injected_write_failure(&self) -> Result<(), StoreError> {
+        if self.fail_writes_with_disk_full.load(Ordering::Relaxed) {
+            return Err(StoreError::InjectedDiskFull);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn check_injected_write_failure(&self) -> Result<(), StoreError> {
         Ok(())
     }
 

@@ -19,4 +19,8 @@ pub enum StoreError {
 
     #[error("store write lock is poisoned")]
     WriteLockPoisoned,
+
+    #[cfg(feature = "test-utils")]
+    #[error("injected storage write failure: no space left on device")]
+    InjectedDiskFull,
 }

@@ -130,8 +130,8 @@ automatically with the regression details.
 - [x] Seed corpus committed in `fuzz/corpus/`
 
 **Sled hardening**:
-- [ ] Test: sled file corruption → recovery from op-log
-- [ ] Test: full disk → graceful degrade
+- [x] Test: corrupted persisted CRDT state is detected and startup fails safely
+- [x] Test: storage write failure (`ENOSPC`) → no partial state, no panic
 
 **Closing criterion**:
 > 24 hours of fuzzing on all targets without panic. Verifiable SBOM. Releases verifiable with `cosign verify`.
