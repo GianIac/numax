@@ -78,6 +78,7 @@ pub fn host_capabilities() -> Result<Vec<String>> {
 
 /// Emit a named event to the runtime.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn event_emit(name: &str, payload: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::event_emit(

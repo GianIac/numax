@@ -44,6 +44,7 @@ pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
 
 /// SHA-256 digest of `input`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn hash_sha256(input: &[u8]) -> Result<[u8; HASH_LEN]> {
     let mut out = [0u8; HASH_LEN];
     let input_len = u32::try_from(input.len()).map_err(|_| NxError::Internal)?;
@@ -61,6 +62,7 @@ pub fn hash_sha256(input: &[u8]) -> Result<[u8; HASH_LEN]> {
 
 /// BLAKE3 digest of `input`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn hash_blake3(input: &[u8]) -> Result<[u8; HASH_LEN]> {
     let mut out = [0u8; HASH_LEN];
     let input_len = u32::try_from(input.len()).map_err(|_| NxError::Internal)?;

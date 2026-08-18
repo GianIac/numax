@@ -8,6 +8,7 @@ const ERR_SYNC_DISABLED: i32 = -5;
 
 /// Increment the positive side of the PNCounter under `key` by `delta`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn inc(key: &str, delta: u64) -> Result<()> {
     let rc = unsafe { ffi::crdt_pncounter_inc(key.as_ptr() as u32, key.len() as u32, delta) };
     map_unit_result(rc)
@@ -15,6 +16,7 @@ pub fn inc(key: &str, delta: u64) -> Result<()> {
 
 /// Increment the negative side of the PNCounter under `key` by `delta`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn dec(key: &str, delta: u64) -> Result<()> {
     let rc = unsafe { ffi::crdt_pncounter_dec(key.as_ptr() as u32, key.len() as u32, delta) };
     map_unit_result(rc)
@@ -22,6 +24,7 @@ pub fn dec(key: &str, delta: u64) -> Result<()> {
 
 /// Read the current converged signed value of the PNCounter under `key`.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn value(key: &str) -> Result<i64> {
     let mut buf = [0u8; 8];
     let n = unsafe {

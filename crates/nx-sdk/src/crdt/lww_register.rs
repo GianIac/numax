@@ -15,6 +15,7 @@ const MAX_LWW_BUFFER: usize = 1024 * 1024;
 ///
 /// The host assigns the timestamp and local writer NodeId.
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn set(key: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::crdt_lww_set(

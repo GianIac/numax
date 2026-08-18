@@ -23,6 +23,7 @@ fn map_rc_unit(rc: i32) -> Result<()> {
 
 /// set(key, value) -> Result<(), NxError>
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn set(key: &str, value: &[u8]) -> Result<()> {
     let rc = unsafe {
         ffi::db_set(
@@ -37,6 +38,7 @@ pub fn set(key: &str, value: &[u8]) -> Result<()> {
 
 /// delete(key) -> Result<(), NxError>
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn delete(key: &str) -> Result<()> {
     let rc = unsafe { ffi::db_delete(key.as_ptr() as u32, key.len() as u32) };
     map_rc_unit(rc)
@@ -44,6 +46,7 @@ pub fn delete(key: &str) -> Result<()> {
 
 /// exists(key) -> Result<bool, NxError>
 #[must_use = "this SDK call can fail; handle the Result"]
+#[inline]
 pub fn exists(key: &str) -> Result<bool> {
     let rc = unsafe { ffi::db_exists(key.as_ptr() as u32, key.len() as u32) };
     match rc {
