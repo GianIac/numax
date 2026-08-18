@@ -1,0 +1,60 @@
+name: Wire Fuzzing
+
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wire-fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - wire_hello
+          - wire_push_ops
+          - wire_pull_since
+          - wire_framing
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Rust
+        uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
+        with:
+          toolchain: nightly
+          rustflags: ""
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz wire parser
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          CORPUS_DIR: fuzz/corpus/${{ matrix.target }}
+        run: |
+          cargo fuzz run "${FUZZ_TARGET}" "${CORPUS_DIR}" -- \
+            -max_total_time=300 \
+            -max_len=1048576 \
+            -timeout=10 \
+            -rss_limit_mb=2048
+
+      - name: Upload crash artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: warn

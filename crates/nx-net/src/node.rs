@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{NetError, NetResult};
 use crate::message::{
     DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
-    WireError,
+    WireError, validate_payload_len,
 };
 use crate::peer::{PeerInfo, PeerState};
 use crate::tls::{NetStream, TlsConfig};
@@ -1097,13 +1097,7 @@ async fn read_message_with_format<R: AsyncReadExt + Unpin>(
         .map_err(|_| NetError::Timeout)??;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Sanity check
-    if len > max_message_size {
-        return Err(NetError::MessageTooLarge {
-            len,
-            limit: max_message_size,
-        });
-    }
+    validate_payload_len(len, max_message_size)?;
 
     // Read payload
     let mut buf = vec![0u8; len];

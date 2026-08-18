@@ -1,0 +1,20 @@
+# Wire protocol fuzzing
+
+The fuzz package exercises the production Numax wire decoder through four
+focused targets:
+
+- `wire_hello`
+- `wire_push_ops`
+- `wire_pull_since`
+- `wire_framing`
+
+Install a pinned cargo-fuzz release and run one target with its seed corpus:
+
+```bash
+cargo install cargo-fuzz --version 0.13.2 --locked
+cargo +nightly fuzz run wire_hello fuzz/corpus/wire_hello -- \
+  -max_len=1048576 -timeout=10
+```
+
+Crashes are written under `fuzz/artifacts/<target>/`. A minimized input that
+reproduces a fixed bug should be added to the corresponding corpus directory.

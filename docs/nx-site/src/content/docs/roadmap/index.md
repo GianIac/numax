@@ -125,10 +125,10 @@ automatically with the regression details.
 - [x] Action SHA pinning (no `@v3` but `@<sha>`)
 
 **Fuzzing**:
-- [ ] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
+- [x] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
 - [ ] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
 - [ ] **OSS-Fuzz** integration
-- [ ] Seed corpus committed in `fuzz/corpus/`
+- [x] Seed corpus committed in `fuzz/corpus/`
 
 **Sled hardening**:
 - [ ] Test: sled file corruption → recovery from op-log

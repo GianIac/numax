@@ -297,6 +297,40 @@ impl Message {
         };
         Ok((format, msg))
     }
+
+    /// Deserialize one complete length-prefixed wire frame.
+    ///
+    /// The advertised payload length must match the supplied bytes exactly and
+    /// must not exceed `max_message_size`.
+    pub fn from_frame_bytes(
+        bytes: &[u8],
+        max_message_size: usize,
+    ) -> NetResult<(SerializationFormat, Self)> {
+        let len_bytes: [u8; 4] = bytes
+            .get(..4)
+            .ok_or_else(|| NetError::InvalidMessage("frame is missing its length prefix".into()))?
+            .try_into()
+            .map_err(|_| NetError::InvalidMessage("invalid frame length prefix".into()))?;
+        let advertised_len = u32::from_be_bytes(len_bytes) as usize;
+        validate_payload_len(advertised_len, max_message_size)?;
+
+        let payload = &bytes[4..];
+        if payload.len() != advertised_len {
+            return Err(NetError::InvalidMessage(format!(
+                "frame length mismatch: advertised {advertised_len}, got {}",
+                payload.len()
+            )));
+        }
+
+        Self::from_bytes_with_format(payload)
+    }
+}
+
+pub(crate) fn validate_payload_len(len: usize, limit: usize) -> NetResult<()> {
+    if len > limit {
+        return Err(NetError::MessageTooLarge { len, limit });
+    }
+    Ok(())
 }
 
 fn deserialize_binary(payload: &[u8]) -> Result<Message, wincode::ReadError> {
@@ -566,6 +600,50 @@ mod tests {
         let err = Message::from_bytes(&[0xff, b'{', b'}']).unwrap_err();
 
         assert!(matches!(err, NetError::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn complete_frame_roundtrips() {
+        let message = Message::hello(NodeId::new("node-a"));
+        let frame = message.to_bytes().unwrap();
+        let (format, decoded) = Message::from_frame_bytes(&frame, 1024).unwrap();
+
+        assert_eq!(format, SerializationFormat::Bincode);
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn complete_frame_rejects_missing_truncated_and_trailing_payloads() {
+        let message = Message::pull_since(Some("op-1".into()));
+        let frame = message.to_bytes().unwrap();
+
+        assert!(matches!(
+            Message::from_frame_bytes(&frame[..3], 1024),
+            Err(NetError::InvalidMessage(_))
+        ));
+        assert!(matches!(
+            Message::from_frame_bytes(&frame[..frame.len() - 1], 1024),
+            Err(NetError::InvalidMessage(_))
+        ));
+
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(matches!(
+            Message::from_frame_bytes(&trailing, 1024),
+            Err(NetError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn complete_frame_rejects_oversized_advertised_payload() {
+        let frame = Message::ping().to_bytes().unwrap();
+        let advertised_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+
+        assert!(matches!(
+            Message::from_frame_bytes(&frame, advertised_len - 1),
+            Err(NetError::MessageTooLarge { len, limit })
+                if len == advertised_len && limit == advertised_len - 1
+        ));
     }
 
     #[test]
