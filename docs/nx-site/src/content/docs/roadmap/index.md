@@ -127,7 +127,6 @@ automatically with the regression details.
 **Fuzzing**:
 - [x] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
 - [x] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
-- [ ] **OSS-Fuzz** integration
 - [x] Seed corpus committed in `fuzz/corpus/`
 
 **Sled hardening**:
@@ -517,6 +516,7 @@ time = true
 > Nothing promised. These are **candidate themes** that may enter `0.3.x` or later, based on feedback and priorities.
 
 - **NAT traversal and WAN gossip** (STUN, relay, possibly libp2p)
+- **OSS-Fuzz integration**, once Numax has enough adoption to meet upstream eligibility requirements
 - **User-defined CRDTs** complete and production-ready
 - **Legacy ABI deprecated**: Component Model only
 - **Federated clusters**: clusters of clusters, with cross-cluster replication policies
