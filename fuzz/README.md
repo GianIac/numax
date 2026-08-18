@@ -13,6 +13,9 @@ calls the same asynchronous length-prefix reader used by network connections,
 including its size limit and short-read handling. The `PushOps` corpus contains
 every current `OpKind` variant.
 
+Pull requests and pushes to `main` run 1,000 iterations per target as a regular
+CI smoke test. There is no scheduled fuzzing job.
+
 Install a pinned cargo-fuzz release and run one target with its seed corpus:
 
 ```bash

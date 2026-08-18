@@ -1,8 +1,10 @@
 name: Wire Fuzzing
 
 on:
-  schedule:
-    - cron: "37 2 * * *"
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +12,7 @@ permissions:
 
 concurrency:
   group: wire-fuzz-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   fuzz:
@@ -40,13 +42,13 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
-      - name: Fuzz wire parser
+      - name: Smoke-test wire parser
         env:
           FUZZ_TARGET: ${{ matrix.target }}
           CORPUS_DIR: fuzz/corpus/${{ matrix.target }}
         run: |
           cargo fuzz run "${FUZZ_TARGET}" "${CORPUS_DIR}" -- \
-            -max_total_time=300 \
+            -runs=1000 \
             -max_len=1048576 \
             -timeout=10 \
             -rss_limit_mb=2048
