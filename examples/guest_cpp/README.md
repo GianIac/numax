@@ -54,17 +54,19 @@ cargo build --release
 
 ## Build
 
+From the repository root:
+
 ### Windows
 
 ```bash
-cd /examples/guest_cpp
+cd examples/guest_cpp
 ./build.bat
 ```
 
 ### Linux / macOS
 
 ```bash
-cd /examples/guest_cpp
+cd examples/guest_cpp
 chmod +x build.sh
 ./build.sh
 ```
@@ -75,7 +77,7 @@ This generates:
 guest.wasm
 ```
 
-In the guest_cpp directory
+The output is written to the `examples/guest_cpp` directory.
 
 ## Run
 
@@ -87,13 +89,13 @@ From the repository root:
 .\target\release\nx.exe run .\examples\guest_cpp\guest.wasm
 ```
 
-### Run on MacOS/Linux
+### Run on Linux / macOS
 
 ```bash
 ./target/release/nx run ./examples/guest_cpp/guest.wasm
 ```
 
-## output
+## Output
 
 ```bash
 [guest] Hello from C++ guest!
