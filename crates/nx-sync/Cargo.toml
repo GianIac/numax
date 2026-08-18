@@ -12,3 +12,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wincode = { version = "0.6.0", features = ["derive"] }
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

@@ -126,7 +126,7 @@ automatically with the regression details.
 
 **Fuzzing**:
 - [x] `cargo-fuzz` on wire parsers (`Hello`, `PushOps`, `PullSince`, framing)
-- [ ] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
+- [x] Proptest extended to all CRDTs (LWW-Map, RGA, ORSet)
 - [ ] **OSS-Fuzz** integration
 - [x] Seed corpus committed in `fuzz/corpus/`
 

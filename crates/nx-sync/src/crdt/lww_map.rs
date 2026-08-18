@@ -66,6 +66,10 @@ impl LwwMap {
     }
 
     /// Sets a field if the write wins the field-level LWW ordering.
+    ///
+    /// Writes are ordered by timestamp and writer id. 
+    /// On an exact tie, a tombstone wins over a value, while values use lexicographic byte order.
+    /// This final tie-break keeps merges deterministic even when one writer emits multiple operations in the same millisecond.
     pub fn set(
         &mut self,
         field: impl Into<String>,
@@ -153,7 +157,17 @@ impl LwwMap {
 fn entry_wins(candidate: &LwwMapEntry, current: &LwwMapEntry) -> bool {
     candidate.timestamp_ms > current.timestamp_ms
         || (candidate.timestamp_ms == current.timestamp_ms
-            && candidate.writer.as_str() > current.writer.as_str())
+            && (candidate.writer.as_str() > current.writer.as_str()
+                || (candidate.writer == current.writer
+                    && value_wins(&candidate.value, &current.value))))
+}
+
+fn value_wins(candidate: &Option<Vec<u8>>, current: &Option<Vec<u8>>) -> bool {
+    match (candidate, current) {
+        (None, Some(_)) => true,
+        (Some(_), None) | (None, None) => false,
+        (Some(candidate), Some(current)) => candidate > current,
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +224,31 @@ mod tests {
 
         assert_eq!(map.get_bytes("theme"), Some(b"light".to_vec()));
         assert_eq!(map.entry("theme").unwrap().writer().as_str(), "node-b");
+    }
+
+    #[test]
+    fn equal_timestamp_and_writer_use_value_tie_breaker() {
+        let mut left = LwwMap::new();
+        left.set("theme", b"dark".to_vec(), 100, NodeId::new("node-a"));
+
+        let mut right = LwwMap::new();
+        right.set("theme", b"light".to_vec(), 100, NodeId::new("node-a"));
+
+        assert_eq!(left.merged_with(&right), right.merged_with(&left));
+        assert_eq!(left.merged_with(&right).get("theme"), Some(&b"light"[..]));
+    }
+
+    #[test]
+    fn tombstone_wins_an_exact_timestamp_and_writer_tie() {
+        let mut value = LwwMap::new();
+        value.set("theme", b"dark".to_vec(), 100, NodeId::new("node-a"));
+
+        let mut tombstone = LwwMap::new();
+        tombstone.remove("theme", 100, NodeId::new("node-a"));
+
+        let merged = value.merged_with(&tombstone);
+        assert_eq!(merged, tombstone.merged_with(&value));
+        assert!(!merged.contains("theme"));
     }
 
     #[test]
