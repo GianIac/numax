@@ -1108,6 +1108,17 @@ async fn read_message_with_format<R: AsyncReadExt + Unpin>(
     Message::from_bytes_with_format(&buf)
 }
 
+/// Fuzzing-only entry point for the production stream framing path.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub async fn read_wire_message_for_fuzzing(
+    bytes: &[u8],
+    max_message_size: usize,
+) -> NetResult<(SerializationFormat, Message)> {
+    let mut reader = bytes;
+    read_message_with_format(&mut reader, max_message_size, DEFAULT_SOCKET_TIMEOUT).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

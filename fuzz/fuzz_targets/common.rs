@@ -26,8 +26,9 @@ pub fn assert_roundtrip(format: SerializationFormat, message: &Message) {
     if frame.len().saturating_sub(4) > MAX_FUZZ_MESSAGE_SIZE {
         return;
     }
-    let (_, decoded) = Message::from_frame_bytes(&frame, MAX_FUZZ_MESSAGE_SIZE)
-        .expect("a serialized bounded message must decode");
+    let (decoded_format, decoded) =
+        Message::from_bytes_with_format(&frame[4..]).expect("a serialized message must decode");
+    assert_eq!(decoded_format, format);
     assert_eq!(&decoded, message);
 }
 

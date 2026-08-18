@@ -486,6 +486,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "nx-net",
+ "tokio",
 ]
 
 [[package]]

@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-nx-net = { path = "../crates/nx-net" }
+nx-net = { path = "../crates/nx-net", features = ["fuzzing"] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [[bin]]
 name = "wire_hello"
