@@ -11,11 +11,11 @@ heap-profiling = ["dep:dhat"]
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 sha2 = "0.11.0"
 serde_json = "1"
-wasmtime = "46.0.1"
-wasmtime-wasi = "46.0.1"
+wasmtime = "47.0.3"
+wasmtime-wasi = "47.0.3"
 nx-store = { version = "0.1.2", path = "../nx-store" }
 nx-sync = { version = "0.1.2", path = "../nx-sync" }
 nx-net = { version = "0.1.2", path = "../nx-net" }
