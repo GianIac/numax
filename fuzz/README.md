@@ -47,8 +47,8 @@ fuzz/artifacts/<target>/
 ```
 
 Each file in this directory is a raw input that triggered a panic or other
-failure in the target. The filenames are assigned by cargo-fuzz and do not
-carry semantic meaning — keep the original name when reproducing.
+failure in the target. The filenames are assigned by cargo-fuzz. They may include hash/crash metadata,
+so keep the original name when reproducing and reporting.
 
 ### Reproducing a crash
 
