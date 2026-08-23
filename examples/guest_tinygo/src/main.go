@@ -5,6 +5,7 @@ import (
 )
 
 // Import Numax host functions.
+//
 //go:wasmimport nx host_log_v2
 func nxHostLogV2(ptr uint32, size uint32) int32
 
@@ -12,10 +13,11 @@ func nxHostLogV2(ptr uint32, size uint32) int32
 func nxDbSet(keyPtr uint32, keySize uint32, valPtr uint32, valSize uint32) int32
 
 // The guest entrypoint that Numax calls.
+//
 //go:export run
 func run() {
 	log("Hello from TinyGo guest!")
-	
+
 	dbSet("hello", "numax-tinygo")
 
 	log("db_set ok")
