@@ -17,6 +17,8 @@ Instead of traditional C-style header inclusions, TinyGo uses:
 
 to explicitly control the generated WebAssembly symbol names and imports.
 
+> Note: Because this example is compiled with -target wasi, the resulting module imports both the nx namespace and wasi_snapshot_preview1. This means its import surface is slightly larger than the AssemblyScript and Zig guest examples.
+
 ### Wasm binary
 
 on inspection of the `.wasm` binary, the exported and imported WebAssembly ABI symbols remain clean because of using explicit directives, mapping directly to the nx namespace (no name mangling)
@@ -28,6 +30,8 @@ on inspection of the `.wasm` binary, the exported and imported WebAssembly ABI s
 ```
 
 > Note: Even though Go uses packages and module paths internally, the exported/imported WASM ABI remains clean and stable using //go:wasmimport and //go:export.
+
+> Note: stringToWasmPtr passes the address of a heap-allocated []byte to the host. This currently works with TinyGo's default GC on wasi, but the pointer's lifetime depends on the referenced allocation remaining valid while the host uses it.
 
 ## Requirements
 
