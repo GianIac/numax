@@ -1,9 +1,13 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn run_nx(args: &[&str], working_directory: &PathBuf) -> Output {
+static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+fn run_nx(args: &[&str], working_directory: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nx"))
         .args(args)
         .current_dir(working_directory)
@@ -12,13 +16,29 @@ fn run_nx(args: &[&str], working_directory: &PathBuf) -> Output {
 }
 
 fn empty_working_directory() -> PathBuf {
-    let unique = SystemTime::now()
+    let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("nx-completions-{}-{unique}", std::process::id()));
-    fs::create_dir(&path).unwrap();
-    path
+
+    loop {
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "nx-completions-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                panic!(
+                    "failed to create temporary directory {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 #[test]
