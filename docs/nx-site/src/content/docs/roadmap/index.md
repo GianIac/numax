@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Current release line**: `v0.1.3` (active - supply chain & fuzzing)
+- **Current release line**: `v0.1.4` (active - Management API)
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -46,8 +46,8 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
 | `v0.1.2` | Performance & Profiling | released |
-| `v0.1.3` | Supply Chain & Fuzzing | active |
-| `v0.1.4` | Management API | planned |
+| `v0.1.3` | Supply Chain & Fuzzing | released |
+| `v0.1.4` | Management API | active |
 | `v0.1.5` | Peer Discovery - Foundations | planned |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
 | `v0.1.7` | Reactive Module Model - Events | planned |
@@ -138,26 +138,52 @@ a partially updated state.
 
 **Goal**: provide a programmatic alternative to the CLI for integration with automation tooling.
 
+**Daemon lifecycle**:
+- [ ] `nx serve` starts a node without requiring a WASM module
+- [ ] The daemon remains active when sync is disabled
+- [ ] After daemon startup, all management operations are available through the REST API
+
 **REST API `/api/v1/*`**:
 - [ ] Served on a separate port (default `127.0.0.1:9102`)
 - [ ] Auth with bearer token (never open without)
+- [ ] Management API disabled when no bearer token is configured
 - [ ] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
 - [ ] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
 
+**API contract and safety**:
+- [ ] Contract-first design: OpenAPI is reviewed before endpoint implementation
+- [ ] Stable JSON error envelope with documented HTTP status codes
+- [ ] Cursor-based pagination with bounded page and response sizes
+- [ ] Binary-safe key and value encoding; internal `__nx/` keys are never exposed
+- [ ] Bounded request bodies, request timeouts and concurrency limits
+- [ ] Documented idempotency and retry semantics for every mutating endpoint
+- [ ] Explicit authentication policy for health and readiness endpoints
+- [ ] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
+
 **v1 endpoints**:
-- [ ] `GET/POST /api/v1/modules` - module management
+- [ ] `POST /api/v1/modules` - register a WASM module
+- [ ] `GET /api/v1/modules` - list registered modules
+- [ ] `GET /api/v1/modules/{id}` - inspect a registered module
+- [ ] `DELETE /api/v1/modules/{id}` - remove a registered module
+- [ ] `POST /api/v1/modules/{id}/runs` - execute a registered module once
 - [ ] `GET /api/v1/peers` - list connected peers
-- [ ] `POST /api/v1/peers` - manually add a peer
 - [ ] `GET /api/v1/keys?prefix=...` - list keys
 - [ ] `GET /api/v1/keys/{key}` - read a value
 - [ ] `GET /api/v1/health`, `GET /api/v1/ready` (aliases of existing observability endpoints)
-- [ ] `POST /api/v1/snapshot` - trigger snapshot
+
+**Module lifecycle**:
+- [ ] Registered modules are local artifacts with stable IDs
+- [ ] Module execution remains one-shot; long-running modules and hot reload are out of scope
 
 **Internal pattern**:
-- [ ] Single source of truth: `RuntimeIntrospection` trait used by CLI, REST API, dashboard, TUI
+- [ ] `RuntimeIntrospection` is the single source of truth for read-only operations used by CLI, REST API, dashboard and TUI
+- [ ] `RuntimeManagement` is the single source of truth for mutating management operations
+
+**Automation example**:
+- [ ] Reproducible example managing a node through the REST API with `curl` and a shell script
 
 **Closing criterion**:
-> A numax node can be managed exclusively via REST API, without ever invoking the CLI. A working Terraform provider example exists in `examples/terraform-provider/`.
+> After starting the daemon, a numax node can be managed exclusively via the authenticated REST API. The documented automation example registers, inspects and runs a module, then verifies node readiness without further CLI commands.
 
 ---
 
@@ -206,6 +232,11 @@ a partially updated state.
 - [ ] Adaptive rate based on load/RTT
 - [ ] Backpressure: controlled drops, never storms
 - [ ] Periodic anti-entropy complementing gossip
+
+**Runtime peer management**:
+- [ ] `POST /api/v1/peers` - manually add a peer to the live membership set
+- [ ] Peers added through the API participate in failure detection, reconnection and anti-entropy
+- [ ] Document whether runtime-added peers persist across node restarts
 
 **Determinism for tests**:
 - [ ] Seedable gossip PRNG for reproducible tests
@@ -519,6 +550,7 @@ time = true
 - **Pluggable storage backends**: redb, fjall, custom
 - **GPU/ML guests**: WASI-NN integration
 - **Edge orchestration**: optional integration with existing edge runtimes
+- **Infrastructure as Code**: evaluate a Terraform provider or Ansible integration.
 - **Cross-platform profiling CI**: extend the canonical Ubuntu/Linux CPU profile to scheduled macOS and Windows artifacts, keeping results separated by OS.
 - **Tiny embedded runtimes**: evaluate interpreter-based WASM engines such as `wasmi` or WAMR for Cortex-M / RISC-V devices with RAM measured in kilobytes. Wasmtime is the right native engine for the current runtime, but it is not a microcontroller-class target.
 
