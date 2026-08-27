@@ -139,8 +139,8 @@ a partially updated state.
 **Goal**: provide a programmatic alternative to the CLI for integration with automation tooling.
 
 **Daemon lifecycle**:
-- [ ] `nx serve` starts a node without requiring a WASM module
-- [ ] The daemon remains active when sync is disabled
+- [x] `nx serve` starts a node without requiring a WASM module
+- [x] The daemon remains active when sync is disabled
 - [ ] After daemon startup, all management operations are available through the REST API
 
 **REST API `/api/v1/*`**:

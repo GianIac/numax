@@ -3,9 +3,10 @@ title: CLI
 description: Reference for the `nx` command line interface.
 ---
 
-`nx` is the Numax command line interface. It has three commands:
+`nx` is the Numax command line interface. It has four commands:
 
 - `nx run` - load and execute a WASM module
+- `nx serve` - run a node without executing a WASM module
 - `nx config` - manage configuration files
 - `nx migrate` - migrate a datastore schema offline
 
@@ -255,6 +256,31 @@ Example:
 ```bash
 nx config show --config node-a.toml --effective
 ```
+
+---
+
+## nx serve
+
+```
+nx serve [OPTIONS]
+```
+
+Starts the datastore and any configured sync or observability services without
+requiring a WASM module. The node remains active until SIGINT, SIGTERM or
+SIGHUP, including when sync is disabled, and then performs a graceful shutdown.
+
+`nx serve` accepts the storage, networking, logging, observability, TLS, debug
+protocol and shutdown options documented below for `nx run`. It rejects
+module-only options such as `--settle-for`, `--wait-before-run` and `--print-*`.
+Configuration precedence is identical for both commands.
+
+```bash
+nx serve --config numax.toml
+```
+
+If neither sync nor observability is configured, the process still waits for a
+shutdown signal and logs a warning. The Management API will attach to this
+daemon lifecycle later in `v0.1.4`.
 
 ---
 

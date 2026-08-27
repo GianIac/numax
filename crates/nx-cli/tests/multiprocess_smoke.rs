@@ -124,6 +124,35 @@ fn restart_and_print_counter(nx: &Path, wasm: &Path, data_dir: &Path, label: &st
     output
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_without_module_waits_for_sigterm_and_shuts_down_cleanly() {
+    let data_dir = temp_path("serve-no-module");
+    let nx = nx_bin();
+    let mut node = Command::new(&nx)
+        .arg("serve")
+        .arg("--datastore-path")
+        .arg(&data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nx serve");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        node.try_wait().expect("poll nx serve").is_none(),
+        "nx serve exited before receiving a shutdown signal"
+    );
+
+    send_signal(node.id(), "TERM");
+    let output = node.wait_with_output().expect("wait for nx serve");
+    assert_success(&output, "nx serve");
+    assert!(
+        data_dir.is_dir(),
+        "nx serve did not initialize the datastore"
+    );
+}
+
 #[test]
 #[ignore = "requires built distributed_counter.wasm and local TCP sockets"]
 fn two_nx_run_processes_converge_distributed_counter() {

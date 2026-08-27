@@ -101,6 +101,7 @@ Runtime::new(config)
 | `run_module(bytes)` | Compiles or retrieves cached module, builds `HostState`, instantiates, calls `run()` or `_start()` |
 | `settle_for(dur)` | Sleeps for `dur`, keeping sync alive. No-op if sync disabled |
 | `serve()` | Blocks until OS signal (SIGINT/SIGTERM/SIGHUP on Unix, Ctrl+C on Windows). No-op if sync disabled |
+| `wait_until_shutdown()` | Blocks until an OS shutdown signal regardless of whether sync is enabled; used by daemon processes |
 | `shutdown_with_timeout(dur)` | Stops sync manager, flushes sled store, shuts down observability server. Bounded by `dur` (default 30s) |
 
 ### Module compilation cache

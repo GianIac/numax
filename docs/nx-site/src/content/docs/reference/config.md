@@ -11,7 +11,8 @@ CLI flags  >  NX_* environment variables  >  numax.toml  >  runtime defaults
 
 A later source only fills in what the earlier ones left unset.
 You can run a single node with nothing but CLI flags, or describe a full cluster
-with a TOML file and override individual fields at launch time.
+with a TOML file and override individual fields at launch time. The same node
+configuration is accepted by both `nx run` and `nx serve`.
 
 ---
 

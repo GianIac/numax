@@ -296,11 +296,27 @@ impl Runtime {
             return Ok(None);
         }
 
-        tracing::info!("runtime entering long-running sync mode");
+        Ok(Some(self.wait_until_shutdown_with(shutdown).await))
+    }
+
+    /// Keep the runtime alive until the process receives a shutdown signal.
+    ///
+    /// Unlike [`Self::serve`], this is independent from sync and is suitable
+    /// for daemon processes that may expose other runtime services.
+    pub async fn wait_until_shutdown(&self) -> ShutdownSignal {
+        self.wait_until_shutdown_with(wait_for_shutdown_signal())
+            .await
+    }
+
+    /// Testable variant of [`Self::wait_until_shutdown`].
+    pub async fn wait_until_shutdown_with<S>(&self, shutdown: S) -> ShutdownSignal
+    where
+        S: Future<Output = ShutdownSignal>,
+    {
+        tracing::info!("runtime waiting for shutdown");
         let signal = shutdown.await;
         tracing::info!(?signal, "runtime shutdown requested");
-
-        Ok(Some(signal))
+        signal
     }
 
     /// Keep sync alive for a bounded settle window, then return.
@@ -670,6 +686,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn wait_until_shutdown_keeps_runtime_alive_without_sync() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-daemon-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        assert!(
+            timeout(
+                Duration::from_millis(25),
+                runtime.wait_until_shutdown_with(async {
+                    let _ = rx.await;
+                    ShutdownSignal::Interrupt
+                })
+            )
+            .await
+            .is_err()
+        );
+
+        let signal = runtime
+            .wait_until_shutdown_with(async { ShutdownSignal::Terminate })
+            .await;
+        assert_eq!(signal, ShutdownSignal::Terminate);
     }
 
     #[tokio::test]

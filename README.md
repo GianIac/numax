@@ -87,6 +87,13 @@ nx run distributed_counter.wasm \
     --print-gcounter counter:visits
 ```
 
+To start the configured node without executing a WASM module, use the daemon
+command:
+
+```bash
+nx serve --config node-a.toml
+```
+
 Runtime precedence is explicit: CLI flags override `NX_*` environment
 variables, environment variables override the TOML file, and the file overrides
 runtime defaults. The distributed examples below include full two-node TOML
