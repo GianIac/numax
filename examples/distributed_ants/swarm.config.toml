@@ -1,0 +1,30 @@
+# Distributed ant-colony swarm configuration.
+#
+# All fields here are re-exposed to every guest node as NUMAX_* environment
+# variables by demo.sh, so every ant in the swarm agrees on the same world.
+# Hotspot positions are NOT listed here: they are derived deterministically
+# inside the guest from (seed, grid_width, grid_height, hotspot_count), so
+# every node computes the identical layout without needing to replicate it.
+
+grid_width = 12
+grid_height = 12
+
+# How many food sources ("hotspots") exist on the grid.
+hotspot_count = 3
+
+# Deterministic layout seed. Must be identical across every node in the
+# swarm — changing it reshuffles where the hotspots land.
+seed = 1337
+
+# Nest coordinates (where ants start, and where they deliver food to).
+nest_x = 0
+nest_y = 0
+
+# How many local simulation ticks (nx run invocations) each ant performs.
+ticks_per_ant = 40
+
+# How many ant nodes to launch.
+ants = 4
+
+# Base TCP port for node 0; node N listens on base_port + N.
+base_port = 9000

@@ -23,6 +23,7 @@ Examples that replicate state across Numax nodes using CRDTs and converge throug
 | --- | --- |
 | [`distributed_counter`](distributed_counter/README.md) | Grow-only distributed counter (GCounter). |
 | [`distributed_inventory`](distributed_inventory/README.md) | Two-way stock counter (PNCounter) for restocks, sales, and returns. |
+| [`distributed_ants`](distributed_ants/README.md) | Distributed Ant Colony Optimization swarm: a shared pheromone trail (PNCounter grid) emerges from many independent nodes. |
 | [`distributed_status`](distributed_status/README.md) | Single latest-value service status (LWW-Register). |
 | [`distributed_settings`](distributed_settings/README.md) | Distributed settings document with per-field last-writer-wins resolution (LWW-Map). |
 | [`distributed_tags`](distributed_tags/README.md) | Distributed tag set with add/remove semantics (ORSet). |
