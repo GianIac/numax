@@ -37,7 +37,6 @@ on inspection of the `.wasm` binary, the exported and imported WebAssembly ABI s
 
 - `TinyGo` installed and in your PATH.
 - A built nx runtime.
-- `wasm-opt` installed via a method of your choice (tested with `npm i -g wasm-opt`)
 
 ## Build
 
@@ -50,15 +49,14 @@ cargo build --release
 ### Windows
 
 ```bash
-cd /examples/guest_tinygo
-./build.bat
+cd examples\guest_tinygo
+.\build.bat
 ```
 
 ### Linux / macOS
 
 ```bash
-cd /examples/guest_tinygo
-chmod +x build.sh
+cd examples/guest_tinygo
 ./build.sh
 ```
 
