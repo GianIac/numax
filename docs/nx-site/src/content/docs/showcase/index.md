@@ -41,4 +41,17 @@ We will merge it with great honor !
 
 ## Projects
 
-*No entries yet. Be the first.*
+### Distributed Ant Colony
+
+**Created by:** [Alessandro Basile (@abasile-tf)](https://github.com/abasile-tf)
+
+**Project:** [`examples/distributed_ants`](https://github.com/GianIac/numax/tree/main/examples/distributed_ants) · [PR #113](https://github.com/GianIac/numax/pull/113) · [sample report](https://github.com/GianIac/numax/blob/main/examples/distributed_ants/screenshots/swarm-full.png)
+
+**What it does:** Runs a distributed Ant Colony Optimization swarm in which every
+Numax node controls an independent ant. The ants coordinate without a leader or
+shared server: pheromone deposits and evaporation are modeled as a convergent
+`PNCounter` grid, while completed trips are tracked with a swarm-wide `GCounter`.
+
+The example includes a configurable multi-node demo and a standard-library-only
+renderer that turns a converged replica into a self-contained HTML pheromone
+heatmap with derived paths between the nest and food hotspots.
