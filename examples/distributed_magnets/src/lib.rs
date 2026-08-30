@@ -18,21 +18,39 @@
 //! entering a cell, dec on leaving) purely for the heatmap — showing where
 //! the swarm is clustered now, not an accumulated trail.
 //!
+//! Every particle also carries a fixed magnetic polarity -- like the
+//! north/south pole of a real magnet, alternating by particle id, needing
+//! no extra replicated state since any node can derive any particle's
+//! polarity from its id alone. Opposite-polarity peers attract each other
+//! (the MOA mechanic), same-polarity peers repel, so the swarm isn't just
+//! one undifferentiated mass converging on the best anchor: same-polarity
+//! particles spread apart even while both are drawn toward the same place.
+//!
+//! Anchor weights are *adaptive*, not fixed for the whole run: each anchor
+//! has a PRNG-derived base weight plus a live adjustment,
+//! `mag:anchor_boost:{i}` -- a `PNCounter` any single node can `inc`/`dec`
+//! (see `demo.sh`'s scripted scenario) to make an anchor suddenly matter
+//! more or less. Every particle re-reads every anchor's *effective* weight
+//! (base + live boost) on every tick, so a boost genuinely redirects the
+//! swarm's movement from that point on -- it isn't just a rendering
+//! overlay, it changes what the guest's own optimization loop is chasing.
+//!
 //! Grid size, anchor count, the deterministic layout seed, the settle
 //! radius, the particle count and this node's particle id all come from
 //! `NUMAX_*` environment variables (see `swarm.config.toml` / `demo.sh` in
-//! this crate). Anchor positions/weights are never transmitted between
-//! nodes: every node derives the identical list from
+//! this crate). Anchor *positions* are never transmitted between nodes:
+//! every node derives the identical list from
 //! `(seed, grid_width, grid_height, anchor_count)` with a seeded PRNG, so the
-//! whole swarm agrees on the search space without replicating it.
+//! whole swarm agrees on the search space layout without replicating it --
+//! only the live weight adjustments travel over the CRDT layer.
 //!
 //! One `nx run` invocation performs exactly one particle step: read this
 //! particle's position from local (non-replicated) `nx_sdk::db`, read every
-//! other particle's published position, compute a magnetic pull toward the
-//! anchors and toward any heavier peer, move to the neighbor cell with the
-//! best pull (weighted-random, same as `distributed_ants`), publish the new
-//! position, and update the occupancy field. Repeated invocations (see
-//! `demo.sh`) are the "ticks".
+//! other particle's published position plus every anchor's live weight,
+//! compute a magnetic pull toward the anchors and toward any heavier peer,
+//! move to the neighbor cell with the best pull (weighted-random, same as
+//! `distributed_ants`), publish the new position, and update the occupancy
+//! field. Repeated invocations (see `demo.sh`) are the "ticks".
 
 extern crate alloc;
 
@@ -82,10 +100,41 @@ struct Config {
     particle_count: u32,
     particle_id: u32,
     render: bool,
+    snapshot_label: String,
+    boosts: Vec<(u32, i64)>,
+    polarity_enabled: bool,
+}
+
+/// Parses `NUMAX_BOOST="idx:delta,idx:delta,..."` into a list of
+/// (anchor index, weight delta) pairs. Malformed entries are skipped rather
+/// than failing the whole tick -- a scripted scenario is easier to author
+/// if one bad entry doesn't take down every particle's run.
+fn parse_boosts(raw: &str) -> Vec<(u32, i64)> {
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((idx_str, delta_str)) = entry.split_once(':') else {
+            continue;
+        };
+        if let (Ok(idx), Ok(delta)) = (
+            idx_str.trim().parse::<u32>(),
+            delta_str.trim().parse::<i64>(),
+        ) {
+            out.push((idx, delta));
+        }
+    }
+    out
 }
 
 impl Config {
     fn from_env() -> Self {
+        let boosts = env_str("NUMAX_BOOST")
+            .map(|s| parse_boosts(&s))
+            .unwrap_or_default();
+
         Config {
             grid_w: env_u32("NUMAX_GRID_W", DEFAULT_GRID_W).max(2),
             grid_h: env_u32("NUMAX_GRID_H", DEFAULT_GRID_H).max(2),
@@ -95,6 +144,10 @@ impl Config {
             particle_count: env_u32("NUMAX_PARTICLE_COUNT", DEFAULT_PARTICLE_COUNT).max(1),
             particle_id: env_u32("NUMAX_PARTICLE_ID", DEFAULT_PARTICLE_ID),
             render: env_str("NUMAX_RENDER").as_deref() == Some("1"),
+            snapshot_label: env_str("NUMAX_SNAPSHOT_LABEL")
+                .unwrap_or_else(|| String::from("snapshot")),
+            boosts,
+            polarity_enabled: env_str("NUMAX_POLARITY").as_deref() != Some("0"),
         }
     }
 }
@@ -154,6 +207,31 @@ fn anchors(cfg: &Config) -> Vec<Anchor> {
     }
 
     out
+}
+
+fn anchor_boost_key(index: u32) -> String {
+    format!("mag:anchor_boost:{index}")
+}
+
+/// Live weight adjustment for one anchor, replicated via a `PNCounter` any
+/// single node can nudge (see `demo.sh`'s scripted scenario). Starts at 0
+/// (no adjustment) until something applies a boost.
+fn anchor_boost_value(index: u32) -> i64 {
+    pncounter::value(&anchor_boost_key(index)).unwrap_or(0)
+}
+
+/// The anchor list every particle actually optimizes against this tick:
+/// each anchor's PRNG-derived base weight plus its current live boost,
+/// floored at 1 so a heavily negative boost never makes an anchor
+/// repulsive or weightless -- just the least attractive option available.
+fn effective_anchors(base: &[Anchor]) -> Vec<Anchor> {
+    base.iter()
+        .enumerate()
+        .map(|(i, &(x, y, base_w))| {
+            let live = base_w as i64 + anchor_boost_value(i as u32);
+            (x, y, live.max(1) as u64)
+        })
+        .collect()
 }
 
 /// Every node derives this particle's starting cell from a PRNG stream
@@ -220,9 +298,18 @@ fn mass_at(pos: (u32, u32), anchors: &[Anchor]) -> u64 {
         .sum()
 }
 
-/// Every other particle's last-known position and mass at that position,
-/// read straight from their published `LWW-Register`s.
-fn peers(cfg: &Config, anchors: &[Anchor]) -> Vec<(u32, u32, u64)> {
+/// Every particle also carries a fixed magnetic polarity, like the north/
+/// south pole of a real magnet -- alternating by particle id so the swarm
+/// always has both, with no extra state to replicate: any node can compute
+/// any particle's polarity locally from its id alone.
+fn is_positive(particle_id: u32) -> bool {
+    particle_id.is_multiple_of(2)
+}
+
+/// Every other particle's last-known position, mass at that position, and
+/// polarity, read straight from their published `LWW-Register`s (position)
+/// and derived locally (polarity).
+fn peers(cfg: &Config, anchors: &[Anchor]) -> Vec<(u32, u32, u64, bool)> {
     let mut out = Vec::new();
     for id in 0..cfg.particle_count {
         if id == cfg.particle_id {
@@ -232,35 +319,66 @@ fn peers(cfg: &Config, anchors: &[Anchor]) -> Vec<(u32, u32, u64)> {
             && bytes.len() == 2
         {
             let pos = (bytes[0] as u32, bytes[1] as u32);
-            out.push((pos.0, pos.1, mass_at(pos, anchors)));
+            out.push((pos.0, pos.1, mass_at(pos, anchors), is_positive(id)));
         }
     }
     out
 }
 
-/// A candidate cell's total magnetic score: its own anchor pull, plus a
-/// capped attraction toward any peer that currently outmasses this particle
-/// -- the actual MOA mechanic, lighter particles get pulled toward heavier
-/// ones, which is what drives clustering/convergence instead of a random
-/// walk.
+/// A candidate cell's total magnetic score: its own anchor pull, plus every
+/// peer's capped pull or push.
+///
+/// With polarity enabled (`NUMAX_POLARITY` unset or not `"0"`): opposite
+/// poles attract (the MOA mechanic: a candidate gets more attractive the
+/// closer it is to a massive opposite-polarity peer), like poles repel (the
+/// same candidate gets *less* attractive the closer it is to a massive
+/// same-polarity peer), same as two real magnets. Repulsion is subtracted
+/// with saturating arithmetic and the whole score floored at 1, since
+/// candidate scores feed a weighted-random draw that needs positive
+/// weights, not a signed force.
+///
+/// With polarity disabled: falls back to the original, polarity-less MOA
+/// rule -- every peer with more mass than this particle currently has
+/// attracts, regardless of anything else, and no peer ever repels.
+#[allow(clippy::too_many_arguments)]
 fn candidate_score(
     candidate: (u32, u32),
     anchors: &[Anchor],
+    polarity_enabled: bool,
+    self_positive: bool,
     self_mass_now: u64,
-    peers: &[(u32, u32, u64)],
+    peers: &[(u32, u32, u64, bool)],
 ) -> u64 {
     let base = mass_at(candidate, anchors).max(1);
-    let peer_bonus: u64 = peers
-        .iter()
-        .filter(|&&(_, _, other_mass)| other_mass > self_mass_now)
-        .map(|&(px, py, other_mass)| {
-            let capped = other_mass.min(PEER_MASS_CAP);
-            let d = manhattan(candidate, (px, py)) as u64;
-            let denom = (d + 1) * (d + 1);
-            (capped * PEER_SCALE) / denom
-        })
-        .sum();
-    base + peer_bonus
+
+    if !polarity_enabled {
+        let attract: u64 = peers
+            .iter()
+            .filter(|&&(_, _, other_mass, _)| other_mass > self_mass_now)
+            .map(|&(px, py, other_mass, _)| {
+                let capped = other_mass.min(PEER_MASS_CAP);
+                let d = manhattan(candidate, (px, py)) as u64;
+                let denom = (d + 1) * (d + 1);
+                (capped * PEER_SCALE) / denom
+            })
+            .sum();
+        return base.saturating_add(attract).max(1);
+    }
+
+    let mut attract: u64 = 0;
+    let mut repel: u64 = 0;
+    for &(px, py, other_mass, other_positive) in peers {
+        let capped = other_mass.min(PEER_MASS_CAP);
+        let d = manhattan(candidate, (px, py)) as u64;
+        let denom = (d + 1) * (d + 1);
+        let magnitude = (capped * PEER_SCALE) / denom;
+        if other_positive == self_positive {
+            repel += magnitude;
+        } else {
+            attract += magnitude;
+        }
+    }
+    base.saturating_add(attract).saturating_sub(repel).max(1)
 }
 
 fn rand_u64() -> Result<u64, NxError> {
@@ -305,13 +423,21 @@ pub extern "C" fn run() {
     };
 
     let cfg = Config::from_env();
-    let anchor_list = anchors(&cfg);
+    let base_anchors = anchors(&cfg);
 
-    if cfg.render {
-        for (x, y, w) in &anchor_list {
-            nx_log!("ANCHOR,{},{},{}", x, y, w);
+    for &(index, delta) in &cfg.boosts {
+        let result = if delta >= 0 {
+            pncounter::inc(&anchor_boost_key(index), delta as u64)
+        } else {
+            pncounter::dec(&anchor_boost_key(index), (-delta) as u64)
+        };
+        match result {
+            Ok(()) => nx_log!("BOOST,{},{}", index, delta),
+            Err(e) => nx_log!("distributed_magnets: failed to apply anchor boost: {}", e),
         }
     }
+
+    let anchor_list = effective_anchors(&base_anchors);
 
     let spawn = spawn_pos(&cfg);
     let (had_previous, old_pos) = match db::get(POS_KEY) {
@@ -323,13 +449,23 @@ pub extern "C" fn run() {
         }
     };
 
+    let self_positive = is_positive(cfg.particle_id);
     let self_mass_now = mass_at(old_pos, &anchor_list).max(1);
     let peer_list = peers(&cfg, &anchor_list);
 
     let candidates = neighbors(old_pos, cfg.grid_w, cfg.grid_h);
     let weights: Vec<u64> = candidates
         .iter()
-        .map(|&c| candidate_score(c, &anchor_list, self_mass_now, &peer_list))
+        .map(|&c| {
+            candidate_score(
+                c,
+                &anchor_list,
+                cfg.polarity_enabled,
+                self_positive,
+                self_mass_now,
+                &peer_list,
+            )
+        })
         .collect();
 
     let new_pos = match choose_weighted(&candidates, &weights) {
@@ -382,9 +518,16 @@ pub extern "C" fn run() {
 
     let settled_events = gcounter::value(SETTLED_EVENTS_KEY).unwrap_or(0);
     nx_log!(
-        "distributed_magnets: node={} particle={} pos=({},{}) mass_here={} settled={} settled_events={}",
+        "distributed_magnets: node={} particle={} polarity={} pos=({},{}) mass_here={} settled={} settled_events={}",
         node_id,
         cfg.particle_id,
+        if !cfg.polarity_enabled {
+            "off"
+        } else if self_positive {
+            "+"
+        } else {
+            "-"
+        },
         new_pos.0,
         new_pos.1,
         mass_at(new_pos, &anchor_list),
@@ -393,6 +536,10 @@ pub extern "C" fn run() {
     );
 
     if cfg.render {
+        nx_log!("SNAPSHOT,{}", cfg.snapshot_label);
+        for (x, y, w) in &anchor_list {
+            nx_log!("ANCHOR,{},{},{}", x, y, w);
+        }
         for id in 0..cfg.particle_count {
             let pos = if id == cfg.particle_id {
                 Some(new_pos)

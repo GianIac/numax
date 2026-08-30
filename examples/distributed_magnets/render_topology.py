@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Render the converged occupancy heatmap + particle/anchor topology from a
-distributed_magnets NUMAX_RENDER=1 log into a single self-contained HTML
-file.
+"""Render the adaptive topology story from a distributed_magnets
+NUMAX_RENDER=1 log into a single self-contained HTML file.
 
 The guest never computes a "final layout" itself -- it only exposes the raw
-converged PNCounter occupancy grid (`FIELD,x,y,value`) plus `ANCHOR,x,y,weight`
-and `PARTICLE,id,x,y,mass` snapshot lines (see src/lib.rs). This script turns
-that into a topology report: an occupancy heatmap, anchor/particle markers
-sized and colored by weight/mass, and a table of every particle's final
-position, mass, and distance to its nearest anchor.
+converged PNCounter occupancy grid (`FIELD,x,y,value`), the current
+effective `ANCHOR,x,y,weight` list, and `PARTICLE,id,x,y,mass` snapshots
+(see src/lib.rs). demo.sh's scripted scenario captures several such
+snapshots over the run -- one per "phase" of the adaptive weight scenario,
+each opened with a `SNAPSHOT,<label>` marker line -- so this script can
+render every phase as its own tab, letting you step through how the swarm
+re-optimizes each time an anchor's live weight changes.
 
 Usage:
     python3 render_topology.py logs/particle-0.log --out topology.html
@@ -18,10 +19,20 @@ from __future__ import annotations
 
 import argparse
 import html
+import math
 import re
+import sys
 from dataclasses import dataclass, field
 
+# Labels can contain spaces/commas ("phase 2: after 0:18,1:-5"), so this
+# captures the rest of the line rather than stopping at the first
+# whitespace -- but stops before an embedded ANSI escape or carriage
+# return, since concurrent processes writing to the same log file can
+# interleave a fragment of another log line onto the same physical line
+# with no newline in between.
+SNAPSHOT_RE = re.compile(r"SNAPSHOT,([^\x1b\r\n]+)")
 LINE_RE = re.compile(r"(ANCHOR|PARTICLE|FIELD),(-?\d+),(-?\d+),(-?\d+)(?:,(-?\d+))?")
+BOOST_RE = re.compile(r"BOOST,(-?\d+),(-?\d+)")
 SETTLED_RE = re.compile(r"mag:settled_events\s*=\s*(\d+)")
 START_RE = re.compile(r"distributed_magnets: start")
 NODE_RE = re.compile(r"node=([0-9a-fA-F-]+)")
@@ -37,8 +48,18 @@ HEAT_STOPS = [
     (1.0, (16, 42, 74)),
 ]
 
-PARTICLE_COLOR = "#c0392b"
+# Every particle's magnetic polarity is derived from its id parity alone
+# (see `is_positive` in src/lib.rs) -- never transmitted in the log -- so
+# this mirrors that rule exactly for coloring.
+POSITIVE_COLOR = "#c0392b"
+NEGATIVE_COLOR = "#1f5fa8"
+
+
+def particle_color(pid: int) -> str:
+    return POSITIVE_COLOR if pid % 2 == 0 else NEGATIVE_COLOR
 ANCHOR_COLOR = "#1f6f4a"
+BOOST_UP_COLOR = "#1f6f4a"
+BOOST_DOWN_COLOR = "#a8283a"
 
 
 @dataclass
@@ -49,46 +70,87 @@ class World:
 
 
 @dataclass
+class Phase:
+    label: str
+    world: World
+    tick: int
+    settled_events: int | None
+    boosts_since_previous: list[tuple[int, int]]
+
+
+@dataclass
 class RunStats:
     node_id: str | None = None
     ticks: int = 0
-    settled_events: int | None = None
 
 
-def parse_log(path: str) -> tuple[World, RunStats]:
-    world = World()
+def parse_log(path: str) -> tuple[list[Phase], RunStats]:
+    """Split a log into one `Phase` per `SNAPSHOT,<label>` marker, tracking
+    which anchor boosts landed since the previous snapshot so each phase can
+    say what just changed."""
     stats = RunStats()
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if START_RE.search(line):
-                stats.ticks += 1
-            if m := NODE_RE.search(line):
-                stats.node_id = m.group(1)
-            if m := SETTLED_RE.search(line):
-                stats.settled_events = int(m.group(1))
+    phases: list[Phase] = []
+    current: Phase | None = None
+    pending_boosts: list[tuple[int, int]] = []
 
-            m = LINE_RE.search(line)
-            if not m:
-                continue
-            kind, a, b, c, d = m.groups()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        sys.exit(f"error: log file not found: {path!r}")
+    except OSError as e:
+        sys.exit(f"error: could not read {path!r}: {e}")
+
+    for line in lines:
+        if START_RE.search(line):
+            stats.ticks += 1
+        if m := NODE_RE.search(line):
+            stats.node_id = m.group(1)
+        if m := BOOST_RE.search(line):
+            pending_boosts.append((int(m.group(1)), int(m.group(2))))
+
+        if m := SNAPSHOT_RE.search(line):
+            current = Phase(
+                label=m.group(1).rstrip(),
+                world=World(),
+                tick=stats.ticks,
+                settled_events=None,
+                boosts_since_previous=pending_boosts,
+            )
+            pending_boosts = []
+            phases.append(current)
+            continue
+
+        if m := SETTLED_RE.search(line):
+            if current is not None:
+                current.settled_events = int(m.group(1))
+            continue
+
+        m = LINE_RE.search(line)
+        if not m or current is None:
+            continue
+        kind, a, b, c, d = m.groups()
+        try:
             a, b, c = int(a), int(b), int(c)
-            if kind == "ANCHOR":
-                if not any((ax, ay) == (a, b) for ax, ay, _ in world.anchors):
-                    world.anchors.append((a, b, c))
-            elif kind == "PARTICLE":
-                # PARTICLE,id,x,y,mass
-                particle_id, x, y, mass = a, b, c, int(d) if d is not None else 0
-                world.particles[particle_id] = (x, y, mass)
-            elif kind == "FIELD":
-                world.field_grid[(a, b)] = c
-    return world, stats
+        except ValueError:
+            continue
+        if kind == "ANCHOR":
+            if not any((ax, ay) == (a, b) for ax, ay, _ in current.world.anchors):
+                current.world.anchors.append((a, b, c))
+        elif kind == "PARTICLE":
+            particle_id, x, y, mass = a, b, c, int(d) if d is not None else 0
+            current.world.particles[particle_id] = (x, y, mass)
+        elif kind == "FIELD":
+            current.world.field_grid[(a, b)] = c
+
+    return phases, stats
 
 
-def infer_grid_size(world: World, grid_width: int | None, grid_height: int | None) -> tuple[int, int]:
+def infer_grid_size(phases: list[Phase], grid_width: int | None, grid_height: int | None) -> tuple[int, int]:
     if grid_width and grid_height:
         return grid_width, grid_height
-    xs = [x for (x, _y) in world.field_grid]
-    ys = [y for (_x, y) in world.field_grid]
+    xs = [x for phase in phases for (x, _y) in phase.world.field_grid]
+    ys = [y for phase in phases for (_x, y) in phase.world.field_grid]
     return (max(xs) + 1 if xs else 14), (max(ys) + 1 if ys else 14)
 
 
@@ -109,12 +171,11 @@ def color_for(value: int, max_value: int) -> str:
 
 
 def build_svg(world: World, grid_w: int, grid_h: int) -> str:
-    cell = 34
+    cell = 30
     pad = 2
     width = grid_w * cell + pad * 2
     height = grid_h * cell + pad * 2
     max_value = max(world.field_grid.values(), default=0)
-    max_mass = max((m for _, _, m in world.particles.values()), default=1) or 1
 
     cells_svg = []
     for y in range(grid_h):
@@ -130,32 +191,49 @@ def build_svg(world: World, grid_w: int, grid_h: int) -> str:
     anchors_svg = []
     for ax, ay, weight in world.anchors:
         cx, cy = pad + ax * cell + cell / 2, pad + ay * cell + cell / 2
-        r = 6 + 2.2 * weight
+        r = 5 + 2.0 * weight
         anchors_svg.append(
             f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" '
             f'stroke="{ANCHOR_COLOR}" stroke-width="2.5" stroke-dasharray="3,2" />'
         )
+        anchors_svg.append(f'<circle cx="{cx}" cy="{cy}" r="3.5" fill="{ANCHOR_COLOR}" />')
         anchors_svg.append(
-            f'<circle cx="{cx}" cy="{cy}" r="4" fill="{ANCHOR_COLOR}" />'
+            f'<text x="{cx}" y="{cy - r - 4}" font-size="9" text-anchor="middle" '
+            f'fill="{ANCHOR_COLOR}" font-family="ui-monospace, monospace" '
+            f'font-weight="600">w={weight}</text>'
         )
 
+    # Particles sharing a cell are drawn as separate small dots arranged in
+    # a tight ring around the cell center, not one bigger dot -- so a
+    # cluster of 6 particles on one anchor visibly reads as 6 particles,
+    # not as a single blob whose size you'd have to decode.
+    by_cell: dict[tuple[int, int], list[int]] = {}
+    for pid, (x, y, _mass) in world.particles.items():
+        by_cell.setdefault((x, y), []).append(pid)
+
+    particle_dot_r = 3.2
+    cluster_ring_r = cell * 0.24
+
     particles_svg = []
-    for pid, (x, y, mass) in sorted(world.particles.items()):
-        cx, cy = pad + x * cell + cell / 2, pad + y * cell + cell / 2
-        r = 5 + 6 * min(1.0, mass / max_mass)
-        particles_svg.append(
-            f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{PARTICLE_COLOR}" '
-            f'stroke="#fbf3e4" stroke-width="2" />'
-        )
-        particles_svg.append(
-            f'<text x="{cx}" y="{cy - r - 4}" font-size="9.5" text-anchor="middle" '
-            f'fill="{PARTICLE_COLOR}" font-family="\'IBM Plex Mono\', monospace" '
-            f'font-weight="600">P{pid}</text>'
-        )
+    for (x, y), pids in by_cell.items():
+        cx0, cy0 = pad + x * cell + cell / 2, pad + y * cell + cell / 2
+        pids = sorted(pids)
+        n = len(pids)
+        for k, pid in enumerate(pids):
+            if n == 1:
+                cx, cy = cx0, cy0
+            else:
+                angle = 2 * math.pi * k / n
+                cx = cx0 + cluster_ring_r * math.cos(angle)
+                cy = cy0 + cluster_ring_r * math.sin(angle)
+            particles_svg.append(
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{particle_dot_r}" '
+                f'fill="{particle_color(pid)}" stroke="#fbf3e4" stroke-width="1" />'
+            )
 
     svg = (
         f'<svg width="100%" viewBox="0 0 {width} {height}" '
-        f'role="img" aria-label="Magnetic field occupancy grid with anchors and converged particle positions">'
+        f'role="img" aria-label="Magnetic field occupancy grid with anchors and particle positions">'
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ebf1f7" />'
         f"{''.join(cells_svg)}{''.join(anchors_svg)}{''.join(particles_svg)}"
         f"</svg>"
@@ -163,17 +241,25 @@ def build_svg(world: World, grid_w: int, grid_h: int) -> str:
     return svg
 
 
-def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_radius: int) -> str:
-    svg = build_svg(world, grid_w, grid_h)
+def render_phase_panel(
+    phase: Phase,
+    index: int,
+    grid_w: int,
+    grid_h: int,
+    settle_radius: int,
+    anchor_count: int,
+    settled_delta: int | None,
+) -> str:
+    svg = build_svg(phase.world, grid_w, grid_h)
 
     stat_chips = [
-        ("grid", f"{grid_w}×{grid_h}"),
-        ("anchors", str(len(world.anchors))),
-        ("particles", str(len(world.particles))),
-        ("ticks observed", str(stats.ticks)),
+        ("tick", str(phase.tick)),
+        ("particles", str(len(phase.world.particles))),
     ]
-    if stats.settled_events is not None:
-        stat_chips.append(("settled events", str(stats.settled_events)))
+    if phase.settled_events is not None:
+        stat_chips.append(("settled events", str(phase.settled_events)))
+    if settled_delta is not None:
+        stat_chips.append(("new settles this phase", f"+{settled_delta}"))
 
     chips_html = "".join(
         f'<div class="chip"><span class="chip-label">{html.escape(label)}</span>'
@@ -181,9 +267,23 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
         for label, value in stat_chips
     )
 
+    boost_notes = []
+    for anchor_idx, delta in phase.boosts_since_previous:
+        if anchor_idx >= anchor_count:
+            continue
+        color = BOOST_UP_COLOR if delta >= 0 else BOOST_DOWN_COLOR
+        sign = "+" if delta >= 0 else ""
+        boost_notes.append(
+            f'<div class="boost-note" style="color:{color}">'
+            f"anchor {anchor_idx} weight {sign}{delta} applied before this snapshot</div>"
+        )
+    boosts_html = "".join(boost_notes)
+
     rows_html = []
-    for pid, (x, y, mass) in sorted(world.particles.items()):
-        nearest = min((manhattan((x, y), (ax, ay)) for ax, ay, _ in world.anchors), default=None)
+    for pid, (x, y, mass) in sorted(phase.world.particles.items()):
+        nearest = min(
+            (manhattan((x, y), (ax, ay)) for ax, ay, _ in phase.world.anchors), default=None
+        )
         converged = nearest is not None and nearest <= settle_radius
         status = (
             '<span class="status status-ok">converged</span>'
@@ -191,9 +291,11 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
             else '<span class="status status-warn">drifting</span>'
         )
         nearest_display = str(nearest) if nearest is not None else "n/a"
+        polarity = "+" if pid % 2 == 0 else "−"
         rows_html.append(
             "<tr>"
-            f'<td><span class="swatch" style="background:{PARTICLE_COLOR}"></span>particle {pid}</td>'
+            f'<td><span class="swatch" style="background:{particle_color(pid)}"></span>'
+            f"particle {pid} ({polarity})</td>"
             f'<td class="num">({x}, {y})</td>'
             f'<td class="num">{mass}</td>'
             f'<td class="num">{nearest_display}</td>'
@@ -201,8 +303,133 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
             "</tr>"
         )
     table_rows = "".join(rows_html) if rows_html else (
-        '<tr><td colspan="5" class="muted">no particles observed</td></tr>'
+        '<tr><td colspan="5" class="muted">no particles observed in this snapshot</td></tr>'
     )
+
+    return f"""
+  <section class="tab-panel" id="panel-{index}">
+    <div class="phase-heading">
+      <h2>{html.escape(phase.label)}</h2>
+      <div class="stats">{chips_html}</div>
+    </div>
+    {boosts_html}
+    <div class="plate">
+      <div class="plate-frame">{svg}</div>
+      <div class="plate-caption">
+        <div class="legend">
+          <span class="legend-item"><span class="dot" style="background:{ANCHOR_COLOR}"></span>anchor (dashed ring + label = live effective weight)</span>
+          <span class="legend-item"><span class="dot" style="background:{POSITIVE_COLOR}"></span>positive-polarity particle</span>
+          <span class="legend-item"><span class="dot" style="background:{NEGATIVE_COLOR}"></span>negative-polarity particle</span>
+          <span class="legend-item muted">a cell's dots ring outward as more particles land there; cell shade = current occupancy</span>
+        </div>
+      </div>
+    </div>
+    <div class="table-card">
+      <table>
+        <thead>
+          <tr><th>particle</th><th>position</th><th>mass</th><th>dist. to nearest anchor</th><th>outcome</th></tr>
+        </thead>
+        <tbody>
+          {table_rows}
+        </tbody>
+      </table>
+    </div>
+  </section>
+"""
+
+
+def build_carousel_css(n: int, seconds_per_phase: float) -> tuple[str, str, float]:
+    """Pure-CSS autoplay carousel: for each phase i of n, builds a
+    `@keyframes` block that is "on" only during that phase's slice of one
+    shared cycle, and a matching one for its progress dot. No JS -- the
+    slide switch is a hard cut (two keyframe stops `eps` apart) rather than
+    a crossfade, so it reads as a deliberate step, not an animation."""
+    total = n * seconds_per_phase
+    eps = 0.05
+    panel_blocks = []
+    dot_blocks = []
+    for i in range(n):
+        start = i / n * 100
+        end = (i + 1) / n * 100
+        stops: list[tuple[float, bool]] = []
+        if start <= 1e-9:
+            stops.append((0.0, True))
+        else:
+            stops.append((0.0, False))
+            stops.append((start, False))
+            stops.append((min(start + eps, end), True))
+        if end >= 100 - 1e-9:
+            stops.append((100.0, True))
+        else:
+            stops.append((end, True))
+            stops.append((min(end + eps, 100.0), False))
+            stops.append((100.0, False))
+
+        deduped: list[tuple[float, bool]] = []
+        for pct, on in stops:
+            if deduped and abs(deduped[-1][0] - pct) < 1e-9:
+                deduped[-1] = (pct, on)
+            else:
+                deduped.append((pct, on))
+
+        panel_kf = "\n".join(
+            f"    {pct:.4f}% {{ opacity: {1 if on else 0}; visibility: {'visible' if on else 'hidden'}; }}"
+            for pct, on in deduped
+        )
+        panel_blocks.append(f"  @keyframes phase-cycle-{i} {{\n{panel_kf}\n  }}")
+
+        dot_kf = "\n".join(
+            f"    {pct:.4f}% {{ background: {'var(--accent)' if on else 'var(--rule)'}; "
+            f"transform: scale({1.4 if on else 1}); }}"
+            for pct, on in deduped
+        )
+        dot_blocks.append(f"  @keyframes dot-cycle-{i} {{\n{dot_kf}\n  }}")
+
+    return "\n".join(panel_blocks), "\n".join(dot_blocks), total
+
+
+SECONDS_PER_PHASE = 4.5
+
+
+def render_html(phases: list[Phase], grid_w: int, grid_h: int, stats: RunStats, settle_radius: int) -> str:
+    anchor_count = max((len(p.world.anchors) for p in phases), default=0)
+    n = len(phases)
+
+    settled_deltas: list[int | None] = []
+    prev_settled: int | None = None
+    for phase in phases:
+        if phase.settled_events is None or prev_settled is None:
+            settled_deltas.append(None)
+        else:
+            settled_deltas.append(max(0, phase.settled_events - prev_settled))
+        if phase.settled_events is not None:
+            prev_settled = phase.settled_events
+
+    panels = "".join(
+        render_phase_panel(
+            phase, i, grid_w, grid_h, settle_radius, anchor_count, settled_deltas[i]
+        )
+        for i, phase in enumerate(phases)
+    )
+
+    carousel_css = ""
+    dots_html = ""
+    if n > 1:
+        panel_keyframes_css, dot_keyframes_css, total_duration = build_carousel_css(
+            n, SECONDS_PER_PHASE
+        )
+        panel_animation_css = "\n".join(
+            f"  #panel-{i} {{ animation: phase-cycle-{i} {total_duration:.2f}s infinite; }}"
+            for i in range(n)
+        )
+        dot_animation_css = "\n".join(
+            f"  #dot-{i} {{ animation: dot-cycle-{i} {total_duration:.2f}s infinite; }}"
+            for i in range(n)
+        )
+        carousel_css = "\n".join(
+            [panel_keyframes_css, dot_keyframes_css, panel_animation_css, dot_animation_css]
+        )
+        dots_html = "".join(f'<span class="carousel-dot" id="dot-{i}"></span>' for i in range(n))
 
     node_line = (
         f'<span class="mono muted">node {html.escape(stats.node_id[:8])}…</span>'
@@ -255,7 +482,7 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     margin: 0;
     background: var(--bg);
     color: var(--ink);
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
     -webkit-font-smoothing: antialiased;
   }}
   .page {{
@@ -264,7 +491,7 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     padding: 56px 24px 80px;
     display: flex;
     flex-direction: column;
-    gap: 36px;
+    gap: 28px;
   }}
   .eyebrow {{
     font-size: 12px;
@@ -274,13 +501,18 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     font-weight: 600;
   }}
   h1 {{
-    font-family: 'Fraunces', Georgia, serif;
-    font-optical-sizing: auto;
+    font-family: Georgia, "Times New Roman", serif;
     font-weight: 600;
     font-size: clamp(32px, 5vw, 44px);
     line-height: 1.05;
     margin: 10px 0 0;
     text-wrap: balance;
+  }}
+  h2 {{
+    font-family: Georgia, "Times New Roman", serif;
+    font-weight: 600;
+    font-size: 20px;
+    margin: 0;
   }}
   .dek {{
     max-width: 62ch;
@@ -289,34 +521,64 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     line-height: 1.6;
     margin: 14px 0 0;
   }}
-  .mono {{ font-family: 'IBM Plex Mono', ui-monospace, monospace; }}
+  .mono {{ font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }}
   .muted {{ color: var(--muted); }}
 
-  .stats {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-  }}
+  .stats {{ display: flex; flex-wrap: wrap; gap: 10px; }}
   .chip {{
     background: var(--surface);
     border: 1px solid var(--rule);
     border-radius: 8px;
-    padding: 10px 14px;
+    padding: 8px 12px;
     display: flex;
     flex-direction: column;
     gap: 2px;
-    min-width: 96px;
+    min-width: 88px;
   }}
   .chip-label {{
-    font-size: 10.5px;
+    font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--muted);
   }}
-  .chip-value {{
-    font-size: 18px;
+  .chip-value {{ font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }}
+
+  .carousel {{ display: grid; }}
+  .tab-panel {{
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    opacity: 1;
+    visibility: visible;
+  }}
+
+  .carousel-dots {{ display: flex; gap: 8px; align-items: center; }}
+  .carousel-dot {{
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--rule);
+    display: inline-block;
+  }}
+
+{carousel_css}
+
+  .phase-heading {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 10px;
+  }}
+
+  .boost-note {{
+    font-size: 12.5px;
     font-weight: 600;
-    font-variant-numeric: tabular-nums;
+    background: var(--accent-soft);
+    border-radius: 8px;
+    padding: 8px 12px;
+    width: fit-content;
   }}
 
   .plate {{
@@ -324,35 +586,19 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     border: 1px solid var(--rule);
     border-radius: 12px;
     box-shadow: var(--shadow);
-    padding: 18px;
+    padding: 16px;
   }}
-  .plate-frame {{
-    border-radius: 6px;
-    overflow: hidden;
-    border: 1px solid #c7d6e3;
-  }}
-  .plate-caption {{
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    margin-top: 12px;
-    font-size: 12px;
-  }}
-  .legend {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-    font-size: 12px;
-    color: var(--muted);
-  }}
+  .plate-frame {{ border-radius: 6px; overflow: hidden; border: 1px solid #c7d6e3; }}
+  .plate-caption {{ margin-top: 10px; font-size: 12px; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted); }}
   .legend-item {{ display: inline-flex; align-items: center; gap: 6px; }}
   .dot {{ width: 9px; height: 9px; border-radius: 50%; display: inline-block; }}
   .swatch {{ width: 9px; height: 9px; display: inline-block; margin-right: 8px; border-radius: 50%; }}
 
-  table {{ width: 100%; border-collapse: collapse; font-size: 13.5px; }}
-  th, td {{ text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--rule); }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); }}
   th {{
-    font-size: 10.5px;
+    font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--muted);
@@ -361,12 +607,7 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
   td.num {{ font-variant-numeric: tabular-nums; }}
   tr:last-child td {{ border-bottom: none; }}
 
-  .status {{
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-weight: 600;
-  }}
+  .status {{ font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }}
   .status-ok {{ background: var(--accent-soft); color: var(--accent); }}
   .status-warn {{ background: var(--rule); color: var(--muted); }}
 
@@ -375,16 +616,11 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     border: 1px solid var(--rule);
     border-radius: 12px;
     box-shadow: var(--shadow);
-    padding: 6px 18px 4px;
+    padding: 4px 16px 2px;
     overflow-x: auto;
   }}
 
-  footer {{
-    font-size: 12px;
-    color: var(--muted);
-    border-top: 1px solid var(--rule);
-    padding-top: 18px;
-  }}
+  footer {{ font-size: 12px; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 18px; }}
 </style>
 </head>
 <body>
@@ -395,43 +631,27 @@ def render_html(world: World, grid_w: int, grid_h: int, stats: RunStats, settle_
     <p class="dek">
       Every particle is an independent numax node; each publishes its
       position as an <span class="mono">LWW-Register</span> that every other
-      particle reads before moving, so lighter particles get pulled toward
-      whichever peer or anchor currently has the most magnetic mass. The
-      occupancy field below is a <span class="mono">PNCounter</span> per
-      grid cell, incremented on entry and decremented on exit &mdash; it
-      shows where the swarm is clustered right now, not an accumulated
-      trail.
+      particle reads before moving, pulled toward whichever peer or anchor
+      currently has the most magnetic mass. Anchor weights are adaptive: a
+      live <span class="mono">PNCounter</span> boost on top of each anchor's
+      base weight can retarget the whole swarm mid-run. The plate below
+      rotates through every captured phase on its own, {SECONDS_PER_PHASE:g}s
+      each, on a loop -- open this file in a browser and watch it replay the
+      adaptation, no interaction needed.
     </p>
-    <div class="stats">{chips_html}</div>
+    {node_line}
   </header>
 
-  <section class="plate">
-    <div class="plate-frame">{svg}</div>
-    <div class="plate-caption">
-      <div class="legend">
-        <span class="legend-item"><span class="dot" style="background:{ANCHOR_COLOR}"></span>anchor (dashed ring = weight)</span>
-        <span class="legend-item"><span class="dot" style="background:{PARTICLE_COLOR}"></span>particle (size = mass)</span>
-        <span class="legend-item muted">cell shade = current occupancy</span>
-      </div>
-      {node_line}
-    </div>
-  </section>
-
-  <section class="table-card">
-    <table>
-      <thead>
-        <tr><th>particle</th><th>final position</th><th>mass</th><th>dist. to nearest anchor</th><th>outcome</th></tr>
-      </thead>
-      <tbody>
-        {table_rows}
-      </tbody>
-    </table>
-  </section>
+  {f'<div class="carousel-dots">{dots_html}</div>' if n > 1 else ""}
+  <div class="carousel">
+  {panels}
+  </div>
 
   <footer>
     Rendered by <span class="mono">render_topology.py</span> from a single
-    node's <span class="mono">NUMAX_RENDER=1</span> log &mdash; a snapshot of
-    one converged replica's view of the swarm, not a live view.
+    node's <span class="mono">NUMAX_RENDER=1</span> log &mdash; {len(phases)}
+    snapshot(s) of one replica's view of the swarm over {stats.ticks} observed
+    ticks, not a live view.
   </footer>
 </div>
 </body>
@@ -448,24 +668,50 @@ def main() -> None:
     parser.add_argument("--out", default="topology.html")
     args = parser.parse_args()
 
-    world, stats = parse_log(args.log)
-    if not world.field_grid:
-        raise SystemExit(
-            f"no FIELD lines found in {args.log!r} -- rerun demo.sh "
-            "(the last tick of particle-0 sets NUMAX_RENDER=1)"
+    if args.settle_radius < 0:
+        sys.exit("error: --settle-radius must be >= 0")
+
+    phases, stats = parse_log(args.log)
+    if not phases:
+        sys.exit(
+            f"error: no SNAPSHOT sections found in {args.log!r} -- rerun demo.sh "
+            "(it sets NUMAX_RENDER=1 + NUMAX_SNAPSHOT_LABEL at each scripted checkpoint)"
         )
+    phases_with_data = [p for p in phases if p.world.field_grid]
+    if not phases_with_data:
+        sys.exit(f"error: no FIELD data found in any snapshot in {args.log!r}")
 
-    grid_w, grid_h = infer_grid_size(world, args.grid_width, args.grid_height)
+    grid_w, grid_h = infer_grid_size(phases, args.grid_width, args.grid_height)
 
-    out_html = render_html(world, grid_w, grid_h, stats, args.settle_radius)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(out_html)
+    out_html = render_html(phases, grid_w, grid_h, stats, args.settle_radius)
+    try:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(out_html)
+    except OSError as e:
+        sys.exit(f"error: could not write {args.out!r}: {e}")
 
-    print(f"wrote {args.out}")
-    print(f"anchors={[(a, b) for a, b, _ in world.anchors]}")
-    for pid, (x, y, mass) in sorted(world.particles.items()):
-        nearest = min((manhattan((x, y), (ax, ay)) for ax, ay, _ in world.anchors), default=None)
-        print(f"particle {pid}: pos=({x},{y}) mass={mass} dist_to_nearest_anchor={nearest}")
+    print(f"wrote {args.out} ({len(phases)} phase(s))")
+    prev_settled: int | None = None
+    for phase in phases:
+        print(f"-- {phase.label} (tick {phase.tick}) --")
+        if phase.boosts_since_previous:
+            for anchor_idx, delta in phase.boosts_since_previous:
+                print(f"   boost applied: anchor {anchor_idx} weight {delta:+d}")
+        if phase.settled_events is not None:
+            if prev_settled is not None:
+                print(
+                    f"   settled_events={phase.settled_events} "
+                    f"(+{max(0, phase.settled_events - prev_settled)} this phase)"
+                )
+            else:
+                print(f"   settled_events={phase.settled_events}")
+            prev_settled = phase.settled_events
+        print(f"   anchors={[(a, b, w) for a, b, w in phase.world.anchors]}")
+        for pid, (x, y, mass) in sorted(phase.world.particles.items()):
+            nearest = min(
+                (manhattan((x, y), (ax, ay)) for ax, ay, _ in phase.world.anchors), default=None
+            )
+            print(f"   particle {pid}: pos=({x},{y}) mass={mass} dist_to_nearest_anchor={nearest}")
 
 
 if __name__ == "__main__":
