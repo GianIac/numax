@@ -22,6 +22,7 @@ Examples that replicate state across Numax nodes using CRDTs and converge throug
 | Example | Description |
 | --- | --- |
 | [`distributed_ants`](distributed_ants/README.md) | Distributed Ant Colony Optimization swarm: a shared pheromone trail (PNCounter grid) emerges from many independent nodes. |
+| [`distributed_magnets`](distributed_magnets/README.md) | Distributed Magnetic Optimization Algorithm swarm: particles publish their position (LWW-Register) and pull toward whichever anchor or peer has the most mass. |
 | [`distributed_counter`](distributed_counter/README.md) | Grow-only distributed counter (GCounter). |
 | [`distributed_inventory`](distributed_inventory/README.md) | Two-way stock counter (PNCounter) for restocks, sales, and returns. |
 | [`distributed_status`](distributed_status/README.md) | Single latest-value service status (LWW-Register). |

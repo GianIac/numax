@@ -1,0 +1,34 @@
+# Distributed Magnetic Optimization Algorithm (MOA) swarm configuration.
+#
+# All fields here are re-exposed to every guest node as NUMAX_* environment
+# variables by demo.sh, so every particle agrees on the same search space.
+# Anchor positions/weights are NOT listed here: they are derived
+# deterministically inside the guest from (seed, grid_width, grid_height,
+# anchor_count), so every node computes the identical layout without ever
+# replicating it.
+
+grid_width = 14
+grid_height = 14
+
+# How many weighted attractor points ("anchors") exist on the grid. Particles
+# are pulled toward whichever anchors give them the highest local mass.
+anchor_count = 3
+
+# Deterministic layout seed. Must be identical across every node in the
+# swarm -- changing it reshuffles where the anchors land and each particle's
+# starting position.
+seed = 4242
+
+# Distance (Manhattan) under which a particle counts as "settled" near its
+# nearest anchor, incrementing the swarm-wide mag:settled_events GCounter.
+settle_radius = 1
+
+# How many local simulation ticks (nx run invocations) each particle
+# performs.
+ticks_per_particle = 50
+
+# How many particle nodes to launch.
+particles = 5
+
+# Base TCP port for node 0; node N listens on base_port + N.
+base_port = 9100
