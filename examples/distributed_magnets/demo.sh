@@ -97,15 +97,25 @@ for ((i = 0; i < PARTICLES; i++)); do
                 --wait-before-run 300ms \
                 --settle-for 800ms \
                 "${render_flag[@]}" \
-                >>"$LOG_DIR/particle-${i}.log" 2>&1 || true
+                >>"$LOG_DIR/particle-${i}.log" 2>&1 || {
+                    echo "error: particle ${i} failed at tick ${t}; see $LOG_DIR/particle-${i}.log" >&2
+                    exit 1
+                }
         done
     ) &
     pids+=($!)
 done
 
+worker_status=0
 for pid in "${pids[@]}"; do
-    wait "$pid"
+    if ! wait "$pid"; then
+        worker_status=1
+    fi
 done
+
+if [[ "$worker_status" -ne 0 ]]; then
+    exit "$worker_status"
+fi
 
 echo
 echo "== final settled_events per node =="
