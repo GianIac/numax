@@ -7,8 +7,8 @@
 # anchor_count), so every node computes the identical layout without ever
 # replicating it.
 
-grid_width = 14
-grid_height = 14
+grid_width = 16
+grid_height = 16
 
 # How many weighted attractor points ("anchors") exist on the grid. Particles
 # are pulled toward whichever anchors give them the highest local mass.
@@ -17,18 +17,61 @@ anchor_count = 3
 # Deterministic layout seed. Must be identical across every node in the
 # swarm -- changing it reshuffles where the anchors land and each particle's
 # starting position.
-seed = 4242
+seed = 7
 
 # Distance (Manhattan) under which a particle counts as "settled" near its
 # nearest anchor, incrementing the swarm-wide mag:settled_events GCounter.
 settle_radius = 1
 
 # How many local simulation ticks (nx run invocations) each particle
-# performs.
-ticks_per_particle = 50
+# performs. Split roughly evenly across the phase_count phases below.
+ticks_per_particle = 120
 
-# How many particle nodes to launch.
-particles = 5
+# How many particle nodes to launch. More particles make the re-clustering
+# effect of an adaptive weight change much easier to see.
+particles = 14
 
 # Base TCP port for node 0; node N listens on base_port + N.
 base_port = 9100
+
+# Whether particles have a magnetic polarity (alternating by particle id:
+# even = positive, odd = negative). With polarity on, opposite-polarity
+# peers attract each other on top of the usual anchor pull and same-polarity
+# peers repel, so the swarm doesn't collapse into one dense blob. Set to
+# false to fall back to the original, polarity-less MOA rule: every peer
+# with more mass than this particle currently has attracts, and nothing
+# ever repels.
+polarity_enabled = true
+
+# Adaptive weight scenario: node 0 acts as the "controller". Phase 1 always
+# runs under the plain seeded (base) weights; phase_count counts phase 1,
+# so phase_count = 6 means 5 scripted weight changes follow it. At each
+# phaseN_at_tick, node 0 applies every "anchor_index:delta" pair in
+# phaseN_boosts to that anchor's live weight (mag:anchor_boost:{index}
+# PNCounter, which accumulates every delta ever applied -- these are
+# deltas on top of the *current* live weight, not target absolutes).
+# Every particle re-reads live anchor weights every tick, so this actually
+# redirects the swarm, not just the rendering. A topology snapshot is
+# captured on the tick immediately before each boost lands (showing
+# convergence under the *previous* weights), plus a final snapshot at the
+# end of the run -- one snapshot per phase, for render_topology.py to
+# rotate through. Anchor indices are 0-based, in the order the seeded
+# layout derives them (run demo.sh once and check the ANCHOR lines in
+# logs/particle-0.log to see the layout for a given seed/grid before
+# tuning these).
+phase_count = 6
+
+phase2_at_tick = 21
+phase2_boosts = "0:18"
+
+phase3_at_tick = 41
+phase3_boosts = "0:-17,1:20"
+
+phase4_at_tick = 61
+phase4_boosts = "1:-20,2:20"
+
+phase5_at_tick = 81
+phase5_boosts = "2:-20,0:20"
+
+phase6_at_tick = 101
+phase6_boosts = "0:-20,1:5,2:5"
