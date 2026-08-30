@@ -43,6 +43,15 @@ Examples that use Numax's local key-value store (`nx_sdk::db::*` or the raw host
 | [`kv_sdk_roundtrip`](kv_sdk_roundtrip/README.md) | SDK version of the local key-value roundtrip. |
 | [`distributed_chat`](distributed_chat/README.md) | Local chat log built on the key-value API; intentionally not replicated. |
 
+## Host capabilities
+
+Focused examples for individual Numax host capabilities exposed through the SDK.
+
+| Example | Description |
+| --- | --- |
+| [`crypto_hashing`](crypto_hashing/README.md) | Secure random bytes, SHA-256, and BLAKE3 through the crypto API. |
+| [`time_clock`](time_clock/README.md) | Wall-clock timestamps and monotonic time for measuring elapsed durations. |
+
 ## Non-Rust guests
 
 Examples that build guests in languages other than Rust.
@@ -51,3 +60,5 @@ Examples that build guests in languages other than Rust.
 | --- | --- |
 | [`guest_c`](guest_c/README.md) | Minimal C guest compiled to WASM, with manual host imports and no libc. |
 | [`guest_cpp`](guest_cpp/README.md) | Minimal C++ guest compiled to WASM, using `import_name`/`export_name` instead of `extern "C"`. |
+| [`guest_tinygo`](guest_tinygo/README.md) | TinyGo guest using direct WASM imports for logging and local key/value storage. |
+| [`guest_zig`](guest_zig/README.md) | Freestanding Zig guest that calls the raw Numax logging ABI. |
