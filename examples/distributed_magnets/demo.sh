@@ -92,14 +92,10 @@ PHASE_COUNT="$(config_get phase_count 1)"
 POLARITY_ENABLED="$(config_get polarity_enabled true)"
 
 for pair in "grid_width $GRID_W" "grid_height $GRID_H" "anchor_count $ANCHOR_COUNT" \
-    "settle_radius $SETTLE_RADIUS" "ticks_per_particle $TICKS_PER_PARTICLE" \
+    "seed $SEED" "settle_radius $SETTLE_RADIUS" "ticks_per_particle $TICKS_PER_PARTICLE" \
     "particles $PARTICLES" "base_port $BASE_PORT" "phase_count $PHASE_COUNT"; do
     require_uint ${pair}
 done
-if ! [[ "$SEED" =~ ^-?[0-9]+$ ]]; then
-    echo "error: seed must be an integer, got: '$SEED'" >&2
-    exit 1
-fi
 if [[ "$POLARITY_ENABLED" != "true" && "$POLARITY_ENABLED" != "false" ]]; then
     echo "error: polarity_enabled must be 'true' or 'false', got: '$POLARITY_ENABLED'" >&2
     exit 1
