@@ -1,0 +1,61 @@
+---
+title: Showcase
+description: Projects built with Numax.
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Projects, experiments, and tools built with Numax by the community.
+
+## Featured projects
+
+<CardGrid>
+  <Card title="Distributed Ant Colony">
+    **Ant Colony Optimization · `PNCounter` + `GCounter`**
+
+    A leaderless swarm where every Numax node controls an independent ant.
+    Pheromone deposits and evaporation converge across a shared CRDT grid, while
+    completed trips are tracked across the whole swarm.
+
+    Includes a configurable multi-node demo and a self-contained HTML renderer
+    for pheromone heatmaps and derived paths.
+
+    **Created by [Alessandro Basile (@abasile-tf)](https://github.com/abasile-tf)**
+
+    [Explore the example](https://github.com/GianIac/numax/tree/main/examples/distributed_ants)
+    · [View report](https://github.com/GianIac/numax/blob/main/examples/distributed_ants/screenshots/swarm-full.png)
+    · [PR #113](https://github.com/GianIac/numax/pull/113)
+  </Card>
+
+  <Card title="Distributed Magnetic Optimization">
+    **Magnetic Optimization · `LWW-Register` + `PNCounter` + `GCounter`**
+
+    A distributed swarm where particles publish live positions and move toward
+    weighted anchors and heavier peers, coordinating without a leader or shared
+    server.
+
+    Includes a configurable multi-node demo and a self-contained HTML topology
+    report with occupancy, anchor, particle, and convergence data.
+
+    **Created by [Alessandro Basile (@abasile-tf)](https://github.com/abasile-tf)**
+
+    [Explore the example](https://github.com/GianIac/numax/tree/main/examples/distributed_magnets)
+    · [View report](https://github.com/GianIac/numax/blob/main/examples/distributed_magnets/screenshots/magnets-full.png)
+    · [PR #115](https://github.com/GianIac/numax/pull/115)
+  </Card>
+</CardGrid>
+
+---
+
+## Add your project
+
+Built something with Numax? We would love to see it. Side projects, experiments,
+demo modules, tools, and course exercises are all welcome—the only requirement is
+that they use Numax in some way.
+
+1. Fork the [Numax repository](https://github.com/GianIac/numax).
+2. Edit `docs/nx-site/src/content/docs/showcase/index.mdx` and add a card with
+   your project name, repository, creator attribution, and a short description.
+3. Open a pull request titled `showcase: add <your project name>`.
+
+No screenshot, minimum code size, or production deployment is required.
