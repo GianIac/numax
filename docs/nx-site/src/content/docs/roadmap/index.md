@@ -141,13 +141,13 @@ a partially updated state.
 **Daemon lifecycle**:
 - [x] `nx serve` starts a node without requiring a WASM module
 - [x] The daemon remains active when sync is disabled
-- [ ] After daemon startup, all management operations are available through the REST API
+- [x] The Management API starts with `nx serve` when configured and shuts down gracefully with the daemon
 
 **REST API `/api/v1/*`**:
-- [ ] Served on a separate port (default `127.0.0.1:9102`)
-- [ ] Auth with bearer token (never open without)
-- [ ] Management API disabled when no bearer token is configured
-- [ ] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
+- [x] Served on a separate port (default `127.0.0.1:9102`)
+- [x] Auth with bearer token (never open without)
+- [x] Management API disabled when no bearer token is configured
+- [x] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
 - [ ] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
 
 **API contract and safety**:
@@ -158,7 +158,7 @@ a partially updated state.
 - [ ] Bounded request bodies, request timeouts and concurrency limits
 - [ ] Documented idempotency and retry semantics for every mutating endpoint
 - [ ] Explicit authentication policy for health and readiness endpoints
-- [ ] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
+- [x] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
 
 **v1 endpoints**:
 - [ ] `POST /api/v1/modules` - register a WASM module

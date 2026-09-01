@@ -201,6 +201,12 @@ log_level = "info"
 log_format = "text"
 request_timeout_secs = 5
 
+[management]
+# listen = "127.0.0.1:9102"
+# token_file = "./management.token"
+allow_non_loopback = false
+request_timeout_secs = 10
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
@@ -265,9 +271,10 @@ nx config show --config node-a.toml --effective
 nx serve [OPTIONS]
 ```
 
-Starts the datastore and any configured sync or observability services without
-requiring a WASM module. The node remains active until SIGINT, SIGTERM or
-SIGHUP, including when sync is disabled, and then performs a graceful shutdown.
+Starts the datastore and any configured sync, observability or management
+services without requiring a WASM module. The node remains active until SIGINT,
+SIGTERM or SIGHUP, including when sync is disabled, and then performs a graceful
+shutdown.
 
 `nx serve` accepts the storage, networking, logging, observability, TLS, debug
 protocol and shutdown options documented below for `nx run`. It rejects
@@ -278,9 +285,13 @@ Configuration precedence is identical for both commands.
 nx serve --config numax.toml
 ```
 
-If neither sync nor observability is configured, the process still waits for a
-shutdown signal and logs a warning. The Management API will attach to this
-daemon lifecycle later in `v0.1.4`.
+The Management API starts on `127.0.0.1:9102` when `[management].token_file` or
+`NX_MANAGEMENT_TOKEN` is configured. It stops accepting requests and drains
+active connections before the runtime shuts down. Until the OpenAPI contract
+and v1 endpoints are implemented, authenticated requests return `404`.
+
+If sync, observability and management are all disabled, the process still waits
+for a shutdown signal and logs a warning.
 
 ---
 
@@ -350,6 +361,21 @@ request_timeout_secs = 5
 | `log_level` | string | `trace` `debug` `info` `warn` `error` | Log verbosity |
 | `log_format` | string | `text` `json` | Log output format |
 | `request_timeout_secs` | integer | > 0 | Observability request timeout in seconds |
+
+### [management]
+
+```toml
+[management]
+listen = "127.0.0.1:9102"
+token_file = "./management.token"
+allow_non_loopback = false
+request_timeout_secs = 10
+```
+
+The listener is disabled without a token. `NX_MANAGEMENT_TOKEN` overrides the
+token file and is never printed by `nx config show`. Non-loopback binds require
+`allow_non_loopback = true`; protect external traffic with TLS or a
+TLS-terminating reverse proxy.
 
 ### [limits]
 

@@ -4,12 +4,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use config::*;
+use nx_api::ManagementServer;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
@@ -419,19 +420,26 @@ async fn real_main(cli: Cli) -> Result<()> {
         }
         Cli::Serve { node } => {
             let resolved = resolve_node_args(node)?;
-            let effective = resolved.effective;
+            let mut effective = resolved.effective;
             init_logging(
                 &effective.log_level,
                 effective.log_format,
                 resolved.tokio_console,
             )?;
 
-            let has_active_service = effective.sync.is_some() || effective.observability.is_some();
+            let management_config = effective.management.take();
+            let has_active_service = effective.sync.is_some()
+                || effective.observability.is_some()
+                || management_config.is_some();
             let cfg = runtime_config_from_effective(effective, None);
             let mut rt = Runtime::new(cfg)?;
+            let mut management_server = None;
             let serve_result: Result<()> = async {
                 rt.start_observability().await?;
                 rt.start_sync().await?;
+                if let Some(config) = management_config {
+                    management_server = Some(ManagementServer::start(config).await?);
+                }
                 if !has_active_service {
                     tracing::warn!(
                         "node has no sync or observability listener; waiting for shutdown"
@@ -442,8 +450,17 @@ async fn real_main(cli: Cli) -> Result<()> {
             }
             .await;
 
-            let shutdown_result = rt.shutdown_with_timeout(resolved.shutdown_timeout).await;
+            let shutdown_started = Instant::now();
+            let management_shutdown_result = match management_server {
+                Some(server) => server.shutdown(resolved.shutdown_timeout).await,
+                None => Ok(()),
+            };
+            let runtime_shutdown_timeout = resolved
+                .shutdown_timeout
+                .saturating_sub(shutdown_started.elapsed());
+            let shutdown_result = rt.shutdown_with_timeout(runtime_shutdown_timeout).await;
             serve_result?;
+            management_shutdown_result?;
             shutdown_result?;
         }
         Cli::Config { command } => match command {
@@ -635,6 +652,12 @@ mod tests {
                 log_level: None,
                 log_format: None,
             }
+        }
+
+        #[test]
+        fn generated_config_template_is_valid() {
+            let config: RunFileConfig = toml::from_str(CONFIG_TEMPLATE).unwrap();
+            validate_run_file_config(&config).unwrap();
         }
 
         #[test]
@@ -854,6 +877,86 @@ mod tests {
             assert_eq!(observability.log_level.as_deref(), Some("debug"));
             assert_eq!(observability.log_format, Some(LogFormat::Json));
             assert_eq!(observability.request_timeout_secs, Some(7));
+        }
+
+        #[test]
+        fn parses_management_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [management]
+                listen = "127.0.0.1:9202"
+                token_file = "./management.token"
+                allow_non_loopback = false
+                request_timeout_secs = 7
+                "#,
+            )
+            .unwrap();
+
+            let management = cfg.management.unwrap();
+            assert_eq!(management.listen.as_deref(), Some("127.0.0.1:9202"));
+            assert_eq!(
+                management.token_file.as_deref(),
+                Some(std::path::Path::new("./management.token"))
+            );
+            assert_eq!(management.allow_non_loopback, Some(false));
+            assert_eq!(management.request_timeout_secs, Some(7));
+        }
+
+        #[test]
+        fn management_is_disabled_without_a_token() {
+            let config = ManagementFileConfig {
+                listen: Some("127.0.0.1:9202".into()),
+                token_file: None,
+                allow_non_loopback: None,
+                request_timeout_secs: None,
+            };
+
+            assert!(
+                build_management_config(&EnvRunConfig::default(), Some(&config))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn management_uses_environment_token_without_exposing_it() {
+            let env_config = EnvRunConfig {
+                management_token: Some(SecretValue::new("top-secret")),
+                management_listen: Some("127.0.0.1:9202".into()),
+                management_request_timeout_secs: Some(7),
+                ..EnvRunConfig::default()
+            };
+
+            let management = build_management_config(&env_config, None).unwrap().unwrap();
+            assert_eq!(management.listen_addr().to_string(), "127.0.0.1:9202");
+            assert_eq!(management.request_timeout(), Duration::from_secs(7));
+            assert!(!format!("{management:?}").contains("top-secret"));
+            assert!(!format!("{env_config:?}").contains("top-secret"));
+
+            let effective = EffectiveRunConfig {
+                datastore_path: None,
+                sync: None,
+                observability: None,
+                management: Some(management),
+                log_level: "info".into(),
+                log_format: LogFormat::Text,
+            };
+            let rendered = effective.render_effective_toml();
+            assert!(rendered.contains("token_configured = true"));
+            assert!(rendered.contains("request_timeout = \"7s\""));
+            assert!(!rendered.contains("top-secret"));
+        }
+
+        #[test]
+        fn management_rejects_non_loopback_without_opt_in() {
+            let env_config = EnvRunConfig {
+                management_token: Some(SecretValue::new("top-secret")),
+                management_listen: Some("0.0.0.0:9102".into()),
+                ..EnvRunConfig::default()
+            };
+
+            let error = build_management_config(&env_config, None).unwrap_err();
+            assert!(error.to_string().contains("allow_non_loopback"));
         }
 
         #[test]

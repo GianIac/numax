@@ -20,7 +20,8 @@ and hands a fully-built `RuntimeConfig` to `nx-core`. It never contains runtime 
 | Read environment variables | `config.rs` - `EnvRunConfig::from_env` |
 | Resolve precedence (CLI > env > file > defaults) | `config.rs` - `EffectiveRunConfig::resolve` |
 | Validate flag combinations (TLS, sync, settle) | `config.rs` - `validate_tls_flags`, `validate_settle_mode`, etc. |
-| Build `SyncConfig`, `TlsConfig`, `ObservabilityConfig` | `config.rs` - `build_sync_config`, `build_tls_config`, `build_observability_config` |
+| Build runtime and Management API configuration | `config.rs` - `build_sync_config`, `build_tls_config`, `build_observability_config`, `build_management_config` |
+| Coordinate daemon and Management API lifecycle | `main.rs` - `Cli::Serve` |
 | Initialize logging and optional Tokio Console diagnostics | `config.rs` - `init_logging` |
 | Generate `numax.toml` template | `config.rs` - `CONFIG_TEMPLATE`, `init_config_file` |
 | Print effective resolved config | `config.rs` - `EffectiveRunConfig::render_effective_toml` |
@@ -32,6 +33,7 @@ and hands a fully-built `RuntimeConfig` to `nx-core`. It never contains runtime 
 ```
 nx
 ├── run <MODULE> [OPTIONS]
+├── serve [OPTIONS]
 └── config
     ├── init [--output PATH] [--force]
     ├── validate [--config PATH]
@@ -42,7 +44,8 @@ Defined in `main.rs` as:
 
 ```rust
 enum Cli {
-    Run { module, datastore_path, config, listen, peers, ... },
+    Run { module, node, ... },
+    Serve { node },
     Config { command: ConfigCommand },
 }
 
@@ -103,6 +106,9 @@ Built by `EnvRunConfig::from_env()`. Each field maps to one env var:
 | `listen` | `NX_LISTEN` | |
 | `peers` | `NX_PEER` + `NX_PEERS` | additive - both used if set |
 | `observability_listen` | `NX_OBSERVABILITY_LISTEN` | |
+| `management_listen` | `NX_MANAGEMENT_LISTEN` | Management API only starts under `nx serve` when a token is configured |
+| `management_token` | `NX_MANAGEMENT_TOKEN` | Secret; debug and effective output are redacted |
+| `management_token_file` | `NX_MANAGEMENT_TOKEN_FILE` | Overridden by `NX_MANAGEMENT_TOKEN` |
 | `tls_cert` | `NX_TLS_CERT` | |
 | `tls_key` | `NX_TLS_KEY` | |
 | `tls_ca` | `NX_TLS_CA` | |
@@ -121,19 +127,22 @@ pub struct RunFileConfig {
     pub storage:      Option<StorageFileConfig>,
     pub limits:       Option<LimitsFileConfig>,
     pub observability: Option<ObservabilityFileConfig>,
+    pub management:   Option<ManagementFileConfig>,
     pub discovery:    Option<DiscoveryFileConfig>,
 }
 ```
 
 All structs use `#[serde(deny_unknown_fields)]` - unknown keys in the TOML are rejected at parse time.
 
-**`EffectiveRunConfig`** - the final merged result passed to `nx-core`.
+**`EffectiveRunConfig`** - the final merged result used to configure `nx-core`
+and the optional `nx-api` listener.
 
 ```rust
 pub struct EffectiveRunConfig {
     pub datastore_path: Option<PathBuf>,
     pub sync:           Option<SyncConfig>,
     pub observability:  Option<ObservabilityConfig>,
+    pub management:     Option<ManagementConfig>,
     pub log_level:      String,
     pub log_format:     LogFormat,
 }

@@ -1,4 +1,5 @@
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +58,35 @@ fn assert_success(output: &Output, label: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(unix)]
+fn wait_for_http(addr: SocketAddr, authorization: Option<&str>) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let authorization = authorization
+                    .map(|value| format!("Authorization: {value}\r\n"))
+                    .unwrap_or_default();
+                let request = format!(
+                    "GET /api/v1/health HTTP/1.1\r\nHost: {addr}\r\n{authorization}Connection: close\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                return response;
+            }
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => panic!("management API did not start on {addr}: {error}"),
+        }
+    }
 }
 
 fn assert_printed_counter(output: &Output, label: &str, expected: u64) {
@@ -151,6 +181,82 @@ fn serve_without_module_waits_for_sigterm_and_shuts_down_cleanly() {
         data_dir.is_dir(),
         "nx serve did not initialize the datastore"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_starts_authenticated_management_listener_and_stops_it_on_sigterm() {
+    let data_dir = temp_path("serve-management-data");
+    let config_path = temp_path("serve-management-config.toml");
+    let token_path = temp_path("serve-management-token");
+    let listen: SocketAddr = free_addr().parse().unwrap();
+    std::fs::write(&token_path, "top-secret\n").unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "[management]\nlisten = \"{listen}\"\ntoken_file = \"{}\"\n",
+            token_path.display()
+        ),
+    )
+    .unwrap();
+
+    let nx = nx_bin();
+    let node = Command::new(&nx)
+        .arg("serve")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--datastore-path")
+        .arg(&data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn nx serve with management API");
+
+    let unauthorized = wait_for_http(listen, None);
+    assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+    let authenticated = wait_for_http(listen, Some("Bearer top-secret"));
+    assert!(authenticated.starts_with("HTTP/1.1 404 Not Found"));
+
+    send_signal(node.id(), "TERM");
+    let output = node.wait_with_output().expect("wait for nx serve");
+    assert_success(&output, "nx serve with management API");
+    assert!(TcpStream::connect(listen).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn management_bind_failure_rolls_back_started_observability_service() {
+    let data_dir = temp_path("serve-management-rollback-data");
+    let config_path = temp_path("serve-management-rollback-config.toml");
+    let token_path = temp_path("serve-management-rollback-token");
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let management_addr = occupied.local_addr().unwrap();
+    let observability_addr = free_addr();
+    std::fs::write(&token_path, "top-secret\n").unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "[observability]\nlisten = \"{observability_addr}\"\n\n[management]\nlisten = \"{management_addr}\"\ntoken_file = \"{}\"\n",
+            token_path.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(nx_bin())
+        .arg("serve")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--datastore-path")
+        .arg(&data_dir)
+        .output()
+        .expect("run nx serve with occupied management port");
+
+    assert!(!output.status.success());
+    assert!(
+        TcpStream::connect(&observability_addr).is_err(),
+        "observability listener remained open after management startup failed"
+    );
+    assert!(data_dir.is_dir());
 }
 
 #[test]

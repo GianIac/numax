@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/nx-core",
+  "crates/nx-api",
   "crates/nx-cli",
   "crates/nx-store",
   "crates/nx-sync",

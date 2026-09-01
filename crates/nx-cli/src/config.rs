@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use nx_api::{DEFAULT_MANAGEMENT_LISTEN, DEFAULT_MANAGEMENT_REQUEST_TIMEOUT, ManagementConfig};
 use nx_core::runtime::RuntimeConfig;
 use nx_core::{ObservabilityConfig, SerializationFormat, SyncConfig, TlsConfig};
 use serde::Deserialize;
@@ -27,6 +28,7 @@ pub(crate) struct RunFileConfig {
     pub(crate) storage: Option<StorageFileConfig>,
     pub(crate) limits: Option<LimitsFileConfig>,
     pub(crate) observability: Option<ObservabilityFileConfig>,
+    pub(crate) management: Option<ManagementFileConfig>,
     pub(crate) discovery: Option<DiscoveryFileConfig>,
 }
 
@@ -87,6 +89,15 @@ pub(crate) struct ObservabilityFileConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ManagementFileConfig {
+    pub(crate) listen: Option<String>,
+    pub(crate) token_file: Option<PathBuf>,
+    pub(crate) allow_non_loopback: Option<bool>,
+    pub(crate) request_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveryFileConfig {
     pub(crate) mode: Option<DiscoveryMode>,
 }
@@ -119,6 +130,7 @@ pub(crate) struct EffectiveRunConfig {
     pub(crate) datastore_path: Option<PathBuf>,
     pub(crate) sync: Option<SyncConfig>,
     pub(crate) observability: Option<ObservabilityConfig>,
+    pub(crate) management: Option<ManagementConfig>,
     pub(crate) log_level: String,
     pub(crate) log_format: LogFormat,
 }
@@ -135,6 +147,7 @@ impl EffectiveRunConfig {
         file_config: &RunFileConfig,
     ) -> Result<Self> {
         let env_has_sync_inputs = env_config.has_sync_inputs();
+        let management = build_management_config(&env_config, file_config.management.as_ref())?;
         let datastore_path = cli
             .datastore_path
             .or(env_config.datastore_path)
@@ -225,11 +238,11 @@ impl EffectiveRunConfig {
             cli.observability_listen.or(env_config.observability_listen),
             file_config.observability.as_ref(),
         )?;
-
         Ok(Self {
             datastore_path,
             sync,
             observability,
+            management,
             log_level,
             log_format,
         })
@@ -325,6 +338,25 @@ impl EffectiveRunConfig {
             render_log_format(self.log_format)
         ));
 
+        out.push_str("[management]\n");
+        match &self.management {
+            Some(management) => {
+                out.push_str("enabled = true\n");
+                out.push_str(&format!("listen = \"{}\"\n", management.listen_addr()));
+                out.push_str("token_configured = true\n");
+                out.push_str(&format!(
+                    "allow_non_loopback = {}\n",
+                    management.allows_non_loopback()
+                ));
+                out.push_str(&format!(
+                    "request_timeout = \"{}\"\n",
+                    render_duration(management.request_timeout())
+                ));
+            }
+            None => out.push_str("enabled = false\n"),
+        }
+        out.push('\n');
+
         out.push_str("[limits]\n");
         if let Some(sync) = &self.sync {
             out.push_str(&format!("max_peers = {}\n", sync.max_peers));
@@ -386,6 +418,12 @@ log_level = "info"
 log_format = "text"
 request_timeout_secs = 5
 
+[management]
+# listen = "127.0.0.1:9102"
+# token_file = "./management.token"
+allow_non_loopback = false
+request_timeout_secs = 10
+
 [limits]
 max_peers = 64
 queued_ops_limit = 10000
@@ -420,6 +458,11 @@ pub(crate) struct EnvRunConfig {
     pub(crate) listen: Option<String>,
     pub(crate) peers: Option<Vec<String>>,
     pub(crate) observability_listen: Option<String>,
+    pub(crate) management_listen: Option<String>,
+    pub(crate) management_token: Option<SecretValue>,
+    pub(crate) management_token_file: Option<PathBuf>,
+    pub(crate) management_allow_non_loopback: Option<bool>,
+    pub(crate) management_request_timeout_secs: Option<u64>,
     pub(crate) tls_cert: Option<PathBuf>,
     pub(crate) tls_key: Option<PathBuf>,
     pub(crate) tls_ca: Option<PathBuf>,
@@ -437,6 +480,11 @@ impl EnvRunConfig {
             listen: env_non_empty("NX_LISTEN")?,
             peers: env_peers()?,
             observability_listen: env_non_empty("NX_OBSERVABILITY_LISTEN")?,
+            management_listen: env_non_empty("NX_MANAGEMENT_LISTEN")?,
+            management_token: env_non_empty("NX_MANAGEMENT_TOKEN")?.map(SecretValue),
+            management_token_file: env_path("NX_MANAGEMENT_TOKEN_FILE"),
+            management_allow_non_loopback: env_bool("NX_MANAGEMENT_ALLOW_NON_LOOPBACK")?,
+            management_request_timeout_secs: env_u64("NX_MANAGEMENT_REQUEST_TIMEOUT_SECS")?,
             tls_cert: env_path("NX_TLS_CERT"),
             tls_key: env_path("NX_TLS_KEY"),
             tls_ca: env_path("NX_TLS_CA"),
@@ -457,6 +505,25 @@ impl EnvRunConfig {
             || self.allowed_peers.is_some()
             || self.tls_insecure.unwrap_or(false)
             || self.serialization_format.is_some()
+    }
+}
+
+pub(crate) struct SecretValue(String);
+
+impl SecretValue {
+    #[cfg(test)]
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
     }
 }
 
@@ -566,6 +633,16 @@ fn env_bool(name: &str) -> Result<Option<bool>> {
     }
 }
 
+fn env_u64(name: &str) -> Result<Option<u64>> {
+    let Some(value) = env_non_empty(name)? else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
 fn env_serialization_format() -> Result<Option<SerializationFormat>> {
     let Some(value) = env_non_empty("NX_SERIALIZATION_FORMAT")? else {
         return Ok(None);
@@ -611,7 +688,7 @@ pub(crate) fn load_run_config_or_default(path: Option<&PathBuf>) -> Result<RunFi
     load_run_config(Some(path))
 }
 
-fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
+pub(crate) fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
     if let Some(network) = &config.network {
         validate_optional_non_empty("network.listen", network.listen.as_deref())?;
         if let Some(peers) = &network.peers {
@@ -641,7 +718,13 @@ fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
         if insecure && (tls.ca.is_some() || tls.allowed_peers.is_some()) {
             bail!("tls.insecure is mutually exclusive with tls.ca and tls.allowed_peers");
         }
-        if tls.allowed_peers.is_some() && tls.ca.is_none() && !insecure {
+        if tls
+            .allowed_peers
+            .as_ref()
+            .is_some_and(|allowed_peers| !allowed_peers.is_empty())
+            && tls.ca.is_none()
+            && !insecure
+        {
             bail!("tls.allowed_peers requires tls.ca");
         }
     }
@@ -708,6 +791,15 @@ fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
         validate_optional_non_zero(
             "observability.request_timeout_secs",
             observability.request_timeout_secs,
+        )?;
+    }
+
+    if let Some(management) = &config.management {
+        validate_optional_non_empty("management.listen", management.listen.as_deref())?;
+        validate_optional_path("management.token_file", management.token_file.as_ref())?;
+        validate_optional_non_zero(
+            "management.request_timeout_secs",
+            management.request_timeout_secs,
         )?;
     }
 
@@ -862,6 +954,52 @@ pub(crate) fn build_observability_config(
     }
 
     Ok(Some(config))
+}
+
+pub(crate) fn build_management_config(
+    env_config: &EnvRunConfig,
+    management: Option<&ManagementFileConfig>,
+) -> Result<Option<ManagementConfig>> {
+    let token = match env_config.management_token.as_ref() {
+        Some(token) => Some(token.expose().to_string()),
+        None => {
+            let token_file = env_config
+                .management_token_file
+                .as_ref()
+                .or_else(|| management.and_then(|config| config.token_file.as_ref()));
+            token_file.map(read_management_token).transpose()?
+        }
+    };
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let listen = env_config
+        .management_listen
+        .clone()
+        .or_else(|| management.and_then(|config| config.listen.clone()))
+        .unwrap_or_else(|| DEFAULT_MANAGEMENT_LISTEN.to_string());
+    let allow_non_loopback = env_config
+        .management_allow_non_loopback
+        .or_else(|| management.and_then(|config| config.allow_non_loopback))
+        .unwrap_or(false);
+    let request_timeout_secs = env_config
+        .management_request_timeout_secs
+        .or_else(|| management.and_then(|config| config.request_timeout_secs));
+
+    let mut config = ManagementConfig::new(&listen, &token, allow_non_loopback)?;
+    if let Some(seconds) = request_timeout_secs {
+        config = config.with_request_timeout(Duration::from_secs(seconds))?;
+    } else {
+        config = config.with_request_timeout(DEFAULT_MANAGEMENT_REQUEST_TIMEOUT)?;
+    }
+    Ok(Some(config))
+}
+
+fn read_management_token(path: &PathBuf) -> Result<String> {
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("read management token file {}", path.display()))?;
+    Ok(token.trim_end_matches(['\r', '\n']).to_string())
 }
 
 pub(crate) fn apply_limit_config(

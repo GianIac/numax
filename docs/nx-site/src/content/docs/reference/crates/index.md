@@ -3,16 +3,17 @@ title: Crates
 description: Overview of the Numax Rust crates.
 ---
 
-Numax is a Cargo workspace with six crates. Each one owns a single layer of the stack.
+Numax is a Cargo workspace with seven crates. Each one owns a single layer of the stack.
 No crate reaches across its boundary.
 
 ```
 nx-cli
-  └── nx-core
-        ├── nx-store
-        ├── nx-sync
-        └── nx-net
-              └── nx-sync
+      ├── nx-core
+      │     ├── nx-store
+      │     ├── nx-sync
+      │     └── nx-net
+      │           └── nx-sync
+      └── nx-api
 
 nx-sdk          (standalone — targets wasm32, no internal deps)
 ```
@@ -21,9 +22,11 @@ nx-sdk          (standalone — targets wasm32, no internal deps)
 
 ## nx-cli
 
-**What it owns:** the `nx` binary. Configuration parsing, CLI flag validation, precedence resolution, logging setup.
+**What it owns:** the `nx` binary. Configuration parsing, CLI flag validation,
+precedence resolution, logging setup, and process lifecycle coordination.
 
-**Does not own:** runtime logic, WASM execution, networking. Everything below the CLI surface is delegated to `nx-core`.
+**Does not own:** runtime logic, WASM execution, networking, or HTTP serving.
+Those responsibilities are delegated to `nx-core` and `nx-api`.
 
 **Produces:** the `nx` executable.
 
@@ -145,20 +148,38 @@ Compiles to `wasm32-unknown-unknown`. Has no internal workspace dependencies and
 
 ---
 
+## nx-api
+
+**What it owns:** the Management API transport: listener binding, bearer
+authentication, header/request timeouts, and bounded connection draining.
+
+**Does not own:** runtime operations or endpoint semantics. Those will be
+provided through the shared control interfaces after the OpenAPI contract is
+defined.
+
+**Key files:**
+- `src/lib.rs` - `ManagementConfig` and `ManagementServer`
+
+**External dependencies:** `axum`, `hyper`, `hyper-util`, `tower`, `tokio`, `subtle`, `tracing`
+
+---
+
 ## Dependency graph in full
 
 ```
 nx-cli ──────────────────────────────────── bin: nx
   │
-  └── nx-core ──────────────────────────── runtime, host API, sync manager
-        │
-        ├── nx-store ─────────────────────  sled KV store
-        │
-        ├── nx-sync ──────────────────────  CRDT types, op types, pure logic
-        │
-        └── nx-net ───────────────────────  TCP, TLS, gossip, anti-entropy
-              │
-              └── nx-sync
+      ├── nx-core ──────────────────────────── runtime, host API, sync manager
+      │     │
+      │     ├── nx-store ─────────────────────  sled KV store
+      │     │
+      │     ├── nx-sync ──────────────────────  CRDT types, op types, pure logic
+      │     │
+      │     └── nx-net ───────────────────────  TCP, TLS, gossip, anti-entropy
+      │           │
+      │           └── nx-sync
+      │
+      └── nx-api ─────────────────────────────  Management API transport
 
 nx-sdk ───────────────────────────────────  guest SDK (wasm32, no internal deps)
 ```
