@@ -4,31 +4,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use http_body_util::Limited;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tower::Service;
 
 pub const DEFAULT_MANAGEMENT_LISTEN: &str = "127.0.0.1:9102";
 pub const DEFAULT_MANAGEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_MANAGEMENT_REQUEST_BODY_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_MANAGEMENT_CONCURRENT_REQUESTS: usize = 64;
 
 #[derive(Clone)]
 pub struct ManagementConfig {
     listen_addr: SocketAddr,
     authorization: Arc<[u8]>,
     request_timeout: Duration,
+    request_body_limit: usize,
+    concurrent_request_limit: usize,
     allow_non_loopback: bool,
 }
 
@@ -48,6 +55,8 @@ impl ManagementConfig {
             listen_addr,
             authorization: Arc::from(format!("Bearer {bearer_token}").into_bytes()),
             request_timeout: DEFAULT_MANAGEMENT_REQUEST_TIMEOUT,
+            request_body_limit: MAX_MANAGEMENT_REQUEST_BODY_SIZE,
+            concurrent_request_limit: MAX_MANAGEMENT_CONCURRENT_REQUESTS,
             allow_non_loopback,
         })
     }
@@ -57,6 +66,29 @@ impl ManagementConfig {
             bail!("management request timeout must be greater than zero");
         }
         self.request_timeout = request_timeout;
+        Ok(self)
+    }
+
+    pub fn with_request_body_limit(mut self, request_body_limit: usize) -> Result<Self> {
+        if !(1..=MAX_MANAGEMENT_REQUEST_BODY_SIZE).contains(&request_body_limit) {
+            bail!(
+                "management request body limit must be between 1 and {MAX_MANAGEMENT_REQUEST_BODY_SIZE} bytes"
+            );
+        }
+        self.request_body_limit = request_body_limit;
+        Ok(self)
+    }
+
+    pub fn with_concurrent_request_limit(
+        mut self,
+        concurrent_request_limit: usize,
+    ) -> Result<Self> {
+        if !(1..=MAX_MANAGEMENT_CONCURRENT_REQUESTS).contains(&concurrent_request_limit) {
+            bail!(
+                "management concurrent request limit must be between 1 and {MAX_MANAGEMENT_CONCURRENT_REQUESTS}"
+            );
+        }
+        self.concurrent_request_limit = concurrent_request_limit;
         Ok(self)
     }
 
@@ -80,6 +112,8 @@ impl fmt::Debug for ManagementConfig {
             .field("listen_addr", &self.listen_addr)
             .field("bearer_token", &"[REDACTED]")
             .field("request_timeout", &self.request_timeout)
+            .field("request_body_limit", &self.request_body_limit)
+            .field("concurrent_request_limit", &self.concurrent_request_limit)
             .field("allow_non_loopback", &self.allow_non_loopback)
             .finish()
     }
@@ -107,6 +141,23 @@ struct AuthState {
 #[derive(Clone, Copy)]
 struct TimeoutState(Duration);
 
+#[derive(Clone, Copy)]
+struct BodyLimitState(usize);
+
+#[derive(Clone)]
+struct ConcurrencyState(Arc<Semaphore>);
+
+#[derive(Serialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    code: &'static str,
+    message: &'static str,
+}
+
 pub struct ManagementServer {
     local_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<Duration>>,
@@ -126,10 +177,21 @@ impl ManagementServer {
         };
         let header_timeout = config.request_timeout;
         let request_timeout = TimeoutState(header_timeout);
+        let request_body_limit = BodyLimitState(config.request_body_limit);
+        let concurrency =
+            ConcurrencyState(Arc::new(Semaphore::new(config.concurrent_request_limit)));
         let router = router
+            .layer(middleware::from_fn_with_state(
+                request_body_limit,
+                enforce_request_body_limit,
+            ))
             .layer(middleware::from_fn_with_state(
                 request_timeout,
                 enforce_request_timeout,
+            ))
+            .layer(middleware::from_fn_with_state(
+                concurrency,
+                enforce_concurrency_limit,
             ))
             .layer(middleware::from_fn_with_state(auth, require_bearer));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -267,8 +329,56 @@ async fn enforce_request_timeout(
 ) -> Response {
     match timeout(state.0, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+        Err(_) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "request_timeout",
+            "request timed out",
+        ),
     }
+}
+
+async fn enforce_request_body_limit(
+    State(state): State<BodyLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > state.0 as u64)
+    {
+        return payload_too_large_response();
+    }
+
+    let request = request.map(|body| Body::new(Limited::new(body, state.0)));
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        payload_too_large_response()
+    } else {
+        response
+    }
+}
+
+async fn enforce_concurrency_limit(
+    State(state): State<ConcurrencyState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = state.0.try_acquire_owned() else {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "management API concurrency limit reached",
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+
+    next.run(request).await
 }
 
 async fn require_bearer(State(state): State<AuthState>, request: Request, next: Next) -> Response {
@@ -278,36 +388,63 @@ async fn require_bearer(State(state): State<AuthState>, request: Request, next: 
         .is_some_and(|value| bool::from(value.as_bytes().ct_eq(state.authorization.as_ref())));
 
     if !authorized {
-        return (
+        let mut response = error_response(
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-        )
-            .into_response();
+            "unauthorized",
+            "bearer authentication required",
+        );
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return response;
     }
 
     next.run(request).await
 }
 
+fn payload_too_large_response() -> Response {
+    error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "payload_too_large",
+        "request body exceeds the configured limit",
+    )
+}
+
+fn error_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    (
+        status,
+        Json(ErrorEnvelope {
+            error: ErrorBody { code, message },
+        }),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
+    use axum::body::Bytes;
+    use axum::routing::{get, post};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
 
-    async fn request(addr: SocketAddr, path: &str, authorization: Option<&str>) -> String {
+    async fn raw_request(addr: SocketAddr, request: &[u8]) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    async fn request(addr: SocketAddr, path: &str, authorization: Option<&str>) -> String {
         let authorization = authorization
             .map(|value| format!("Authorization: {value}\r\n"))
             .unwrap_or_default();
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{authorization}Connection: close\r\n\r\n"
         );
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-        response
+        raw_request(addr, request.as_bytes()).await
     }
 
     #[test]
@@ -316,10 +453,30 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("top-secret"));
         assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("request_body_limit: 16777216"));
+        assert!(rendered.contains("concurrent_request_limit: 64"));
 
         let error = ManagementConfig::new("0.0.0.0:9102", "top-secret", false).unwrap_err();
         assert!(error.to_string().contains("allow_non_loopback"));
         ManagementConfig::new("0.0.0.0:9102", "top-secret", true).unwrap();
+    }
+
+    #[test]
+    fn config_rejects_zero_or_above_contract_transport_limits() {
+        let config = || ManagementConfig::new("127.0.0.1:9102", "top-secret", false).unwrap();
+
+        assert!(config().with_request_body_limit(0).is_err());
+        assert!(
+            config()
+                .with_request_body_limit(MAX_MANAGEMENT_REQUEST_BODY_SIZE + 1)
+                .is_err()
+        );
+        assert!(config().with_concurrent_request_limit(0).is_err());
+        assert!(
+            config()
+                .with_concurrent_request_limit(MAX_MANAGEMENT_CONCURRENT_REQUESTS + 1)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -330,6 +487,10 @@ mod tests {
 
         let unauthorized = request(addr, "/api/v1/health", None).await;
         assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(unauthorized.contains("content-type: application/json"));
+        assert!(unauthorized.contains(
+            r#"{"error":{"code":"unauthorized","message":"bearer authentication required"}}"#
+        ));
         let authorized = request(addr, "/api/v1/health", Some("Bearer top-secret")).await;
         assert!(authorized.starts_with("HTTP/1.1 404 Not Found"));
 
@@ -436,6 +597,8 @@ mod tests {
         let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
             .unwrap()
             .with_request_timeout(Duration::from_millis(20))
+            .unwrap()
+            .with_concurrent_request_limit(1)
             .unwrap();
         let server = ManagementServer::start(config).await.unwrap();
         let mut stream = tokio::net::TcpStream::connect(server.local_addr())
@@ -454,5 +617,169 @@ mod tests {
 
         assert!(response.is_empty());
         server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_accepts_the_boundary_and_rejects_larger_bodies() {
+        let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
+            .unwrap()
+            .with_request_body_limit(8)
+            .unwrap();
+        let router = Router::new().route(
+            "/upload",
+            post(|body: Bytes| async move {
+                assert_eq!(body.len(), 8);
+                StatusCode::NO_CONTENT
+            }),
+        );
+        let server = ManagementServer::start_with_router(config, router)
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+
+        let boundary = format!(
+            "POST /upload HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer top-secret\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678"
+        );
+        let accepted = raw_request(addr, boundary.as_bytes()).await;
+        assert!(accepted.starts_with("HTTP/1.1 204 No Content"));
+
+        let oversized = format!(
+            "POST /upload HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer top-secret\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789"
+        );
+        let rejected = raw_request(addr, oversized.as_bytes()).await;
+        assert_payload_too_large(&rejected);
+
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_rejects_oversized_chunked_bodies() {
+        let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
+            .unwrap()
+            .with_request_body_limit(8)
+            .unwrap();
+        let router =
+            Router::new().route("/upload", post(|_: Bytes| async { StatusCode::NO_CONTENT }));
+        let server = ManagementServer::start_with_router(config, router)
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let request = format!(
+            "POST /upload HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n9\r\n123456789\r\n0\r\n\r\n"
+        );
+
+        let response = raw_request(addr, request.as_bytes()).await;
+
+        assert_payload_too_large(&response);
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn routed_request_timeout_cancels_the_handler_and_returns_json() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(20))
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handler_started = started.clone();
+        let handler_dropped = dropped.clone();
+        let router = Router::new()
+            .route(
+                "/hold",
+                get(move || {
+                    let started = handler_started.clone();
+                    let dropped = handler_dropped.clone();
+                    async move {
+                        let _drop_flag = DropFlag(dropped);
+                        started.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }),
+            )
+            .route("/quick", get(|| async { StatusCode::NO_CONTENT }));
+        let server = ManagementServer::start_with_router(config, router)
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let response =
+            tokio::spawn(async move { request(addr, "/hold", Some("Bearer top-secret")).await });
+        started.notified().await;
+
+        let response = response.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 504 Gateway Timeout"));
+        assert!(
+            response
+                .contains(r#"{"error":{"code":"request_timeout","message":"request timed out"}}"#)
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        let recovered = request(addr, "/quick", Some("Bearer top-secret")).await;
+        assert!(recovered.starts_with("HTTP/1.1 204 No Content"));
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_immediately_and_recovers_the_slot() {
+        let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
+            .unwrap()
+            .with_concurrent_request_limit(1)
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handler_started = started.clone();
+        let handler_release = release.clone();
+        let router = Router::new()
+            .route(
+                "/hold",
+                get(move || {
+                    let started = handler_started.clone();
+                    let release = handler_release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route("/quick", get(|| async { StatusCode::NO_CONTENT }));
+        let server = ManagementServer::start_with_router(config, router)
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let held =
+            tokio::spawn(async move { request(addr, "/hold", Some("Bearer top-secret")).await });
+        started.notified().await;
+
+        let unauthorized = request(addr, "/quick", None).await;
+        assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+        let rejected = request(addr, "/quick", Some("Bearer top-secret")).await;
+        assert!(rejected.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(rejected.contains("retry-after: 1"));
+        assert!(rejected.contains(
+            r#"{"error":{"code":"rate_limited","message":"management API concurrency limit reached"}}"#
+        ));
+
+        release.notify_one();
+        assert!(held.await.unwrap().starts_with("HTTP/1.1 204 No Content"));
+        let recovered = request(addr, "/quick", Some("Bearer top-secret")).await;
+        assert!(recovered.starts_with("HTTP/1.1 204 No Content"));
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    fn assert_payload_too_large(response: &str) {
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("content-type: application/json"));
+        assert!(response.contains(
+            r#"{"error":{"code":"payload_too_large","message":"request body exceeds the configured limit"}}"#
+        ));
     }
 }

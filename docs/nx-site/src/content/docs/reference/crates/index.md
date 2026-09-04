@@ -151,7 +151,8 @@ Compiles to `wasm32-unknown-unknown`. Has no internal workspace dependencies and
 ## nx-api
 
 **What it owns:** the Management API transport: listener binding, bearer
-authentication, header/request timeouts, and bounded connection draining.
+authentication, body/header/request limits, concurrency admission, and bounded
+connection draining.
 
 **Does not own:** runtime operations or endpoint semantics. Those will be
 provided through the shared control interfaces after the OpenAPI contract is
@@ -160,7 +161,7 @@ defined.
 **Key files:**
 - `src/lib.rs` - `ManagementConfig` and `ManagementServer`
 
-**External dependencies:** `axum`, `hyper`, `hyper-util`, `tower`, `tokio`, `subtle`, `tracing`
+**External dependencies:** `axum`, `http-body-util`, `hyper`, `hyper-util`, `serde`, `tower`, `tokio`, `subtle`, `tracing`
 
 ---
 

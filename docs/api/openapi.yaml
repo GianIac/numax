@@ -607,7 +607,7 @@ components:
               value:
                 error:
                   code: payload_too_large
-                  message: request body exceeds 16777216 bytes
+                  message: request body exceeds the configured limit
     UnsupportedMediaType:
       description: The request body is not `application/wasm`.
       content:

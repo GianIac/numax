@@ -203,6 +203,10 @@ allow_non_loopback = false
 request_timeout_secs = 10
 ```
 
+The transport always caps request bodies at 16 MiB and processes at most 64
+authenticated requests concurrently. These hard safety bounds are not TOML
+settings.
+
 The Management API does not terminate TLS. Keep it on loopback behind a TLS-terminating reverse proxy whenever possible. A non-loopback bind requires
 `allow_non_loopback = true` and must only be used on a transport protected by
 TLS or equivalent network controls. Bearer tokens are never written to logs or

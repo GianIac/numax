@@ -155,7 +155,7 @@ a partially updated state.
 - [x] Stable JSON error envelope with documented HTTP status codes
 - [x] Cursor-based pagination with bounded page and response sizes
 - [x] Binary-safe key and value encoding; internal `__nx/` keys are never exposed
-- [ ] Bounded request bodies, request timeouts and concurrency limits
+- [x] Bounded request bodies, request timeouts and concurrency limits
 - [x] Documented idempotency and retry semantics for every mutating endpoint
 - [x] Explicit authentication policy for health and readiness endpoints
 - [x] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
