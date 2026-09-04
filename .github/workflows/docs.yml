@@ -4,11 +4,13 @@ on:
   push:
     branches: ["main"]
     paths:
+      - "docs/api/**"
       - "docs/nx-site/**"
       - ".github/workflows/docs.yml"
   pull_request:
     branches: ["main"]
     paths:
+      - "docs/api/**"
       - "docs/nx-site/**"
       - ".github/workflows/docs.yml"
 
@@ -42,7 +44,11 @@ jobs:
 
       - name: Check
         working-directory: docs/nx-site
-        run: npm run check
+        env:
+          REDOCLY_TELEMETRY: off
+        run: |
+          npm run check
+          npm run check:api
 
       - name: Build
         working-directory: docs/nx-site

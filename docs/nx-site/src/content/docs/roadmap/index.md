@@ -148,16 +148,16 @@ a partially updated state.
 - [x] Auth with bearer token (never open without)
 - [x] Management API disabled when no bearer token is configured
 - [x] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
-- [ ] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
+- [x] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
 
 **API contract and safety**:
-- [ ] Contract-first design: OpenAPI is reviewed before endpoint implementation
-- [ ] Stable JSON error envelope with documented HTTP status codes
-- [ ] Cursor-based pagination with bounded page and response sizes
-- [ ] Binary-safe key and value encoding; internal `__nx/` keys are never exposed
+- [x] Contract-first design: OpenAPI is reviewed before endpoint implementation
+- [x] Stable JSON error envelope with documented HTTP status codes
+- [x] Cursor-based pagination with bounded page and response sizes
+- [x] Binary-safe key and value encoding; internal `__nx/` keys are never exposed
 - [ ] Bounded request bodies, request timeouts and concurrency limits
-- [ ] Documented idempotency and retry semantics for every mutating endpoint
-- [ ] Explicit authentication policy for health and readiness endpoints
+- [x] Documented idempotency and retry semantics for every mutating endpoint
+- [x] Explicit authentication policy for health and readiness endpoints
 - [x] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
 
 **v1 endpoints**:

@@ -1,0 +1,724 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+info:
+  title: Numax Management API
+  version: 0.1.4
+  description: |
+    Authenticated API for operating a single Numax node.
+
+    Every endpoint requires the bearer token configured for `nx serve`, including
+    health and readiness. The unauthenticated `/health` and `/ready` probes remain
+    available only on the separately configured observability listener.
+
+    Unless an operation says otherwise, clients may retry `GET` requests after
+    transient `429`, `503`, or `504` responses. Clients should honor `Retry-After`
+    whenever it is present.
+
+    Contract limits:
+      * at most 64 requests are processed concurrently;
+      * a WASM upload is limited to 16 MiB;
+      * collection pages contain 50 items by default and at most 100;
+      * response bodies are limited to 1 MiB.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://127.0.0.1:9102
+    description: Default local Management API listener
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Modules
+    description: Registration and one-shot execution of local WASM artifacts.
+  - name: Peers
+    description: Read-only inspection of currently connected peers.
+  - name: Datastore
+    description: Read-only access to application keys and values.
+  - name: Probes
+    description: Authenticated aliases of the observability health and readiness probes.
+
+paths:
+  /api/v1/modules:
+    post:
+      tags: [Modules]
+      operationId: registerModule
+      summary: Register a WASM module
+      description: |
+        Stores a local module artifact after validating that it is valid WebAssembly.
+        The stable module ID is the lowercase hexadecimal BLAKE3 digest of the exact
+        uploaded bytes.
+
+        Registration is content-idempotent: uploading identical bytes returns the
+        existing module and does not create a duplicate. A first registration returns
+        `201`; an existing identical module returns `200`.
+      requestBody:
+        required: true
+        content:
+          application/wasm:
+            schema:
+              type: string
+              format: binary
+              maxLength: 16777216
+      responses:
+        "200":
+          description: The identical module was already registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Module"
+        "201":
+          description: The module was registered.
+          headers:
+            Location:
+              description: Canonical path of the registered module.
+              schema:
+                type: string
+                example: /api/v1/modules/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Module"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/InvalidModule"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+    get:
+      tags: [Modules]
+      operationId: listModules
+      summary: List registered modules
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A bounded page of modules ordered by module ID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModulePage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/modules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ModuleId"
+    get:
+      tags: [Modules]
+      operationId: getModule
+      summary: Inspect a registered module
+      responses:
+        "200":
+          description: Module metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Module"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ModuleNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+    delete:
+      tags: [Modules]
+      operationId: deleteModule
+      summary: Remove a registered module
+      description: |
+        Idempotent and safe to retry. The response is `204` whether or not the module
+        existed. A run that already started may finish; later run requests return `404`.
+      responses:
+        "204":
+          description: The module is no longer registered.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/modules/{id}/runs:
+    parameters:
+      - $ref: "#/components/parameters/ModuleId"
+    post:
+      tags: [Modules]
+      operationId: runModule
+      summary: Execute a registered module once
+      description: |
+        Runs the module synchronously and returns only after successful completion.
+        This operation is not idempotent: a failed response or lost connection may
+        occur after the guest has already produced effects. Clients must not retry it
+        automatically.
+      responses:
+        "204":
+          description: The module completed successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ModuleNotFound"
+        "422":
+          $ref: "#/components/responses/ModuleExecutionFailed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/peers:
+    get:
+      tags: [Peers]
+      operationId: listConnectedPeers
+      summary: List connected peers
+      description: Returns an empty page when synchronization is disabled or no peer is connected.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A bounded page of connected peers ordered by address.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/keys:
+    get:
+      tags: [Datastore]
+      operationId: listKeys
+      summary: List application keys
+      description: |
+        Lists binary keys as unpadded Base64URL strings. Keys under the internal
+        `__nx/` namespace are always filtered out.
+      parameters:
+        - $ref: "#/components/parameters/Prefix"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A bounded page of keys in bytewise lexicographic order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/keys/{key}:
+    get:
+      tags: [Datastore]
+      operationId: getValue
+      summary: Read an application value
+      description: |
+        The path parameter is the unpadded Base64URL representation of the binary key.
+        The value is returned without JSON or Base64 expansion so the 1 MiB response
+        limit remains compatible with Numax's 1 MiB value limit. Internal `__nx/` keys
+        behave as absent and return `404`.
+      parameters:
+        - $ref: "#/components/parameters/Key"
+      responses:
+        "200":
+          description: Raw value bytes.
+          headers:
+            X-Numax-Key:
+              description: Canonical unpadded Base64URL representation of the key.
+              schema:
+                $ref: "#/components/schemas/Base64UrlKey"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                maxLength: 1048576
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/KeyNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/health:
+    get:
+      tags: [Probes]
+      operationId: getHealth
+      summary: Check process health
+      description: Requires bearer authentication on the Management API listener.
+      responses:
+        "200":
+          description: The process is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+  /api/v1/ready:
+    get:
+      tags: [Probes]
+      operationId: getReadiness
+      summary: Check node readiness
+      description: Requires bearer authentication on the Management API listener.
+      responses:
+        "200":
+          description: The node is ready to serve management operations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/NotReady"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Bearer token configured for the Management API listener.
+
+  parameters:
+    ModuleId:
+      name: id
+      in: path
+      required: true
+      description: Lowercase hexadecimal BLAKE3 digest of the module bytes.
+      schema:
+        $ref: "#/components/schemas/ModuleId"
+    Key:
+      name: key
+      in: path
+      required: true
+      description: Binary key encoded as unpadded Base64URL.
+      schema:
+        $ref: "#/components/schemas/Base64UrlKey"
+    Prefix:
+      name: prefix
+      in: query
+      required: false
+      description: Optional binary prefix encoded as unpadded Base64URL. Omit it to list all application keys.
+      schema:
+        $ref: "#/components/schemas/Base64UrlKey"
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor returned by the preceding page. It must not be inspected or modified.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 16384
+        pattern: "^[A-Za-z0-9_-]+$"
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+  schemas:
+    ModuleId:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+      example: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    Module:
+      type: object
+      additionalProperties: false
+      required: [id, size_bytes]
+      properties:
+        id:
+          $ref: "#/components/schemas/ModuleId"
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          example: 4096
+    Base64UrlKey:
+      type: string
+      minLength: 1
+      maxLength: 10923
+      pattern: "^[A-Za-z0-9_-]+$"
+      description: Unpadded RFC 4648 Base64URL encoding of a binary key up to 8 KiB.
+      example: YXBwOnVzZXI6NDI
+    ModulePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items:
+                $ref: "#/components/schemas/Module"
+    Peer:
+      type: object
+      additionalProperties: false
+      required: [address, node_id]
+      properties:
+        address:
+          type: string
+          minLength: 1
+          description: Connected peer socket address.
+          example: 127.0.0.1:9001
+        node_id:
+          type: string
+          minLength: 1
+          description: Node identity reported by the connected peer.
+          example: node-a
+    PeerPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items:
+                $ref: "#/components/schemas/Peer"
+    KeyPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items:
+                $ref: "#/components/schemas/Base64UrlKey"
+    Page:
+      type: object
+      additionalProperties: false
+      required: [next_cursor]
+      properties:
+        next_cursor:
+          description: Opaque cursor for the next page, or null when this is the final page.
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 16384
+              pattern: "^[A-Za-z0-9_-]+$"
+            - type: "null"
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          const: healthy
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          const: ready
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          minLength: 1
+        details:
+          type: object
+          additionalProperties: true
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - unauthorized
+        - not_found
+        - payload_too_large
+        - unsupported_media_type
+        - module_invalid
+        - module_execution_failed
+        - rate_limited
+        - not_ready
+        - service_unavailable
+        - request_timeout
+        - internal_error
+
+  responses:
+    BadRequest:
+      description: The path, query string, headers, or body are invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            invalidRequest:
+              value:
+                error:
+                  code: invalid_request
+                  message: invalid request
+    Unauthorized:
+      description: The bearer token is absent or invalid.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            const: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            unauthorized:
+              value:
+                error:
+                  code: unauthorized
+                  message: bearer authentication required
+    ModuleNotFound:
+      description: No registered module has the requested ID.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            notFound:
+              value:
+                error:
+                  code: not_found
+                  message: module not found
+    KeyNotFound:
+      description: The key does not exist or belongs to Numax's internal namespace.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            notFound:
+              value:
+                error:
+                  code: not_found
+                  message: key not found
+    PayloadTooLarge:
+      description: The request body exceeds 16 MiB.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            payloadTooLarge:
+              value:
+                error:
+                  code: payload_too_large
+                  message: request body exceeds 16777216 bytes
+    UnsupportedMediaType:
+      description: The request body is not `application/wasm`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            unsupportedMediaType:
+              value:
+                error:
+                  code: unsupported_media_type
+                  message: Content-Type must be application/wasm
+    InvalidModule:
+      description: The upload is not a valid or supported WebAssembly module.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            moduleInvalid:
+              value:
+                error:
+                  code: module_invalid
+                  message: module validation failed
+    ModuleExecutionFailed:
+      description: The guest trapped, could not be instantiated, or otherwise failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            executionFailed:
+              value:
+                error:
+                  code: module_execution_failed
+                  message: module execution failed
+    RateLimited:
+      description: All 64 Management API execution slots are occupied.
+      headers:
+        Retry-After:
+          description: Suggested delay in seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            rateLimited:
+              value:
+                error:
+                  code: rate_limited
+                  message: management API concurrency limit reached
+    NotReady:
+      description: The process is healthy but the node is not ready.
+      headers:
+        Retry-After:
+          description: Suggested delay in seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            notReady:
+              value:
+                error:
+                  code: not_ready
+                  message: node is not ready
+    ServiceUnavailable:
+      description: The requested subsystem is temporarily unavailable.
+      headers:
+        Retry-After:
+          description: Suggested delay in seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            unavailable:
+              value:
+                error:
+                  code: service_unavailable
+                  message: service unavailable
+    RequestTimeout:
+      description: The routed request exceeded the configured Management API timeout.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            timeout:
+              value:
+                error:
+                  code: request_timeout
+                  message: request timed out
+    InternalError:
+      description: An unexpected internal error occurred. Sensitive details are not exposed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            internal:
+              value:
+                error:
+                  code: internal_error
+                  message: internal server error

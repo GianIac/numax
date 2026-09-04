@@ -17,6 +17,9 @@ separate from `nx-core`: HTTP remains an adapter over the shared runtime control
 The listener is disabled when no bearer token is configured. Its default
 address is `127.0.0.1:9102`; non-loopback exposure requires explicit opt-in.
 
+The OpenAPI 3.1 contract lives in `docs/api/openapi.yaml`. It is validated in
+the documentation CI before endpoint implementations are accepted.
+
 The crate currently exposes no management operations. Authenticated requests
-therefore return `404` until the OpenAPI contract and shared
-`RuntimeIntrospection` / `RuntimeManagement` interfaces are implemented.
+therefore return `404` until the shared `RuntimeIntrospection` /
+`RuntimeManagement` interfaces and the specified handlers are implemented.
