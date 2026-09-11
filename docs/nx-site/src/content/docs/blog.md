@@ -5,6 +5,7 @@ description: Release notes, deep dives and RFC discussions.
 
 ## Posts
 
+- [What is coming in Numax v0.1.5 and v0.1.6](/numax/blog/v0-1-5-v0-1-6-peer-discovery/)
 - [What is coming in Numax v0.1.4](/numax/blog/v0-1-4-management-api/)
 - [What is coming in Numax v0.1.3](/numax/blog/v0-1-3-supply-chain-fuzzing/)
 - [What is coming in Numax v0.1.2](/numax/blog/v0-1-2-performance-profiling/)
