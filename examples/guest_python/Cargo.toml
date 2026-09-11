@@ -1,0 +1,19 @@
+[package]
+name = "numax-guest-python"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "guest"
+path = "src/main.rs"
+
+[dependencies]
+rustpython-vm = "0.5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
