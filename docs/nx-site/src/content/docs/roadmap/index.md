@@ -164,66 +164,102 @@ single further CLI command.
 
 ## v0.1.5 - Peer Discovery: Foundations 🌐
 
-**Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce the abstraction and mechanical bootstrap (not yet gossip-based; that comes in 0.1.6).
+**Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce discovery providers and bootstrap address exchange; SWIM membership and K-fanout data gossip follow in `0.1.6`.
 
 **Abstraction**:
 - [ ] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
 - [ ] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
+- [ ] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery
+
+**Peer coordination and identity**:
+- [ ] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
+- [ ] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
+- [ ] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
+- [ ] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
+- [ ] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
+- [ ] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown
 
 **Initial implementations**:
 - [ ] `StaticDiscovery` - peer list from config (backward-compatible)
-- [ ] `BootstrapGossipDiscovery` - join with 1 address, learn the others through `Hello` exchange
+- [ ] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
 - [ ] `MdnsDiscovery` - LAN discovery for demo and dev
 - [ ] `DnsSrvDiscovery` - discovery via DNS-SRV record
 - [ ] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
 
 **Configuration**:
 - [ ] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
+- [ ] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
+
+**Protocol compatibility**:
+- [ ] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
+- [ ] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
 
 **Explicit decision**:
 - [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.
 
+**Acceptance tests**:
+- [ ] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
+- [ ] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
+- [ ] Real LAN mDNS checks, TLS rejection and reconnection after restart; justify and validate additional provider dependencies
+
 **Closing criterion**:
-> Three nodes on the same LAN discover each other via mDNS without any `--peer` flag. Reproducible demo in `examples/discovery_lan/`.
+> All five providers pass their acceptance tests. Three nodes on the same LAN discover each other via mDNS without any `--peer` flag, replicate a CRDT update and recover after reconnection within the declared retention window. Reproducible demo in `examples/discovery_lan/`.
 
 ---
 
 ## v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout 🕸
 
-**Goal**: **dynamic** discovery, with membership, failure detection and dissemination separated. This is **the strength of `0.2.0`**.
+**Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
 
 **Design doc as a public RFC**:
-- [ ] `peer-discovery.md`
+- [ ] `peer-discovery.md`, documenting accepted contracts and recording unresolved alternatives
 - [ ] Documented failure scenarios
 - [ ] Detailed test plan
 
-**Three separate channels**:
+**Replication correctness prerequisites**:
+- [ ] Define and test atomic local persistence of CRDT state, operation identity and replay metadata before acknowledging a local write
+- [ ] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics
+- [ ] Decide how to deduplicate delayed replay safely and identify missing operations; evaluate per-origin sequencing versus idempotent state/delta replication without treating an observed maximum OpId as a causal frontier
+- [ ] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures
+- [ ] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary
+- [ ] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
+- [ ] Decide whether bounded-window recovery is sufficient or a versioned CRDT state-transfer subset must move forward from `0.1.11`; do not promise unrestricted lossless recovery before this decision
+
+**Separate control and data responsibilities**:
 - [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)
-- [ ] **Failure detection**: phi-accrual or SWIM-style suspicion (who is dead/suspect)
+- [ ] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
 - [ ] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
+- [ ] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
+- [ ] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
+- [ ] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
 
 **Adaptive K-fanout gossip**:
-- [ ] Configurable fanout (default `K = ceil(log2(N) + c)`)
+- [ ] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits
+- [ ] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
+- [ ] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect
 - [ ] Adaptive rate based on load/RTT
-- [ ] Backpressure: controlled drops, never storms
-- [ ] Periodic anti-entropy complementing gossip
+- [ ] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
+- [ ] Periodic, byte-bounded and paginated anti-entropy complementing gossip
 
 **Runtime peer management**:
-- [ ] `POST /api/v1/peers` - manually add a peer to the live membership set
-- [ ] Peers added through the API participate in failure detection, reconnection and anti-entropy
+- [ ] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
+- [ ] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
 - [ ] Document whether runtime-added peers persist across node restarts
+- [ ] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
 
 **Determinism for tests**:
-- [ ] Seedable gossip PRNG for reproducible tests
+- [ ] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
 
 **Test scenarios**:
-- [ ] 50 nodes, 10% packet loss, partition recovery
-- [ ] Cluster split-brain → merge without op loss
-- [ ] 100% rolling restart of nodes → cluster survives
-- [ ] False positive detection rate measured
+- [ ] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model
+- [ ] Separate simulated message loss from packet loss over the real transport
+- [ ] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
+- [ ] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
+- [ ] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
+- [ ] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use
 
 **Closing criterion**:
-> A 50-node cluster on a simulated network with 10% packet loss converges in < 30s after a 60s partition. No false-positive failure detection in nominal conditions for 1h.
+> A reproducible 50-node test with a declared 10% loss model converges in < 30s after a 60s partition into two groups of 25, with no loss of accepted operations within the specified recovery contract. The primary recovery test stops new writes at rejoin; a separate test continues writing under recovery load. Validate the real transport under packet loss as well. A defined nominal 1h run records no false failure declarations and reports refuted suspicions separately. Publish workloads, seeds and results; this observation is not a universal zero-failure guarantee.
 
 ---
 
