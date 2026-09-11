@@ -60,5 +60,6 @@ Examples that build guests in languages other than Rust.
 | --- | --- |
 | [`guest_c`](guest_c/README.md) | Minimal C guest compiled to WASM, with manual host imports and no libc. |
 | [`guest_cpp`](guest_cpp/README.md) | Minimal C++ guest compiled to WASM, using `import_name`/`export_name` instead of `extern "C"`. |
+| [`guest_python`](guest_python/README.md) | Minimal Python guest using embedded RustPython and the raw Numax host ABI. |
 | [`guest_tinygo`](guest_tinygo/README.md) | TinyGo guest using direct WASM imports for logging and local key/value storage. |
 | [`guest_zig`](guest_zig/README.md) | Freestanding Zig guest that calls the raw Numax logging ABI. |
