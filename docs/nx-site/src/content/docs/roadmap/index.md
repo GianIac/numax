@@ -167,9 +167,9 @@ single further CLI command.
 **Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce discovery providers and bootstrap address exchange; SWIM membership and K-fanout data gossip follow in `0.1.6`.
 
 **Abstraction**:
-- [ ] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
-- [ ] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
-- [ ] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery
+- [x] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
+- [x] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
+- [x] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery ([contract](/numax/design/discovery-contract/))
 
 **Peer coordination and identity**:
 - [ ] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
@@ -180,7 +180,7 @@ single further CLI command.
 - [ ] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown
 
 **Initial implementations**:
-- [ ] `StaticDiscovery` - peer list from config (backward-compatible)
+- [x] `StaticDiscovery` - peer list from config (backward-compatible)
 - [ ] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
 - [ ] `MdnsDiscovery` - LAN discovery for demo and dev
 - [ ] `DnsSrvDiscovery` - discovery via DNS-SRV record

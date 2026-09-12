@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::observability::RuntimeMetrics;
 use crate::sync_config::SyncConfig;
+use crate::{PeerDiscovery, StaticDiscovery};
 
 use super::peer::{
     ConfiguredPeerConnectContext, ConfiguredPeerConnectOutcome, PeerHealth, PeerHealthState,
@@ -113,6 +114,12 @@ pub struct SyncManager {
 
     /// SyncConfig
     config: SyncConfig,
+
+    /// Discovery provider backing the configured peer list.
+    discovery: Arc<dyn PeerDiscovery>,
+
+    /// Peer snapshot used consistently by initial connect, reconnect, and anti-entropy.
+    discovered_peers: Vec<String>,
 
     /// Network node. Wrapped in `Arc` so the broadcast drain task spawned
     /// by `start` can share ownership with the manager.
@@ -220,6 +227,8 @@ impl SyncManager {
         let mut orsets = HashMap::new();
         let mut rgas = HashMap::new();
         let (op_log, op_log_next_sequence) = hydrate_op_log(&store, op_log_limit)?;
+        let discovery: Arc<dyn PeerDiscovery> =
+            Arc::new(StaticDiscovery::new(config.peers.clone()));
         let peer_health = config
             .peers
             .iter()
@@ -244,6 +253,8 @@ impl SyncManager {
         Ok(Self {
             node_id,
             config,
+            discovery,
+            discovered_peers: Vec::new(),
             node: None,
             counters,
             pncounters,
@@ -312,9 +323,18 @@ impl SyncManager {
             }
         };
 
+        // Resolve discovery before acquiring network resources. This makes a
+        // provider failure atomic with respect to listener and task startup.
+        let discovered_peers = self.discovery.discover().await?.into_peers();
+        self.discovered_peers = discovered_peers.clone();
+        *self.peer_health.write().await = discovered_peers
+            .iter()
+            .map(|peer| (peer.clone(), PeerHealth::default()))
+            .collect();
+
         // Build the network node.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
-            .with_peers(self.config.peers.clone())
+            .with_peers(discovered_peers.clone())
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
             .with_socket_timeout(self.config.socket_timeout)
@@ -340,7 +360,7 @@ impl SyncManager {
             metrics: &self.metrics,
             peer_health: &self.peer_health,
         };
-        for peer_addr in &self.config.peers {
+        for peer_addr in &discovered_peers {
             if matches!(
                 try_connect_configured_peer(&connect_context, peer_addr).await,
                 ConfiguredPeerConnectOutcome::SlotLimitReached
@@ -420,7 +440,7 @@ impl SyncManager {
 
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
             node: Arc::clone(&node),
-            peers: self.config.peers.clone(),
+            peers: discovered_peers.clone(),
             max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
             max_delay: self.config.reconnect_max_delay,
@@ -432,7 +452,7 @@ impl SyncManager {
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
             node: Arc::clone(&node),
-            peers: self.config.peers.clone(),
+            peers: discovered_peers,
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
@@ -464,7 +484,7 @@ impl SyncManager {
             metrics: &self.metrics,
             peer_health: &self.peer_health,
         };
-        for peer_addr in &self.config.peers {
+        for peer_addr in &self.discovered_peers {
             if matches!(
                 try_connect_configured_peer(&connect_context, peer_addr).await,
                 ConfiguredPeerConnectOutcome::SlotLimitReached
