@@ -11,14 +11,16 @@ pub use control::{
     RuntimeControlHandle, RuntimeIntrospection, RuntimeManagement, SharedRuntimeControl,
 };
 pub use discovery::{
-    AnnouncementSupport, DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY,
-    DEFAULT_MAX_PEER_CANDIDATES, DiscoveryChange, DiscoveryError, DiscoveryEvent,
-    DiscoveryProvider, DiscoveryRuntimeConfig, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement,
-    PeerDiscovery, StaticDiscovery,
+    AnnouncementSupport, BootstrapGossipDiscovery, BootstrapGossipDiscoveryConfig,
+    DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY, DEFAULT_MAX_PEER_CANDIDATES,
+    DiscoveryChange, DiscoveryError, DiscoveryEvent, DiscoveryProvider, DiscoveryRuntimeConfig,
+    DiscoverySnapshot, DiscoveryWatch, DnsSrvDiscovery, DnsSrvDiscoveryConfig, FileWatchDiscovery,
+    FileWatchDiscoveryConfig, MdnsDiscovery, MdnsDiscoveryConfig, PeerAnnouncement, PeerDiscovery,
+    StaticDiscovery,
 };
 pub use nx_net::{
-    ConnectionDirection, PeerConnectionInfo, PeerIdentity, PeerIdentityVerification,
-    SerializationFormat, TlsConfig,
+    BootstrapClientConfig, ConnectionDirection, PeerConnectionInfo, PeerIdentity,
+    PeerIdentityVerification, SerializationFormat, TlsConfig,
 };
 pub use observability::ObservabilityConfig;
 pub use sync_config::SyncConfig;

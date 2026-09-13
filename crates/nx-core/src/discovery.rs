@@ -6,6 +6,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+mod bootstrap_gossip;
+mod dns_srv;
+mod dynamic;
+mod file_watch;
+mod mdns;
+
+pub use bootstrap_gossip::{BootstrapGossipDiscovery, BootstrapGossipDiscoveryConfig};
+pub use dns_srv::{DnsSrvDiscovery, DnsSrvDiscoveryConfig};
+pub(crate) use dynamic::AbortOnDropTask;
+pub use file_watch::{FileWatchDiscovery, FileWatchDiscoveryConfig};
+pub use mdns::{MdnsDiscovery, MdnsDiscoveryConfig};
+
 /// Default number of discovery events retained for each provider watch channel.
 pub const DEFAULT_DISCOVERY_EVENT_CAPACITY: usize = 128;
 
@@ -162,6 +174,8 @@ pub struct DiscoveryEvent {
 pub enum DiscoveryChange {
     Added(String),
     Removed(String),
+    /// Atomically replace the provider's complete ordered contribution.
+    Replaced(Vec<String>),
 }
 
 /// The endpoint a provider is asked to announce.
@@ -331,7 +345,15 @@ pub trait PeerDiscovery: Send + Sync {
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError>;
 
     /// Stop provider-owned work and withdraw announcements made by this node.
+    ///
+    /// This hook is synchronous so an owner can initiate cancellation before
+    /// awaiting unrelated shutdown work. Implementations with background work
+    /// must make repeated calls safe and return promptly.
+    fn request_shutdown(&self) {}
+
+    /// Wait for provider-owned work to stop and complete bounded withdrawal.
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
+        self.request_shutdown();
         Ok(())
     }
 }

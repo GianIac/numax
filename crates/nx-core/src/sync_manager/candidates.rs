@@ -10,7 +10,7 @@ use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
 
 use crate::discovery::{
-    AnnouncementSupport, DiscoveryChange, DiscoveryError, DiscoveryProvider,
+    AbortOnDropTask, AnnouncementSupport, DiscoveryChange, DiscoveryError, DiscoveryProvider,
     DiscoveryRuntimeConfig, DiscoveryWatch, PeerAnnouncement,
 };
 
@@ -32,6 +32,8 @@ struct CandidateRecord {
 struct CandidateRegistry {
     max_candidates: usize,
     order: Vec<String>,
+    source_order: Vec<String>,
+    source_candidates: HashMap<String, Vec<String>>,
     records: HashMap<String, CandidateRecord>,
     local_endpoints: HashSet<String>,
 }
@@ -47,6 +49,8 @@ impl CandidateRegistry {
         Ok(Self {
             max_candidates,
             order: Vec::new(),
+            source_order: Vec::new(),
+            source_candidates: HashMap::new(),
             records: HashMap::new(),
             local_endpoints: HashSet::new(),
         })
@@ -69,22 +73,57 @@ impl CandidateRegistry {
         ttl: Option<Duration>,
         now: StdInstant,
     ) -> Result<bool, DiscoveryError> {
+        if peers.len() > self.max_candidates {
+            return Err(configuration_error(
+                "coordinator",
+                format!(
+                    "discovery snapshot exceeds the {} candidate limit",
+                    self.max_candidates
+                ),
+            ));
+        }
         let mut canonical = Vec::new();
         let mut seen = HashSet::new();
         for peer in peers {
-            let endpoint = canonicalize_endpoint(peer)?;
+            let endpoint = match canonicalize_endpoint(peer) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(
+                        source = %source_id,
+                        endpoint = %peer,
+                        error = %error,
+                        "rejected invalid discovery snapshot candidate"
+                    );
+                    continue;
+                }
+            };
             if seen.insert(endpoint.clone()) {
                 canonical.push(endpoint);
             }
         }
+        if canonical.len() > self.max_candidates {
+            return Err(configuration_error(
+                "coordinator",
+                format!(
+                    "discovery snapshot exceeds the {} candidate limit",
+                    self.max_candidates
+                ),
+            ));
+        }
 
+        let before = self.endpoints();
         let mut updated = self.clone();
+        updated.register_source(source_id);
+        updated
+            .source_candidates
+            .insert(source_id.to_string(), canonical.clone());
         let retained = canonical.iter().cloned().collect::<HashSet<_>>();
         updated.remove_source_except(source_id, &retained);
         for endpoint in canonical {
             updated.add(source_id, endpoint, ttl, now)?;
         }
-        let changed = updated.endpoints() != self.endpoints();
+        updated.rebuild_order();
+        let changed = updated.endpoints() != before;
         *self = updated;
         Ok(changed)
     }
@@ -112,23 +151,36 @@ impl CandidateRegistry {
             })?),
             None => None,
         };
+        let previous_order = self.order.clone();
+        self.register_source(source_id);
+        let source_candidates = self
+            .source_candidates
+            .entry(source_id.to_string())
+            .or_default();
+        if !source_candidates.contains(&endpoint) {
+            source_candidates.push(endpoint.clone());
+        }
         self.records
             .entry(endpoint.clone())
             .or_default()
             .sources
             .insert(source_id.to_string(), CandidateContribution { expires_at });
-        if is_new {
-            self.order.push(endpoint);
-        }
-        Ok(is_new)
+        self.rebuild_order();
+        Ok(self.order != previous_order)
     }
 
     fn remove(&mut self, source_id: &str, endpoint: &str) -> bool {
-        let Some(record) = self.records.get_mut(endpoint) else {
-            return false;
-        };
-        record.sources.remove(source_id);
-        self.prune_empty()
+        let before = self.endpoints();
+        if let Some(candidates) = self.source_candidates.get_mut(source_id) {
+            candidates.retain(|candidate| candidate != endpoint);
+        }
+        if let Some(record) = self.records.get_mut(endpoint) {
+            record.sources.remove(source_id);
+        }
+        self.prune_empty();
+        self.prune_source_candidates();
+        self.rebuild_order();
+        self.endpoints() != before
     }
 
     fn remove_source_except(&mut self, source_id: &str, retained: &HashSet<String>) {
@@ -144,31 +196,41 @@ impl CandidateRegistry {
         if leased {
             return false;
         }
+        let before = self.endpoints();
+        self.source_candidates.remove(source_id);
         for record in self.records.values_mut() {
             record.sources.remove(source_id);
         }
-        self.prune_empty()
+        self.prune_empty();
+        self.prune_source_candidates();
+        self.rebuild_order();
+        self.endpoints() != before
     }
 
     fn set_local_endpoints(&mut self, endpoints: Vec<String>) -> bool {
+        let before = self.endpoints();
         self.local_endpoints.clear();
         for endpoint in endpoints {
             self.local_endpoints.insert(endpoint);
         }
-        let before = self.records.len();
         self.records
             .retain(|endpoint, _| !self.local_endpoints.contains(endpoint));
-        self.prune_order();
-        self.records.len() != before
+        self.prune_source_candidates();
+        self.rebuild_order();
+        self.endpoints() != before
     }
 
     fn expire(&mut self, now: StdInstant) -> bool {
+        let before = self.endpoints();
         for record in self.records.values_mut() {
             record
                 .sources
                 .retain(|_, source| source.expires_at.is_none_or(|deadline| deadline > now));
         }
-        self.prune_empty()
+        self.prune_empty();
+        self.prune_source_candidates();
+        self.rebuild_order();
+        self.endpoints() != before
     }
 
     fn next_expiry(&self) -> Option<StdInstant> {
@@ -182,13 +244,45 @@ impl CandidateRegistry {
     fn prune_empty(&mut self) -> bool {
         let before = self.records.len();
         self.records.retain(|_, record| !record.sources.is_empty());
-        self.prune_order();
         self.records.len() != before
     }
 
-    fn prune_order(&mut self) {
-        self.order
-            .retain(|endpoint| self.records.contains_key(endpoint));
+    fn register_source(&mut self, source_id: &str) {
+        if !self.source_order.iter().any(|known| known == source_id) {
+            self.source_order.push(source_id.to_string());
+        }
+    }
+
+    fn prune_source_candidates(&mut self) {
+        for (source_id, candidates) in &mut self.source_candidates {
+            candidates.retain(|endpoint| {
+                self.records
+                    .get(endpoint)
+                    .is_some_and(|record| record.sources.contains_key(source_id))
+            });
+        }
+        self.source_candidates
+            .retain(|_, candidates| !candidates.is_empty());
+    }
+
+    fn rebuild_order(&mut self) {
+        let mut order = Vec::with_capacity(self.records.len());
+        for source_id in &self.source_order {
+            let Some(candidates) = self.source_candidates.get(source_id) else {
+                continue;
+            };
+            for endpoint in candidates {
+                if self
+                    .records
+                    .get(endpoint)
+                    .is_some_and(|record| record.sources.contains_key(source_id))
+                    && !order.contains(endpoint)
+                {
+                    order.push(endpoint.clone());
+                }
+            }
+        }
+        self.order = order;
     }
 }
 
@@ -229,7 +323,7 @@ pub(super) struct DiscoveryCoordinator {
 
 impl Drop for DiscoveryCoordinator {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.request_shutdown();
         for task in &self.provider_tasks {
             task.abort();
         }
@@ -315,6 +409,13 @@ impl DiscoveryCoordinator {
         self.candidates_rx.clone()
     }
 
+    pub(super) fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        for source in &self.providers {
+            source.provider().request_shutdown();
+        }
+    }
+
     pub(super) async fn configure_local_endpoint(
         &self,
         bound_addr: SocketAddr,
@@ -374,12 +475,12 @@ impl DiscoveryCoordinator {
     }
 
     pub(super) async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
-        let _ = self.shutdown_tx.send(true);
+        self.request_shutdown();
         for task in self.provider_tasks.drain(..) {
-            let _ = task.await;
+            let _ = AbortOnDropTask::new(task).join().await;
         }
         if let Some(task) = self.coordinator_task.take() {
-            let _ = task.await;
+            let _ = AbortOnDropTask::new(task).join().await;
         }
 
         shutdown_providers(&self.providers).await
@@ -499,6 +600,11 @@ async fn run_provider_watch(
                     DiscoveryChange::Removed(endpoint) => CandidateCommand::Remove {
                         source_id: source.source_id().to_string(),
                         endpoint,
+                    },
+                    DiscoveryChange::Replaced(peers) => CandidateCommand::ReplaceSource {
+                        source_id: source.source_id().to_string(),
+                        peers,
+                        ttl: source.candidate_ttl(),
                     },
                 };
                 if !send_command(&command_tx, command, &mut shutdown_rx).await {
@@ -676,7 +782,7 @@ fn resolve_advertised_endpoint(
     }
 }
 
-fn canonicalize_endpoint(endpoint: &str) -> Result<String, DiscoveryError> {
+pub(crate) fn canonicalize_endpoint(endpoint: &str) -> Result<String, DiscoveryError> {
     let (host, port) = parse_host_port(endpoint, false)?;
     canonicalize_host_port(&host, port)
 }
@@ -754,10 +860,14 @@ fn canonicalize_host_port(host: &str, port: u16) -> Result<String, DiscoveryErro
         ));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if ip.is_unspecified() {
+        let undialable = ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, IpAddr::V4(address) if address.is_broadcast())
+            || matches!(ip, IpAddr::V6(address) if address.is_unicast_link_local());
+        if undialable {
             return Err(configuration_error(
                 "coordinator",
-                "advertised endpoint cannot use an unspecified IP address",
+                "peer endpoint must use a dialable unicast IP address",
             ));
         }
         return Ok(SocketAddr::new(ip, port).to_string());
@@ -783,6 +893,7 @@ fn provider_timeout(provider: &str, operation: &str) -> DiscoveryError {
 async fn shutdown_providers(providers: &[DiscoveryProvider]) -> Result<(), DiscoveryError> {
     let mut tasks = tokio::task::JoinSet::new();
     for source in providers {
+        source.provider().request_shutdown();
         let source_id = source.source_id().to_string();
         let provider = Arc::clone(source.provider());
         tasks.spawn(async move {
@@ -986,6 +1097,114 @@ mod tests {
     }
 
     #[test]
+    fn registry_applies_pure_source_reordering_atomically() {
+        let mut registry = CandidateRegistry::new(4).unwrap();
+        let now = StdInstant::now();
+        registry
+            .replace_source(
+                "dynamic",
+                &["one.example:9000".into(), "two.example:9000".into()],
+                None,
+                now,
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .replace_source(
+                    "dynamic",
+                    &["two.example:9000".into(), "one.example:9000".into()],
+                    None,
+                    now,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            &*registry.endpoints(),
+            &["two.example:9000", "one.example:9000"]
+        );
+    }
+
+    #[test]
+    fn removing_a_priority_contribution_publishes_the_new_source_order() {
+        let mut registry = CandidateRegistry::new(4).unwrap();
+        let now = StdInstant::now();
+        registry
+            .replace_source("first", &["shared.example:9000".into()], None, now)
+            .unwrap();
+        registry
+            .replace_source(
+                "second",
+                &["other.example:9000".into(), "shared.example:9000".into()],
+                None,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            &*registry.endpoints(),
+            &["shared.example:9000", "other.example:9000"]
+        );
+
+        assert!(registry.remove("first", "shared.example:9000"));
+        assert_eq!(
+            &*registry.endpoints(),
+            &["other.example:9000", "shared.example:9000"]
+        );
+    }
+
+    #[test]
+    fn expiry_prunes_historical_source_candidates() {
+        let mut registry = CandidateRegistry::new(2).unwrap();
+        let now = StdInstant::now();
+        registry
+            .add(
+                "leased",
+                "old.example:9000".into(),
+                Some(Duration::from_millis(1)),
+                now,
+            )
+            .unwrap();
+
+        assert!(registry.expire(now + Duration::from_millis(2)));
+        assert!(registry.endpoints().is_empty());
+        assert!(!registry.source_candidates.contains_key("leased"));
+
+        registry
+            .add(
+                "leased",
+                "new.example:9000".into(),
+                Some(Duration::from_millis(1)),
+                now,
+            )
+            .unwrap();
+        assert_eq!(&*registry.endpoints(), &["new.example:9000"]);
+    }
+
+    #[test]
+    fn registry_skips_invalid_snapshot_entries_without_losing_valid_candidates() {
+        let mut registry = CandidateRegistry::new(4).unwrap();
+
+        registry
+            .replace_source(
+                "static",
+                &[
+                    "not-an-endpoint".to_string(),
+                    "Peer.Example:9000".to_string(),
+                    "0.0.0.0:9001".to_string(),
+                    "other.example:9002".to_string(),
+                ],
+                None,
+                StdInstant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &*registry.endpoints(),
+            &["peer.example:9000", "other.example:9002"]
+        );
+    }
+
+    #[test]
     fn local_endpoint_is_removed_and_rejected_on_refresh() {
         let mut registry = CandidateRegistry::new(4).unwrap();
         let now = StdInstant::now();
@@ -1010,6 +1229,10 @@ mod tests {
         );
         assert_eq!(canonicalize_endpoint("[::1]:9000").unwrap(), "[::1]:9000");
         assert!(canonicalize_endpoint("0.0.0.0:9000").is_err());
+        assert!(canonicalize_endpoint("224.0.0.1:9000").is_err());
+        assert!(canonicalize_endpoint("255.255.255.255:9000").is_err());
+        assert!(canonicalize_endpoint("[ff02::1]:9000").is_err());
+        assert!(canonicalize_endpoint("[fe80::1]:9000").is_err());
         assert!(canonicalize_endpoint("peer.example:0").is_err());
         assert!(canonicalize_endpoint(" peer.example:9000").is_err());
         assert!(canonicalize_endpoint("_service.example:9000").is_err());
@@ -1034,6 +1257,8 @@ mod tests {
                 .is_err()
         );
         assert!(registry.endpoints().is_empty());
+        assert!(registry.source_order.is_empty());
+        assert!(registry.source_candidates.is_empty());
     }
 
     #[test]

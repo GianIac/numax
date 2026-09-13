@@ -140,11 +140,11 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build previous release binary
         run: |
-          git worktree add "${RUNNER_TEMP}/numax-v0.1.0" v0.1.0
-          cargo build --release --manifest-path "${RUNNER_TEMP}/numax-v0.1.0/Cargo.toml" -p nx-cli
+          git worktree add "${RUNNER_TEMP}/numax-v0.1.4" v0.1.4
+          cargo build --release --manifest-path "${RUNNER_TEMP}/numax-v0.1.4/Cargo.toml" -p nx-cli
       - name: Run multi-process CLI smoke test
         env:
-          NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.0/target/release/nx
+          NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.4/target/release/nx
         run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
   benchmark-tools:

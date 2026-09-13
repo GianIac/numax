@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::AtomicU64};
 
-use nx_net::{Node, NodeConfig, PeerConnectionInfo};
+use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
 use tokio::sync::{RwLock, mpsc, watch};
@@ -10,7 +10,9 @@ use tracing::{debug, info, warn};
 
 use crate::observability::RuntimeMetrics;
 use crate::sync_config::SyncConfig;
-use crate::{DiscoveryProvider, DiscoveryRuntimeConfig, StaticDiscovery};
+use crate::{
+    DEFAULT_MAX_PEER_CANDIDATES, DiscoveryProvider, DiscoveryRuntimeConfig, StaticDiscovery,
+};
 
 use super::candidates::DiscoveryCoordinator;
 use super::peer::{
@@ -231,13 +233,18 @@ impl SyncManager {
         metrics: Arc<RuntimeMetrics>,
     ) -> anyhow::Result<Self> {
         let static_discovery = Arc::new(StaticDiscovery::new(config.peers.clone()));
+        // Explicit peers were accepted as a finite caller-owned list before the
+        // discovery coordinator existed. Keep that compatibility while retaining
+        // the configured bound for every dynamic-discovery construction path.
+        let discovery_config = DiscoveryRuntimeConfig::default()
+            .with_max_candidates(DEFAULT_MAX_PEER_CANDIDATES.max(config.peers.len()));
         Self::try_new_with_discovery(
             node_id,
             config,
             store,
             metrics,
             vec![DiscoveryProvider::new("static", static_discovery)],
-            DiscoveryRuntimeConfig::default(),
+            discovery_config,
         )
     }
 
@@ -380,6 +387,10 @@ impl SyncManager {
             .with_socket_timeout(self.config.socket_timeout)
             .with_serialization_format(self.config.serialization_format)
             .with_event_channel_capacity(self.config.queued_ops_limit.max(1));
+        let bootstrap_server = BootstrapServerConfig::new(self.discovery_config.cluster_id())?
+            .with_max_cached_candidates(self.discovery_config.max_candidates())?
+            .with_max_response_candidates(self.discovery_config.max_candidates())?;
+        node_config = node_config.with_bootstrap_server(bootstrap_server);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);
@@ -409,6 +420,13 @@ impl SyncManager {
                 return Err(error.into());
             }
         };
+        if let Some(endpoint) = &advertised_endpoint
+            && let Err(error) = node.announce_bootstrap_endpoint(endpoint.clone())
+        {
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            return Err(error.into());
+        }
         if let Err(error) = discovery_coordinator
             .announce(advertised_endpoint.as_deref())
             .await
@@ -639,6 +657,10 @@ impl SyncManager {
     /// Gracefully stop sync tasks and close network connections.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(true);
+        let mut discovery_coordinator = self.discovery_coordinator.take();
+        if let Some(coordinator) = discovery_coordinator.as_ref() {
+            coordinator.request_shutdown();
+        }
         let mut discovery_error = None;
 
         if let Some(task) = self.broadcast_task.take()
@@ -659,7 +681,7 @@ impl SyncManager {
             warn!(error = %e, "anti-entropy task failed during shutdown");
         }
 
-        if let Some(mut coordinator) = self.discovery_coordinator.take()
+        if let Some(mut coordinator) = discovery_coordinator.take()
             && let Err(error) = coordinator.shutdown().await
         {
             warn!(error = %error, "discovery shutdown failed");

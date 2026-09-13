@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::bootstrap::{BootstrapServer, BootstrapServerConfig};
 use crate::error::{NetError, NetResult};
 use crate::message::{
     DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
@@ -55,6 +56,7 @@ struct IncomingContext {
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
     shutdown_rx: watch::Receiver<bool>,
+    bootstrap_server: Option<Arc<BootstrapServer>>,
 }
 
 struct ReadLoopContext {
@@ -66,6 +68,20 @@ struct ReadLoopContext {
     max_message_size: usize,
     socket_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+enum IncomingHandshake {
+    Peer {
+        node_id: NodeId,
+        format: SerializationFormat,
+    },
+    Bootstrap {
+        node_id: NodeId,
+        format: SerializationFormat,
+        cluster_id: String,
+        advertised_endpoint: Option<String>,
+        max_results: usize,
+    },
 }
 
 /// Node configuration.
@@ -97,6 +113,9 @@ pub struct NodeConfig {
 
     /// Number of node events buffered for the runtime event loop.
     pub event_channel_capacity: usize,
+
+    /// Optional policy for authenticated one-shot bootstrap requests.
+    pub bootstrap_server: Option<BootstrapServerConfig>,
 }
 
 impl NodeConfig {
@@ -111,6 +130,7 @@ impl NodeConfig {
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
             serialization_format: SerializationFormat::Bincode,
             event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
+            bootstrap_server: None,
         }
     }
 
@@ -146,6 +166,11 @@ impl NodeConfig {
 
     pub fn with_event_channel_capacity(mut self, event_channel_capacity: usize) -> Self {
         self.event_channel_capacity = event_channel_capacity;
+        self
+    }
+
+    pub fn with_bootstrap_server(mut self, config: BootstrapServerConfig) -> Self {
+        self.bootstrap_server = Some(config);
         self
     }
 }
@@ -232,6 +257,7 @@ pub struct Node {
     outbound_attempt_slots: Arc<Semaphore>,
     outbound_attempts: Arc<StdMutex<HashSet<String>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    bootstrap_server: Option<Arc<BootstrapServer>>,
 }
 
 impl Node {
@@ -241,6 +267,11 @@ impl Node {
         let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let max_peers = config.max_peers;
+        let bootstrap_server = config
+            .bootstrap_server
+            .clone()
+            .map(BootstrapServer::new)
+            .map(Arc::new);
 
         Self {
             config,
@@ -252,6 +283,7 @@ impl Node {
             outbound_attempt_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)),
             outbound_attempts: Arc::new(StdMutex::new(HashSet::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            bootstrap_server,
         }
     }
 
@@ -283,6 +315,7 @@ impl Node {
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_tx = self.shutdown_tx.clone();
+        let bootstrap_server = self.bootstrap_server.clone();
 
         let listener_task = tokio::spawn(async move {
             loop {
@@ -310,6 +343,7 @@ impl Node {
                                 let tls = tls.clone();
                                 let limits = limits;
                                 let shutdown_rx = shutdown_tx.subscribe();
+                                let bootstrap_server = bootstrap_server.clone();
 
                                 let task = tokio::spawn(async move {
                                     let context = IncomingContext {
@@ -320,6 +354,7 @@ impl Node {
                                         limits,
                                         slot,
                                         shutdown_rx,
+                                        bootstrap_server,
                                     };
 
                                     if let Err(e) =
@@ -358,35 +393,8 @@ impl Node {
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
-        let tcp = timeout(self.config.socket_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| NetError::Timeout)?
-            .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
-        let transport_addr = tcp.peer_addr()?.to_string();
-
-        let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
-            // Extract host from "host:port"
-            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-
-            // rustls verifies the presented certificate against this name
-            // ServerName returned above is not 'static; turn it into owned 'static
-            let server_name = rustls::pki_types::ServerName::try_from(host)
-                .or_else(|_| rustls::pki_types::ServerName::try_from("localhost"))
-                .map_err(|e| {
-                    NetError::TlsError(format!("invalid server name '{}': {}", host, e))
-                })?;
-
-            let server_name = server_name.to_owned();
-
-            timeout(
-                self.config.socket_timeout,
-                tls_cfg.connect_stream(tcp, server_name),
-            )
-            .await
-            .map_err(|_| NetError::Timeout)??
-        } else {
-            NetStream::Plain(tcp)
-        };
+        let (stream, transport_addr) =
+            connect_transport(addr, self.config.tls.as_ref(), self.config.socket_timeout).await?;
 
         // Capture the peer certificate (owned) before moving the stream into split().
         let peer_cert = stream.peer_cert_der();
@@ -442,42 +450,12 @@ impl Node {
             }
         };
 
-        if peer_node_id == self.config.node_id {
-            return Err(NetError::SelfConnection(peer_node_id.to_string()));
-        }
-
-        // TLS identity binding: claimed NodeId must match the peer certificate public key.
-        if let Some(tls_cfg) = &self.config.tls
-            && !tls_cfg.insecure
-        {
-            let peer_cert = peer_cert.ok_or_else(|| {
-                NetError::TlsError("missing peer certificate in TLS session".into())
-            })?;
-
-            let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
-
-            if peer_node_id != expected {
-                let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
-                    .unwrap_or_else(|_| "<unavailable>".into());
-
-                return Err(NetError::TlsError(format!(
-                    "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
-                    peer_node_id, expected, fingerprint
-                )));
-            }
-
-            // Optional allowlist enforcement (permissioned network).
-            if let Some(_allowed) = &tls_cfg.allowed_peers {
-                // Peer NodeId on the wire is nx_sync::NodeId; allowlist stores strings.
-                let peer_id_str = peer_node_id.to_string();
-                if !tls_cfg.is_peer_allowed(&peer_id_str) {
-                    return Err(NetError::TlsError(format!(
-                        "peer node_id not in allowlist: {:?}",
-                        peer_node_id
-                    )));
-                }
-            }
-        }
+        verify_peer_identity(
+            &self.config.node_id,
+            &peer_node_id,
+            peer_cert.as_ref(),
+            self.config.tls.as_ref(),
+        )?;
 
         // Save connection
         let writer = Arc::new(Mutex::new(writer));
@@ -724,6 +702,24 @@ impl Node {
         })
     }
 
+    /// Publish the endpoint returned by this node's bootstrap service.
+    pub fn announce_bootstrap_endpoint(&self, endpoint: impl Into<String>) -> NetResult<()> {
+        let server = self
+            .bootstrap_server
+            .as_ref()
+            .ok_or_else(|| NetError::InvalidMessage("bootstrap server is not configured".into()))?;
+        server.announce(endpoint.into())
+    }
+
+    /// Withdraw the endpoint returned by this node's bootstrap service.
+    pub fn withdraw_bootstrap_endpoint(&self) -> NetResult<()> {
+        let server = self
+            .bootstrap_server
+            .as_ref()
+            .ok_or_else(|| NetError::InvalidMessage("bootstrap server is not configured".into()))?;
+        server.withdraw()
+    }
+
     async fn mark_peer_failed(&self, addr: &str) -> Option<(NodeId, usize)> {
         let mut peers = self.peers.write().await;
         let node_id = {
@@ -737,6 +733,9 @@ impl Node {
     /// Close outbound peer connections by dropping their writers.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+        if let Some(server) = &self.bootstrap_server {
+            server.clear();
+        }
 
         let mut tasks = {
             let mut tasks = self.tasks.lock().await;
@@ -781,6 +780,7 @@ async fn handle_incoming(
         limits,
         slot,
         shutdown_rx,
+        bootstrap_server,
     } = context;
 
     let stream: NetStream = match tls {
@@ -799,7 +799,7 @@ async fn handle_incoming(
     let (hello_format, msg) =
         read_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
             .await?;
-    let (peer_node_id, negotiated_format) = match msg.kind {
+    let handshake = match msg.kind {
         MessageKind::Hello {
             node_id,
             protocol_version,
@@ -832,50 +832,157 @@ async fn handle_incoming(
                     "selected alternate serialization format"
                 );
             }
-            (node_id, negotiated_format)
+            IncomingHandshake::Peer {
+                node_id,
+                format: negotiated_format,
+            }
+        }
+        MessageKind::BootstrapHello {
+            node_id,
+            protocol_version,
+            supported_formats,
+            preferred_format,
+            cluster_id,
+            advertised_endpoint,
+            max_results,
+        } => {
+            if !is_protocol_version_compatible(protocol_version) {
+                let error = WireError::protocol_mismatch(protocol_version);
+                let _ = write_message(
+                    &mut writer,
+                    &Message::wire_error(error),
+                    hello_format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(protocol_version_mismatch(protocol_version));
+            }
+            let negotiated_format =
+                negotiate_serialization_format(limits.serialization_format, &supported_formats)
+                    .ok_or_else(|| {
+                        NetError::InvalidMessage(
+                            "no mutually supported serialization format".to_string(),
+                        )
+                    })?;
+            if negotiated_format != preferred_format {
+                debug!(
+                    peer = %node_id,
+                    peer_preferred_format = ?preferred_format,
+                    selected_format = ?negotiated_format,
+                    "selected alternate bootstrap serialization format"
+                );
+            }
+            IncomingHandshake::Bootstrap {
+                node_id,
+                format: negotiated_format,
+                cluster_id,
+                advertised_endpoint,
+                max_results: max_results as usize,
+            }
         }
         MessageKind::Error { error } => {
             return Err(NetError::Wire(error));
         }
         _ => {
-            return Err(NetError::InvalidMessage("expected Hello".into()));
+            return Err(NetError::InvalidMessage(
+                "expected Hello or BootstrapHello".into(),
+            ));
         }
     };
 
-    if peer_node_id == our_node_id {
-        return Err(NetError::SelfConnection(peer_node_id.to_string()));
-    }
+    let peer_node_id = match &handshake {
+        IncomingHandshake::Peer { node_id, .. } | IncomingHandshake::Bootstrap { node_id, .. } => {
+            node_id
+        }
+    };
+    verify_peer_identity(&our_node_id, peer_node_id, peer_cert.as_ref(), tls.as_ref())?;
 
-    // TLS identity binding: claimed NodeId must match the peer certificate public key.
-    if let Some(tls_cfg) = &tls
-        && !tls_cfg.insecure
+    if let IncomingHandshake::Bootstrap {
+        node_id,
+        format,
+        cluster_id,
+        advertised_endpoint,
+        max_results,
+    } = handshake
     {
-        let peer_cert = peer_cert
-            .ok_or_else(|| NetError::TlsError("missing peer certificate in TLS session".into()))?;
-
-        let expected = crate::tls::derive_protocol_node_id_from_cert(&peer_cert)?;
-
-        if peer_node_id != expected {
-            let fingerprint = crate::tls::cert_fingerprint_hex(&peer_cert)
-                .unwrap_or_else(|_| "<unavailable>".into());
-
-            return Err(NetError::TlsError(format!(
-                "node_id mismatch (claimed={:?}, expected={:?}, fingerprint={})",
-                peer_node_id, expected, fingerprint
-            )));
-        }
-
-        // Optional allowlist enforcement (permissioned network).
-        if let Some(_allowed) = &tls_cfg.allowed_peers {
-            let peer_id_str = peer_node_id.to_string();
-            if !tls_cfg.is_peer_allowed(&peer_id_str) {
-                return Err(NetError::TlsError(format!(
-                    "peer node_id not in allowlist: {:?}",
-                    peer_node_id
-                )));
+        let server = match bootstrap_server {
+            Some(server) => server,
+            None => {
+                let error = WireError::BootstrapRejected {
+                    reason: "bootstrap service is disabled".into(),
+                };
+                let _ = write_message(
+                    &mut writer,
+                    &Message::wire_error(error.clone()),
+                    format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(NetError::Wire(error));
             }
+        };
+        if cluster_id != server.cluster_id() {
+            let error = WireError::BootstrapRejected {
+                reason: "cluster ID does not match this bootstrap seed".into(),
+            };
+            let _ = write_message(
+                &mut writer,
+                &Message::wire_error(error.clone()),
+                format,
+                limits.socket_timeout,
+            )
+            .await;
+            return Err(NetError::Wire(error));
         }
+        if max_results == 0 {
+            let error = WireError::BootstrapRejected {
+                reason: "max_results must be greater than zero".into(),
+            };
+            let _ = write_message(
+                &mut writer,
+                &Message::wire_error(error.clone()),
+                format,
+                limits.socket_timeout,
+            )
+            .await;
+            return Err(NetError::Wire(error));
+        }
+        let candidates = match server.exchange(&node_id, advertised_endpoint, max_results) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                let wire_error = WireError::BootstrapRejected {
+                    reason: error.to_string(),
+                };
+                let _ = write_message(
+                    &mut writer,
+                    &Message::wire_error(wire_error.clone()),
+                    format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(NetError::Wire(wire_error));
+            }
+        };
+        let candidate_ttl_ms =
+            u64::try_from(server.candidate_ttl().as_millis()).unwrap_or(u64::MAX);
+        let ack = Message::bootstrap_ack(
+            our_node_id,
+            format,
+            cluster_id,
+            candidates,
+            candidate_ttl_ms,
+        );
+        write_message(&mut writer, &ack, format, limits.socket_timeout).await?;
+        return Ok(());
     }
+
+    let IncomingHandshake::Peer {
+        node_id: peer_node_id,
+        format: negotiated_format,
+    } = handshake
+    else {
+        unreachable!("bootstrap handshakes return before peer admission")
+    };
 
     {
         let peers = peers.read().await;
@@ -995,6 +1102,77 @@ fn remove_connection_if_current(
         .flatten()
 }
 
+pub(crate) async fn connect_transport(
+    addr: &str,
+    tls: Option<&TlsConfig>,
+    socket_timeout: Duration,
+) -> NetResult<(NetStream, String)> {
+    let tcp = timeout(socket_timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| NetError::Timeout)?
+        .map_err(|error| NetError::ConnectionFailed(format!("{addr}: {error}")))?;
+    let transport_addr = tcp.peer_addr()?.to_string();
+    let stream = if let Some(tls_config) = tls {
+        let host = endpoint_host(addr)?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|error| {
+                NetError::TlsError(format!("invalid server name '{host}': {error}"))
+            })?;
+        timeout(socket_timeout, tls_config.connect_stream(tcp, server_name))
+            .await
+            .map_err(|_| NetError::Timeout)??
+    } else {
+        NetStream::Plain(tcp)
+    };
+    Ok((stream, transport_addr))
+}
+
+fn endpoint_host(endpoint: &str) -> NetResult<&str> {
+    if endpoint.starts_with('[') {
+        let closing = endpoint
+            .find(']')
+            .ok_or_else(|| NetError::InvalidMessage("invalid bracketed peer endpoint".into()))?;
+        return Ok(&endpoint[1..closing]);
+    }
+    endpoint
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| NetError::InvalidMessage("peer endpoint must be host:port".into()))
+}
+
+pub(crate) fn verify_peer_identity(
+    our_node_id: &NodeId,
+    peer_node_id: &NodeId,
+    peer_cert: Option<&rustls::pki_types::CertificateDer<'static>>,
+    tls: Option<&TlsConfig>,
+) -> NetResult<()> {
+    if peer_node_id == our_node_id {
+        return Err(NetError::SelfConnection(peer_node_id.to_string()));
+    }
+
+    if let Some(tls_config) = tls
+        && !tls_config.insecure
+    {
+        let peer_cert = peer_cert
+            .ok_or_else(|| NetError::TlsError("missing peer certificate in TLS session".into()))?;
+        let expected = crate::tls::derive_protocol_node_id_from_cert(peer_cert)?;
+        if peer_node_id != &expected {
+            let fingerprint = crate::tls::cert_fingerprint_hex(peer_cert)
+                .unwrap_or_else(|_| "<unavailable>".into());
+            return Err(NetError::TlsError(format!(
+                "node_id mismatch (claimed={peer_node_id:?}, expected={expected:?}, fingerprint={fingerprint})"
+            )));
+        }
+        if !tls_config.is_peer_allowed(&peer_node_id.to_string()) {
+            return Err(NetError::TlsError(format!(
+                "peer node_id not in allowlist: {peer_node_id:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn identity_verification(tls: Option<&TlsConfig>) -> PeerIdentityVerification {
     if tls.is_some_and(|config| !config.insecure) {
         PeerIdentityVerification::CertificateBound
@@ -1020,14 +1198,14 @@ fn ensure_peer_slot_available(
     Ok(())
 }
 
-fn supported_formats_for(preferred: SerializationFormat) -> Vec<SerializationFormat> {
+pub(crate) fn supported_formats_for(preferred: SerializationFormat) -> Vec<SerializationFormat> {
     match preferred {
         SerializationFormat::Json => vec![SerializationFormat::Json],
         SerializationFormat::Bincode => DEFAULT_SUPPORTED_FORMATS.to_vec(),
     }
 }
 
-fn negotiate_serialization_format(
+pub(crate) fn negotiate_serialization_format(
     preferred: SerializationFormat,
     peer_supported: &[SerializationFormat],
 ) -> Option<SerializationFormat> {
@@ -1167,7 +1345,7 @@ async fn read_loop(
 }
 
 /// Writes a message to a stream.
-async fn write_message<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_message<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &Message,
     serialization_format: SerializationFormat,
@@ -1193,7 +1371,7 @@ async fn write_bytes<W: AsyncWriteExt + Unpin>(
 }
 
 /// Reads a message from a stream.
-async fn read_message<R: AsyncReadExt + Unpin>(
+pub(crate) async fn read_message<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     max_message_size: usize,
     socket_timeout: Duration,

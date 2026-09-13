@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -319,20 +319,16 @@ async fn reconcile_reconnect_candidates(
     peer_health: &Arc<RwLock<std::collections::HashMap<String, super::peer::PeerHealth>>>,
 ) {
     let retained = candidates.iter().collect::<HashSet<_>>();
-    state.retain(|peer| retained.contains(&peer.addr));
-
-    let existing = state
-        .iter()
-        .map(|peer| peer.addr.clone())
-        .collect::<HashSet<_>>();
+    let mut existing = state
+        .drain(..)
+        .map(|peer| (peer.addr.clone(), peer))
+        .collect::<HashMap<_, _>>();
     let now = StdInstant::now();
-    state.extend(
-        candidates
-            .iter()
-            .filter(|candidate| !existing.contains(candidate.as_str()))
-            .cloned()
-            .map(|addr| PeerReconnectState::new(addr, initial_delay, now)),
-    );
+    state.extend(candidates.iter().map(|addr| {
+        existing
+            .remove(addr)
+            .unwrap_or_else(|| PeerReconnectState::new(addr.clone(), initial_delay, now))
+    }));
 
     let mut health = peer_health.write().await;
     health.retain(|addr, _| retained.contains(addr));
@@ -679,6 +675,41 @@ mod tests {
 
         assert!(state.is_empty());
         assert!(peer_health.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_reordering_preserves_backoff_state() {
+        let now = StdInstant::now();
+        let mut first = PeerReconnectState::new(
+            "one.example:9000".to_string(),
+            Duration::from_millis(10),
+            now,
+        );
+        first.record_failure(Duration::from_secs(1), now);
+        let first_deadline = first.next_attempt_at;
+        let first_delay = first.delay;
+        let mut state = vec![
+            first,
+            PeerReconnectState::new(
+                "two.example:9000".to_string(),
+                Duration::from_millis(10),
+                now,
+            ),
+        ];
+        let peer_health = Arc::new(RwLock::new(HashMap::new()));
+
+        reconcile_reconnect_candidates(
+            &mut state,
+            &["two.example:9000".into(), "one.example:9000".into()],
+            Duration::from_millis(10),
+            &peer_health,
+        )
+        .await;
+
+        assert_eq!(state[0].addr, "two.example:9000");
+        assert_eq!(state[1].addr, "one.example:9000");
+        assert_eq!(state[1].next_attempt_at, first_deadline);
+        assert_eq!(state[1].delay, first_delay);
     }
 
     fn test_event_context(

@@ -181,18 +181,18 @@ single further CLI command.
 
 **Initial implementations**:
 - [x] `StaticDiscovery` - peer list from config (backward-compatible)
-- [ ] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
-- [ ] `MdnsDiscovery` - LAN discovery for demo and dev
-- [ ] `DnsSrvDiscovery` - discovery via DNS-SRV record
-- [ ] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
+- [x] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
+- [x] `MdnsDiscovery` - LAN discovery for demo and dev
+- [x] `DnsSrvDiscovery` - discovery via DNS-SRV record
+- [x] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
 
 **Configuration**:
 - [ ] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
 - [ ] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
 
 **Protocol compatibility**:
-- [ ] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
-- [ ] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
+- [x] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
+- [x] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
 
 **Explicit decision**:
 - [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.

@@ -25,6 +25,8 @@ It depends on `nx-sync` for `Op` and `NodeId` types. It does not depend on `nx-c
 | Peer slot enforcement (semaphore) | `node.rs` - `connection_slots`, `ensure_peer_slot_available` |
 | Broadcast and targeted op send | `node.rs` - `Node::broadcast_ops`, `Node::send_ops_to_addr` |
 | Anti-entropy pull requests | `node.rs` - `Node::send_pull_since_to_addr` |
+| Authenticated one-shot bootstrap exchange | `bootstrap.rs`, `node.rs` - `BootstrapClient`, inbound bootstrap handling |
+| Bounded bootstrap advertisement cache | `bootstrap.rs` - `BootstrapServerConfig`, `BootstrapServer` |
 | Cooperative shutdown via watch channel | `node.rs` - `Node::shutdown`, `shutdown_tx` |
 | Wire message types and encode/decode | `message.rs` - `Message`, `MessageKind` |
 | Peer state tracking | `node.rs` - `PeerConnection`, `peer.rs` - `PeerInfo`, `PeerState` |
@@ -59,6 +61,7 @@ NodeConfig::new(node_id, "0.0.0.0:9000")
     .with_socket_timeout(Duration::from_secs(30))
     .with_serialization_format(SerializationFormat::Bincode)
     .with_event_channel_capacity(1024)
+    .with_bootstrap_server(BootstrapServerConfig::new("cluster-a")?)
 ```
 
 ### Node lifecycle
@@ -69,6 +72,8 @@ Node::new(config)
   └── start_listener()          bind TCP, spawn listener task, returns bound SocketAddr
   └── connect_to_peer(addr)     dial, TLS, handshake, register, spawn read loop
   └── connection_info(addr)     transport, direction and verified/claimed identity
+  └── announce_bootstrap_endpoint(addr)  publish the local bootstrap suggestion
+  └── withdraw_bootstrap_endpoint()      remove that suggestion
       ...running...
   └── broadcast_ops(ops)        push ops to all connected peers
   └── send_ops_to_addr(addr, ops)
@@ -107,7 +112,7 @@ connect_to_peer(addr)
   5. capture peer_cert DER bytes
   6. send Hello { node_id, protocol_version, supported_formats, preferred_format }
   7. receive HelloAck { node_id, protocol_version, selected_format }
-  8. validate protocol version == PROTOCOL_VERSION (4) and reject the local NodeId
+  8. validate protocol version == PROTOCOL_VERSION (5) and reject the local NodeId
   9. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
   10. if allowlist configured: verify peer_node_id in allowed_peers
   11. insert PeerConnection and its `PeerConnectionInfo` into the peers map
@@ -119,14 +124,11 @@ connect_to_peer(addr)
 ```
 handle_incoming(stream, addr, context)
   1. TLS accept (if configured), capture peer_cert
-  2. receive Hello
-  3. validate protocol version
-  4. negotiate_serialization_format
-  5. reject the local NodeId, then perform TLS identity binding (same as outbound)
-  6. send HelloAck { node_id, protocol_version, selected_format }
-  7. insert PeerConnection and inbound transport metadata into the peers map
-  8. emit PeerConnected event
-  9. run read_loop inline (not spawned - task already spawned by listener)
+  2. receive Hello or BootstrapHello
+  3. validate protocol version and negotiate_serialization_format
+  4. reject the local NodeId, then perform TLS identity binding and allowlist checks
+  5a. normal: send HelloAck, insert PeerConnection, emit PeerConnected, run read_loop
+  5b. bootstrap: validate service/cluster/request, send BootstrapAck, close without peer admission
 ```
 
 `PeerConnectionInfo` keeps the TCP transport address separate from the outbound
@@ -148,7 +150,7 @@ Every message is framed as:
 - Format byte: `0x01` = JSON, `0x02` = bincode.
 - Payload is the serialized `Message` struct.
 
-`PROTOCOL_VERSION = 4`. Version mismatch during handshake causes a structured
+`PROTOCOL_VERSION = 5`. Version mismatch during a recognized handshake causes a structured
 `WireError::ProtocolMismatch` and immediate disconnect.
 
 ### MessageKind variants
@@ -162,6 +164,8 @@ Every message is framed as:
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
 | `Ping` / `Pong` | both | Keepalive |
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
+| `BootstrapHello` | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
+| `BootstrapAck` | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
 
 ### WireError semantics
 
@@ -171,6 +175,7 @@ Every message is framed as:
 | `NotAuthorized` | Fatal for that peer/config | Credentials, certificate identity, or allowlist must change before retrying. |
 | `RateLimited` | Retryable | Back off. Use `retry_after_ms` when present, otherwise use normal reconnect backoff. |
 | `OpRejected` | Fatal for those ops | Do not resend the same rejected ops unchanged. Current generic error handling closes the peer connection. |
+| `BootstrapRejected` | Fatal for that request | Bootstrap is disabled or its cluster, advertisement or request bounds are invalid. |
 | `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
 
 The configured-peer reconnect loop uses this policy: fatal wire errors stop
@@ -191,6 +196,29 @@ HelloAck selected_format = Json
 
 A `--debug-protocol` node (JSON only) always negotiates JSON with any peer.
 A standard node advertises both and prefers bincode.
+
+### Bootstrap transport
+
+`BootstrapClient::query(seed, request)` opens a bounded, one-shot connection,
+sends `BootstrapHello`, authenticates the `BootstrapAck` seed identity and
+returns `BootstrapResponse`. `BootstrapClientConfig` reuses `NodeId`, optional
+`TlsConfig`, message-size, socket-timeout and serialization controls. Its
+defaults permit one concurrent query, at most 128 returned candidates and a
+maximum accepted candidate TTL of 300s.
+
+The server is enabled through `NodeConfig::with_bootstrap_server`. By default it
+retains at most 1024 authenticated requester advertisements for 60s and returns
+at most 128 candidates. Its own advertised endpoint is returned first, followed
+by cached requester endpoints in stable insertion order; responses are
+deduplicated and exclude the current requester. A request without an advertised
+endpoint withdraws that requester's cache entry.
+
+Cluster IDs, endpoint strings, response count and leases are validated on both
+sides. A bootstrap socket holds an inbound connection slot while the request is
+processed but is never inserted into the active peer map, never enters a read
+loop and never emits `PeerConnected`. Suggestions in `BootstrapResponse` are
+not authenticated identities; the normal dialer must authenticate each one in
+a separate `Hello`/`HelloAck` exchange.
 
 ---
 
@@ -271,6 +299,7 @@ Node::shutdown()
   3. for each task: timeout(3s, task).await
      - if task does not finish in 3s: task.abort()
   4. peers.clear() -> drops all PeerConnection -> drops all semaphore permits
+  5. clear the bootstrap advertisement and leased requester cache
 ```
 
 Read loops check the shutdown signal on every iteration via `tokio::select!`.
@@ -285,16 +314,21 @@ This avoids waiting for socket timeouts during clean shutdown.
 pub enum NetError {
     Io(std::io::Error),
     Serialization(serde_json::Error),
-    BincodeSerialization(Box<bincode::ErrorKind>),
+    BinarySerialization(wincode::WriteError),
+    BinaryDeserialization(wincode::ReadError),
     ConnectionFailed(String),
     PeerDisconnected(String),
     InvalidMessage(String),
+    Wire(WireError),
     MessageTooLarge { len: usize, limit: usize },
     Timeout,
     ChannelClosed,
     TlsError(String),
     PeerNotAllowed(String),
     PeerLimitReached(usize),
+    ConnectionAttemptLimitReached(usize),
+    ConnectionInProgress(String),
+    SelfConnection(String),
     NodeIdMismatch { expected: String, got: String },
 }
 ```
@@ -309,6 +343,10 @@ pub enum NetError {
 | `DEFAULT_MAX_MESSAGE_SIZE` | 16 MiB | Maximum wire message size |
 | `DEFAULT_SOCKET_TIMEOUT` | 30s | Read/write timeout per operation |
 | `DEFAULT_EVENT_CHANNEL_CAPACITY` | 1024 | Event channel buffer size |
+| `DEFAULT_BOOTSTRAP_CACHE_CAPACITY` | 1024 | Seed-side advertised endpoint cache |
+| `DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY` | 128 | Results returned by one bootstrap exchange |
+| `DEFAULT_BOOTSTRAP_CANDIDATE_TTL` | 60s | Seed-side advertisement lease |
+| `DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES` | 1 | Simultaneous queries per bootstrap client |
 | `TASK_SHUTDOWN_GRACE` | 3s | Cooperative shutdown grace per task |
 
 ---
@@ -335,6 +373,9 @@ Tests live in `node.rs` and `message.rs` (`#[cfg(test)]`), plus integration test
 | `connect_to_peer_times_out_during_tls_handshake` | Timeout during TLS handshake |
 | `connect_to_peer_rejects_protocol_version_mismatch` | old version in HelloAck |
 | `incoming_rejects_protocol_version_mismatch` | old version in Hello |
+| `protocol_v5_binary_encoding_matches_bincode_golden_hashes` | stable binary encoding for normal and bootstrap messages |
+| `one_shot_query_returns_candidates_without_registering_a_peer` | bootstrap response without active peer admission or events |
+| `cluster_mismatch_is_rejected_without_populating_the_cache` | cluster isolation before advertisement caching |
 | `incoming_idle_handshake_consumes_peer_slot` | slot held before handshake completes |
 | `incoming_idle_tls_handshake_releases_peer_slot_after_timeout` | slot released after timeout |
 | `active_peer_shutdown_does_not_wait_for_socket_timeout` | cooperative shutdown timing |

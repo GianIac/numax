@@ -31,11 +31,21 @@ need updates therefore start with `DiscoveryWatch::snapshot()` and then process
 the same watch's event stream. The separate `discover()` method is for
 point-in-time reads and must not be combined with a later `watch()` call.
 
-`StaticDiscovery` is immutable. Its snapshot preserves the configured peer list
-exactly, including input order and duplicate entries. Its watch produces no
-change events. The coordinator canonicalizes endpoints and keeps the first
-occurrence order, so duplicate configuration entries still result in only one
-connection candidate.
+`StaticDiscovery` is immutable. Its provider snapshot preserves the configured
+peer list exactly, including input order and duplicate entries, and its watch
+produces no change events. The coordinator canonicalizes endpoints and keeps
+the first occurrence order, so duplicate configuration entries still result in
+only one effective connection candidate. Invalid legacy `--peer` values are
+logged and skipped instead of making discovery startup fail.
+
+Dynamic providers keep a complete ordered view and publish bounded,
+revisioned `Replaced` events. A replacement changes the provider contribution
+atomically, including its ordering: consumers never observe a synthetic empty
+view between removals and additions. `Added` and `Removed` remain available for
+incremental providers. Providers deduplicate their own snapshots where their
+source naturally can repeat endpoints; the coordinator also deduplicates
+across providers. Ordering is deterministic for a given set of provider
+observations, but it is not a membership or authorization guarantee.
 
 ## Candidate ownership, expiry, and removal
 
@@ -85,6 +95,120 @@ calls every provider shutdown hook during normal shutdown and partial-startup
 rollback. Provider operations have a finite timeout so a stuck implementation
 cannot keep runtime shutdown alive indefinitely.
 
+`shutdown()` is idempotent. After shutdown, a provider cannot be restarted.
+Dropping a provider is also a cancellation boundary: implementations that own
+background work signal or abort it rather than leaving detached discovery
+activity alive.
+
+## Provider contracts
+
+All provider limits are checked before a view is exposed to the coordinator.
+The runtime-wide candidate limit remains an additional bound after different
+sources are combined.
+
+### StaticDiscovery
+
+`StaticDiscovery::new(peers)` is the compatibility adapter for configured
+peers. It performs no I/O, never refreshes or expires entries, preserves the
+input list byte-for-byte, and does not support announcements. An empty list is
+valid.
+
+### BootstrapGossipDiscovery
+
+`BootstrapGossipDiscovery` contacts a bounded, ordered seed list through the
+one-shot `BootstrapHello`/`BootstrapAck` exchange. Startup with no responses is
+valid: the initial provider snapshot is empty and probing continues in the
+background. Seed addresses are canonicalized and deduplicated while retaining
+their first configured occurrence.
+
+Each request optionally advertises the caller's endpoint and asks for at most
+the configured number of results. A successful view contains the seed itself
+followed by the seed's bounded, deduplicated suggestions. Views from multiple
+seeds are flattened in configured seed order and deduplicated again. Returned
+entries expire at the earlier of the seed-provided lease and the provider's
+`stale_after` bound. Failed probes retain an unexpired last valid view; expired
+views are removed.
+
+Probe failures use exponential retry bounded by `retry_initial` and
+`retry_max`; a success restores `refresh_interval`. Fatal wire failures such as
+protocol mismatch or bootstrap request rejection disable that seed for the
+provider lifetime. Bootstrap announcement support is required. Shutdown stops
+and joins the probe loop, performs bounded best-effort withdrawal from every
+seed that accepted the announcement, and clears the local view. An unreachable
+seed retains at most its bounded advertisement lease.
+
+The seed authenticates the requester before caching its advertisement, and the
+client authenticates the responding seed according to the normal TLS and
+allowlist policy. That authentication covers only the two participants in the
+bootstrap exchange. Every returned endpoint is still an untrusted suggestion
+that must complete its own normal peer handshake before it becomes a
+connection.
+
+### MdnsDiscovery
+
+`MdnsDiscovery` browses `_numax._tcp.local.` using a cluster-specific DNS-SD
+subtype derived from the BLAKE3 hash of the cluster ID. It also requires an
+exact `cluster` TXT property match. This two-part filter prevents accidental
+cross-cluster discovery; neither value is authentication evidence.
+
+Resolved instances retain first-observation order. Addresses within an
+instance are sorted and deduplicated; instances and the flattened candidate
+view are both bounded. Port zero, unspecified and multicast addresses, and
+IPv6 link-local addresses without a usable scope are ignored. A DNS-SD removal
+event removes the complete instance contribution; expiry is delegated to the
+mDNS daemon's cache and removal events.
+
+mDNS announcement support is required. Announcements accept a concrete IP
+address or a `.local` hostname, never a wildcard host or port zero. The provider
+filters its own DNS-SD fullname and advertised endpoint. Re-announcement updates
+the same service in place, avoiding a withdrawal gap.
+Shutdown sends a goodbye/unregister request, stops browsing, waits within the
+bounded daemon grace period, shuts the daemon down, joins the bridge task, and
+clears the view. This provider is intended for LAN development and demos, not
+untrusted multicast networks.
+
+### DnsSrvDiscovery
+
+`DnsSrvDiscovery` reads a fully qualified SRV name beginning with `_` and
+ending with `.`, using the system resolver. It starts with an empty view and
+performs refreshes in the background. Results are sorted deterministically by
+SRV priority, target, port and weight, then deduplicated and bounded. Root
+targets and records with port zero do not become candidates. SRV weight is not
+used as a membership assertion or a connection authorization rule.
+
+A successful answer replaces the complete view. Refresh happens no later than
+the DNS validity deadline and is capped by `max_refresh_interval`. A successful
+empty or no-record answer removes the previous view. A transient lookup error
+keeps the last valid view only until its DNS validity deadline, then removes it
+while retrying at `retry_interval`. DNS-SRV does not support announcements.
+Shutdown stops and joins the refresh task.
+
+### FileWatchDiscovery
+
+`FileWatchDiscovery` polls an externally managed UTF-8 file. Each trimmed,
+non-empty line is one `host:port` endpoint; a line whose first non-whitespace
+character is `#` is a comment. Entries are canonicalized and deduplicated in
+first-occurrence order. File size, candidate count, event capacity and polling
+interval are bounded and configurable.
+
+A missing file is a valid empty view, both initially and after removal. This
+also observes delayed creation and Kubernetes-style atomic file replacement.
+The initial read fails for other I/O, encoding, syntax or limit errors. After a
+valid snapshot exists, an unreadable, non-UTF-8, malformed, oversized or
+over-limit update is rejected atomically and the last valid snapshot remains
+active; polling continues. File discovery does not support announcements.
+Shutdown stops and joins the polling task.
+
+### Provider dependencies
+
+The two added runtime dependencies have narrow protocol roles. `mdns-sd`
+provides DNS-SD browse, cache-expiry, unregister/goodbye and daemon shutdown
+behavior that should not be reimplemented as ad-hoc multicast parsing.
+`hickory-resolver` provides real SRV records and their DNS validity deadlines;
+Tokio's host lookup does not expose either. File discovery uses Tokio polling
+instead of adding a filesystem-notification dependency, which also makes
+delete/create and atomic replacement semantics consistent across platforms.
+
 ## Endpoints, identity, and connection admission
 
 Four values remain deliberately separate:
@@ -127,8 +251,9 @@ Each provider reports the logical cluster it serves. Startup rejects a provider
 whose cluster differs from the runtime cluster, and duplicate source IDs are
 invalid. Provider implementations must scope all snapshots, changes, and
 announcements to that cluster. The cluster value is a discovery routing scope,
-not proof of membership and not a replacement for TLS identity or authorization;
-it is intentionally not added to the current wire handshake.
+not proof of membership and not a replacement for TLS identity or authorization.
+The bootstrap handshake carries and validates it; the normal replication
+`Hello` remains unchanged.
 
 ## Security and compatibility boundaries
 
@@ -138,10 +263,13 @@ membership. Existing TLS and mTLS verification, peer allowlists, connection
 limits, and handshake checks remain authoritative when the runtime attempts a
 connection.
 
-The abstraction and `StaticDiscovery` do not change peer messages, framing,
-handshake semantics, persisted data, or the WebAssembly host and guest APIs.
-They therefore require no wire-protocol version increment, storage migration,
-or guest ABI change.
+Static, mDNS, DNS-SRV and file discovery do not change persisted data or the
+WebAssembly host and guest APIs. Bootstrap adds a wire exchange and therefore
+increments `PROTOCOL_VERSION` to `5`; version `4` peers are rejected before
+bootstrap or replication admission. No storage migration or guest ABI change
+is involved. See [Wire Versioning](/numax/design/wire-versioning/) for the exact
+compatibility boundary.
 
-Bootstrap exchange, mDNS, DNS-SRV, and file watching remain provider-specific
-roadmap work outside this contract.
+Provider construction is currently a Rust integration API. CLI, environment
+and `numax.toml` selection of `bootstrap`, `mdns`, `dns-srv` and `file` modes is
+separate roadmap work; `--peer` continues to select static discovery.

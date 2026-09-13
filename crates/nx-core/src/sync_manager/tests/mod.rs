@@ -1525,6 +1525,20 @@ fn manager_rejects_corrupted_durable_crdt_state() {
     }
 }
 
+#[test]
+fn static_peer_lists_keep_their_historical_finite_size() {
+    let peers = (0..=crate::DEFAULT_MAX_PEER_CANDIDATES)
+        .map(|index| format!("peer-{index}.example:9000"))
+        .collect::<Vec<_>>();
+    let mut config = SyncConfig::new();
+    config.peers = peers.clone();
+
+    let manager =
+        SyncManager::try_new(NodeId::new("local-node"), config, temp_store(), metrics()).unwrap();
+
+    assert_eq!(manager.discovery_config.max_candidates(), peers.len());
+}
+
 #[tokio::test]
 async fn manager_hydrates_pncounter_registry_from_durable_state() {
     let store = temp_store();

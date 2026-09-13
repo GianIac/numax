@@ -1,9 +1,16 @@
+mod bootstrap;
 mod error;
 mod message;
 mod node;
 mod peer;
 mod tls;
 
+pub use bootstrap::{
+    BootstrapClient, BootstrapClientConfig, BootstrapRequest, BootstrapResponse,
+    BootstrapServerConfig, DEFAULT_BOOTSTRAP_CACHE_CAPACITY, DEFAULT_BOOTSTRAP_CANDIDATE_TTL,
+    DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY, DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES,
+    MAX_BOOTSTRAP_CANDIDATE_TTL,
+};
 pub use error::{NetError, NetResult};
 pub use message::{
     Message, MessageKind, PROTOCOL_VERSION, SerializationFormat, WireError, WireRetryPolicy,

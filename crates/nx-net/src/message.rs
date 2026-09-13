@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -60,6 +60,7 @@ pub enum WireError {
     RateLimited { retry_after_ms: Option<u64> },
     NotAuthorized { reason: String },
     Internal { reason: String },
+    BootstrapRejected { reason: String },
 }
 
 /// Reconnect behavior implied by a structured wire error.
@@ -90,7 +91,9 @@ impl WireError {
                 retry_after_ms: None,
             }
             | Self::Internal { .. } => WireRetryPolicy::Retry,
-            Self::OpRejected { .. } => WireRetryPolicy::RequestFatal,
+            Self::OpRejected { .. } | Self::BootstrapRejected { .. } => {
+                WireRetryPolicy::RequestFatal
+            }
         }
     }
 }
@@ -113,6 +116,9 @@ impl std::fmt::Display for WireError {
                 None => formatter.write_str("rate limited"),
             },
             Self::NotAuthorized { reason } => write!(formatter, "not authorized: {reason}"),
+            Self::BootstrapRejected { reason } => {
+                write!(formatter, "bootstrap request rejected: {reason}")
+            }
             Self::Internal { reason } => write!(formatter, "internal wire error: {reason}"),
         }
     }
@@ -158,6 +164,27 @@ pub enum MessageKind {
 
     /// Structured protocol error.
     Error { error: WireError },
+
+    /// One-shot bootstrap handshake. This never establishes a replication connection.
+    BootstrapHello {
+        node_id: NodeId,
+        protocol_version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        cluster_id: String,
+        advertised_endpoint: Option<String>,
+        max_results: u32,
+    },
+
+    /// Authenticated response to a one-shot bootstrap handshake.
+    BootstrapAck {
+        node_id: NodeId,
+        protocol_version: u32,
+        selected_format: SerializationFormat,
+        cluster_id: String,
+        candidates: Vec<String>,
+        candidate_ttl_ms: u64,
+    },
 }
 
 /// Complete message with metadata.
@@ -241,6 +268,46 @@ impl Message {
     pub fn wire_error(error: WireError) -> Self {
         Self {
             kind: MessageKind::Error { error },
+        }
+    }
+
+    pub fn bootstrap_hello(
+        node_id: NodeId,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        cluster_id: String,
+        advertised_endpoint: Option<String>,
+        max_results: u32,
+    ) -> Self {
+        Self {
+            kind: MessageKind::BootstrapHello {
+                node_id,
+                protocol_version: PROTOCOL_VERSION,
+                supported_formats,
+                preferred_format,
+                cluster_id,
+                advertised_endpoint,
+                max_results,
+            },
+        }
+    }
+
+    pub fn bootstrap_ack(
+        node_id: NodeId,
+        selected_format: SerializationFormat,
+        cluster_id: String,
+        candidates: Vec<String>,
+        candidate_ttl_ms: u64,
+    ) -> Self {
+        Self {
+            kind: MessageKind::BootstrapAck {
+                node_id,
+                protocol_version: PROTOCOL_VERSION,
+                selected_format,
+                cluster_id,
+                candidates,
+                candidate_ttl_ms,
+            },
         }
     }
 
@@ -386,7 +453,7 @@ mod tests {
         }
     }
 
-    fn protocol_v4_messages() -> Vec<Message> {
+    fn protocol_v5_messages() -> Vec<Message> {
         let origin = NodeId::new("node-a");
         let ops = vec![
             Op {
@@ -504,6 +571,24 @@ mod tests {
             Message::wire_error(WireError::Internal {
                 reason: "internal".into(),
             }),
+            Message::wire_error(WireError::BootstrapRejected {
+                reason: "wrong cluster".into(),
+            }),
+            Message::bootstrap_hello(
+                NodeId::new("bootstrap-client"),
+                DEFAULT_SUPPORTED_FORMATS.to_vec(),
+                SerializationFormat::Bincode,
+                "cluster-a".into(),
+                Some("client.example:9000".into()),
+                32,
+            ),
+            Message::bootstrap_ack(
+                NodeId::new("bootstrap-seed"),
+                SerializationFormat::Bincode,
+                "cluster-a".into(),
+                vec!["one.example:9000".into(), "two.example:9001".into()],
+                60_000,
+            ),
         ]
     }
 
@@ -552,6 +637,18 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v5_messages_roundtrip_in_json() {
+        for message in protocol_v5_messages() {
+            let bytes = message
+                .to_bytes_with_format(SerializationFormat::Json)
+                .unwrap();
+            let (format, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
+            assert_eq!(format, SerializationFormat::Json);
+            assert_eq!(parsed, message);
+        }
+    }
+
+    #[test]
     fn test_message_roundtrip_bincode() {
         let node = NodeId::new("node-1");
         let op = Op::gcounter_increment(node, "counter:test", 5);
@@ -569,23 +666,26 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_binary_encoding_matches_bincode_golden_hashes() {
+    fn protocol_v5_binary_encoding_matches_bincode_golden_hashes() {
         let expected_sha256 = [
-            "62cb7aa9f8be207d22c1b8e92bdf8096ddc4e1f1ed79a64b7e42047ae267df9a",
-            "762558e92347d927b302e4a5a22de6a7f61feb74b25108d1adbe0037b93463f8",
+            "d3cdccc16446588fd57d15139604980cb441667ab5604bd95dbc95de9a222934",
+            "97cc49ef87c772c7eabb0e5e43fd9737460973e18c7e9ab2009dd5b0e6478ad1",
             "1953b5c9bfa1929dbe636c27e4e6d504d585c2eba0eb4f61d5a955974b57c31d",
             "7c16f5631b09eef6cfc2ecdfb0d5336adbaa187c45cf7b6c5e37c4b6dc98158d",
             "88420266dfd64d604627234a8a6c75cf6477c6fd5505df0d17c59959ae9ce234",
             "0dd60804260500069dbc38d3b7f3cc4c54ae6952e89b620a9c6d7378705e5b78",
             "2594b6a92ebfb1c3312deb7d01c015fb95e9fbe9bd7bc6b527af07813ec7b910",
             "7aa8ca4a02506da9133d8f889678b76f716ce45d02e22fdb7b70a15e56a0eff8",
-            "4779c171ec57c753c34e20aa6a17595fb121d7bea35261f990213a495ef9cca5",
+            "aa39a5af59f8c5ce2b32cb8b742ecd8879697b7219a19a82cbeea01e8211bedc",
             "0239a8fac27cbe2066f549e3ef3bf654f34699e7338f328878dbdb5a956096ee",
             "169f3c91969ead0a7a678f98088e54519e7c8679ed6d8a5ade85d7a00c718e50",
             "678ff351757c2bbcba3d3aeb9aa6cef34c34dd07b122817509765742351ec3ab",
             "574f81f9e34c4b5f8d195759d62c42983380a5a83ddd77cfebe5e7dd84425ae0",
+            "57ba3f720f28fcca7cc3a6746601570f754a7ac459b22ab27b4f1fc974eebdf5",
+            "f161ff565f35624c3764278b16c671ffb75fa1f51d5dbcb63a5599b9ffbe642e",
+            "fda6321c8c6b33659ff2c4e5411215e9e6b719890eb1f707cea29e10ae32e654",
         ];
-        let messages = protocol_v4_messages();
+        let messages = protocol_v5_messages();
         assert_eq!(messages.len(), expected_sha256.len());
 
         for (message, expected_hash) in messages.into_iter().zip(expected_sha256) {
@@ -694,6 +794,13 @@ mod tests {
         assert_eq!(
             WireError::OpRejected {
                 reason: "bad op".into(),
+            }
+            .retry_policy(),
+            WireRetryPolicy::RequestFatal
+        );
+        assert_eq!(
+            WireError::BootstrapRejected {
+                reason: "wrong cluster".into(),
             }
             .retry_policy(),
             WireRetryPolicy::RequestFatal
