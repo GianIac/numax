@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use nx_sync::{NodeId, Op};
@@ -15,7 +15,10 @@ use crate::message::{
     DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
     WireError, validate_payload_len,
 };
-use crate::peer::{PeerInfo, PeerState};
+use crate::peer::{
+    ConnectionDirection, PeerConnectionInfo, PeerIdentity, PeerIdentityVerification, PeerInfo,
+    PeerState,
+};
 use crate::tls::{NetStream, TlsConfig};
 
 /// Default maximum number of simultaneously connected peers.
@@ -32,6 +35,7 @@ pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Time allowed for network tasks to finish cooperatively after shutdown.
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 1;
 
 type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
 
@@ -180,10 +184,41 @@ pub enum NodeEvent {
 /// connection; dropping the connection releases capacity.
 struct PeerConnection {
     info: PeerInfo,
+    connection_info: Option<PeerConnectionInfo>,
+    instance: Arc<()>,
     state: PeerState,
     serialization_format: SerializationFormat,
     writer: Option<PeerWriter>,
     _slot: OwnedSemaphorePermit,
+}
+
+struct ConnectionAttemptGuard {
+    endpoint: String,
+    attempts: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl ConnectionAttemptGuard {
+    fn acquire(endpoint: &str, attempts: Arc<StdMutex<HashSet<String>>>) -> NetResult<Self> {
+        let mut active = attempts.lock().map_err(|_| {
+            NetError::ConnectionFailed("outbound attempt registry is poisoned".to_string())
+        })?;
+        if !active.insert(endpoint.to_string()) {
+            return Err(NetError::ConnectionInProgress(endpoint.to_string()));
+        }
+        drop(active);
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            attempts,
+        })
+    }
+}
+
+impl Drop for ConnectionAttemptGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.attempts.lock() {
+            active.remove(&self.endpoint);
+        }
+    }
 }
 
 /// node
@@ -194,6 +229,8 @@ pub struct Node {
     event_rx: Option<mpsc::Receiver<NodeEvent>>,
     shutdown_tx: watch::Sender<bool>,
     connection_slots: Arc<Semaphore>,
+    outbound_attempt_slots: Arc<Semaphore>,
+    outbound_attempts: Arc<StdMutex<HashSet<String>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -212,6 +249,8 @@ impl Node {
             event_rx: Some(event_rx),
             shutdown_tx,
             connection_slots: Arc::new(Semaphore::new(max_peers)),
+            outbound_attempt_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)),
+            outbound_attempts: Arc::new(StdMutex::new(HashSet::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -306,6 +345,15 @@ impl Node {
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
+        if self.is_connected_addr(addr).await {
+            return Ok(());
+        }
+        let _attempt = ConnectionAttemptGuard::acquire(addr, Arc::clone(&self.outbound_attempts))?;
+        let _attempt_slot = Arc::clone(&self.outbound_attempt_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                NetError::ConnectionAttemptLimitReached(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)
+            })?;
         let slot = Arc::clone(&self.connection_slots)
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
@@ -314,6 +362,7 @@ impl Node {
             .await
             .map_err(|_| NetError::Timeout)?
             .map_err(|e| NetError::ConnectionFailed(format!("{}: {}", addr, e)))?;
+        let transport_addr = tcp.peer_addr()?.to_string();
 
         let stream: NetStream = if let Some(tls_cfg) = &self.config.tls {
             // Extract host from "host:port"
@@ -393,6 +442,10 @@ impl Node {
             }
         };
 
+        if peer_node_id == self.config.node_id {
+            return Err(NetError::SelfConnection(peer_node_id.to_string()));
+        }
+
         // TLS identity binding: claimed NodeId must match the peer certificate public key.
         if let Some(tls_cfg) = &self.config.tls
             && !tls_cfg.insecure
@@ -428,13 +481,30 @@ impl Node {
 
         // Save connection
         let writer = Arc::new(Mutex::new(writer));
+        let connection_instance = Arc::new(());
         let peers_connected = {
             let mut peers = self.peers.write().await;
+            if peers
+                .get(addr)
+                .is_some_and(|connection| connection.state == PeerState::Connected)
+            {
+                return Ok(());
+            }
             ensure_peer_slot_available(&peers, self.config.max_peers, Some(addr))?;
             peers.insert(
                 addr.to_string(),
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
+                    connection_info: Some(PeerConnectionInfo {
+                        transport_addr,
+                        dialed_endpoint: Some(addr.to_string()),
+                        direction: ConnectionDirection::Outbound,
+                        identity: PeerIdentity {
+                            node_id: peer_node_id.clone(),
+                            verification: identity_verification(self.config.tls.as_ref()),
+                        },
+                    }),
+                    instance: Arc::clone(&connection_instance),
                     state: PeerState::Connected,
                     serialization_format: negotiated_format,
                     writer: Some(Arc::clone(&writer)),
@@ -488,15 +558,16 @@ impl Node {
             // Cleanup
             let disconnected = {
                 let mut peers = peers.write().await;
-                peers.remove(&addr_owned).and_then(|removed| {
-                    (removed.state == PeerState::Connected).then(|| {
-                        (
-                            peer_node_id.clone(),
-                            addr_owned.clone(),
-                            connected_peer_count(&peers),
-                        )
+                remove_connection_if_current(&mut peers, &addr_owned, &connection_instance)
+                    .and_then(|removed| {
+                        (removed.state == PeerState::Connected).then(|| {
+                            (
+                                peer_node_id.clone(),
+                                addr_owned.clone(),
+                                connected_peer_count(&peers),
+                            )
+                        })
                     })
-                })
             };
 
             if let Some((node_id, addr, peers_connected)) = disconnected {
@@ -643,6 +714,16 @@ impl Node {
             .is_some_and(|conn| conn.state == PeerState::Connected)
     }
 
+    /// Returns authenticated/claimed identity and transport facts for an active connection.
+    pub async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo> {
+        let peers = self.peers.read().await;
+        peers.get(addr).and_then(|connection| {
+            (connection.state == PeerState::Connected)
+                .then(|| connection.connection_info.clone())
+                .flatten()
+        })
+    }
+
     async fn mark_peer_failed(&self, addr: &str) -> Option<(NodeId, usize)> {
         let mut peers = self.peers.write().await;
         let node_id = {
@@ -761,6 +842,10 @@ async fn handle_incoming(
         }
     };
 
+    if peer_node_id == our_node_id {
+        return Err(NetError::SelfConnection(peer_node_id.to_string()));
+    }
+
     // TLS identity binding: claimed NodeId must match the peer certificate public key.
     if let Some(tls_cfg) = &tls
         && !tls_cfg.insecure
@@ -801,6 +886,7 @@ async fn handle_incoming(
     write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
     let writer = Arc::new(Mutex::new(writer));
+    let connection_instance = Arc::new(());
     let peers_connected = {
         let mut peers = peers.write().await;
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
@@ -808,6 +894,16 @@ async fn handle_incoming(
             addr.clone(),
             PeerConnection {
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
+                connection_info: Some(PeerConnectionInfo {
+                    transport_addr: addr.clone(),
+                    dialed_endpoint: None,
+                    direction: ConnectionDirection::Inbound,
+                    identity: PeerIdentity {
+                        node_id: peer_node_id.clone(),
+                        verification: identity_verification(tls.as_ref()),
+                    },
+                }),
+                instance: Arc::clone(&connection_instance),
                 state: PeerState::Connected,
                 serialization_format: negotiated_format,
                 writer: Some(Arc::clone(&writer)),
@@ -850,7 +946,8 @@ async fn handle_incoming(
 
     let disconnected = {
         let mut peers = peers.write().await;
-        let Some(removed) = peers.remove(&addr) else {
+        let Some(removed) = remove_connection_if_current(&mut peers, &addr, &connection_instance)
+        else {
             return read_result;
         };
         (removed.state == PeerState::Connected).then(|| {
@@ -884,6 +981,26 @@ fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
         .values()
         .filter(|c| c.state == PeerState::Connected)
         .count()
+}
+
+fn remove_connection_if_current(
+    peers: &mut HashMap<String, PeerConnection>,
+    addr: &str,
+    instance: &Arc<()>,
+) -> Option<PeerConnection> {
+    peers
+        .get(addr)
+        .is_some_and(|connection| Arc::ptr_eq(&connection.instance, instance))
+        .then(|| peers.remove(addr))
+        .flatten()
+}
+
+fn identity_verification(tls: Option<&TlsConfig>) -> PeerIdentityVerification {
+    if tls.is_some_and(|config| !config.insecure) {
+        PeerIdentityVerification::CertificateBound
+    } else {
+        PeerIdentityVerification::Unverified
+    }
 }
 
 fn ensure_peer_slot_available(
@@ -1185,6 +1302,8 @@ mod tests {
             "127.0.0.1:9001".to_string(),
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
+                connection_info: None,
+                instance: Arc::new(()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
                 writer: None,
@@ -1204,6 +1323,8 @@ mod tests {
             "127.0.0.1:9001".to_string(),
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
+                connection_info: None,
+                instance: Arc::new(()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
                 writer: None,
@@ -1212,6 +1333,30 @@ mod tests {
         );
 
         ensure_peer_slot_available(&peers, 1, Some("127.0.0.1:9001")).unwrap();
+    }
+
+    #[test]
+    fn stale_connection_cleanup_cannot_remove_a_replacement() {
+        let addr = "127.0.0.1:9001";
+        let current = Arc::new(());
+        let stale = Arc::new(());
+        let mut peers = HashMap::from([(
+            addr.to_string(),
+            PeerConnection {
+                info: PeerInfo::new(addr),
+                connection_info: None,
+                instance: Arc::clone(&current),
+                state: PeerState::Connected,
+                serialization_format: SerializationFormat::Bincode,
+                writer: None,
+                _slot: test_slot(),
+            },
+        )]);
+
+        assert!(remove_connection_if_current(&mut peers, addr, &stale).is_none());
+        assert!(peers.contains_key(addr));
+        assert!(remove_connection_if_current(&mut peers, addr, &current).is_some());
+        assert!(!peers.contains_key(addr));
     }
 
     #[tokio::test]
@@ -1223,6 +1368,8 @@ mod tests {
                 "127.0.0.1:9001".to_string(),
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
+                    connection_info: None,
+                    instance: Arc::new(()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1233,6 +1380,8 @@ mod tests {
                 "127.0.0.1:9002".to_string(),
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
+                    connection_info: None,
+                    instance: Arc::new(()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1287,6 +1436,8 @@ mod tests {
                 "127.0.0.1:9001".to_string(),
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
+                    connection_info: None,
+                    instance: Arc::new(()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1297,6 +1448,8 @@ mod tests {
                 "127.0.0.1:9002".to_string(),
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
+                    connection_info: None,
+                    instance: Arc::new(()),
                     state: PeerState::Failed,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1658,8 +1811,66 @@ mod tests {
         assert_eq!(peer.serialization_format, SerializationFormat::Json);
 
         drop(peers);
+        let connection = node_a
+            .connection_info(&addr_b.to_string())
+            .await
+            .expect("active connection metadata");
+        assert_eq!(connection.transport_addr, addr_b.to_string());
+        assert_eq!(connection.dialed_endpoint, Some(addr_b.to_string()));
+        assert_eq!(connection.direction, ConnectionDirection::Outbound);
+        assert_eq!(connection.identity.node_id, NodeId::new("node-b"));
+        assert_eq!(
+            connection.identity.verification,
+            PeerIdentityVerification::Unverified
+        );
         node_a.shutdown().await;
         node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn self_node_id_is_rejected_after_handshake() {
+        let node = Node::new(
+            NodeConfig::new(NodeId::new("same-node"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(1)),
+        );
+        let addr = node.start_listener().await.unwrap();
+
+        assert!(node.connect_to_peer(&addr.to_string()).await.is_err());
+        assert_eq!(node.connected_peer_count().await, 0);
+
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_outbound_attempt_is_rejected_while_handshake_is_pending() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            drop(stream);
+        });
+        let node = Arc::new(Node::new(
+            NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                .with_socket_timeout(Duration::from_secs(2)),
+        ));
+        let first_node = Arc::clone(&node);
+        let first_addr = addr.clone();
+        let first = tokio::spawn(async move { first_node.connect_to_peer(&first_addr).await });
+        accepted_rx.await.unwrap();
+
+        assert!(matches!(
+            node.connect_to_peer(&addr).await,
+            Err(NetError::ConnectionInProgress(endpoint)) if endpoint == addr
+        ));
+
+        let _ = release_tx.send(());
+        assert!(first.await.unwrap().is_err());
+        server.await.unwrap();
+        node.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

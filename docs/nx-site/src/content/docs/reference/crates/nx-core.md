@@ -22,6 +22,7 @@ Everything below that boundary lives here or in the crates it composes.
 | Remote operation application | `sync_manager/apply.rs` |
 | Durable CRDT state and startup hydration | `sync_manager/storage.rs` |
 | Anti-entropy, peer broadcast and reconnect handling | `sync_manager/replication.rs` + `nx-net` |
+| Peer discovery contract and candidate coordination | `discovery.rs`, `sync_manager/candidates.rs` |
 | Schema headers and offline migration support | `sync_manager/schema.rs`, `sync_manager/migration.rs` |
 | Peer health tracking | `sync_manager/peer.rs` |
 | NodeId persistence | `runtime.rs` - `load_or_create_node_id` |
@@ -98,7 +99,7 @@ Runtime::new(config)
 | `new(config)` | Opens sled store, builds wasmtime engine + linker with all host API functions registered, creates `SyncManager` if configured |
 | `start_observability()` | Binds the HTTP metrics endpoint. No-op if not configured |
 | `start_sync()` | Calls `SyncManager::start()`, starts TCP listener + dial loop. No-op if sync disabled |
-| `wait_before_run(dur)` | Repeatedly reconnects configured peers until the deadline. No-op if sync disabled |
+| `wait_before_run(dur)` | Repeatedly reconnects current discovery candidates until the deadline. No-op if sync disabled |
 | `run_module(bytes)` | Compiles or retrieves cached module, builds `HostState`, instantiates, calls `run()` or `_start()` |
 | `control_handle()` | Returns the shared introspection and management handle used by transport adapters |
 | `settle_for(dur)` | Sleeps for `dur`, keeping sync alive. No-op if sync disabled |
@@ -186,6 +187,13 @@ Peers alone do not enable sync - a node must also listen.
 
 `SyncManager` owns the runtime side of replication. It is the bridge between host API calls
 from guest modules and the network layer in `nx-net`.
+
+The default constructor wraps configured peers in `StaticDiscovery` and remains
+backward-compatible. Integrations can use `SyncManager::try_new_with_discovery`
+with named `DiscoveryProvider` values and `DiscoveryRuntimeConfig`. The manager
+keeps one bounded candidate snapshot shared by initial connection, reconnect and
+anti-entropy, while `SyncHandle::active_connections()` exposes transport and
+identity-verification details separately.
 
 Since `v0.1.1`, its implementation is split by responsibility under `sync_manager/`:
 orchestration in `manager.rs`, remote application in `apply.rs`, replication in

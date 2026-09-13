@@ -15,7 +15,10 @@ pub use node::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS, DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig,
     NodeEvent,
 };
-pub use peer::{PeerId, PeerInfo};
+pub use peer::{
+    ConnectionDirection, PeerConnectionInfo, PeerId, PeerIdentity, PeerIdentityVerification,
+    PeerInfo,
+};
 pub use tls::{
     NetStream, NodeId, TestPki, TlsConfig, derive_node_id, generate_ca, generate_self_signed,
     generate_signed, node_id_from_hex, node_id_to_hex, write_cert_files,

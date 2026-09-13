@@ -68,6 +68,7 @@ Node::new(config)
   └── take_event_receiver()     take the event channel before starting
   └── start_listener()          bind TCP, spawn listener task, returns bound SocketAddr
   └── connect_to_peer(addr)     dial, TLS, handshake, register, spawn read loop
+  └── connection_info(addr)     transport, direction and verified/claimed identity
       ...running...
   └── broadcast_ops(ops)        push ops to all connected peers
   └── send_ops_to_addr(addr, ops)
@@ -99,18 +100,18 @@ of the `Node` so the sync manager owns it.
 
 ```
 connect_to_peer(addr)
-  1. acquire semaphore slot (PeerLimitReached if full)
-  2. TCP connect with socket_timeout
-  3. TLS handshake (if configured)
-  4. capture peer_cert DER bytes
-  5. send Hello { node_id, protocol_version, supported_formats, preferred_format }
-  6. receive HelloAck { node_id, protocol_version, selected_format }
-  7. validate protocol version == PROTOCOL_VERSION (4)
-  8. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
-  9. if allowlist configured: verify peer_node_id in allowed_peers
-  10. insert PeerConnection into peers map
-  11. emit PeerConnected event
-  12. spawn read_loop task
+  1. reject a duplicate attempt for the same endpoint and acquire the bounded outbound-attempt slot
+  2. acquire connection semaphore slot (PeerLimitReached if full)
+  3. TCP connect with socket_timeout and retain the actual transport address
+  4. TLS handshake (if configured)
+  5. capture peer_cert DER bytes
+  6. send Hello { node_id, protocol_version, supported_formats, preferred_format }
+  7. receive HelloAck { node_id, protocol_version, selected_format }
+  8. validate protocol version == PROTOCOL_VERSION (4) and reject the local NodeId
+  9. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
+  10. if allowlist configured: verify peer_node_id in allowed_peers
+  11. insert PeerConnection and its `PeerConnectionInfo` into the peers map
+  12. emit PeerConnected event and spawn the read loop
 ```
 
 ### Inbound (listener)
@@ -121,12 +122,17 @@ handle_incoming(stream, addr, context)
   2. receive Hello
   3. validate protocol version
   4. negotiate_serialization_format
-  5. TLS identity binding (same as outbound)
+  5. reject the local NodeId, then perform TLS identity binding (same as outbound)
   6. send HelloAck { node_id, protocol_version, selected_format }
-  7. insert PeerConnection into peers map
+  7. insert PeerConnection and inbound transport metadata into the peers map
   8. emit PeerConnected event
   9. run read_loop inline (not spawned - task already spawned by listener)
 ```
+
+`PeerConnectionInfo` keeps the TCP transport address separate from the outbound
+endpoint that was dialed. It also records inbound/outbound direction and whether
+the handshake NodeId was certificate-bound or unverified. These are runtime
+facts only and do not change the wire format.
 
 ---
 

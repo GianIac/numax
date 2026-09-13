@@ -1,8 +1,9 @@
 use super::*;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::sync_manager::{apply::*, peer::*, replication::*, storage::*};
-use nx_net::NodeEvent;
+use nx_net::{ConnectionDirection, NodeEvent, PeerIdentityVerification};
 use nx_sync::OpKind;
+use std::sync::Mutex as StdMutex;
 use std::time::Instant as StdInstant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
@@ -11,6 +12,68 @@ mod e2e;
 mod support;
 
 use support::*;
+
+struct TestDynamicDiscovery {
+    state: StdMutex<(u64, Vec<String>)>,
+    events: tokio::sync::broadcast::Sender<crate::DiscoveryEvent>,
+}
+
+impl TestDynamicDiscovery {
+    fn empty() -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        Self {
+            state: StdMutex::new((0, Vec::new())),
+            events,
+        }
+    }
+
+    fn add(&self, endpoint: String) {
+        let mut state = self.state.lock().unwrap();
+        state.0 += 1;
+        state.1.push(endpoint.clone());
+        let _ = self.events.send(crate::DiscoveryEvent {
+            revision: state.0,
+            change: crate::DiscoveryChange::Added(endpoint),
+        });
+    }
+
+    fn remove(&self, endpoint: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.0 += 1;
+        state.1.retain(|candidate| candidate != endpoint);
+        let _ = self.events.send(crate::DiscoveryEvent {
+            revision: state.0,
+            change: crate::DiscoveryChange::Removed(endpoint.to_string()),
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::PeerDiscovery for TestDynamicDiscovery {
+    async fn discover(&self) -> Result<crate::DiscoverySnapshot, crate::DiscoveryError> {
+        let state = self.state.lock().unwrap();
+        Ok(crate::DiscoverySnapshot::new(state.0, state.1.clone()))
+    }
+
+    async fn announce(
+        &self,
+        _announcement: &crate::PeerAnnouncement,
+    ) -> Result<(), crate::DiscoveryError> {
+        Err(crate::DiscoveryError::Unsupported {
+            provider: "test-dynamic".to_string(),
+            operation: "announcement",
+        })
+    }
+
+    async fn watch(&self) -> Result<crate::DiscoveryWatch, crate::DiscoveryError> {
+        let state = self.state.lock().unwrap();
+        let events = self.events.subscribe();
+        Ok(crate::DiscoveryWatch::new(
+            crate::DiscoverySnapshot::new(state.0, state.1.clone()),
+            events,
+        ))
+    }
+}
 
 #[test]
 fn crdt_store_keys_roundtrip_through_generic_namespace_helpers() {
@@ -1789,6 +1852,78 @@ async fn reconnect_loop_connects_configured_peer_that_starts_later() {
 
     wait_for_counter(&manager_b, key, 1).await;
     assert_eq!(read_materialized(&store_b, key), 1);
+}
+
+#[tokio::test]
+async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let discovery = Arc::new(TestDynamicDiscovery::empty());
+    let config_a = SyncConfig::new()
+        .with_listen_addr(addr_a)
+        .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50));
+    let mut manager_a = SyncManager::try_new_with_discovery(
+        NodeId::generate(),
+        config_a,
+        temp_store(),
+        metrics(),
+        vec![DiscoveryProvider::new("test-dynamic", discovery.clone())],
+        DiscoveryRuntimeConfig::default(),
+    )
+    .unwrap();
+    manager_a.start().await.unwrap();
+    assert_eq!(manager_a.connected_peer_count().await, 0);
+
+    let config_b = SyncConfig::new().with_listen_addr(addr_b.clone());
+    let (mut manager_b, _handle_b, _store_b) = started_manager_with_config(config_b).await;
+
+    discovery.add(addr_b.clone());
+    wait_for_connected_peer(&manager_a).await;
+
+    let handle_a = manager_a.handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let connections = loop {
+        let connections = handle_a.active_connections().await;
+        if !connections.is_empty() {
+            break connections;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection metadata was not published"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(connections.len(), 1);
+    assert_eq!(
+        connections[0].dialed_endpoint.as_deref(),
+        Some(addr_b.as_str())
+    );
+    assert_eq!(connections[0].direction, ConnectionDirection::Outbound);
+    assert_eq!(
+        connections[0].identity.verification,
+        PeerIdentityVerification::Unverified
+    );
+
+    discovery.remove(&addr_b);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if manager_a.peer_candidates().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "removed discovery candidate remained visible"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        manager_a.connected_peer_count().await,
+        1,
+        "removing a candidate must not terminate an admitted connection"
+    );
+
+    manager_a.shutdown().await.unwrap();
+    manager_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -139,7 +139,7 @@ pub(super) fn test_event_context(
             "127.0.0.1:0",
         ))),
         peer_health,
-        peer_node_ids: Arc::new(RwLock::new(HashMap::new())),
+        active_connections: Arc::new(RwLock::new(HashMap::new())),
         anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
         peer_dead_after_failures: 2,
     }

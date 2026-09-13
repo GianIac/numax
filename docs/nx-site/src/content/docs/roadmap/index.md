@@ -172,12 +172,12 @@ single further CLI command.
 - [x] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery ([contract](/numax/design/discovery-contract/))
 
 **Peer coordination and identity**:
-- [ ] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
-- [ ] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
-- [ ] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
-- [ ] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
-- [ ] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
-- [ ] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown
+- [x] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
+- [x] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
+- [x] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
+- [x] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
+- [x] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
+- [x] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown ([contract](/numax/design/discovery-contract/))
 
 **Initial implementations**:
 - [x] `StaticDiscovery` - peer list from config (backward-compatible)

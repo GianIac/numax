@@ -1,4 +1,5 @@
 mod apply;
+mod candidates;
 mod manager;
 mod migration;
 mod peer;

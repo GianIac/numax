@@ -1,11 +1,124 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 /// Default number of discovery events retained for each provider watch channel.
 pub const DEFAULT_DISCOVERY_EVENT_CAPACITY: usize = 128;
+
+/// Default maximum number of peer candidates retained by the coordinator.
+pub const DEFAULT_MAX_PEER_CANDIDATES: usize = 1024;
+
+/// Default logical cluster used when no explicit discovery scope is supplied.
+pub const DEFAULT_DISCOVERY_CLUSTER: &str = "default";
+
+/// Whether a provider can publish the local advertised endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnouncementSupport {
+    Unsupported,
+    Optional,
+    Required,
+}
+
+/// Runtime policy shared by all discovery sources for one node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryRuntimeConfig {
+    cluster_id: String,
+    advertised_endpoint: Option<String>,
+    max_candidates: usize,
+}
+
+impl Default for DiscoveryRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            cluster_id: DEFAULT_DISCOVERY_CLUSTER.to_string(),
+            advertised_endpoint: None,
+            max_candidates: DEFAULT_MAX_PEER_CANDIDATES,
+        }
+    }
+}
+
+impl DiscoveryRuntimeConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_cluster_id(mut self, cluster_id: impl Into<String>) -> Self {
+        self.cluster_id = cluster_id.into();
+        self
+    }
+
+    pub fn with_advertised_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.advertised_endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_max_candidates(mut self, max_candidates: usize) -> Self {
+        self.max_candidates = max_candidates;
+        self
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub fn advertised_endpoint(&self) -> Option<&str> {
+        self.advertised_endpoint.as_deref()
+    }
+
+    pub fn max_candidates(&self) -> usize {
+        self.max_candidates
+    }
+}
+
+/// A named provider contribution and its optional candidate lease duration.
+#[derive(Clone)]
+pub struct DiscoveryProvider {
+    source_id: String,
+    provider: Arc<dyn PeerDiscovery>,
+    candidate_ttl: Option<Duration>,
+}
+
+impl fmt::Debug for DiscoveryProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryProvider")
+            .field("source_id", &self.source_id)
+            .field("cluster_id", &self.provider.cluster_id())
+            .field("candidate_ttl", &self.candidate_ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveryProvider {
+    pub fn new(source_id: impl Into<String>, provider: Arc<dyn PeerDiscovery>) -> Self {
+        Self {
+            source_id: source_id.into(),
+            provider,
+            candidate_ttl: None,
+        }
+    }
+
+    pub fn with_candidate_ttl(mut self, candidate_ttl: Duration) -> Self {
+        self.candidate_ttl = Some(candidate_ttl);
+        self
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn provider(&self) -> &Arc<dyn PeerDiscovery> {
+        &self.provider
+    }
+
+    pub fn candidate_ttl(&self) -> Option<Duration> {
+        self.candidate_ttl
+    }
+}
 
 /// A complete provider view at one logical revision.
 ///
@@ -194,6 +307,16 @@ impl DiscoveryWatch {
 /// and wire handshake.
 #[async_trait]
 pub trait PeerDiscovery: Send + Sync {
+    /// Logical cluster whose candidates and announcements this provider serves.
+    fn cluster_id(&self) -> &str {
+        DEFAULT_DISCOVERY_CLUSTER
+    }
+
+    /// Declare whether startup must publish an advertised endpoint.
+    fn announcement_support(&self) -> AnnouncementSupport {
+        AnnouncementSupport::Unsupported
+    }
+
     /// Return the provider's complete view at one logical revision.
     async fn discover(&self) -> Result<DiscoverySnapshot, DiscoveryError>;
 
@@ -206,13 +329,18 @@ pub trait PeerDiscovery: Send + Sync {
     /// must not silently discard events. Dropping the returned watch cancels
     /// that subscription.
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError>;
+
+    /// Stop provider-owned work and withdraw announcements made by this node.
+    async fn shutdown(&self) -> Result<(), DiscoveryError> {
+        Ok(())
+    }
 }
 
 /// Backward-compatible discovery provider for explicitly configured peers.
 ///
 /// Static discovery intentionally preserves input order and duplicates. Peer
-/// admission and connection deduplication remain responsibilities of the
-/// existing networking path.
+/// candidate deduplication and connection admission remain responsibilities of
+/// the coordinator and networking path.
 #[derive(Debug)]
 pub struct StaticDiscovery {
     peers: Vec<String>,
