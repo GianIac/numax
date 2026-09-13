@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -443,6 +443,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             print_orset,
             print_rga,
         } => {
+            check_module_path(&module)?;
             let resolved = resolve_node_args(node)?;
             let effective = resolved.effective;
 
@@ -463,7 +464,9 @@ async fn real_main(cli: Cli) -> Result<()> {
             validate_print_rga(&effective.sync, &print_rga)?;
 
             // Read the wasm module
-            let bytes = fs::read(&module)?;
+            let bytes = fs::read(&module).map_err(|e| {
+                anyhow::anyhow!("cannot read WASM module at `{}`: {e}", module.display())
+            })?;
 
             let cfg = runtime_config_from_effective(
                 effective,
@@ -632,6 +635,25 @@ async fn real_main(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Fails early with an actionable message when `nx run` is given a module path
+/// that is missing or is not a file, instead of a bare I/O error from loading.
+fn check_module_path(module: &Path) -> Result<()> {
+    match fs::metadata(module) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "`{}` is not a file; pass the path to a compiled `.wasm` module",
+            module.display()
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => anyhow::bail!(
+            "WASM module not found at `{}`\n\
+             hint: did you build it? (`cargo build --release --target wasm32-unknown-unknown`); \
+             relative paths are resolved from the current directory",
+            module.display()
+        ),
+        Err(e) => anyhow::bail!("cannot read WASM module at `{}`: {e}", module.display()),
+    }
+}
+
 fn parse_nonzero_u32(input: &str) -> Result<NonZeroU32> {
     let value = input.parse::<u32>()?;
     NonZeroU32::new(value).ok_or_else(|| anyhow::anyhow!("value must be greater than zero"))
@@ -646,6 +668,40 @@ fn parse_nonzero_byte_size(input: &str) -> Result<NonZeroUsize> {
 mod tests {
     use super::*;
     use nx_core::{SerializationFormat, SyncConfig, TlsConfig};
+
+    mod check_module_path {
+        use super::*;
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("nx-cli-module-path-{name}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn missing_module_names_the_path_and_hints_at_building() {
+            let path = temp_dir("missing").join("does_not_exist.wasm");
+            let err = check_module_path(&path).unwrap_err().to_string();
+            assert!(err.contains("WASM module not found at"), "{err}");
+            assert!(err.contains("does_not_exist.wasm"), "{err}");
+            assert!(err.contains("hint: did you build it?"), "{err}");
+        }
+
+        #[test]
+        fn directory_is_rejected_as_not_a_file() {
+            let dir = temp_dir("dir");
+            let err = check_module_path(&dir).unwrap_err().to_string();
+            assert!(err.contains("is not a file"), "{err}");
+        }
+
+        #[test]
+        fn existing_file_is_accepted() {
+            let path = temp_dir("file").join("module.wasm");
+            fs::write(&path, b"\0asm").unwrap();
+            assert!(check_module_path(&path).is_ok());
+        }
+    }
     use std::path::PathBuf;
 
     fn p(s: &str) -> Option<PathBuf> {
