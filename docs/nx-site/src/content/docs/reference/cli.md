@@ -9,6 +9,7 @@ description: Reference for the `nx` command line interface.
 - `nx serve` - run a node without executing a WASM module
 - `nx config` - manage configuration files
 - `nx migrate` - migrate a datastore schema offline
+- `nx completions` - generate shell completion scripts
 
 ---
 
@@ -128,6 +129,30 @@ CLI flags > NX_* environment variables > TOML config file > runtime defaults
 ```
 
 ---
+
+
+
+---
+
+## nx completions
+
+```
+nx completions <SHELL>
+```
+
+Generates shell completion scripts for the Numax CLI.
+
+### Arguments
+
+| Argument | Description | Values |
+|---|---|---|
+| `<SHELL>` | Target shell for completions | `bash`, `elvish`, `fish`, `powershell`, `zsh` |
+
+Example:
+
+```bash
+nx completions zsh > ~/.zfunc/_nx
+```
 
 ## nx migrate
 
