@@ -3,7 +3,7 @@ title: CLI
 description: Reference for the `nx` command line interface.
 ---
 
-`nx` is the Numax command line interface. It has four commands:
+`nx` is the Numax command line interface. It has five commands:
 
 - `nx run` - load and execute a WASM module
 - `nx serve` - run a node without executing a WASM module
@@ -127,10 +127,6 @@ the resolution order is:
 ```
 CLI flags > NX_* environment variables > TOML config file > runtime defaults
 ```
-
----
-
-
 
 ---
 
