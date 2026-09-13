@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::{Future, pending};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -309,14 +310,16 @@ async fn run_bootstrap(
             if let Some(endpoint) = &announcement {
                 request = request.with_advertised_endpoint(endpoint.clone());
             }
-            let result = tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-                result = client.query(seed, request) => result,
+            let Some(result) = await_query_with_expiry(
+                client.query(seed, request),
+                &config,
+                &mut views,
+                &state,
+                &mut shutdown_rx,
+            )
+            .await
+            else {
+                return;
             };
             match result {
                 Ok(response) => {
@@ -358,16 +361,16 @@ async fn run_bootstrap(
                     tracing::debug!(%error, %seed, "bootstrap seed query failed");
                 }
             }
+            publish_views(&config, &mut views, &state);
         }
 
-        let now = Instant::now();
-        views.retain(|_, view| view.expires_at > now);
-        state.replace(flatten_views(&config.seeds, &views, config.max_candidates));
-        let base_delay = if any_success {
-            config.refresh_interval
-        } else {
-            retry_delay.max(retry_after.unwrap_or(Duration::ZERO))
-        };
+        publish_views(&config, &mut views, &state);
+        let base_delay = next_probe_delay(
+            any_success,
+            config.refresh_interval,
+            retry_delay,
+            retry_after,
+        );
         let next_expiry = views.values().map(|view| view.expires_at).min();
         let deadline = next_expiry
             .map(|expiry| expiry.min(Instant::now() + base_delay))
@@ -391,6 +394,64 @@ async fn run_bootstrap(
             retry_delay.saturating_mul(2).min(config.retry_max)
         };
     }
+}
+
+fn next_probe_delay(
+    any_success: bool,
+    refresh_interval: Duration,
+    retry_delay: Duration,
+    retry_after: Option<Duration>,
+) -> Duration {
+    let delay = if any_success {
+        refresh_interval
+    } else {
+        retry_delay
+    };
+    delay.max(retry_after.unwrap_or(Duration::ZERO))
+}
+
+async fn await_query_with_expiry<F, T>(
+    query: F,
+    config: &BootstrapGossipDiscoveryConfig,
+    views: &mut HashMap<String, SeedView>,
+    state: &DynamicState,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(query);
+    loop {
+        let next_expiry = views.values().map(|view| view.expires_at).min();
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
+            result = &mut query => return Some(result),
+            _ = sleep_until_optional(next_expiry) => {
+                publish_views(config, views, state);
+            }
+        }
+    }
+}
+
+async fn sleep_until_optional(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
+}
+
+fn publish_views(
+    config: &BootstrapGossipDiscoveryConfig,
+    views: &mut HashMap<String, SeedView>,
+    state: &DynamicState,
+) {
+    let now = Instant::now();
+    views.retain(|_, view| view.expires_at > now);
+    state.replace(flatten_views(&config.seeds, views, config.max_candidates));
 }
 
 fn flatten_views(
@@ -511,6 +572,57 @@ mod tests {
         assert!(validate_config(&config).is_err());
     }
 
+    #[test]
+    fn successful_seed_does_not_override_another_seeds_retry_after() {
+        assert_eq!(
+            next_probe_delay(
+                true,
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                Some(Duration::from_secs(30)),
+            ),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_view_expires_while_a_seed_query_is_stalled() {
+        let config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+        let state = DynamicState::new(8);
+        state.replace(vec!["peer:9000".into()]);
+        let mut watch = state.watch();
+        let mut views = HashMap::from([(
+            "seed:9000".into(),
+            SeedView {
+                endpoints: vec!["peer:9000".into()],
+                expires_at: Instant::now() + Duration::from_millis(10),
+            },
+        )]);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let wait = await_query_with_expiry(
+            std::future::pending::<()>(),
+            &config,
+            &mut views,
+            &state,
+            &mut shutdown_rx,
+        );
+        tokio::pin!(wait);
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut wait => panic!("pending query unexpectedly completed"),
+                event = watch.recv() => event.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            event.change,
+            super::super::DiscoveryChange::Replaced(Vec::new())
+        );
+    }
+
     #[tokio::test]
     async fn provider_learns_candidates_and_withdraws_its_announcement() {
         let seed = Node::new(
@@ -559,5 +671,70 @@ mod tests {
             .unwrap();
         assert_eq!(response.endpoints, [bound.to_string()]);
         seed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_expires_candidates_and_recovers_after_seed_restart() {
+        let server_config = BootstrapServerConfig::new("cluster-a")
+            .unwrap()
+            .with_candidate_ttl(Duration::from_millis(40))
+            .unwrap();
+        let seed = Node::new(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
+                .with_bootstrap_server(server_config.clone()),
+        );
+        let bound = seed.start_listener().await.unwrap();
+        seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
+
+        let mut client_config = BootstrapClientConfig::new(NodeId::new("client"));
+        client_config.max_response_candidates = 4;
+        let mut config = BootstrapGossipDiscoveryConfig::new(vec![bound.to_string()]);
+        config.cluster_id = "cluster-a".into();
+        config.max_candidates = 4;
+        config.refresh_interval = Duration::from_millis(10);
+        config.retry_initial = Duration::from_millis(10);
+        config.retry_max = Duration::from_millis(20);
+        config.stale_after = Duration::from_millis(40);
+        let provider = BootstrapGossipDiscovery::new(config, client_config).unwrap();
+        let mut watch = provider.watch().await.unwrap();
+
+        let discovered = tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            discovered.change,
+            super::super::DiscoveryChange::Replaced(vec![bound.to_string()])
+        );
+
+        seed.shutdown().await;
+        let expired = tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            expired.change,
+            super::super::DiscoveryChange::Replaced(Vec::new())
+        );
+
+        let restarted = Node::new(
+            NodeConfig::new(NodeId::new("seed-restarted"), bound.to_string())
+                .with_bootstrap_server(server_config),
+        );
+        restarted.start_listener().await.unwrap();
+        restarted
+            .announce_bootstrap_endpoint(bound.to_string())
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.change,
+            super::super::DiscoveryChange::Replaced(vec![bound.to_string()])
+        );
+
+        provider.shutdown().await.unwrap();
+        restarted.shutdown().await;
     }
 }

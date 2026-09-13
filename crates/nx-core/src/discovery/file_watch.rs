@@ -368,15 +368,18 @@ mod tests {
         );
 
         replace_file(&path, "valid.example:3\nnot-an-endpoint\n").await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(read_peer_file(&discovery.inner.config).await.is_err());
+
+        tokio::fs::write(&path, [0xff, 0xfe]).await.unwrap();
+        assert!(read_peer_file(&discovery.inner.config).await.is_err());
+        replace_file(&path, "recovered.example:5\n").await;
+        let recovered = tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            discovery.inner.state.snapshot().peers(),
-            ["b.example:2", "a.example:1"]
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), watch.recv())
-                .await
-                .is_err()
+            recovered.change,
+            super::super::DiscoveryChange::Replaced(vec!["recovered.example:5".into()])
         );
 
         tokio::fs::remove_file(&path).await.unwrap();

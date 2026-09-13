@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hickory_resolver::TokioResolver;
+use hickory_resolver::net::{DnsError, NetError as DnsNetError};
 use hickory_resolver::proto::rr::rdata::SRV;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use tokio::sync::watch;
@@ -49,6 +50,20 @@ struct SrvAnswer {
     valid_until: Instant,
 }
 
+#[async_trait]
+trait SrvResolver: Send + Sync {
+    async fn lookup(&self, config: &DnsSrvDiscoveryConfig) -> Result<SrvAnswer, DiscoveryError>;
+}
+
+struct HickorySrvResolver(TokioResolver);
+
+#[async_trait]
+impl SrvResolver for HickorySrvResolver {
+    async fn lookup(&self, config: &DnsSrvDiscoveryConfig) -> Result<SrvAnswer, DiscoveryError> {
+        lookup(config, &self.0).await
+    }
+}
+
 struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
@@ -58,7 +73,7 @@ struct Lifecycle {
 struct Inner {
     config: DnsSrvDiscoveryConfig,
     state: Arc<DynamicState>,
-    resolver: TokioResolver,
+    resolver: Arc<dyn SrvResolver>,
     lifecycle: StdMutex<Lifecycle>,
 }
 
@@ -98,10 +113,13 @@ impl DnsSrvDiscovery {
                     false,
                 )
             })?;
-        Ok(Self::with_resolver(config, resolver))
+        Ok(Self::with_resolver(
+            config,
+            Arc::new(HickorySrvResolver(resolver)),
+        ))
     }
 
-    fn with_resolver(config: DnsSrvDiscoveryConfig, resolver: TokioResolver) -> Self {
+    fn with_resolver(config: DnsSrvDiscoveryConfig, resolver: Arc<dyn SrvResolver>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Arc::new(DynamicState::new(config.event_capacity)),
@@ -200,7 +218,7 @@ impl PeerDiscovery for DnsSrvDiscovery {
 
 async fn run_dns_refresh(
     config: DnsSrvDiscoveryConfig,
-    resolver: TokioResolver,
+    resolver: Arc<dyn SrvResolver>,
     state: Arc<DynamicState>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -212,15 +230,18 @@ async fn run_dns_refresh(
                 if changed.is_err() || *shutdown.borrow() { break; }
             }
             _ = tokio::time::sleep_until(next_refresh) => {
-                match lookup(&config, &resolver).await {
-                    Ok(answer) => {
-                        state.replace(records_to_peers(answer.records, config.max_candidates));
-                        let now = Instant::now();
-                        valid_until = Some(answer.valid_until);
-                        next_refresh = answer.valid_until.min(now + config.max_refresh_interval);
-                        if next_refresh <= now {
-                            next_refresh = now + config.retry_interval;
+                let result = tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
                         }
+                        continue;
+                    }
+                    result = resolver.lookup(&config) => result,
+                };
+                match result {
+                    Ok(answer) => {
+                        (valid_until, next_refresh) = apply_dns_answer(&config, &state, answer);
                     }
                     Err(error) => {
                         let now = Instant::now();
@@ -228,12 +249,29 @@ async fn run_dns_refresh(
                             state.replace(Vec::new());
                         }
                         tracing::warn!(%error, name = %config.service_name, "DNS-SRV discovery refresh failed");
-                        next_refresh = now + config.retry_interval;
+                        next_refresh = retry_deadline(now, config.retry_interval, valid_until);
                     }
                 }
             }
         }
     }
+}
+
+fn apply_dns_answer(
+    config: &DnsSrvDiscoveryConfig,
+    state: &DynamicState,
+    answer: SrvAnswer,
+) -> (Option<Instant>, Instant) {
+    let now = Instant::now();
+    if answer.valid_until <= now {
+        state.replace(Vec::new());
+        return (None, now + config.retry_interval);
+    }
+    state.replace(records_to_peers(answer.records, config.max_candidates));
+    (
+        Some(answer.valid_until),
+        answer.valid_until.min(now + config.max_refresh_interval),
+    )
 }
 
 async fn lookup(
@@ -242,15 +280,33 @@ async fn lookup(
 ) -> Result<SrvAnswer, DiscoveryError> {
     match inner_lookup(config, resolver).await {
         Ok(answer) => Ok(answer),
-        Err(error) if error.is_no_records_found() => Ok(SrvAnswer {
-            records: Vec::new(),
-            valid_until: Instant::now() + config.max_refresh_interval,
-        }),
+        Err(DnsNetError::Dns(DnsError::NoRecordsFound(no_records))) => {
+            let negative_ttl =
+                bounded_negative_ttl(no_records.negative_ttl, config.max_refresh_interval);
+            Ok(SrvAnswer {
+                records: Vec::new(),
+                valid_until: Instant::now() + negative_ttl,
+            })
+        }
         Err(error) => Err(provider_error(
             format!("lookup of {} failed: {error}", config.service_name),
             true,
         )),
     }
+}
+
+fn retry_deadline(now: Instant, retry_interval: Duration, valid_until: Option<Instant>) -> Instant {
+    valid_until
+        .filter(|deadline| *deadline > now)
+        .map(|deadline| deadline.min(now + retry_interval))
+        .unwrap_or(now + retry_interval)
+}
+
+fn bounded_negative_ttl(negative_ttl: Option<u32>, max_refresh_interval: Duration) -> Duration {
+    negative_ttl
+        .map(|seconds| Duration::from_secs(u64::from(seconds)))
+        .unwrap_or(max_refresh_interval)
+        .min(max_refresh_interval)
 }
 
 async fn inner_lookup(
@@ -362,9 +418,53 @@ fn provider_error(message: impl Into<String>, retryable: bool) -> DiscoveryError
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use hickory_resolver::proto::rr::Name;
 
     use super::*;
+
+    enum ResolverStep {
+        Success(Vec<SRV>, Duration),
+        TransientFailure,
+    }
+
+    struct SequenceResolver {
+        steps: Mutex<VecDeque<ResolverStep>>,
+    }
+
+    #[async_trait]
+    impl SrvResolver for SequenceResolver {
+        async fn lookup(
+            &self,
+            _config: &DnsSrvDiscoveryConfig,
+        ) -> Result<SrvAnswer, DiscoveryError> {
+            let step = self.steps.lock().unwrap().pop_front();
+            match step {
+                Some(ResolverStep::Success(records, ttl)) => Ok(SrvAnswer {
+                    records,
+                    valid_until: Instant::now() + ttl,
+                }),
+                Some(ResolverStep::TransientFailure) => {
+                    Err(provider_error("temporary resolver failure", true))
+                }
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct PendingResolver;
+
+    #[async_trait]
+    impl SrvResolver for PendingResolver {
+        async fn lookup(
+            &self,
+            _config: &DnsSrvDiscoveryConfig,
+        ) -> Result<SrvAnswer, DiscoveryError> {
+            std::future::pending().await
+        }
+    }
 
     #[test]
     fn srv_records_are_bounded_deduplicated_and_deterministic() {
@@ -401,5 +501,114 @@ mod tests {
 
         assert!(DnsSrvDiscovery::new(DnsSrvDiscoveryConfig::new("_numax.example.")).is_err());
         assert!(DnsSrvDiscovery::new(DnsSrvDiscoveryConfig::new("_numax._http.example.")).is_err());
+    }
+
+    #[test]
+    fn transient_retry_never_outlives_the_last_valid_view() {
+        let now = Instant::now();
+        let valid_until = now + Duration::from_secs(2);
+
+        assert_eq!(
+            retry_deadline(now, Duration::from_secs(30), Some(valid_until)),
+            valid_until
+        );
+        assert_eq!(
+            retry_deadline(now, Duration::from_secs(1), Some(valid_until)),
+            now + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn negative_dns_ttl_is_preserved_and_bounded() {
+        assert_eq!(
+            bounded_negative_ttl(Some(30), Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            bounded_negative_ttl(Some(120), Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            bounded_negative_ttl(None, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn already_expired_answers_are_not_published() {
+        let config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        let state = DynamicState::new(8);
+        state.replace(vec!["stale.example:9000".into()]);
+        let answer = SrvAnswer {
+            records: vec![SRV::new(
+                0,
+                0,
+                9001,
+                Name::from_ascii("expired.example.").unwrap(),
+            )],
+            valid_until: Instant::now(),
+        };
+
+        let (valid_until, _) = apply_dns_answer(&config, &state, answer);
+
+        assert!(valid_until.is_none());
+        assert!(state.snapshot().peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_expires_stale_data_and_recovers_after_a_transient_error() {
+        let first = SRV::new(0, 0, 9001, Name::from_ascii("first.example.").unwrap());
+        let second = SRV::new(0, 0, 9002, Name::from_ascii("second.example.").unwrap());
+        let resolver = Arc::new(SequenceResolver {
+            steps: Mutex::new(VecDeque::from([
+                ResolverStep::Success(vec![first], Duration::from_millis(20)),
+                ResolverStep::TransientFailure,
+                ResolverStep::Success(vec![second], Duration::from_secs(1)),
+            ])),
+        });
+        let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        config.retry_interval = Duration::from_millis(10);
+        let provider = DnsSrvDiscovery::with_resolver(config, resolver);
+        let mut watch = provider.watch().await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.change,
+            super::super::DiscoveryChange::Replaced(vec!["first.example:9001".into()])
+        );
+        let expired = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            expired.change,
+            super::super::DiscoveryChange::Replaced(Vec::new())
+        );
+        let recovered = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.change,
+            super::super::DiscoveryChange::Replaced(vec!["second.example:9002".into()])
+        );
+
+        provider.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_lookup() {
+        let config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        let provider = DnsSrvDiscovery::with_resolver(config, Arc::new(PendingResolver));
+        provider.watch().await.unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(1), provider.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

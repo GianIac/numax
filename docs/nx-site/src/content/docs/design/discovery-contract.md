@@ -127,7 +127,9 @@ followed by the seed's bounded, deduplicated suggestions. Views from multiple
 seeds are flattened in configured seed order and deduplicated again. Returned
 entries expire at the earlier of the seed-provided lease and the provider's
 `stale_after` bound. Failed probes retain an unexpired last valid view; expired
-views are removed.
+views are removed at their deadline even while another seed query is still in
+flight. Each successful seed response is published without waiting for the
+remaining seeds in the refresh pass.
 
 Probe failures use exponential retry bounded by `retry_initial` and
 `retry_max`; a success restores `refresh_interval`. Fatal wire failures such as
@@ -152,8 +154,9 @@ exact `cluster` TXT property match. This two-part filter prevents accidental
 cross-cluster discovery; neither value is authentication evidence.
 
 Resolved instances retain first-observation order. Addresses within an
-instance are sorted and deduplicated; instances and the flattened candidate
-view are both bounded. Port zero, unspecified and multicast addresses, and
+instance are sorted, deduplicated and limited to `max_candidates` before they
+enter retained provider state; the instance count and flattened candidate view
+are bounded separately. Port zero, unspecified and multicast addresses, and
 IPv6 link-local addresses without a usable scope are ignored. A DNS-SD removal
 event removes the complete instance contribution; expiry is delegated to the
 mDNS daemon's cache and removal events.
@@ -181,7 +184,8 @@ the DNS validity deadline and is capped by `max_refresh_interval`. A successful
 empty or no-record answer removes the previous view. A transient lookup error
 keeps the last valid view only until its DNS validity deadline, then removes it
 while retrying at `retry_interval`. DNS-SRV does not support announcements.
-Shutdown stops and joins the refresh task.
+Shutdown cancels an in-flight resolver lookup, then stops and joins the refresh
+task.
 
 ### FileWatchDiscovery
 
@@ -273,3 +277,33 @@ compatibility boundary.
 Provider construction is currently a Rust integration API. CLI, environment
 and `numax.toml` selection of `bootstrap`, `mdns`, `dns-srv` and `file` modes is
 separate roadmap work; `--peer` continues to select static discovery.
+
+## Verification coverage
+
+Deterministic unit and component tests cover static compatibility, bounded
+watch overflow, snapshot revision continuity, late candidate arrival,
+overlapping source contributions, source removal, startup rollback and
+cancellation-safe shutdown. Provider-specific tests additionally cover:
+
+- bootstrap TTL expiry during a stalled seed query, bounded responses,
+  authenticated TLS/allowlist rejection, seed loss, restart and withdrawal;
+- DNS-SRV ordering, filtering, refresh, validity expiry, transient failure,
+  recovery and cancellation of an in-flight lookup;
+- file creation and removal, atomic replacement, malformed and non-UTF-8
+  updates, last-good retention, recovery and shutdown;
+- mDNS address and instance bounds, self filtering, removal and service-name
+  conflicts.
+
+The ignored
+`discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint`
+test exercises two real DNS-SD daemons over local multicast, including goodbye
+removal. Run it on a multicast-capable host with:
+
+```sh
+cargo test -p nx-core \
+  discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint \
+  -- --ignored --exact
+```
+
+The three-node CRDT LAN demo remains the release closing criterion and is not
+substituted by this two-daemon provider test.

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -373,13 +373,11 @@ async fn run_mdns_browse(
             event = events.recv_async() => match event {
                 Ok(ServiceEvent::ServiceResolved(service)) => {
                     let fullname = service.get_fullname().to_string();
-                    let mut endpoints = service
-                        .get_addresses()
-                        .iter()
-                        .filter_map(|address| dialable_mdns_address(address.to_ip_addr(), service.get_port()))
-                        .collect::<Vec<_>>();
-                    endpoints.sort();
-                    endpoints.dedup();
+                    let endpoints = bounded_mdns_endpoints(
+                        service.get_addresses().iter().map(|address| address.to_ip_addr()),
+                        service.get_port(),
+                        config.max_candidates,
+                    );
                     let matches_fullname = own_fullname.lock().unwrap_or_else(|error| error.into_inner())
                         .as_ref().is_some_and(|own| own == &fullname);
                     let matches_endpoint = own_endpoint.lock().unwrap_or_else(|error| error.into_inner())
@@ -516,6 +514,23 @@ fn dialable_mdns_address(address: IpAddr, port: u16) -> Option<String> {
     Some(SocketAddr::new(address, port).to_string())
 }
 
+fn bounded_mdns_endpoints(
+    addresses: impl IntoIterator<Item = IpAddr>,
+    port: u16,
+    max_candidates: usize,
+) -> Vec<String> {
+    let mut endpoints = BTreeSet::new();
+    for address in addresses {
+        if let Some(endpoint) = dialable_mdns_address(address, port) {
+            endpoints.insert(endpoint);
+            if endpoints.len() > max_candidates {
+                endpoints.pop_last();
+            }
+        }
+    }
+    endpoints.into_iter().collect()
+}
+
 fn cluster_service_type(cluster_id: &str) -> String {
     let hash = blake3::hash(cluster_id.as_bytes()).to_hex();
     format!("_c{}._sub.{SERVICE_BASE}", &hash[..16])
@@ -610,6 +625,8 @@ fn provider_error(message: impl Into<String>, retryable: bool) -> DiscoveryError
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -646,6 +663,21 @@ mod tests {
     }
 
     #[test]
+    fn resolved_instance_addresses_are_bounded_and_deterministic() {
+        let addresses = [
+            "127.0.0.3".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.2".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            bounded_mdns_endpoints(addresses, 9000, 2),
+            ["127.0.0.1:9000", "127.0.0.2:9000"]
+        );
+    }
+
+    #[test]
     fn rejected_resolution_removes_a_previously_accepted_instance() {
         let mut instances = HashMap::from([(
             "peer._numax._tcp.local.".into(),
@@ -677,5 +709,57 @@ mod tests {
             own_fullname.into_inner().unwrap(),
             Some("node (2)._numax._tcp.local.".into())
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local multicast mDNS networking"]
+    async fn two_daemons_discover_and_remove_an_announced_endpoint() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let suffix = format!("{}-{nonce}", std::process::id());
+        let cluster = format!("mdns-test-{suffix}");
+        let mut publisher_config = MdnsDiscoveryConfig::new(format!("publisher-{suffix}"));
+        publisher_config.cluster_id = cluster.clone();
+        let mut observer_config = MdnsDiscoveryConfig::new(format!("observer-{suffix}"));
+        observer_config.cluster_id = cluster;
+        let publisher = MdnsDiscovery::new(publisher_config).unwrap();
+        let observer = MdnsDiscovery::new(observer_config).unwrap();
+        let endpoint = "127.0.0.1:43111";
+        let mut watch = observer.watch().await.unwrap();
+
+        publisher
+            .announce(&PeerAnnouncement {
+                endpoint: endpoint.into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if watch.recv().await.unwrap().change
+                    == super::super::DiscoveryChange::Replaced(vec![endpoint.into()])
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        publisher.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if watch.recv().await.unwrap().change
+                    == super::super::DiscoveryChange::Replaced(Vec::new())
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        observer.shutdown().await.unwrap();
     }
 }

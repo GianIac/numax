@@ -198,9 +198,9 @@ single further CLI command.
 - [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.
 
 **Acceptance tests**:
-- [ ] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
-- [ ] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
-- [ ] Real LAN mDNS checks, TLS rejection and reconnection after restart; justify and validate additional provider dependencies
+- [x] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
+- [x] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
+- [ ] Automate the environment-gated LAN mDNS check alongside the existing TLS rejection and reconnection-after-restart coverage; provider dependencies are justified in the discovery contract
 
 **Closing criterion**:
 > All five providers pass their acceptance tests. Three nodes on the same LAN discover each other via mDNS without any `--peer` flag, replicate a CRDT update and recover after reconnection within the declared retention window. Reproducible demo in `examples/discovery_lan/`.
