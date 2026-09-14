@@ -48,6 +48,15 @@ pub enum NetError {
     #[error("peer connection limit reached: {0}")]
     PeerLimitReached(usize),
 
+    #[error("outbound connection attempt limit reached: {0}")]
+    ConnectionAttemptLimitReached(usize),
+
+    #[error("connection attempt already in progress for peer: {0}")]
+    ConnectionInProgress(String),
+
+    #[error("refusing connection to local node ID: {0}")]
+    SelfConnection(String),
+
     #[error("node ID mismatch: expected {expected}, got {got}")]
     NodeIdMismatch { expected: String, got: String },
 }

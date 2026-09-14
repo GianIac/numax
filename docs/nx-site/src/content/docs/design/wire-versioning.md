@@ -5,10 +5,14 @@ description: Rules for evolving the Numax peer protocol safely.
 
 ## Purpose
 
-`PROTOCOL_VERSION` identifies the wire contract used between Numax peers and It is
+`PROTOCOL_VERSION` identifies the wire contract used between Numax peers and is
 independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
+
+For the `v0.1.5` development line the value is `5`. Version `5` adds the
+one-shot bootstrap handshake described below; it is not wire-compatible with
+the version `4` protocol shipped by `v0.1.4`.
 
 ## Compatibility policy
 
@@ -81,3 +85,65 @@ Numax supports bincode and JSON, compatibility must be evaluated for both:
   is established.
 
 Never reuse a protocol version for a different wire contract.
+
+## Protocol 5 bootstrap exchange
+
+Protocol `5` adds `BootstrapHello` and `BootstrapAck` after the existing
+`MessageKind` variants and adds `WireError::BootstrapRejected`. A bootstrap
+exchange is an alternative one-shot handshake on the normal peer listener; it
+does not turn into a replication connection.
+
+```text
+client -> seed: BootstrapHello {
+  node_id,
+  protocol_version: 5,
+  supported_formats,
+  preferred_format,
+  cluster_id,
+  advertised_endpoint?,
+  max_results
+}
+
+seed -> client: BootstrapAck {
+  node_id,
+  protocol_version: 5,
+  selected_format,
+  cluster_id,
+  candidates,
+  candidate_ttl_ms
+}
+```
+
+The seed validates the exact protocol version, negotiates JSON or Bincode,
+authenticates the requester's claimed `NodeId` through the same TLS certificate
+binding and allowlist policy as a normal handshake, and requires an exact
+cluster ID match. It validates any advertised endpoint before caching it. The
+request's `max_results`, the server response limit and the server cache limit
+bound the exchange independently.
+
+The client validates the seed's protocol version, selected format, cluster ID,
+authenticated identity, response length, candidate lease and every endpoint.
+Duplicate endpoints, wildcard hosts, port zero and malformed responses reject
+the complete response. Successful completion closes the one-shot connection;
+it neither registers the seed as an active replication peer nor emits a peer
+connection event.
+
+Only the requester's identity and the responding seed's identity are covered by
+that exchange. The returned endpoint strings are untrusted discovery
+candidates. Dialing one later requires a new normal `Hello`/`HelloAck`, TLS
+identity check, allowlist decision and connection-slot admission.
+
+### Version 4 boundary
+
+Normal `Hello` exchanges between versions `4` and `5` carry a readable version
+field and are rejected with `ProtocolMismatch` before peer registration or CRDT
+traffic. A version `4` decoder does not know the new bootstrap variants and may
+close a `BootstrapHello` as an invalid message rather than returning a
+structured mismatch; this is still a safe rejection and never admits a peer.
+Static peer configuration remains source-compatible but does not make mixed
+version `4`/`5` clusters wire-compatible.
+
+Both JSON and Bincode round trips, exact-version rejection and Bincode golden
+hashes cover the version `5` message set. Multiprocess compatibility coverage
+uses the previous `v0.1.4` binary to verify safe rejection at the normal
+handshake boundary.

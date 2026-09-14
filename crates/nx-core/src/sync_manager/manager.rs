@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::AtomicU64};
 
-use nx_net::{Node, NodeConfig};
+use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
 use tokio::sync::{RwLock, mpsc, watch};
@@ -10,7 +10,11 @@ use tracing::{debug, info, warn};
 
 use crate::observability::RuntimeMetrics;
 use crate::sync_config::SyncConfig;
+use crate::{
+    DEFAULT_MAX_PEER_CANDIDATES, DiscoveryProvider, DiscoveryRuntimeConfig, StaticDiscovery,
+};
 
+use super::candidates::DiscoveryCoordinator;
 use super::peer::{
     ConfiguredPeerConnectContext, ConfiguredPeerConnectOutcome, PeerHealth, PeerHealthState,
     normalize_peer_dead_after_failures,
@@ -41,7 +45,7 @@ pub struct SyncHandle {
     rgas: Arc<RwLock<HashMap<String, Rga>>>,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
-    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+    active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
 }
 
 impl SyncHandle {
@@ -97,13 +101,25 @@ impl SyncHandle {
 
     /// Connected peers known to the sync manager, as `(addr, node_id)` pairs.
     pub async fn connected_peers(&self) -> Vec<(String, NodeId)> {
-        let peers = self.peer_node_ids.read().await;
+        let peers = self.active_connections.read().await;
         let mut peers = peers
             .iter()
-            .map(|(addr, node_id)| (addr.clone(), node_id.clone()))
+            .map(|(addr, connection)| (addr.clone(), connection.identity.node_id.clone()))
             .collect::<Vec<_>>();
         peers.sort_by(|(addr_a, _), (addr_b, _)| addr_a.cmp(addr_b));
         peers
+    }
+
+    /// Active transport connections with handshake identity verification details.
+    pub async fn active_connections(&self) -> Vec<PeerConnectionInfo> {
+        let connections = self.active_connections.read().await;
+        let mut connections = connections.values().cloned().collect::<Vec<_>>();
+        connections.sort_by(|left, right| {
+            left.transport_addr
+                .cmp(&right.transport_addr)
+                .then_with(|| left.dialed_endpoint.cmp(&right.dialed_endpoint))
+        });
+        connections
     }
 }
 
@@ -113,6 +129,15 @@ pub struct SyncManager {
 
     /// SyncConfig
     config: SyncConfig,
+
+    /// Discovery sources whose contributions feed the shared candidate set.
+    discovery_providers: Vec<DiscoveryProvider>,
+
+    /// Discovery coordination, validation, and bound policy.
+    discovery_config: DiscoveryRuntimeConfig,
+
+    /// Owner of provider watches and the live peer candidate registry.
+    discovery_coordinator: Option<DiscoveryCoordinator>,
 
     /// Network node. Wrapped in `Arc` so the broadcast drain task spawned
     /// by `start` can share ownership with the manager.
@@ -154,11 +179,11 @@ pub struct SyncManager {
     /// Monotonic sequence used to retain recent durable operation-log entries.
     op_log_next_sequence: Arc<AtomicU64>,
 
-    /// Health state for configured peers, keyed by configured address.
+    /// Health state for current discovery candidates, keyed by dial endpoint.
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 
-    /// Connected configured peer NodeIds, keyed by configured address.
-    peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+    /// Active connections, keyed by the address used by the network node.
+    active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
 
     /// Last received OpId per peer NodeId, used for incremental anti-entropy pulls.
     anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
@@ -207,6 +232,31 @@ impl SyncManager {
         store: Arc<NxStore>,
         metrics: Arc<RuntimeMetrics>,
     ) -> anyhow::Result<Self> {
+        let static_discovery = Arc::new(StaticDiscovery::new(config.peers.clone()));
+        // Explicit peers were accepted as a finite caller-owned list before the
+        // discovery coordinator existed. Keep that compatibility while retaining
+        // the configured bound for every dynamic-discovery construction path.
+        let discovery_config = DiscoveryRuntimeConfig::default()
+            .with_max_candidates(DEFAULT_MAX_PEER_CANDIDATES.max(config.peers.len()));
+        Self::try_new_with_discovery(
+            node_id,
+            config,
+            store,
+            metrics,
+            vec![DiscoveryProvider::new("static", static_discovery)],
+            discovery_config,
+        )
+    }
+
+    /// Create a manager with explicitly owned discovery sources and policy.
+    pub fn try_new_with_discovery(
+        node_id: NodeId,
+        config: SyncConfig,
+        store: Arc<NxStore>,
+        metrics: Arc<RuntimeMetrics>,
+        discovery_providers: Vec<DiscoveryProvider>,
+        discovery_config: DiscoveryRuntimeConfig,
+    ) -> anyhow::Result<Self> {
         ensure_sync_schema(&store)?;
 
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
@@ -244,6 +294,9 @@ impl SyncManager {
         Ok(Self {
             node_id,
             config,
+            discovery_providers,
+            discovery_config,
+            discovery_coordinator: None,
             node: None,
             counters,
             pncounters,
@@ -258,7 +311,7 @@ impl SyncManager {
             op_log: Arc::new(RwLock::new(op_log)),
             op_log_next_sequence: Arc::new(AtomicU64::new(op_log_next_sequence)),
             peer_health: Arc::new(RwLock::new(peer_health)),
-            peer_node_ids: Arc::new(RwLock::new(HashMap::new())),
+            active_connections: Arc::new(RwLock::new(HashMap::new())),
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
             op_tx,
             op_rx: Some(op_rx),
@@ -298,7 +351,7 @@ impl SyncManager {
             rgas: Arc::clone(&self.rgas),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
-            peer_node_ids: Arc::clone(&self.peer_node_ids),
+            active_connections: Arc::clone(&self.active_connections),
         }
     }
 
@@ -312,23 +365,82 @@ impl SyncManager {
             }
         };
 
+        if self.node.is_some() || self.op_rx.is_none() {
+            anyhow::bail!("sync manager is already started");
+        }
+
+        // Provider watches are acquired before binding so discovery startup is
+        // atomic with respect to network resources.
+        let mut discovery_coordinator = DiscoveryCoordinator::start(
+            self.discovery_providers.clone(),
+            self.discovery_config.clone(),
+        )
+        .await?;
+        let candidates_rx = discovery_coordinator.candidates();
+        let initial_candidates = Arc::clone(&candidates_rx.borrow());
+
         // Build the network node.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
-            .with_peers(self.config.peers.clone())
+            .with_peers(initial_candidates.as_ref().clone())
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
             .with_socket_timeout(self.config.socket_timeout)
             .with_serialization_format(self.config.serialization_format)
             .with_event_channel_capacity(self.config.queued_ops_limit.max(1));
+        let bootstrap_server = BootstrapServerConfig::new(self.discovery_config.cluster_id())?
+            .with_max_cached_candidates(self.discovery_config.max_candidates())?
+            .with_max_response_candidates(self.discovery_config.max_candidates())?;
+        node_config = node_config.with_bootstrap_server(bootstrap_server);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);
         }
 
         let mut node = Node::new(node_config);
-        let mut event_rx = node.take_event_receiver().unwrap();
+        let Some(mut event_rx) = node.take_event_receiver() else {
+            rollback_discovery(&mut discovery_coordinator).await;
+            anyhow::bail!("network event receiver is unavailable");
+        };
 
-        node.start_listener().await?;
+        let bound_addr = match node.start_listener().await {
+            Ok(bound_addr) => bound_addr,
+            Err(error) => {
+                rollback_discovery(&mut discovery_coordinator).await;
+                return Err(error.into());
+            }
+        };
+        let advertised_endpoint = match discovery_coordinator
+            .configure_local_endpoint(bound_addr)
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                node.shutdown().await;
+                rollback_discovery(&mut discovery_coordinator).await;
+                return Err(error.into());
+            }
+        };
+        if let Some(endpoint) = &advertised_endpoint
+            && let Err(error) = node.announce_bootstrap_endpoint(endpoint.clone())
+        {
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            return Err(error.into());
+        }
+        if let Err(error) = discovery_coordinator
+            .announce(advertised_endpoint.as_deref())
+            .await
+        {
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            return Err(error.into());
+        }
+
+        let initial_candidates = Arc::clone(&candidates_rx.borrow());
+        *self.peer_health.write().await = initial_candidates
+            .iter()
+            .map(|peer| (peer.clone(), PeerHealth::default()))
+            .collect();
 
         // Connect to initial peers.
         let peer_dead_after_failures =
@@ -340,7 +452,7 @@ impl SyncManager {
             metrics: &self.metrics,
             peer_health: &self.peer_health,
         };
-        for peer_addr in &self.config.peers {
+        for peer_addr in initial_candidates.iter() {
             if matches!(
                 try_connect_configured_peer(&connect_context, peer_addr).await,
                 ConfiguredPeerConnectOutcome::SlotLimitReached
@@ -348,6 +460,12 @@ impl SyncManager {
                 break;
             }
         }
+
+        let Some(op_rx) = self.op_rx.take() else {
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            anyhow::bail!("sync manager is already started");
+        };
 
         // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
         let node = Arc::new(node);
@@ -370,7 +488,7 @@ impl SyncManager {
             metrics: Arc::clone(&self.metrics),
             node: Arc::clone(&node),
             peer_health: Arc::clone(&self.peer_health),
-            peer_node_ids: Arc::clone(&self.peer_node_ids),
+            active_connections: Arc::clone(&self.active_connections),
             anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
             peer_dead_after_failures: normalize_peer_dead_after_failures(
                 self.config.peer_dead_after_failures,
@@ -399,10 +517,6 @@ impl SyncManager {
         }));
 
         // Outbound loop: drain locally-produced ops into the network.
-        let op_rx = self
-            .op_rx
-            .take()
-            .expect("op_rx already taken: SyncManager::start called twice?");
         self.broadcast_task = Some(spawn_broadcast_loop(
             BroadcastLoopContext {
                 node: Arc::clone(&node),
@@ -420,7 +534,7 @@ impl SyncManager {
 
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
             node: Arc::clone(&node),
-            peers: self.config.peers.clone(),
+            candidates_rx: candidates_rx.clone(),
             max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
             max_delay: self.config.reconnect_max_delay,
@@ -432,11 +546,13 @@ impl SyncManager {
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
             node: Arc::clone(&node),
-            peers: self.config.peers.clone(),
+            candidates_rx,
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
         });
+
+        self.discovery_coordinator = Some(discovery_coordinator);
 
         Ok(())
     }
@@ -450,7 +566,7 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Retry connecting to the peers configured at startup.
+    /// Retry connecting to the current discovery candidates.
     pub async fn reconnect_configured_peers(&self) {
         let Some(node) = self.node.as_ref() else {
             return;
@@ -464,7 +580,12 @@ impl SyncManager {
             metrics: &self.metrics,
             peer_health: &self.peer_health,
         };
-        for peer_addr in &self.config.peers {
+        let Some(coordinator) = self.discovery_coordinator.as_ref() else {
+            return;
+        };
+        let candidates_rx = coordinator.candidates();
+        let candidates = Arc::clone(&candidates_rx.borrow());
+        for peer_addr in candidates.iter() {
             if matches!(
                 try_connect_configured_peer(&connect_context, peer_addr).await,
                 ConfiguredPeerConnectOutcome::SlotLimitReached
@@ -474,10 +595,19 @@ impl SyncManager {
         }
     }
 
-    /// Returns the current health state of a configured peer.
+    /// Returns the current health state of a discovery candidate.
     pub async fn peer_health_state(&self, addr: &str) -> Option<PeerHealthState> {
         let peer_health = self.peer_health.read().await;
         peer_health.get(addr).map(|health| health.state)
+    }
+
+    /// Returns the current ordered, deduplicated discovery candidate snapshot.
+    pub fn peer_candidates(&self) -> Vec<String> {
+        let Some(coordinator) = self.discovery_coordinator.as_ref() else {
+            return Vec::new();
+        };
+        let candidates = coordinator.candidates();
+        candidates.borrow().as_ref().clone()
     }
 
     /// Returns the number of connected peers, or zero before networking starts.
@@ -527,6 +657,11 @@ impl SyncManager {
     /// Gracefully stop sync tasks and close network connections.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(true);
+        let mut discovery_coordinator = self.discovery_coordinator.take();
+        if let Some(coordinator) = discovery_coordinator.as_ref() {
+            coordinator.request_shutdown();
+        }
+        let mut discovery_error = None;
 
         if let Some(task) = self.broadcast_task.take()
             && let Err(e) = task.await
@@ -546,6 +681,13 @@ impl SyncManager {
             warn!(error = %e, "anti-entropy task failed during shutdown");
         }
 
+        if let Some(mut coordinator) = discovery_coordinator.take()
+            && let Err(error) = coordinator.shutdown().await
+        {
+            warn!(error = %error, "discovery shutdown failed");
+            discovery_error = Some(error);
+        }
+
         if let Some(node) = self.node.as_ref() {
             node.shutdown().await;
         }
@@ -558,7 +700,13 @@ impl SyncManager {
         }
 
         info!("sync manager shut down");
-        Ok(())
+        discovery_error.map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+async fn rollback_discovery(coordinator: &mut DiscoveryCoordinator) {
+    if let Err(error) = coordinator.shutdown().await {
+        warn!(error = %error, "discovery rollback failed");
     }
 }
 

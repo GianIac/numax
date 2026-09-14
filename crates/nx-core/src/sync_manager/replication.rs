@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -144,7 +145,7 @@ fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
 pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
     let ReconnectLoopContext {
         node,
-        peers,
+        mut candidates_rx,
         max_peers,
         initial_delay,
         max_delay,
@@ -154,19 +155,19 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         peer_health,
     } = context;
 
-    if peers.is_empty() {
-        return None;
-    }
-
     Some(tokio::spawn(async move {
         let initial_delay = normalize_reconnect_delay(initial_delay);
         let max_delay = max_delay.max(initial_delay);
         let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
-        let now = StdInstant::now();
-        let mut state = peers
-            .into_iter()
-            .map(|addr| PeerReconnectState::new(addr, initial_delay, now))
-            .collect::<Vec<_>>();
+        let mut state = Vec::new();
+        let initial_candidates = Arc::clone(&candidates_rx.borrow());
+        reconcile_reconnect_candidates(
+            &mut state,
+            initial_candidates.as_ref(),
+            initial_delay,
+            &peer_health,
+        )
+        .await;
 
         loop {
             let mut sleep_for: Option<Duration> = None;
@@ -242,6 +243,18 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         break;
                     }
                 }
+                changed = candidates_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let candidates = Arc::clone(&candidates_rx.borrow_and_update());
+                    reconcile_reconnect_candidates(
+                        &mut state,
+                        candidates.as_ref(),
+                        initial_delay,
+                        &peer_health,
+                    ).await;
+                }
                 _ = tokio::time::sleep(sleep_for) => {}
             }
         }
@@ -252,15 +265,11 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
     let AntiEntropyLoopContext {
         node,
-        peers,
+        mut candidates_rx,
         interval,
         mut shutdown_rx,
         metrics,
     } = context;
-
-    if peers.is_empty() {
-        return None;
-    }
 
     Some(tokio::spawn(async move {
         let interval = normalize_anti_entropy_interval(interval);
@@ -272,8 +281,15 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
                         break;
                     }
                 }
+                changed = candidates_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let _ = candidates_rx.borrow_and_update();
+                }
                 _ = tokio::time::sleep(interval) => {
-                    for peer in &peers {
+                    let peers = Arc::clone(&candidates_rx.borrow_and_update());
+                    for peer in peers.iter() {
                         if !node.is_connected_addr(peer).await {
                             continue;
                         }
@@ -294,6 +310,31 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
         }
         debug!("anti-entropy loop terminated");
     }))
+}
+
+async fn reconcile_reconnect_candidates(
+    state: &mut Vec<PeerReconnectState>,
+    candidates: &[String],
+    initial_delay: Duration,
+    peer_health: &Arc<RwLock<std::collections::HashMap<String, super::peer::PeerHealth>>>,
+) {
+    let retained = candidates.iter().collect::<HashSet<_>>();
+    let mut existing = state
+        .drain(..)
+        .map(|peer| (peer.addr.clone(), peer))
+        .collect::<HashMap<_, _>>();
+    let now = StdInstant::now();
+    state.extend(candidates.iter().map(|addr| {
+        existing
+            .remove(addr)
+            .unwrap_or_else(|| PeerReconnectState::new(addr.clone(), initial_delay, now))
+    }));
+
+    let mut health = peer_health.write().await;
+    health.retain(|addr, _| retained.contains(addr));
+    for candidate in candidates {
+        health.entry(candidate.clone()).or_default();
+    }
 }
 
 pub(super) fn normalize_anti_entropy_interval(interval: Duration) -> Duration {
@@ -552,11 +593,17 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
             peers_connected,
         } => {
             mark_known_peer_success(&context.peer_health, &addr).await;
-            context
-                .peer_node_ids
-                .write()
-                .await
-                .insert(addr.clone(), node_id.clone());
+            if let Some(connection) = context.node.connection_info(&addr).await {
+                if connection.identity.node_id == node_id {
+                    context
+                        .active_connections
+                        .write()
+                        .await
+                        .insert(addr.clone(), connection);
+                } else {
+                    warn!(peer = %node_id, addr = %addr, "ignored inconsistent connection identity");
+                }
+            }
             context.metrics.record_peer_connect();
             context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer connected");
@@ -572,7 +619,7 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
                 context.peer_dead_after_failures,
             )
             .await;
-            context.peer_node_ids.write().await.remove(&addr);
+            context.active_connections.write().await.remove(&addr);
             context.metrics.record_peer_disconnect();
             context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer disconnected");
@@ -610,6 +657,61 @@ mod tests {
         Arc::new(RuntimeMetrics::default())
     }
 
+    #[tokio::test]
+    async fn removed_candidates_are_deleted_from_reconnect_state_and_health() {
+        let now = StdInstant::now();
+        let mut state = vec![PeerReconnectState::new(
+            "peer.example:9000".to_string(),
+            Duration::from_millis(10),
+            now,
+        )];
+        let peer_health = Arc::new(RwLock::new(HashMap::from([(
+            "peer.example:9000".to_string(),
+            PeerHealth::default(),
+        )])));
+
+        reconcile_reconnect_candidates(&mut state, &[], Duration::from_millis(10), &peer_health)
+            .await;
+
+        assert!(state.is_empty());
+        assert!(peer_health.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_reordering_preserves_backoff_state() {
+        let now = StdInstant::now();
+        let mut first = PeerReconnectState::new(
+            "one.example:9000".to_string(),
+            Duration::from_millis(10),
+            now,
+        );
+        first.record_failure(Duration::from_secs(1), now);
+        let first_deadline = first.next_attempt_at;
+        let first_delay = first.delay;
+        let mut state = vec![
+            first,
+            PeerReconnectState::new(
+                "two.example:9000".to_string(),
+                Duration::from_millis(10),
+                now,
+            ),
+        ];
+        let peer_health = Arc::new(RwLock::new(HashMap::new()));
+
+        reconcile_reconnect_candidates(
+            &mut state,
+            &["two.example:9000".into(), "one.example:9000".into()],
+            Duration::from_millis(10),
+            &peer_health,
+        )
+        .await;
+
+        assert_eq!(state[0].addr, "two.example:9000");
+        assert_eq!(state[1].addr, "one.example:9000");
+        assert_eq!(state[1].next_attempt_at, first_deadline);
+        assert_eq!(state[1].delay, first_delay);
+    }
+
     fn test_event_context(
         counters: Arc<RwLock<HashMap<String, GCounter>>>,
         seen_ops: Arc<RwLock<SeenOps>>,
@@ -637,7 +739,7 @@ mod tests {
                 "127.0.0.1:0",
             ))),
             peer_health,
-            peer_node_ids: Arc::new(RwLock::new(HashMap::new())),
+            active_connections: Arc::new(RwLock::new(HashMap::new())),
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
             peer_dead_after_failures: 2,
         }

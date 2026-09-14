@@ -167,40 +167,40 @@ single further CLI command.
 **Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce discovery providers and bootstrap address exchange; SWIM membership and K-fanout data gossip follow in `0.1.6`.
 
 **Abstraction**:
-- [ ] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
-- [ ] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
-- [ ] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery
+- [x] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
+- [x] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
+- [x] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery ([contract](/numax/design/discovery-contract/))
 
 **Peer coordination and identity**:
-- [ ] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
-- [ ] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
-- [ ] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
-- [ ] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
-- [ ] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
-- [ ] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown
+- [x] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
+- [x] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
+- [x] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
+- [x] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
+- [x] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
+- [x] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown ([contract](/numax/design/discovery-contract/))
 
 **Initial implementations**:
-- [ ] `StaticDiscovery` - peer list from config (backward-compatible)
-- [ ] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
-- [ ] `MdnsDiscovery` - LAN discovery for demo and dev
-- [ ] `DnsSrvDiscovery` - discovery via DNS-SRV record
-- [ ] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
+- [x] `StaticDiscovery` - peer list from config (backward-compatible)
+- [x] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
+- [x] `MdnsDiscovery` - LAN discovery for demo and dev
+- [x] `DnsSrvDiscovery` - discovery via DNS-SRV record
+- [x] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
 
 **Configuration**:
-- [ ] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
-- [ ] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
+- [x] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
+- [x] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
 
 **Protocol compatibility**:
-- [ ] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
-- [ ] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
+- [x] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
+- [x] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
 
 **Explicit decision**:
 - [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.
 
 **Acceptance tests**:
-- [ ] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
-- [ ] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
-- [ ] Real LAN mDNS checks, TLS rejection and reconnection after restart; justify and validate additional provider dependencies
+- [x] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
+- [x] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
+- [ ] Automate the environment-gated LAN mDNS check alongside the existing TLS rejection and reconnection-after-restart coverage; provider dependencies are justified in the discovery contract
 
 **Closing criterion**:
 > All five providers pass their acceptance tests. Three nodes on the same LAN discover each other via mDNS without any `--peer` flag, replicate a CRDT update and recover after reconnection within the declared retention window. Reproducible demo in `examples/discovery_lan/`.

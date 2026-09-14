@@ -96,6 +96,14 @@ jobs:
           rustflags: ""
       - name: Run tests
         run: cargo test --workspace --verbose
+      - name: Run multicast mDNS check
+        if: matrix.os == 'macos-latest'
+        env:
+          RUST_LOG: nx_core::discovery::mdns=debug,mdns_sd=debug
+        run: >-
+          cargo test -p nx-core
+          discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint
+          -- --ignored --exact --nocapture
 
   build-wasm:
     name: Build WASM Examples
@@ -140,11 +148,11 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build previous release binary
         run: |
-          git worktree add "${RUNNER_TEMP}/numax-v0.1.0" v0.1.0
-          cargo build --release --manifest-path "${RUNNER_TEMP}/numax-v0.1.0/Cargo.toml" -p nx-cli
+          git worktree add "${RUNNER_TEMP}/numax-v0.1.4" v0.1.4
+          cargo build --release --manifest-path "${RUNNER_TEMP}/numax-v0.1.4/Cargo.toml" -p nx-cli
       - name: Run multi-process CLI smoke test
         env:
-          NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.0/target/release/nx
+          NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.4/target/release/nx
         run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
 
   benchmark-tools:
