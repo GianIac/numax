@@ -246,10 +246,11 @@ idempotent shutdown hook. Bootstrap withdrawal and mDNS goodbye are attempted
 during shutdown; provider tasks are joined within the runtime's bounded
 operation policy.
 
-The CLI configuration surface currently continues to construct only
-`StaticDiscovery` from `--peer`. Selecting bootstrap, mDNS, DNS-SRV or file
-providers through CLI, environment variables or `numax.toml` is not yet
-implemented; embedders can compose them through the Rust API.
+`Runtime::new_with_discovery` accepts the resolved `RuntimeDiscoveryConfig`
+after the durable `NodeId` is loaded, then constructs the selected provider.
+The bootstrap client inherits the runtime TLS, message-size, socket-timeout and
+serialization settings. `Runtime::new` remains the backward-compatible static
+constructor for Rust embedders.
 
 For exact snapshot, expiry, ordering and security semantics, see the
 [Peer Discovery Contract](/numax/design/discovery-contract/).

@@ -7,7 +7,11 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use nx_api::{DEFAULT_MANAGEMENT_LISTEN, DEFAULT_MANAGEMENT_REQUEST_TIMEOUT, ManagementConfig};
 use nx_core::runtime::RuntimeConfig;
-use nx_core::{ObservabilityConfig, SerializationFormat, SyncConfig, TlsConfig};
+use nx_core::{
+    BootstrapDiscoverySettings, DnsSrvDiscoverySettings, FileDiscoverySettings,
+    MdnsDiscoverySettings, ObservabilityConfig, RuntimeDiscoveryConfig, RuntimeDiscoveryMode,
+    SerializationFormat, SyncConfig, TlsConfig,
+};
 use serde::Deserialize;
 use tracing::warn;
 #[cfg(feature = "tokio-console")]
@@ -100,12 +104,33 @@ pub(crate) struct ManagementFileConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveryFileConfig {
     pub(crate) mode: Option<DiscoveryMode>,
+    pub(crate) cluster_id: Option<String>,
+    pub(crate) advertised_endpoint: Option<String>,
+    pub(crate) max_candidates: Option<usize>,
+    pub(crate) seeds: Option<Vec<String>>,
+    pub(crate) refresh_interval: Option<String>,
+    pub(crate) retry_initial: Option<String>,
+    pub(crate) retry_max: Option<String>,
+    pub(crate) stale_after: Option<String>,
+    pub(crate) max_seeds: Option<usize>,
+    pub(crate) instance_name: Option<String>,
+    pub(crate) max_instances: Option<usize>,
+    pub(crate) service_name: Option<String>,
+    pub(crate) retry_interval: Option<String>,
+    pub(crate) max_refresh_interval: Option<String>,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) poll_interval: Option<String>,
+    pub(crate) max_file_bytes: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DiscoveryMode {
     Static,
+    Bootstrap,
+    Mdns,
+    DnsSrv,
+    File,
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +148,11 @@ pub(crate) struct RunCliOptions {
     pub(crate) verbose: bool,
     pub(crate) log_level: Option<String>,
     pub(crate) log_format: Option<LogFormat>,
+    pub(crate) discovery_mode: Option<DiscoveryMode>,
+    pub(crate) bootstrap_seeds: Vec<String>,
+    pub(crate) mdns_instance: Option<String>,
+    pub(crate) dns_srv_name: Option<String>,
+    pub(crate) peer_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -131,6 +161,7 @@ pub(crate) struct EffectiveRunConfig {
     pub(crate) sync: Option<SyncConfig>,
     pub(crate) observability: Option<ObservabilityConfig>,
     pub(crate) management: Option<ManagementConfig>,
+    pub(crate) discovery: RuntimeDiscoveryConfig,
     pub(crate) log_level: String,
     pub(crate) log_format: LogFormat,
 }
@@ -147,6 +178,8 @@ impl EffectiveRunConfig {
         file_config: &RunFileConfig,
     ) -> Result<Self> {
         let env_has_sync_inputs = env_config.has_sync_inputs();
+        let mut discovery =
+            resolve_discovery_config(&cli, &env_config, file_config.discovery.as_ref())?;
         let management = build_management_config(&env_config, file_config.management.as_ref())?;
         let datastore_path = cli
             .datastore_path
@@ -212,6 +245,7 @@ impl EffectiveRunConfig {
                 .and_then(|network| network.peers.clone())
                 .unwrap_or_default()
         };
+        discovery.max_candidates = discovery.max_candidates.max(peers.len());
         let serialization_format = if cli.debug_protocol {
             Some(SerializationFormat::Json)
         } else if let Some(format) = env_config.serialization_format {
@@ -228,6 +262,7 @@ impl EffectiveRunConfig {
             || file_config.tls.is_some()
             || file_config.network.is_some()
             || env_has_sync_inputs
+            || !matches!(discovery.mode, RuntimeDiscoveryMode::Static)
             || tls.is_some()
             || serialization_format.is_some();
         let sync = build_sync_config(listen, peers, tls, force_sync, serialization_format)?
@@ -243,6 +278,7 @@ impl EffectiveRunConfig {
             sync,
             observability,
             management,
+            discovery,
             log_level,
             log_format,
         })
@@ -389,7 +425,7 @@ impl EffectiveRunConfig {
         }
 
         out.push_str("[discovery]\n");
-        out.push_str("mode = \"static\"\n");
+        render_discovery_config(&mut out, &self.discovery);
         out
     }
 }
@@ -438,6 +474,13 @@ anti_entropy_interval = "30s"
 
 [discovery]
 mode = "static"
+# cluster_id = "default"
+# advertised_endpoint = "127.0.0.1:9000"
+# max_candidates = 1024
+# Bootstrap: seeds, refresh_interval, retry_initial, retry_max, stale_after, max_seeds
+# mDNS: instance_name, max_instances
+# DNS-SRV: service_name, retry_interval, max_refresh_interval
+# File: path, poll_interval, max_file_bytes
 "#;
 
 pub(crate) fn init_config_file(path: &Path, force: bool) -> Result<()> {
@@ -471,6 +514,24 @@ pub(crate) struct EnvRunConfig {
     pub(crate) serialization_format: Option<SerializationFormat>,
     pub(crate) log_level: Option<String>,
     pub(crate) log_format: Option<LogFormat>,
+    pub(crate) discovery_mode: Option<DiscoveryMode>,
+    pub(crate) discovery_cluster_id: Option<String>,
+    pub(crate) discovery_advertised_endpoint: Option<String>,
+    pub(crate) discovery_max_candidates: Option<usize>,
+    pub(crate) discovery_seeds: Option<Vec<String>>,
+    pub(crate) discovery_refresh_interval: Option<String>,
+    pub(crate) discovery_retry_initial: Option<String>,
+    pub(crate) discovery_retry_max: Option<String>,
+    pub(crate) discovery_stale_after: Option<String>,
+    pub(crate) discovery_max_seeds: Option<usize>,
+    pub(crate) discovery_instance_name: Option<String>,
+    pub(crate) discovery_max_instances: Option<usize>,
+    pub(crate) discovery_service_name: Option<String>,
+    pub(crate) discovery_retry_interval: Option<String>,
+    pub(crate) discovery_max_refresh_interval: Option<String>,
+    pub(crate) discovery_file: Option<PathBuf>,
+    pub(crate) discovery_poll_interval: Option<String>,
+    pub(crate) discovery_max_file_bytes: Option<String>,
 }
 
 impl EnvRunConfig {
@@ -493,6 +554,24 @@ impl EnvRunConfig {
             serialization_format: env_serialization_format()?,
             log_level: env_non_empty("NX_LOG_LEVEL")?,
             log_format: env_log_format()?,
+            discovery_mode: env_discovery_mode()?,
+            discovery_cluster_id: env_non_empty("NX_DISCOVERY_CLUSTER_ID")?,
+            discovery_advertised_endpoint: env_non_empty("NX_DISCOVERY_ADVERTISED_ENDPOINT")?,
+            discovery_max_candidates: env_usize("NX_DISCOVERY_MAX_CANDIDATES")?,
+            discovery_seeds: env_csv("NX_DISCOVERY_SEEDS")?,
+            discovery_refresh_interval: env_non_empty("NX_DISCOVERY_REFRESH_INTERVAL")?,
+            discovery_retry_initial: env_non_empty("NX_DISCOVERY_RETRY_INITIAL")?,
+            discovery_retry_max: env_non_empty("NX_DISCOVERY_RETRY_MAX")?,
+            discovery_stale_after: env_non_empty("NX_DISCOVERY_STALE_AFTER")?,
+            discovery_max_seeds: env_usize("NX_DISCOVERY_MAX_SEEDS")?,
+            discovery_instance_name: env_non_empty("NX_DISCOVERY_INSTANCE_NAME")?,
+            discovery_max_instances: env_usize("NX_DISCOVERY_MAX_INSTANCES")?,
+            discovery_service_name: env_non_empty("NX_DISCOVERY_SERVICE_NAME")?,
+            discovery_retry_interval: env_non_empty("NX_DISCOVERY_RETRY_INTERVAL")?,
+            discovery_max_refresh_interval: env_non_empty("NX_DISCOVERY_MAX_REFRESH_INTERVAL")?,
+            discovery_file: env_path("NX_DISCOVERY_FILE"),
+            discovery_poll_interval: env_non_empty("NX_DISCOVERY_POLL_INTERVAL")?,
+            discovery_max_file_bytes: env_non_empty("NX_DISCOVERY_MAX_FILE_BYTES")?,
         })
     }
 
@@ -505,6 +584,14 @@ impl EnvRunConfig {
             || self.allowed_peers.is_some()
             || self.tls_insecure.unwrap_or(false)
             || self.serialization_format.is_some()
+            || self.discovery_mode.is_some()
+            || self.discovery_cluster_id.is_some()
+            || self.discovery_advertised_endpoint.is_some()
+            || self.discovery_max_candidates.is_some()
+            || self.discovery_seeds.is_some()
+            || self.discovery_instance_name.is_some()
+            || self.discovery_service_name.is_some()
+            || self.discovery_file.is_some()
     }
 }
 
@@ -571,6 +658,85 @@ fn render_log_format(format: LogFormat) -> &'static str {
     }
 }
 
+fn render_discovery_config(out: &mut String, config: &RuntimeDiscoveryConfig) {
+    let mode = match &config.mode {
+        RuntimeDiscoveryMode::Static => "static",
+        RuntimeDiscoveryMode::Bootstrap(_) => "bootstrap",
+        RuntimeDiscoveryMode::Mdns(_) => "mdns",
+        RuntimeDiscoveryMode::DnsSrv(_) => "dns-srv",
+        RuntimeDiscoveryMode::File(_) => "file",
+    };
+    out.push_str(&format!("mode = \"{mode}\"\n"));
+    out.push_str(&format!(
+        "cluster_id = \"{}\"\n",
+        escape_toml(&config.cluster_id)
+    ));
+    render_optional_string(
+        out,
+        "advertised_endpoint",
+        config.advertised_endpoint.as_deref(),
+    );
+    out.push_str(&format!("max_candidates = {}\n", config.max_candidates));
+    match &config.mode {
+        RuntimeDiscoveryMode::Static => {}
+        RuntimeDiscoveryMode::Bootstrap(settings) => {
+            out.push_str(&format!(
+                "seeds = {}\n",
+                render_string_list(&settings.seeds)
+            ));
+            out.push_str(&format!(
+                "refresh_interval = \"{}\"\n",
+                render_duration(settings.refresh_interval)
+            ));
+            out.push_str(&format!(
+                "retry_initial = \"{}\"\n",
+                render_duration(settings.retry_initial)
+            ));
+            out.push_str(&format!(
+                "retry_max = \"{}\"\n",
+                render_duration(settings.retry_max)
+            ));
+            out.push_str(&format!(
+                "stale_after = \"{}\"\n",
+                render_duration(settings.stale_after)
+            ));
+            out.push_str(&format!("max_seeds = {}\n", settings.max_seeds));
+        }
+        RuntimeDiscoveryMode::Mdns(settings) => {
+            out.push_str(&format!(
+                "instance_name = \"{}\"\n",
+                escape_toml(&settings.instance_name)
+            ));
+            out.push_str(&format!("max_instances = {}\n", settings.max_instances));
+        }
+        RuntimeDiscoveryMode::DnsSrv(settings) => {
+            out.push_str(&format!(
+                "service_name = \"{}\"\n",
+                escape_toml(&settings.service_name)
+            ));
+            out.push_str(&format!(
+                "retry_interval = \"{}\"\n",
+                render_duration(settings.retry_interval)
+            ));
+            out.push_str(&format!(
+                "max_refresh_interval = \"{}\"\n",
+                render_duration(settings.max_refresh_interval)
+            ));
+        }
+        RuntimeDiscoveryMode::File(settings) => {
+            out.push_str(&format!(
+                "path = \"{}\"\n",
+                escape_toml(&settings.path.to_string_lossy())
+            ));
+            out.push_str(&format!(
+                "poll_interval = \"{}\"\n",
+                render_duration(settings.poll_interval)
+            ));
+            out.push_str(&format!("max_file_bytes = {}\n", settings.max_file_bytes));
+        }
+    }
+}
+
 fn render_duration(duration: Duration) -> String {
     let millis = duration.as_millis();
     if millis.is_multiple_of(60_000) {
@@ -619,6 +785,294 @@ fn env_peers() -> Result<Option<Vec<String>>> {
         Ok(None)
     } else {
         Ok(Some(peers))
+    }
+}
+
+fn env_csv(name: &str) -> Result<Option<Vec<String>>> {
+    let Some(value) = env_non_empty(name)? else {
+        return Ok(None);
+    };
+    value
+        .split(',')
+        .map(|item| {
+            validate_non_empty(name, item)?;
+            Ok(item.trim().to_string())
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn env_usize(name: &str) -> Result<Option<usize>> {
+    let Some(value) = env_non_empty(name)? else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .map(Some)
+        .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
+fn env_discovery_mode() -> Result<Option<DiscoveryMode>> {
+    let Some(value) = env_non_empty("NX_DISCOVERY_MODE")? else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "static" => Ok(Some(DiscoveryMode::Static)),
+        "bootstrap" => Ok(Some(DiscoveryMode::Bootstrap)),
+        "mdns" => Ok(Some(DiscoveryMode::Mdns)),
+        "dns-srv" => Ok(Some(DiscoveryMode::DnsSrv)),
+        "file" => Ok(Some(DiscoveryMode::File)),
+        _ => bail!("NX_DISCOVERY_MODE must be one of static, bootstrap, mdns, dns-srv, file"),
+    }
+}
+
+fn resolve_discovery_config(
+    cli: &RunCliOptions,
+    env: &EnvRunConfig,
+    file: Option<&DiscoveryFileConfig>,
+) -> Result<RuntimeDiscoveryConfig> {
+    let mode = cli
+        .discovery_mode
+        .or(env.discovery_mode)
+        .or_else(|| file.and_then(|config| config.mode))
+        .unwrap_or(DiscoveryMode::Static);
+    validate_discovery_mode_fields(mode, cli, env, file)?;
+
+    let cluster_id = env
+        .discovery_cluster_id
+        .clone()
+        .or_else(|| file.and_then(|config| config.cluster_id.clone()))
+        .unwrap_or_else(|| nx_core::DEFAULT_DISCOVERY_CLUSTER.to_string());
+    let advertised_endpoint = env
+        .discovery_advertised_endpoint
+        .clone()
+        .or_else(|| file.and_then(|config| config.advertised_endpoint.clone()));
+    let max_candidates = env
+        .discovery_max_candidates
+        .or_else(|| file.and_then(|config| config.max_candidates))
+        .unwrap_or(nx_core::DEFAULT_MAX_PEER_CANDIDATES);
+    validate_non_empty("discovery.cluster_id", &cluster_id)?;
+    validate_optional_non_empty(
+        "discovery.advertised_endpoint",
+        advertised_endpoint.as_deref(),
+    )?;
+    if max_candidates == 0 {
+        bail!("discovery.max_candidates must be greater than zero");
+    }
+
+    let resolved_mode = match mode {
+        DiscoveryMode::Static => RuntimeDiscoveryMode::Static,
+        DiscoveryMode::Bootstrap => {
+            let seeds = if !cli.bootstrap_seeds.is_empty() {
+                cli.bootstrap_seeds.clone()
+            } else {
+                env.discovery_seeds
+                    .clone()
+                    .or_else(|| file.and_then(|config| config.seeds.clone()))
+                    .unwrap_or_default()
+            };
+            if seeds.is_empty() {
+                bail!("discovery.seeds is required when discovery.mode = \"bootstrap\"");
+            }
+            for seed in &seeds {
+                validate_non_empty("discovery.seeds", seed)?;
+            }
+            let mut settings = BootstrapDiscoverySettings::new(seeds);
+            settings.refresh_interval = resolve_discovery_duration(
+                env.discovery_refresh_interval.as_deref(),
+                file.and_then(|config| config.refresh_interval.as_deref()),
+                settings.refresh_interval,
+                "discovery.refresh_interval",
+            )?;
+            settings.retry_initial = resolve_discovery_duration(
+                env.discovery_retry_initial.as_deref(),
+                file.and_then(|config| config.retry_initial.as_deref()),
+                settings.retry_initial,
+                "discovery.retry_initial",
+            )?;
+            settings.retry_max = resolve_discovery_duration(
+                env.discovery_retry_max.as_deref(),
+                file.and_then(|config| config.retry_max.as_deref()),
+                settings.retry_max,
+                "discovery.retry_max",
+            )?;
+            settings.stale_after = resolve_discovery_duration(
+                env.discovery_stale_after.as_deref(),
+                file.and_then(|config| config.stale_after.as_deref()),
+                settings.stale_after,
+                "discovery.stale_after",
+            )?;
+            settings.max_seeds = env
+                .discovery_max_seeds
+                .or_else(|| file.and_then(|config| config.max_seeds))
+                .unwrap_or(settings.max_seeds);
+            validate_non_zero("discovery.max_seeds", settings.max_seeds)?;
+            if settings.retry_initial > settings.retry_max {
+                bail!("discovery.retry_initial must be less than or equal to discovery.retry_max");
+            }
+            RuntimeDiscoveryMode::Bootstrap(settings)
+        }
+        DiscoveryMode::Mdns => {
+            let instance_name = cli
+                .mdns_instance
+                .clone()
+                .or_else(|| env.discovery_instance_name.clone())
+                .or_else(|| file.and_then(|config| config.instance_name.clone()))
+                .context("discovery.instance_name is required when discovery.mode = \"mdns\"")?;
+            validate_non_empty("discovery.instance_name", &instance_name)?;
+            let mut settings = MdnsDiscoverySettings::new(instance_name);
+            settings.max_instances = env
+                .discovery_max_instances
+                .or_else(|| file.and_then(|config| config.max_instances))
+                .unwrap_or(settings.max_instances);
+            validate_non_zero("discovery.max_instances", settings.max_instances)?;
+            RuntimeDiscoveryMode::Mdns(settings)
+        }
+        DiscoveryMode::DnsSrv => {
+            let service_name = cli
+                .dns_srv_name
+                .clone()
+                .or_else(|| env.discovery_service_name.clone())
+                .or_else(|| file.and_then(|config| config.service_name.clone()))
+                .context("discovery.service_name is required when discovery.mode = \"dns-srv\"")?;
+            validate_non_empty("discovery.service_name", &service_name)?;
+            let mut settings = DnsSrvDiscoverySettings::new(service_name);
+            settings.retry_interval = resolve_discovery_duration(
+                env.discovery_retry_interval.as_deref(),
+                file.and_then(|config| config.retry_interval.as_deref()),
+                settings.retry_interval,
+                "discovery.retry_interval",
+            )?;
+            settings.max_refresh_interval = resolve_discovery_duration(
+                env.discovery_max_refresh_interval.as_deref(),
+                file.and_then(|config| config.max_refresh_interval.as_deref()),
+                settings.max_refresh_interval,
+                "discovery.max_refresh_interval",
+            )?;
+            RuntimeDiscoveryMode::DnsSrv(settings)
+        }
+        DiscoveryMode::File => {
+            let path = cli
+                .peer_file
+                .clone()
+                .or_else(|| env.discovery_file.clone())
+                .or_else(|| file.and_then(|config| config.path.clone()))
+                .context("discovery.path is required when discovery.mode = \"file\"")?;
+            validate_optional_path("discovery.path", Some(&path))?;
+            let mut settings = FileDiscoverySettings::new(path);
+            settings.poll_interval = resolve_discovery_duration(
+                env.discovery_poll_interval.as_deref(),
+                file.and_then(|config| config.poll_interval.as_deref()),
+                settings.poll_interval,
+                "discovery.poll_interval",
+            )?;
+            settings.max_file_bytes = env
+                .discovery_max_file_bytes
+                .as_deref()
+                .or_else(|| file.and_then(|config| config.max_file_bytes.as_deref()))
+                .map(parse_byte_size)
+                .transpose()?
+                .unwrap_or(settings.max_file_bytes);
+            RuntimeDiscoveryMode::File(settings)
+        }
+    };
+
+    Ok(RuntimeDiscoveryConfig {
+        cluster_id,
+        advertised_endpoint,
+        max_candidates,
+        mode: resolved_mode,
+    })
+}
+
+fn resolve_discovery_duration(
+    env: Option<&str>,
+    file: Option<&str>,
+    default: Duration,
+    name: &str,
+) -> Result<Duration> {
+    env.or(file)
+        .map(|value| parse_duration(value).map_err(|error| anyhow::anyhow!("{name}: {error}")))
+        .transpose()
+        .map(|duration| duration.unwrap_or(default))
+}
+
+fn validate_discovery_mode_fields(
+    mode: DiscoveryMode,
+    cli: &RunCliOptions,
+    env: &EnvRunConfig,
+    file: Option<&DiscoveryFileConfig>,
+) -> Result<()> {
+    let include_env = cli.discovery_mode.is_none();
+    let include_file = include_env && env.discovery_mode.is_none();
+    let bootstrap = !cli.bootstrap_seeds.is_empty()
+        || include_env
+            && (env.discovery_seeds.is_some()
+                || env.discovery_refresh_interval.is_some()
+                || env.discovery_retry_initial.is_some()
+                || env.discovery_retry_max.is_some()
+                || env.discovery_stale_after.is_some()
+                || env.discovery_max_seeds.is_some())
+        || include_file
+            && file.is_some_and(|config| {
+                config.seeds.is_some()
+                    || config.refresh_interval.is_some()
+                    || config.retry_initial.is_some()
+                    || config.retry_max.is_some()
+                    || config.stale_after.is_some()
+                    || config.max_seeds.is_some()
+            });
+    let mdns = cli.mdns_instance.is_some()
+        || include_env
+            && (env.discovery_instance_name.is_some() || env.discovery_max_instances.is_some())
+        || include_file
+            && file.is_some_and(|config| {
+                config.instance_name.is_some() || config.max_instances.is_some()
+            });
+    let dns_srv = cli.dns_srv_name.is_some()
+        || include_env
+            && (env.discovery_service_name.is_some()
+                || env.discovery_retry_interval.is_some()
+                || env.discovery_max_refresh_interval.is_some())
+        || include_file
+            && file.is_some_and(|config| {
+                config.service_name.is_some()
+                    || config.retry_interval.is_some()
+                    || config.max_refresh_interval.is_some()
+            });
+    let file_watch = cli.peer_file.is_some()
+        || include_env
+            && (env.discovery_file.is_some()
+                || env.discovery_poll_interval.is_some()
+                || env.discovery_max_file_bytes.is_some())
+        || include_file
+            && file.is_some_and(|config| {
+                config.path.is_some()
+                    || config.poll_interval.is_some()
+                    || config.max_file_bytes.is_some()
+            });
+    let invalid = match mode {
+        DiscoveryMode::Static => bootstrap || mdns || dns_srv || file_watch,
+        DiscoveryMode::Bootstrap => mdns || dns_srv || file_watch,
+        DiscoveryMode::Mdns => bootstrap || dns_srv || file_watch,
+        DiscoveryMode::DnsSrv => bootstrap || mdns || file_watch,
+        DiscoveryMode::File => bootstrap || mdns || dns_srv,
+    };
+    if invalid {
+        bail!("discovery contains fields that are not valid for mode {mode}");
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for DiscoveryMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Static => "static",
+            Self::Bootstrap => "bootstrap",
+            Self::Mdns => "mdns",
+            Self::DnsSrv => "dns-srv",
+            Self::File => "file",
+        })
     }
 }
 
@@ -803,11 +1257,11 @@ pub(crate) fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
         )?;
     }
 
-    if let Some(discovery) = &config.discovery {
-        match discovery.mode {
-            Some(DiscoveryMode::Static) | None => {}
-        }
-    }
+    resolve_discovery_config(
+        &RunCliOptions::default(),
+        &EnvRunConfig::default(),
+        config.discovery.as_ref(),
+    )?;
 
     Ok(())
 }
@@ -815,6 +1269,13 @@ pub(crate) fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
 fn validate_non_empty(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{name} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_non_zero(name: &str, value: usize) -> Result<()> {
+    if value == 0 {
+        bail!("{name} must be greater than zero");
     }
     Ok(())
 }

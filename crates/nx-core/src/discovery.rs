@@ -1,10 +1,15 @@
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use nx_net::BootstrapClientConfig;
+use nx_sync::NodeId;
 use tokio::sync::broadcast;
+
+use crate::SyncConfig;
 
 mod bootstrap_gossip;
 mod dns_srv;
@@ -26,6 +31,196 @@ pub const DEFAULT_MAX_PEER_CANDIDATES: usize = 1024;
 
 /// Default logical cluster used when no explicit discovery scope is supplied.
 pub const DEFAULT_DISCOVERY_CLUSTER: &str = "default";
+
+/// Resolved discovery configuration used when constructing a runtime.
+#[derive(Debug, Clone)]
+pub struct RuntimeDiscoveryConfig {
+    pub cluster_id: String,
+    pub advertised_endpoint: Option<String>,
+    pub max_candidates: usize,
+    pub mode: RuntimeDiscoveryMode,
+}
+
+impl Default for RuntimeDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            cluster_id: DEFAULT_DISCOVERY_CLUSTER.to_string(),
+            advertised_endpoint: None,
+            max_candidates: DEFAULT_MAX_PEER_CANDIDATES,
+            mode: RuntimeDiscoveryMode::Static,
+        }
+    }
+}
+
+/// Provider-specific discovery configuration after precedence resolution.
+#[derive(Debug, Clone)]
+pub enum RuntimeDiscoveryMode {
+    Static,
+    Bootstrap(BootstrapDiscoverySettings),
+    Mdns(MdnsDiscoverySettings),
+    DnsSrv(DnsSrvDiscoverySettings),
+    File(FileDiscoverySettings),
+}
+
+#[derive(Debug, Clone)]
+pub struct BootstrapDiscoverySettings {
+    pub seeds: Vec<String>,
+    pub refresh_interval: Duration,
+    pub retry_initial: Duration,
+    pub retry_max: Duration,
+    pub stale_after: Duration,
+    pub max_seeds: usize,
+}
+
+impl BootstrapDiscoverySettings {
+    pub fn new(seeds: Vec<String>) -> Self {
+        let defaults = BootstrapGossipDiscoveryConfig::new(seeds.clone());
+        Self {
+            seeds,
+            refresh_interval: defaults.refresh_interval,
+            retry_initial: defaults.retry_initial,
+            retry_max: defaults.retry_max,
+            stale_after: defaults.stale_after,
+            max_seeds: defaults.max_seeds,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MdnsDiscoverySettings {
+    pub instance_name: String,
+    pub max_instances: usize,
+}
+
+impl MdnsDiscoverySettings {
+    pub fn new(instance_name: impl Into<String>) -> Self {
+        let instance_name = instance_name.into();
+        let defaults = MdnsDiscoveryConfig::new(instance_name.clone());
+        Self {
+            instance_name,
+            max_instances: defaults.max_instances,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsSrvDiscoverySettings {
+    pub service_name: String,
+    pub retry_interval: Duration,
+    pub max_refresh_interval: Duration,
+}
+
+impl DnsSrvDiscoverySettings {
+    pub fn new(service_name: impl Into<String>) -> Self {
+        let service_name = service_name.into();
+        let defaults = DnsSrvDiscoveryConfig::new(service_name.clone());
+        Self {
+            service_name,
+            retry_interval: defaults.retry_interval,
+            max_refresh_interval: defaults.max_refresh_interval,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileDiscoverySettings {
+    pub path: PathBuf,
+    pub poll_interval: Duration,
+    pub max_file_bytes: usize,
+}
+
+impl FileDiscoverySettings {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let defaults = FileWatchDiscoveryConfig::new(path.clone());
+        Self {
+            path,
+            poll_interval: defaults.poll_interval,
+            max_file_bytes: defaults.max_file_bytes,
+        }
+    }
+}
+
+pub(crate) fn build_runtime_discovery(
+    node_id: &NodeId,
+    sync: &SyncConfig,
+    config: &RuntimeDiscoveryConfig,
+) -> Result<(Vec<DiscoveryProvider>, DiscoveryRuntimeConfig), DiscoveryError> {
+    let mut providers = Vec::new();
+    if matches!(config.mode, RuntimeDiscoveryMode::Static) || !sync.peers.is_empty() {
+        providers.push(DiscoveryProvider::new(
+            "static",
+            Arc::new(StaticDiscovery::new(sync.peers.clone())),
+        ));
+    }
+
+    match &config.mode {
+        RuntimeDiscoveryMode::Static => {}
+        RuntimeDiscoveryMode::Bootstrap(settings) => {
+            let mut provider_config = BootstrapGossipDiscoveryConfig::new(settings.seeds.clone());
+            provider_config.cluster_id = config.cluster_id.clone();
+            provider_config.refresh_interval = settings.refresh_interval;
+            provider_config.retry_initial = settings.retry_initial;
+            provider_config.retry_max = settings.retry_max;
+            provider_config.stale_after = settings.stale_after;
+            provider_config.max_seeds = settings.max_seeds;
+            provider_config.max_candidates = config.max_candidates;
+            let mut client_config = BootstrapClientConfig::new(node_id.clone());
+            client_config.tls = sync.tls.clone();
+            client_config.max_message_size = sync.max_message_size;
+            client_config.socket_timeout = sync.socket_timeout;
+            client_config.serialization_format = sync.serialization_format;
+            client_config.max_response_candidates = config.max_candidates;
+            providers.push(DiscoveryProvider::new(
+                "bootstrap",
+                Arc::new(BootstrapGossipDiscovery::new(
+                    provider_config,
+                    client_config,
+                )?),
+            ));
+        }
+        RuntimeDiscoveryMode::Mdns(settings) => {
+            let mut provider_config = MdnsDiscoveryConfig::new(&settings.instance_name);
+            provider_config.cluster_id = config.cluster_id.clone();
+            provider_config.max_instances = settings.max_instances;
+            provider_config.max_candidates = config.max_candidates;
+            providers.push(DiscoveryProvider::new(
+                "mdns",
+                Arc::new(MdnsDiscovery::new(provider_config)?),
+            ));
+        }
+        RuntimeDiscoveryMode::DnsSrv(settings) => {
+            let mut provider_config = DnsSrvDiscoveryConfig::new(&settings.service_name);
+            provider_config.cluster_id = config.cluster_id.clone();
+            provider_config.retry_interval = settings.retry_interval;
+            provider_config.max_refresh_interval = settings.max_refresh_interval;
+            provider_config.max_candidates = config.max_candidates;
+            providers.push(DiscoveryProvider::new(
+                "dns-srv",
+                Arc::new(DnsSrvDiscovery::new(provider_config)?),
+            ));
+        }
+        RuntimeDiscoveryMode::File(settings) => {
+            let mut provider_config = FileWatchDiscoveryConfig::new(&settings.path);
+            provider_config.cluster_id = config.cluster_id.clone();
+            provider_config.poll_interval = settings.poll_interval;
+            provider_config.max_file_bytes = settings.max_file_bytes;
+            provider_config.max_candidates = config.max_candidates;
+            providers.push(DiscoveryProvider::new(
+                "file",
+                Arc::new(FileWatchDiscovery::new(provider_config)?),
+            ));
+        }
+    }
+
+    let mut runtime = DiscoveryRuntimeConfig::new()
+        .with_cluster_id(&config.cluster_id)
+        .with_max_candidates(config.max_candidates);
+    if let Some(endpoint) = &config.advertised_endpoint {
+        runtime = runtime.with_advertised_endpoint(endpoint);
+    }
+    Ok((providers, runtime))
+}
 
 /// Whether a provider can publish the local advertised endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +606,32 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn runtime_factory_composes_explicit_peers_with_dynamic_discovery() {
+        let sync = SyncConfig::new()
+            .with_listen_addr("127.0.0.1:9000")
+            .with_peer("127.0.0.1:9001");
+        let config = RuntimeDiscoveryConfig {
+            mode: RuntimeDiscoveryMode::Bootstrap(BootstrapDiscoverySettings::new(vec![
+                "127.0.0.1:9100".to_string(),
+            ])),
+            ..RuntimeDiscoveryConfig::default()
+        };
+
+        let (providers, runtime) =
+            build_runtime_discovery(&NodeId::new("local"), &sync, &config).unwrap();
+
+        assert_eq!(
+            providers
+                .iter()
+                .map(DiscoveryProvider::source_id)
+                .collect::<Vec<_>>(),
+            ["static", "bootstrap"]
+        );
+        assert_eq!(runtime.cluster_id(), DEFAULT_DISCOVERY_CLUSTER);
+        assert_eq!(runtime.max_candidates(), DEFAULT_MAX_PEER_CANDIDATES);
+    }
 
     #[tokio::test]
     async fn static_snapshot_preserves_order_and_duplicates() {

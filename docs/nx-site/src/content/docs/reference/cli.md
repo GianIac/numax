@@ -43,8 +43,15 @@ Sync is disabled by default. Pass `--listen` to enable it.
 |---|---|---|
 | `--listen <ADDR>` | `NX_LISTEN` | Address to listen on (e.g. `0.0.0.0:9000`). Required for sync |
 | `--peer <ADDR>` | `NX_PEER` / `NX_PEERS` | Peer address to connect to. Can be repeated. Requires `--listen` |
+| `--discovery-mode <MODE>` | `NX_DISCOVERY_MODE` | `static`, `bootstrap`, `mdns`, `dns-srv`, or `file` |
+| `--bootstrap-seed <URL>` | `NX_DISCOVERY_SEEDS` | Bootstrap endpoint. Can be repeated |
+| `--mdns-instance <NAME>` | `NX_DISCOVERY_INSTANCE_NAME` | Local mDNS instance name |
+| `--dns-srv-name <NAME>` | `NX_DISCOVERY_SERVICE_NAME` | Fully qualified DNS-SRV service name |
+| `--peer-file <PATH>` | `NX_DISCOVERY_FILE` | Peer file to watch |
 
 `NX_PEERS` accepts a comma-separated list: `NX_PEERS=127.0.0.1:9001,127.0.0.1:9002`
+Dynamic discovery still requires `--listen`. Explicit `--peer` values remain an
+additional static source and are not treated as bootstrap seeds.
 
 ### Timing
 
@@ -221,6 +228,13 @@ anti_entropy_interval = "30s"
 
 [discovery]
 mode = "static"
+# cluster_id = "default"
+# advertised_endpoint = "127.0.0.1:9000"
+# max_candidates = 1024
+# Bootstrap: seeds, refresh_interval, retry_initial, retry_max, stale_after, max_seeds
+# mDNS: instance_name, max_instances
+# DNS-SRV: service_name, retry_interval, max_refresh_interval
+# File: path, poll_interval, max_file_bytes
 ```
 
 ### nx config validate
@@ -419,7 +433,11 @@ mode = "static"
 
 | Field | Type | Values | Description |
 |---|---|---|---|
-| `mode` | string | `static` | Peer discovery mode. Only `static` is supported today. Dynamic discovery is on the roadmap |
+| `mode` | string | `static`, `bootstrap`, `mdns`, `dns-srv`, `file` | Peer discovery provider |
+
+Provider selectors are `seeds` for bootstrap, `instance_name` for mDNS,
+`service_name` for DNS-SRV, and `path` for file discovery. See the
+[configuration reference](/numax/reference/configuration/) for all tuning fields and environment variables.
 
 ---
 

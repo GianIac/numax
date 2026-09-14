@@ -187,8 +187,8 @@ single further CLI command.
 - [x] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
 
 **Configuration**:
-- [ ] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
-- [ ] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
+- [x] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
+- [x] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
 
 **Protocol compatibility**:
 - [x] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes

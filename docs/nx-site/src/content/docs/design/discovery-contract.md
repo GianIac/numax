@@ -274,9 +274,11 @@ bootstrap or replication admission. No storage migration or guest ABI change
 is involved. See [Wire Versioning](/numax/design/wire-versioning/) for the exact
 compatibility boundary.
 
-Provider construction is currently a Rust integration API. CLI, environment
-and `numax.toml` selection of `bootstrap`, `mdns`, `dns-srv` and `file` modes is
-separate roadmap work; `--peer` continues to select static discovery.
+The CLI resolves provider selection from flags, `NX_DISCOVERY_*` variables and
+the `[discovery]` TOML section. Explicit peers continue to contribute a static
+source when a dynamic provider is selected; they are never reinterpreted as
+bootstrap seeds. Provider construction occurs in `nx-core` after the durable
+local `NodeId` has been loaded.
 
 ## Verification coverage
 
