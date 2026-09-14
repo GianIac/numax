@@ -96,6 +96,14 @@ jobs:
           rustflags: ""
       - name: Run tests
         run: cargo test --workspace --verbose
+      - name: Run multicast mDNS check
+        if: matrix.os == 'macos-latest'
+        env:
+          RUST_LOG: nx_core::discovery::mdns=debug,mdns_sd=debug
+        run: >-
+          cargo test -p nx-core
+          discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint
+          -- --ignored --exact --nocapture
 
   build-wasm:
     name: Build WASM Examples

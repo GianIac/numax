@@ -299,7 +299,7 @@ cancellation-safe shutdown. Provider-specific tests additionally cover:
 The ignored
 `discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint`
 test exercises two real DNS-SD daemons over local multicast, including goodbye
-removal. Run it on a multicast-capable host with:
+removal. CI runs this check explicitly on a dedicated macOS runner; keeping it ignored prevents the ordinary cross-platform suite from failing on hosts or containers without multicast support. Run it manually on a multicast-capable host with:
 
 ```sh
 cargo test -p nx-core \
