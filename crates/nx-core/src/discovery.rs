@@ -337,11 +337,31 @@ impl DiscoveryProvider {
 pub struct DiscoverySnapshot {
     revision: u64,
     peers: Vec<String>,
+    observations: Option<Vec<std::time::Instant>>,
 }
 
 impl DiscoverySnapshot {
     pub fn new(revision: u64, peers: Vec<String>) -> Self {
-        Self { revision, peers }
+        Self {
+            revision,
+            peers,
+            observations: None,
+        }
+    }
+
+    /// Capture endpoint observation times, not cache publication times. A fresh
+    /// watch must preserve these times so resubscription cannot extend a lease.
+    pub fn observed(revision: u64, peers: Vec<(String, std::time::Instant)>) -> Self {
+        let (peers, observations) = peers.into_iter().unzip();
+        Self {
+            revision,
+            peers,
+            observations: Some(observations),
+        }
+    }
+
+    pub fn observations(&self) -> Option<&[std::time::Instant]> {
+        self.observations.as_deref()
     }
 
     pub fn revision(&self) -> u64 {
@@ -371,6 +391,34 @@ pub enum DiscoveryChange {
     Removed(String),
     /// Atomically replace the provider's complete ordered contribution.
     Replaced(Vec<String>),
+    /// Complete view with original per-endpoint observation times. Identical
+    /// peers with newer observations renew leases; cached republication does not.
+    Observed(DiscoverySnapshot),
+}
+
+#[cfg(test)]
+fn observed_peers(change: DiscoveryChange) -> Vec<String> {
+    match change {
+        DiscoveryChange::Observed(snapshot) => {
+            assert!(snapshot.observations().is_some());
+            snapshot.into_peers()
+        }
+        other => panic!("expected an observed snapshot, got {other:?}"),
+    }
+}
+
+#[cfg(test)]
+async fn next_changed_peers(watch: &mut DiscoveryWatch, previous: &[String]) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let peers = observed_peers(watch.recv().await.unwrap().change);
+            if peers != previous {
+                return peers;
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 
 /// The endpoint a provider is asked to announce.
@@ -490,6 +538,15 @@ impl DiscoveryWatch {
 
         match self.events.recv().await {
             Ok(event) => {
+                if let DiscoveryChange::Observed(snapshot) = &event.change
+                    && snapshot.revision() != event.revision
+                {
+                    self.invalidated = true;
+                    return Err(DiscoveryError::WatchRevision {
+                        previous: self.last_revision,
+                        received: snapshot.revision(),
+                    });
+                }
                 if self.last_revision.checked_add(1) != Some(event.revision) {
                     self.invalidated = true;
                     return Err(DiscoveryError::WatchRevision {

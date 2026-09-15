@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const COUNTER_KEY: &str = "counter:visits";
 
+#[cfg(unix)]
+#[path = "support/discovery_lan.rs"]
+mod discovery_lan;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

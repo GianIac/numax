@@ -230,18 +230,25 @@ async fn run_dns_refresh(
                 if changed.is_err() || *shutdown.borrow() { break; }
             }
             _ = tokio::time::sleep_until(next_refresh) => {
-                let result = tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
+                let query = resolver.lookup(&config);
+                tokio::pin!(query);
+                let result = loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return;
+                            }
                         }
-                        continue;
+                        result = &mut query => break result,
+                        _ = wait_for_dns_expiry(valid_until) => {
+                            state.replace(Vec::new());
+                            valid_until = None;
+                        }
                     }
-                    result = resolver.lookup(&config) => result,
                 };
                 match result {
                     Ok(answer) => {
-                        (valid_until, next_refresh) = apply_dns_answer(&config, &state, answer);
+                        (valid_until, next_refresh) = apply_dns_answer(&config, &state, answer, valid_until);
                     }
                     Err(error) => {
                         let now = Instant::now();
@@ -261,17 +268,32 @@ fn apply_dns_answer(
     config: &DnsSrvDiscoveryConfig,
     state: &DynamicState,
     answer: SrvAnswer,
+    previous_valid_until: Option<Instant>,
 ) -> (Option<Instant>, Instant) {
     let now = Instant::now();
     if answer.valid_until <= now {
         state.replace(Vec::new());
         return (None, now + config.retry_interval);
     }
-    state.replace(records_to_peers(answer.records, config.max_candidates));
+    let peers = records_to_peers(answer.records, config.max_candidates);
+    if previous_valid_until.is_some_and(|previous| answer.valid_until <= previous) {
+        // Hickory can return the same cached answer before its original expiry.
+        // Only a newly validated DNS lifetime renews candidate observations.
+        state.replace(peers);
+    } else {
+        state.observe(peers);
+    }
     (
         Some(answer.valid_until),
         answer.valid_until.min(now + config.max_refresh_interval),
     )
+}
+
+async fn wait_for_dns_expiry(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn lookup(
@@ -467,6 +489,67 @@ mod tests {
     }
 
     #[test]
+    fn identical_fresh_dns_answer_renews_but_cached_answer_preserves_observation() {
+        let config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        let state = DynamicState::new(8);
+        let old = std::time::Instant::now() - Duration::from_secs(1);
+        state.observe_at(vec![("peer.example:9000".into(), old)]);
+        let record = SRV::new(0, 0, 9000, Name::from_ascii("peer.example.").unwrap());
+        let valid_until = Instant::now() + Duration::from_secs(10);
+        apply_dns_answer(
+            &config,
+            &state,
+            SrvAnswer {
+                records: vec![record.clone()],
+                valid_until,
+            },
+            None,
+        );
+        let fresh = state.snapshot();
+        assert_eq!(fresh.peers(), ["peer.example:9000"]);
+        assert!(fresh.observations().unwrap()[0] > old);
+        apply_dns_answer(
+            &config,
+            &state,
+            SrvAnswer {
+                records: vec![record],
+                valid_until,
+            },
+            Some(valid_until),
+        );
+        assert_eq!(state.snapshot(), fresh);
+    }
+
+    #[tokio::test]
+    async fn dns_view_expires_even_while_refresh_is_stalled() {
+        let resolver = Arc::new(SequenceResolver {
+            steps: Mutex::new(VecDeque::from([ResolverStep::Success(
+                vec![SRV::new(
+                    0,
+                    0,
+                    9000,
+                    Name::from_ascii("peer.example.").unwrap(),
+                )],
+                Duration::from_millis(30),
+            )])),
+        });
+        let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        config.max_refresh_interval = Duration::from_millis(5);
+        let provider = DnsSrvDiscovery::with_resolver(config, resolver);
+        let mut watch = provider.watch().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(
+                super::super::observed_peers(watch.recv().await.unwrap().change),
+                ["peer.example:9000"]
+            );
+            assert!(super::super::observed_peers(watch.recv().await.unwrap().change).is_empty());
+        })
+        .await
+        .unwrap();
+        provider.shutdown().await.unwrap();
+    }
+
+    #[test]
     fn srv_records_are_bounded_deduplicated_and_deterministic() {
         let records = vec![
             SRV::new(20, 0, 9002, Name::from_ascii("b.example.").unwrap()),
@@ -549,7 +632,7 @@ mod tests {
             valid_until: Instant::now(),
         };
 
-        let (valid_until, _) = apply_dns_answer(&config, &state, answer);
+        let (valid_until, _) = apply_dns_answer(&config, &state, answer, None);
 
         assert!(valid_until.is_none());
         assert!(state.snapshot().peers().is_empty());
@@ -576,24 +659,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            first.change,
-            super::super::DiscoveryChange::Replaced(vec!["first.example:9001".into()])
+            super::super::observed_peers(first.change),
+            ["first.example:9001"]
         );
         let expired = tokio::time::timeout(Duration::from_secs(1), watch.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            expired.change,
-            super::super::DiscoveryChange::Replaced(Vec::new())
+            super::super::observed_peers(expired.change),
+            Vec::<String>::new()
         );
         let recovered = tokio::time::timeout(Duration::from_secs(1), watch.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            recovered.change,
-            super::super::DiscoveryChange::Replaced(vec!["second.example:9002".into()])
+            super::super::observed_peers(recovered.change),
+            ["second.example:9002"]
         );
 
         provider.shutdown().await.unwrap();

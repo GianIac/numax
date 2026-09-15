@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use nx_sync::{NodeId, Op};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -39,6 +40,83 @@ const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 1;
 
 type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
+
+#[derive(Default)]
+struct TaskRegistry {
+    closed: bool,
+    tasks: JoinSet<()>,
+}
+
+impl TaskRegistry {
+    fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) -> NetResult<()> {
+        if self.closed {
+            return Err(NetError::ConnectionFailed("node is shut down".into()));
+        }
+        while self.tasks.try_join_next().is_some() {}
+        // Admission and spawn share the shutdown lock: no untracked task can escape.
+        self.tasks.spawn(task);
+        Ok(())
+    }
+}
+
+fn spawn_task(
+    registry: &StdMutex<TaskRegistry>,
+    task: impl Future<Output = ()> + Send + 'static,
+) -> NetResult<()> {
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .spawn(task)
+}
+
+/// Owns the drained tasks across awaits. Cancellation aborts them without detaching
+/// their handles, so a subsequent shutdown can still join every owned task.
+struct ShutdownTasks<'a> {
+    registry: &'a StdMutex<TaskRegistry>,
+    tasks: JoinSet<()>,
+}
+
+impl<'a> ShutdownTasks<'a> {
+    fn close(registry: &'a StdMutex<TaskRegistry>) -> Self {
+        let mut state = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        Self {
+            registry,
+            tasks: std::mem::take(&mut state.tasks),
+        }
+    }
+
+    async fn join(&mut self, grace: Duration) {
+        if timeout(grace, async {
+            while let Some(result) = self.tasks.join_next().await {
+                if let Err(error) = result {
+                    debug!(%error, "network task ended during shutdown");
+                }
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!("network tasks did not finish cooperatively; aborting");
+            self.tasks.abort_all();
+            while self.tasks.join_next().await.is_some() {}
+        }
+    }
+}
+
+impl Drop for ShutdownTasks<'_> {
+    fn drop(&mut self) {
+        self.tasks.abort_all();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Shutdown callers are serialized and a closed registry rejects all spawns.
+        registry.tasks = std::mem::take(&mut self.tasks);
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct NodeLimits {
@@ -256,7 +334,8 @@ pub struct Node {
     connection_slots: Arc<Semaphore>,
     outbound_attempt_slots: Arc<Semaphore>,
     outbound_attempts: Arc<StdMutex<HashSet<String>>>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    tasks: Arc<StdMutex<TaskRegistry>>,
+    shutdown_lock: Mutex<()>,
     bootstrap_server: Option<Arc<BootstrapServer>>,
 }
 
@@ -282,7 +361,8 @@ impl Node {
             connection_slots: Arc::new(Semaphore::new(max_peers)),
             outbound_attempt_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)),
             outbound_attempts: Arc::new(StdMutex::new(HashSet::new())),
-            tasks: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(StdMutex::new(TaskRegistry::default())),
+            shutdown_lock: Mutex::new(()),
             bootstrap_server,
         }
     }
@@ -317,8 +397,11 @@ impl Node {
         let shutdown_tx = self.shutdown_tx.clone();
         let bootstrap_server = self.bootstrap_server.clone();
 
-        let listener_task = tokio::spawn(async move {
+        spawn_task(&self.tasks, async move {
             loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -345,7 +428,7 @@ impl Node {
                                 let shutdown_rx = shutdown_tx.subscribe();
                                 let bootstrap_server = bootstrap_server.clone();
 
-                                let task = tokio::spawn(async move {
+                                let admitted = spawn_task(&tasks, async move {
                                     let context = IncomingContext {
                                         tls,
                                         our_node_id: node_id,
@@ -363,7 +446,9 @@ impl Node {
                                         error!(%addr, error = %e, "connection error");
                                     }
                                 });
-                                track_task(&tasks, task).await;
+                                if admitted.is_err() {
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 error!(error = %e, "accept error");
@@ -372,14 +457,16 @@ impl Node {
                     }
                 }
             }
-        });
-        track_task(&self.tasks, listener_task).await;
+        })?;
 
         Ok(bound_addr)
     }
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
+        if *self.shutdown_tx.borrow() {
+            return Err(NetError::ConnectionFailed("node is shut down".into()));
+        }
         if self.is_connected_addr(addr).await {
             return Ok(());
         }
@@ -460,15 +547,16 @@ impl Node {
         // Save connection
         let writer = Arc::new(Mutex::new(writer));
         let connection_instance = Arc::new(());
+        let mut peer_connections = self.peers.write().await;
         let peers_connected = {
-            let mut peers = self.peers.write().await;
+            let peers = &mut *peer_connections;
             if peers
                 .get(addr)
                 .is_some_and(|connection| connection.state == PeerState::Connected)
             {
                 return Ok(());
             }
-            ensure_peer_slot_available(&peers, self.config.max_peers, Some(addr))?;
+            ensure_peer_slot_available(peers, self.config.max_peers, Some(addr))?;
             peers.insert(
                 addr.to_string(),
                 PeerConnection {
@@ -489,23 +577,11 @@ impl Node {
                     _slot: slot,
                 },
             );
-            connected_peer_count(&peers)
+            connected_peer_count(peers)
         };
 
-        let shutdown_for_events = self.shutdown_tx.subscribe();
-        send_node_event(
-            &self.event_tx,
-            &shutdown_for_events,
-            "PeerConnected",
-            NodeEvent::PeerConnected {
-                node_id: peer_node_id.clone(),
-                addr: addr.to_string(),
-                peers_connected,
-            },
-        )
-        .await;
-
-        // Start read loop
+        // No await between inserting the connection and registering its owner.
+        // Keep the peer lock until rejected admission has rolled the insertion back.
         let peers = Arc::clone(&self.peers);
         let event_tx = self.event_tx.clone();
         let addr_owned = addr.to_string();
@@ -513,8 +589,23 @@ impl Node {
         let socket_timeout = self.config.socket_timeout;
         let shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_for_events = shutdown_rx.clone();
+        let task_instance = Arc::clone(&connection_instance);
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
 
-        let task = tokio::spawn(async move {
+        let admitted = spawn_task(&self.tasks, async move {
+            send_node_event(
+                &event_tx,
+                &shutdown_for_events,
+                "PeerConnected",
+                NodeEvent::PeerConnected {
+                    node_id: peer_node_id.clone(),
+                    addr: addr_owned.clone(),
+                    peers_connected,
+                },
+            )
+            .await;
+            let _ = connected_tx.send(());
+
             if let Err(e) = read_loop(
                 reader,
                 ReadLoopContext {
@@ -536,8 +627,8 @@ impl Node {
             // Cleanup
             let disconnected = {
                 let mut peers = peers.write().await;
-                remove_connection_if_current(&mut peers, &addr_owned, &connection_instance)
-                    .and_then(|removed| {
+                remove_connection_if_current(&mut peers, &addr_owned, &task_instance).and_then(
+                    |removed| {
                         (removed.state == PeerState::Connected).then(|| {
                             (
                                 peer_node_id.clone(),
@@ -545,7 +636,8 @@ impl Node {
                                 connected_peer_count(&peers),
                             )
                         })
-                    })
+                    },
+                )
             };
 
             if let Some((node_id, addr, peers_connected)) = disconnected {
@@ -562,9 +654,16 @@ impl Node {
                 .await;
             }
         });
-        track_task(&self.tasks, task).await;
-
-        Ok(())
+        if admitted.is_err() {
+            remove_connection_if_current(&mut peer_connections, addr, &connection_instance);
+        }
+        drop(peer_connections);
+        admitted?;
+        // Preserve event delivery before returning, but keep the read task owned
+        // even if the caller cancels while the bounded event queue is full.
+        connected_rx.await.map_err(|_| {
+            NetError::ConnectionFailed("connection task stopped before announcing the peer".into())
+        })
     }
 
     /// Send ops to all connected peers.
@@ -597,7 +696,12 @@ impl Node {
                     (conn.state == PeerState::Connected)
                         .then(|| {
                             conn.writer.as_ref().map(|writer| {
-                                (addr.clone(), Arc::clone(writer), conn.serialization_format)
+                                (
+                                    addr.clone(),
+                                    Arc::clone(writer),
+                                    conn.serialization_format,
+                                    Arc::clone(&conn.instance),
+                                )
                             })
                         })
                         .flatten()
@@ -606,13 +710,15 @@ impl Node {
         };
 
         let mut failed = Vec::new();
-        for (addr, writer, serialization_format) in writers {
+        for (addr, writer, serialization_format, instance) in writers {
             let bytes = msg.to_bytes_with_format(serialization_format)?;
             let mut writer = writer.lock().await;
             if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
                 warn!(%addr, error = %e, "failed to send ops");
                 failed.push(addr.clone());
-                if let Some((node_id, peers_connected)) = self.mark_peer_failed(&addr).await {
+                if let Some((node_id, peers_connected)) =
+                    self.mark_peer_failed(&addr, &instance).await
+                {
                     let shutdown_for_events = self.shutdown_tx.subscribe();
                     send_node_event(
                         &self.event_tx,
@@ -642,15 +748,19 @@ impl Node {
             peers.get(addr).and_then(|conn| {
                 (conn.state == PeerState::Connected)
                     .then(|| {
-                        conn.writer
-                            .as_ref()
-                            .map(|writer| (Arc::clone(writer), conn.serialization_format))
+                        conn.writer.as_ref().map(|writer| {
+                            (
+                                Arc::clone(writer),
+                                conn.serialization_format,
+                                Arc::clone(&conn.instance),
+                            )
+                        })
                     })
                     .flatten()
             })
         };
 
-        let Some((writer, serialization_format)) = peer_writer else {
+        let Some((writer, serialization_format, instance)) = peer_writer else {
             return Err(NetError::PeerDisconnected(addr.to_string()));
         };
 
@@ -658,7 +768,7 @@ impl Node {
         let mut writer = writer.lock().await;
         if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
             warn!(%addr, error = %e, "failed to send message to peer");
-            if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr).await {
+            if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr, &instance).await {
                 let shutdown_for_events = self.shutdown_tx.subscribe();
                 send_node_event(
                     &self.event_tx,
@@ -682,6 +792,25 @@ impl Node {
     pub async fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
         connected_peer_count(&peers)
+    }
+
+    /// Snapshot of active peers as `(connection address, handshake NodeId)` pairs.
+    /// Sorted by address; identities are certificate-bound only with secure TLS.
+    pub async fn connected_peers(&self) -> Vec<(String, NodeId)> {
+        let peers = self.peers.read().await;
+        let mut connected = peers
+            .iter()
+            .filter(|(_, connection)| connection.state == PeerState::Connected)
+            .filter_map(|(addr, connection)| {
+                connection
+                    .info
+                    .node_id
+                    .clone()
+                    .map(|node_id| (addr.clone(), node_id))
+            })
+            .collect::<Vec<_>>();
+        connected.sort_by(|(left, _), (right, _)| left.cmp(right));
+        connected
     }
 
     /// Returns true when the configured peer address currently has an active connection.
@@ -720,41 +849,32 @@ impl Node {
         server.withdraw()
     }
 
-    async fn mark_peer_failed(&self, addr: &str) -> Option<(NodeId, usize)> {
+    async fn mark_peer_failed(&self, addr: &str, instance: &Arc<()>) -> Option<(NodeId, usize)> {
         let mut peers = self.peers.write().await;
         let node_id = {
             let conn = peers.get_mut(addr)?;
+            if !Arc::ptr_eq(&conn.instance, instance) || conn.state != PeerState::Connected {
+                return None;
+            }
             conn.state = PeerState::Failed;
             conn.info.node_id.clone()?
         };
         Some((node_id, connected_peer_count(&peers)))
     }
 
-    /// Close outbound peer connections by dropping their writers.
+    /// Stop admissions, join owned network tasks within one grace period, then
+    /// abort/join any stragglers and close peer writers. Safe to retry if cancelled.
     pub async fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        let _shutdown = self.shutdown_lock.lock().await;
+        let mut tasks = ShutdownTasks::close(&self.tasks);
+        self.shutdown_tx.send_replace(true);
+        self.connection_slots.close();
+        self.outbound_attempt_slots.close();
         if let Some(server) = &self.bootstrap_server {
             server.clear();
         }
 
-        let mut tasks = {
-            let mut tasks = self.tasks.lock().await;
-            std::mem::take(&mut *tasks)
-        };
-
-        for mut task in tasks.drain(..) {
-            match timeout(TASK_SHUTDOWN_GRACE, &mut task).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    debug!(error = %e, "network task ended during shutdown");
-                }
-                Err(_) => {
-                    warn!("network task did not finish cooperatively; aborting");
-                    task.abort();
-                    let _ = task.await;
-                }
-            }
-        }
+        tasks.join(TASK_SHUTDOWN_GRACE).await;
 
         let count = {
             let mut peers = self.peers.write().await;
@@ -763,6 +883,23 @@ impl Node {
             count
         };
         debug!(count, "node peer connections closed");
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut registry = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.closed = true;
+        registry.tasks.abort_all();
+        self.shutdown_tx.send_replace(true);
+        self.connection_slots.close();
+        self.outbound_attempt_slots.close();
+        if let Some(server) = &self.bootstrap_server {
+            server.clear();
+        }
     }
 }
 
@@ -1245,12 +1382,6 @@ async fn send_node_event(
     }
 }
 
-async fn track_task(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: JoinHandle<()>) {
-    let mut tasks = tasks.lock().await;
-    tasks.retain(|task| !task.is_finished());
-    tasks.push(task);
-}
-
 /// Loop for reading messages from a peer until disconnection
 async fn read_loop(
     mut reader: tokio::io::ReadHalf<NetStream>,
@@ -1269,6 +1400,9 @@ async fn read_loop(
     let shutdown_for_events = shutdown_rx.clone();
 
     loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
         let msg = tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -1568,40 +1702,293 @@ mod tests {
             );
         }
 
-        let (node_id, connected) = node.mark_peer_failed("127.0.0.1:9001").await.unwrap();
+        let instance = Arc::clone(&node.peers.read().await["127.0.0.1:9001"].instance);
+        let (node_id, connected) = node
+            .mark_peer_failed("127.0.0.1:9001", &instance)
+            .await
+            .unwrap();
 
         assert_eq!(node_id, NodeId::new("peer-a"));
         assert_eq!(connected, 1);
+        assert!(
+            node.mark_peer_failed("127.0.0.1:9001", &instance)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn track_task_prunes_finished_handles_before_push() {
-        let tasks = Arc::new(Mutex::new(Vec::new()));
-        let finished = tokio::spawn(async {});
+    async fn registry_prunes_finished_tasks_before_admission() {
+        let tasks = StdMutex::new(TaskRegistry::default());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        spawn_task(&tasks, async move {
+            done_tx.send(()).unwrap();
+        })
+        .unwrap();
+        done_rx.await.unwrap();
+        spawn_task(&tasks, std::future::pending()).unwrap();
+        assert_eq!(tasks.lock().unwrap().tasks.len(), 1);
+        ShutdownTasks::close(&tasks).join(Duration::ZERO).await;
+    }
 
+    #[tokio::test]
+    async fn registry_rejects_late_admission_and_drops_the_unspawned_future() {
+        let tasks = StdMutex::new(TaskRegistry::default());
+        let mut shutdown = ShutdownTasks::close(&tasks);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(
+            spawn_task(&tasks, async move {
+                let _sender = dropped_tx;
+                panic!("late task must never run");
+            })
+            .is_err()
+        );
+        assert!(dropped_rx.await.is_err());
+        shutdown.join(Duration::ZERO).await;
+        assert!(shutdown.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_is_joined_or_rejected() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+        let registry = Arc::clone(&node.tasks);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        spawn_task(&node.tasks, async move {
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let admitted = spawn_task(&registry, async {});
+            admitted_tx.send(admitted.is_ok()).unwrap();
+        })
+        .unwrap();
+        entered_rx.await.unwrap();
+        let mut shutdown = tokio_test::task::spawn(node.shutdown());
+        assert!(shutdown.poll().is_pending());
+        release_tx.send(()).unwrap();
+        assert!(!admitted_rx.await.unwrap());
+        shutdown.await;
+        let registry = node.tasks.lock().unwrap();
+        assert!(registry.closed);
+        assert!(registry.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_aborts_tasks_and_retains_handles_for_retry() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        spawn_task(&node.tasks, async move {
+            let _sender = dropped_tx;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        let mut shutdown = tokio_test::task::spawn(node.shutdown());
+        assert!(shutdown.poll().is_pending());
+        drop(shutdown);
+        assert!(
+            dropped_rx.await.is_err(),
+            "cancelled shutdown detached a task"
+        );
+        assert_eq!(node.tasks.lock().unwrap().tasks.len(), 1);
+        assert!(node.start_listener().await.is_err());
+        node.shutdown().await;
+        assert!(node.tasks.lock().unwrap().tasks.is_empty());
+        assert_eq!(node.connected_peer_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_handshake_finishing_after_shutdown_cannot_register_a_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let node = Arc::new(Node::new(NodeConfig::new(
+            NodeId::new("test"),
+            "127.0.0.1:0",
+        )));
+        let client = Arc::clone(&node);
+        let connect = tokio::spawn(async move { client.connect_to_peer(&addr).await });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_message(
+            &mut stream,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.shutdown().await;
+        write_message(
+            &mut stream,
+            &Message::hello_ack_with_format(NodeId::new("peer"), SerializationFormat::Bincode),
+            SerializationFormat::Bincode,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(connect.await.unwrap().is_err());
+        assert!(node.connected_peers().await.is_empty());
+        assert!(node.tasks.lock().unwrap().tasks.is_empty());
+        assert_eq!(node.connection_slots.available_permits(), DEFAULT_MAX_PEERS);
+    }
+
+    #[tokio::test]
+    async fn cancelling_connect_during_event_backpressure_keeps_read_task_owned() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut node = Node::new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0").with_event_channel_capacity(1),
+        );
+        let mut events = node.take_event_receiver().unwrap();
+        node.event_tx
+            .try_send(NodeEvent::OpsReceived {
+                from: NodeId::new("queued"),
+                ops: vec![],
+            })
+            .unwrap();
+        let node = Arc::new(node);
+        let client = Arc::clone(&node);
+        let endpoint = addr.clone();
+        let connect = tokio::spawn(async move { client.connect_to_peer(&endpoint).await });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_message(
+            &mut stream,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut stream,
+            &Message::hello_ack_with_format(NodeId::new("peer"), SerializationFormat::Bincode),
+            SerializationFormat::Bincode,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         timeout(Duration::from_secs(1), async {
-            loop {
-                if finished.is_finished() {
-                    break;
-                }
+            while !node.is_connected_addr(&addr).await {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        assert!(!connect.is_finished());
+        connect.abort();
+        assert!(connect.await.unwrap_err().is_cancelled());
+        assert_eq!(node.tasks.lock().unwrap().tasks.len(), 1);
+        assert!(matches!(
+            events.recv().await,
+            Some(NodeEvent::OpsReceived { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(NodeEvent::PeerConnected { .. })
+        ));
+        node.shutdown().await;
+        assert!(node.tasks.lock().unwrap().tasks.is_empty());
+        assert!(node.connected_peers().await.is_empty());
+    }
 
-        track_task(&tasks, finished).await;
-        assert_eq!(tasks.lock().await.len(), 1);
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_uses_one_total_grace_for_all_tasks() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+        let mut dropped = Vec::new();
+        for _ in 0..8 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            dropped.push(rx);
+            spawn_task(&node.tasks, async move {
+                let _sender = tx;
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        node.shutdown().await;
+        assert_eq!(started.elapsed(), TASK_SHUTDOWN_GRACE);
+        for task in dropped {
+            assert!(task.await.is_err());
+        }
+        assert!(node.tasks.lock().unwrap().tasks.is_empty());
+    }
 
-        let pending = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-        track_task(&tasks, pending).await;
+    #[tokio::test]
+    async fn dropping_node_aborts_owned_tasks_even_when_registry_is_shared() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+        let registry = Arc::clone(&node.tasks);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task_registry = Arc::clone(&registry);
+        spawn_task(&registry, async move {
+            let _registry = task_registry;
+            let _sender = tx;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        drop(node);
+        assert!(rx.await.is_err());
+        assert!(registry.lock().unwrap().closed);
+        ShutdownTasks::close(&registry).join(Duration::ZERO).await;
+    }
 
-        let mut tasks = tasks.lock().await;
-        assert_eq!(tasks.len(), 1);
-        for task in tasks.drain(..) {
-            task.abort();
+    #[tokio::test]
+    async fn stale_writer_failure_does_not_fail_or_emit_disconnect_for_replacement() {
+        for broadcast in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (_remote, _) = listener.accept().await.unwrap();
+            let (_reader, writer) = tokio::io::split(NetStream::Plain(stream));
+            let writer = Arc::new(Mutex::new(writer));
+            let mut held_writer = writer.lock().await;
+            held_writer.shutdown().await.unwrap();
+            let mut node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+            let mut events = node.take_event_receiver().unwrap();
+            let addr = "127.0.0.1:9001";
+            node.peers.write().await.insert(
+                addr.into(),
+                PeerConnection {
+                    info: PeerInfo::new(addr).with_node_id(NodeId::new("old")),
+                    connection_info: None,
+                    instance: Arc::new(()),
+                    state: PeerState::Connected,
+                    serialization_format: SerializationFormat::Bincode,
+                    writer: Some(Arc::clone(&writer)),
+                    _slot: test_slot(),
+                },
+            );
+            let mut send = tokio_test::task::spawn(async {
+                if broadcast {
+                    node.broadcast_message(Message::ping()).await
+                } else {
+                    node.send_message_to_addr(addr, Message::ping()).await
+                }
+            });
+            // The snapshot has been taken, but writing is blocked on our writer lock.
+            assert!(send.poll().is_pending());
+            let replacement = Arc::new(());
+            node.peers.write().await.insert(
+                addr.into(),
+                PeerConnection {
+                    info: PeerInfo::new(addr).with_node_id(NodeId::new("replacement")),
+                    connection_info: None,
+                    instance: Arc::clone(&replacement),
+                    state: PeerState::Connected,
+                    serialization_format: SerializationFormat::Bincode,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+            drop(held_writer);
+            assert!(send.await.is_err());
+            assert!(node.is_connected_addr(addr).await);
+            assert_eq!(
+                node.connected_peers().await,
+                [(addr.into(), NodeId::new("replacement"))]
+            );
+            assert!(events.try_recv().is_err());
+            assert!(Arc::ptr_eq(
+                &node.peers.read().await[addr].instance,
+                &replacement
+            ));
+            node.shutdown().await;
         }
     }
 
@@ -1639,6 +2026,38 @@ mod tests {
         assert!(node.is_connected_addr("127.0.0.1:9001").await);
         assert!(!node.is_connected_addr("127.0.0.1:9002").await);
         assert!(!node.is_connected_addr("127.0.0.1:9003").await);
+    }
+
+    #[tokio::test]
+    async fn connected_peers_is_sorted_and_excludes_failed_connections() {
+        let node = Node::new(NodeConfig::new(NodeId::new("test"), "127.0.0.1:0"));
+        for (addr, state) in [
+            ("z.example:9000", PeerState::Connected),
+            ("a.example:9000", PeerState::Connected),
+            ("failed.example:9000", PeerState::Failed),
+        ] {
+            node.peers.write().await.insert(
+                addr.into(),
+                PeerConnection {
+                    info: PeerInfo::new(addr).with_node_id(NodeId::new(addr)),
+                    connection_info: None,
+                    instance: Arc::new(()),
+                    state,
+                    serialization_format: SerializationFormat::Bincode,
+                    writer: None,
+                    _slot: test_slot(),
+                },
+            );
+        }
+        assert_eq!(
+            node.connected_peers().await,
+            [
+                ("a.example:9000".into(), NodeId::new("a.example:9000")),
+                ("z.example:9000".into(), NodeId::new("z.example:9000")),
+            ]
+        );
+        node.shutdown().await;
+        assert!(node.connected_peers().await.is_empty());
     }
 
     #[test]

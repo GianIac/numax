@@ -124,7 +124,7 @@ impl FileWatchDiscovery {
         if lifecycle.task.is_some() {
             return Ok(());
         }
-        self.inner.state.replace(initial);
+        self.inner.state.observe(initial);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
@@ -210,7 +210,7 @@ async fn run_file_watch(
                 }
             }
             _ = interval.tick() => match read_peer_file(&config).await {
-                Ok(peers) => state.replace(peers),
+                Ok(peers) => state.observe(peers),
                 Err(error) => tracing::warn!(%error, path = %config.path.display(), "ignoring invalid peer file update"),
             }
         }
@@ -355,17 +355,8 @@ mod tests {
         assert!(watch.snapshot().peers().is_empty());
 
         replace_file(&path, "b.example:2\na.example:1\n").await;
-        let event = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            event.change,
-            super::super::DiscoveryChange::Replaced(vec![
-                "b.example:2".into(),
-                "a.example:1".into()
-            ])
-        );
+        let peers = super::super::next_changed_peers(&mut watch, &[]).await;
+        assert_eq!(peers, ["b.example:2", "a.example:1"]);
 
         replace_file(&path, "valid.example:3\nnot-an-endpoint\n").await;
         assert!(read_peer_file(&discovery.inner.config).await.is_err());
@@ -373,31 +364,29 @@ mod tests {
         tokio::fs::write(&path, [0xff, 0xfe]).await.unwrap();
         assert!(read_peer_file(&discovery.inner.config).await.is_err());
         replace_file(&path, "recovered.example:5\n").await;
-        let recovered = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            recovered.change,
-            super::super::DiscoveryChange::Replaced(vec!["recovered.example:5".into()])
-        );
+        let recovered = super::super::next_changed_peers(&mut watch, &peers).await;
+        assert_eq!(recovered, ["recovered.example:5"]);
 
         tokio::fs::remove_file(&path).await.unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            event.change,
-            super::super::DiscoveryChange::Replaced(Vec::new())
+        assert!(
+            super::super::next_changed_peers(&mut watch, &recovered)
+                .await
+                .is_empty()
         );
 
         discovery.shutdown().await.unwrap();
+        let stopped_revision = discovery.inner.state.snapshot().revision();
         replace_file(&path, "late.example:4\n").await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(40), watch.recv())
-                .await
-                .is_err()
+            tokio::time::timeout(Duration::from_millis(40), async {
+                loop {
+                    // Queued observations from before shutdown remain valid;
+                    // no event may have been produced after the final revision.
+                    assert!(watch.recv().await.unwrap().revision <= stopped_revision);
+                }
+            })
+            .await
+            .is_err()
         );
     }
 }

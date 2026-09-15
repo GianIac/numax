@@ -16,6 +16,8 @@ use crate::{NetError, NetResult, SerializationFormat, TlsConfig};
 pub const DEFAULT_BOOTSTRAP_CACHE_CAPACITY: usize = 1_024;
 /// Default maximum number of endpoint suggestions returned by one bootstrap query.
 pub const DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY: usize = 128;
+/// Hard upper bound for candidates requested or returned in one bootstrap query.
+pub const MAX_BOOTSTRAP_RESPONSE_CAPACITY: usize = 4_096;
 /// Default lifetime of an endpoint suggestion learned by a bootstrap seed.
 pub const DEFAULT_BOOTSTRAP_CANDIDATE_TTL: Duration = Duration::from_secs(60);
 /// Hard upper bound for a bootstrap candidate lease.
@@ -66,11 +68,7 @@ impl BootstrapServerConfig {
     }
 
     pub fn with_max_response_candidates(mut self, limit: usize) -> NetResult<Self> {
-        if limit == 0 || u32::try_from(limit).is_err() {
-            return Err(NetError::InvalidMessage(
-                "bootstrap response capacity must be in 1..=u32::MAX".into(),
-            ));
-        }
+        validate_response_capacity(limit)?;
         self.max_response_candidates = limit;
         Ok(self)
     }
@@ -111,12 +109,7 @@ impl BootstrapServerConfig {
                 "bootstrap cache capacity must be greater than zero".into(),
             ));
         }
-        if self.max_response_candidates == 0 || u32::try_from(self.max_response_candidates).is_err()
-        {
-            return Err(NetError::InvalidMessage(
-                "bootstrap response capacity must be in 1..=u32::MAX".into(),
-            ));
-        }
+        validate_response_capacity(self.max_response_candidates)?;
         validate_candidate_ttl(self.candidate_ttl)
     }
 }
@@ -159,12 +152,7 @@ impl BootstrapClientConfig {
                 "bootstrap socket timeout must be greater than zero".into(),
             ));
         }
-        if self.max_response_candidates == 0 || u32::try_from(self.max_response_candidates).is_err()
-        {
-            return Err(NetError::InvalidMessage(
-                "bootstrap response capacity must be in 1..=u32::MAX".into(),
-            ));
-        }
+        validate_response_capacity(self.max_response_candidates)?;
         validate_candidate_ttl(self.max_candidate_ttl)?;
         if self.max_concurrent_queries == 0 {
             return Err(NetError::InvalidMessage(
@@ -471,15 +459,21 @@ impl BootstrapServer {
             }
         }
 
-        let limit = requested_results.min(self.config.max_response_candidates);
+        let limit = requested_results
+            .min(self.config.max_response_candidates)
+            .min(MAX_BOOTSTRAP_RESPONSE_CAPACITY);
         let advertised = self
             .advertised_endpoint
             .lock()
             .map_err(cache_poisoned)?
             .clone();
-        let mut endpoints = Vec::with_capacity(limit);
+        // Reserve for locally available entries, never for a remote request's capacity.
+        let available = cache.by_node.len() - usize::from(cache.by_node.contains_key(requester))
+            + usize::from(advertised.is_some());
+        let mut endpoints = Vec::with_capacity(limit.min(available));
         let mut seen = HashSet::new();
-        if let Some(endpoint) = advertised
+        if limit > 0
+            && let Some(endpoint) = advertised
             && seen.insert(endpoint.clone())
         {
             endpoints.push(endpoint);
@@ -621,6 +615,15 @@ fn valid_dns_name(host: &str) -> bool {
         })
 }
 
+fn validate_response_capacity(limit: usize) -> NetResult<()> {
+    if !(1..=MAX_BOOTSTRAP_RESPONSE_CAPACITY).contains(&limit) {
+        return Err(NetError::InvalidMessage(format!(
+            "bootstrap response capacity must be in 1..={MAX_BOOTSTRAP_RESPONSE_CAPACITY}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_candidate_ttl(ttl: Duration) -> NetResult<()> {
     if ttl.is_zero() || ttl > MAX_BOOTSTRAP_CANDIDATE_TTL {
         return Err(NetError::InvalidMessage(format!(
@@ -639,6 +642,116 @@ mod tests {
     fn certificate_node_id(path: &std::path::Path) -> NodeId {
         let certificate = crate::TlsConfig::load_certs(path).unwrap().remove(0);
         crate::tls::derive_protocol_node_id_from_cert(&certificate).unwrap()
+    }
+
+    #[test]
+    fn response_capacity_is_validated_by_both_configurations_and_client_constructor() {
+        for limit in [
+            0,
+            MAX_BOOTSTRAP_RESPONSE_CAPACITY + 1,
+            u32::MAX as usize,
+            usize::MAX,
+        ] {
+            assert!(
+                BootstrapServerConfig::new("cluster-a")
+                    .unwrap()
+                    .with_max_response_candidates(limit)
+                    .is_err()
+            );
+            let mut server_config = BootstrapServerConfig::new("cluster-a").unwrap();
+            server_config.max_response_candidates = limit;
+            assert!(server_config.validate().is_err());
+            let mut client_config = BootstrapClientConfig::new(NodeId::new("client"));
+            client_config.max_response_candidates = limit;
+            assert!(client_config.validate().is_err());
+            assert!(BootstrapClient::new(client_config).is_err());
+        }
+        for limit in [1, MAX_BOOTSTRAP_RESPONSE_CAPACITY] {
+            BootstrapServerConfig::new("cluster-a")
+                .unwrap()
+                .with_max_response_candidates(limit)
+                .unwrap()
+                .validate()
+                .unwrap();
+            let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+            config.max_response_candidates = limit;
+            BootstrapClient::new(config).unwrap();
+        }
+    }
+
+    #[test]
+    fn huge_request_reserves_only_available_candidates() {
+        let server = BootstrapServer::new(
+            BootstrapServerConfig::new("cluster-a")
+                .unwrap()
+                .with_max_response_candidates(MAX_BOOTSTRAP_RESPONSE_CAPACITY)
+                .unwrap(),
+        );
+        let requester = NodeId::new("client");
+        let empty = server
+            .exchange(&requester, None, u32::MAX as usize)
+            .unwrap();
+        assert_eq!(empty.capacity(), 0);
+        server.announce("seed.example:9000".into()).unwrap();
+        server
+            .exchange(&NodeId::new("peer"), Some("peer.example:9000".into()), 1)
+            .unwrap();
+        let response = server
+            .exchange(
+                &requester,
+                Some("client.example:9000".into()),
+                u32::MAX as usize,
+            )
+            .unwrap();
+        assert_eq!(response, ["seed.example:9000", "peer.example:9000"]);
+        assert_eq!(response.capacity(), 2);
+        let zero = server.exchange(&requester, None, 0).unwrap();
+        assert_eq!(zero.capacity(), 0);
+        assert!(zero.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_u32_max_request_returns_a_bounded_v5_response() {
+        for format in [SerializationFormat::Bincode, SerializationFormat::Json] {
+            let node = Node::new(
+                NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0").with_bootstrap_server(
+                    BootstrapServerConfig::new("cluster-a")
+                        .unwrap()
+                        .with_max_response_candidates(MAX_BOOTSTRAP_RESPONSE_CAPACITY)
+                        .unwrap(),
+                ),
+            );
+            let bound = node.start_listener().await.unwrap();
+            node.announce_bootstrap_endpoint(bound.to_string()).unwrap();
+            let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+            let request = Message::bootstrap_hello(
+                NodeId::new("client"),
+                vec![format],
+                format,
+                "cluster-a".into(),
+                None,
+                u32::MAX,
+            );
+            write_message(&mut stream, &request, format, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let response = read_message(&mut stream, 1024, Duration::from_secs(1))
+                .await
+                .unwrap();
+            match response.kind {
+                MessageKind::BootstrapAck {
+                    protocol_version,
+                    candidates,
+                    ..
+                } => {
+                    assert_eq!(protocol_version, 5);
+                    assert_eq!(candidates, [bound.to_string()]);
+                }
+                other => panic!("unexpected bootstrap reply: {other:?}"),
+            }
+            assert_eq!(node.connected_peer_count().await, 0);
+            node.shutdown().await;
+        }
     }
 
     #[test]

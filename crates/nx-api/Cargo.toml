@@ -1,6 +1,6 @@
 [package]
 name = "nx-api"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license.workspace = true
 
@@ -11,7 +11,7 @@ base64 = "0.22"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-nx-core = { version = "0.1.4", path = "../nx-core" }
+nx-core = { version = "0.1.5", path = "../nx-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"

@@ -185,7 +185,7 @@ pub struct SyncManager {
     /// Active connections, keyed by the address used by the network node.
     active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
 
-    /// Last received OpId per peer NodeId, used for incremental anti-entropy pulls.
+    /// Last received OpId per peer NodeId, for observation only, not a causal frontier.
     anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 
     /// Channel to send Ops to broadcast.
@@ -355,7 +355,10 @@ impl SyncManager {
         }
     }
 
-    /// Start networking: bind the listener, dial initial peers, spawn the inbound event loop and the outbound broadcast drain loop.
+    /// Bind the listener and start discovery, replication, and reconnect tasks.
+    ///
+    /// Initial peers are dialed in the background. Success means local services
+    /// are started, not that a peer is connected or replication has settled.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         let listen_addr = match &self.config.listen_addr {
             Some(addr) => addr.clone(),
@@ -442,25 +445,6 @@ impl SyncManager {
             .map(|peer| (peer.clone(), PeerHealth::default()))
             .collect();
 
-        // Connect to initial peers.
-        let peer_dead_after_failures =
-            normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
-        let connect_context = ConfiguredPeerConnectContext {
-            node: &node,
-            max_peers: self.config.max_peers,
-            peer_dead_after_failures,
-            metrics: &self.metrics,
-            peer_health: &self.peer_health,
-        };
-        for peer_addr in initial_candidates.iter() {
-            if matches!(
-                try_connect_configured_peer(&connect_context, peer_addr).await,
-                ConfiguredPeerConnectOutcome::SlotLimitReached
-            ) {
-                break;
-            }
-        }
-
         let Some(op_rx) = self.op_rx.take() else {
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
@@ -534,7 +518,7 @@ impl SyncManager {
 
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
             node: Arc::clone(&node),
-            candidates_rx: candidates_rx.clone(),
+            candidates_rx,
             max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
             max_delay: self.config.reconnect_max_delay,
@@ -546,7 +530,6 @@ impl SyncManager {
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
             node: Arc::clone(&node),
-            candidates_rx,
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),

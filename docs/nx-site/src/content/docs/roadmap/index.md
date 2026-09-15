@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Current release line**: `v0.1.4` (active - Management API)
+- **Latest version**: `v0.1.5` (Peer Discovery - Foundations).
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -48,7 +48,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.1.2` | Performance & Profiling | released |
 | `v0.1.3` | Supply Chain & Fuzzing | released |
 | `v0.1.4` | Management API | released |
-| `v0.1.5` | Peer Discovery - Foundations | active |
+| `v0.1.5` | Peer Discovery - Foundations | current |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
 | `v0.1.7` | Reactive Module Model - Events | planned |
 | `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | planned |
@@ -62,7 +62,7 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.2.0-rc.1` | Release Candidate hardening | planned |
 | `v0.2.0` | **Stable - production-ready, any criticality** | final goal |
 
-> **Legend**: released = previous stable release; active = current release line; planned = future work; final goal = end of the cycle.
+> **Legend**: released = previous stable release; current = latest stable release; planned = future work; final goal = end of the cycle.
 
 ---
 
@@ -164,6 +164,10 @@ single further CLI command.
 
 ## v0.1.5 - Peer Discovery: Foundations 🌐
 
+**Release status**: current version. The NAT/WAN decision remains open and may
+be evaluated ASAP; this release does not introduce a traversal design or
+implementation. Verification coverage and its limits are recorded below.
+
 **Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce discovery providers and bootstrap address exchange; SWIM membership and K-fanout data gossip follow in `0.1.6`.
 
 **Abstraction**:
@@ -172,7 +176,7 @@ single further CLI command.
 - [x] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery ([contract](/numax/design/discovery-contract/))
 
 **Peer coordination and identity**:
-- [x] Updateable peer candidates shared with reconnection and anti-entropy, including startup with an empty peer list
+- [x] Updateable peer candidates drive initial dialing and reconnection, including startup with an empty peer list; anti-entropy runs over active connections independently of discovery churn
 - [x] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
 - [x] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
 - [x] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
@@ -200,10 +204,16 @@ single further CLI command.
 **Acceptance tests**:
 - [x] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
 - [x] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
-- [ ] Automate the environment-gated LAN mDNS check alongside the existing TLS rejection and reconnection-after-restart coverage; provider dependencies are justified in the discovery contract
+- [x] Automate the environment-gated LAN mDNS check alongside the existing TLS rejection and reconnection-after-restart coverage; provider dependencies are justified in the discovery contract
 
 **Closing criterion**:
 > All five providers pass their acceptance tests. Three nodes on the same LAN discover each other via mDNS without any `--peer` flag, replicate a CRDT update and recover after reconnection within the declared retention window. Reproducible demo in `examples/discovery_lan/`.
+
+**Verification status (2026-09-14)**: the demo and environment-gated three-process
+E2E are present. The local macOS run passed discovery, CRDT replication and
+restart recovery within a 128-operation retention bound. This same-host test
+does not attest a three-device LAN run or the remote cross-platform CI matrix.
+The NAT/WAN decision above remains open.
 
 ---
 

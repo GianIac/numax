@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::discovery::{
     AbortOnDropTask, AnnouncementSupport, DiscoveryChange, DiscoveryError, DiscoveryProvider,
-    DiscoveryRuntimeConfig, DiscoveryWatch, PeerAnnouncement,
+    DiscoveryRuntimeConfig, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement,
 };
 
 const DISCOVERY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
@@ -123,6 +123,52 @@ impl CandidateRegistry {
             updated.add(source_id, endpoint, ttl, now)?;
         }
         updated.rebuild_order();
+        let changed = updated.endpoints() != before;
+        *self = updated;
+        Ok(changed)
+    }
+
+    fn replace_snapshot(
+        &mut self,
+        source_id: &str,
+        snapshot: &DiscoverySnapshot,
+        ttl: Option<Duration>,
+        now: StdInstant,
+    ) -> Result<bool, DiscoveryError> {
+        let Some(observations) = snapshot.observations() else {
+            return self.replace_source(source_id, snapshot.peers(), ttl, now);
+        };
+        if snapshot.peers().len() > self.max_candidates {
+            return Err(configuration_error(
+                source_id,
+                "discovery snapshot exceeds candidate limit",
+            ));
+        }
+        let mut observed = HashMap::<String, StdInstant>::new();
+        let mut peers = Vec::new();
+        for (peer, at) in snapshot.peers().iter().zip(observations) {
+            if let Some(ttl) = ttl {
+                let deadline = at.checked_add(ttl).ok_or_else(|| {
+                    configuration_error(source_id, "candidate_ttl exceeds the platform time range")
+                })?;
+                if deadline <= now {
+                    continue;
+                }
+            }
+            if let Ok(peer) = canonicalize_endpoint(peer) {
+                peers.push(peer.clone());
+                observed
+                    .entry(peer)
+                    .and_modify(|old| *old = (*old).max(*at))
+                    .or_insert(*at);
+            }
+        }
+        let before = self.endpoints();
+        let mut updated = self.clone();
+        updated.replace_source(source_id, &peers, None, now)?;
+        for (peer, at) in observed {
+            updated.add(source_id, peer, ttl, at)?;
+        }
         let changed = updated.endpoints() != before;
         *self = updated;
         Ok(changed)
@@ -287,6 +333,11 @@ impl CandidateRegistry {
 }
 
 enum CandidateCommand {
+    Snapshot {
+        source_id: String,
+        snapshot: DiscoverySnapshot,
+        ttl: Option<Duration>,
+    },
     ReplaceSource {
         source_id: String,
         peers: Vec<String>,
@@ -357,9 +408,9 @@ impl DiscoveryCoordinator {
                         return Err(provider_timeout(source.source_id(), "watch"));
                     }
                 };
-            if let Err(error) = registry.replace_source(
+            if let Err(error) = registry.replace_snapshot(
                 source.source_id(),
-                provider_watch.snapshot().peers(),
+                provider_watch.snapshot(),
                 source.candidate_ttl(),
                 StdInstant::now(),
             ) {
@@ -534,6 +585,17 @@ async fn run_candidate_registry(
 fn apply_candidate_command(registry: &mut CandidateRegistry, command: CandidateCommand) -> bool {
     let now = StdInstant::now();
     match command {
+        CandidateCommand::Snapshot {
+            source_id,
+            snapshot,
+            ttl,
+        } => match registry.replace_snapshot(&source_id, &snapshot, ttl, now) {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(source = %source_id, %error, "rejected observed discovery snapshot");
+                false
+            }
+        },
         CandidateCommand::ReplaceSource {
             source_id,
             peers,
@@ -592,6 +654,11 @@ async fn run_provider_watch(
             Ok(event) => {
                 retry_delay = DISCOVERY_RETRY_INITIAL_DELAY;
                 let command = match event.change {
+                    DiscoveryChange::Observed(snapshot) => CandidateCommand::Snapshot {
+                        source_id: source.source_id().to_string(),
+                        snapshot,
+                        ttl: source.candidate_ttl(),
+                    },
                     DiscoveryChange::Added(endpoint) => CandidateCommand::Add {
                         source_id: source.source_id().to_string(),
                         endpoint,
@@ -643,12 +710,12 @@ async fn run_provider_watch(
                 };
                 match watch_result {
                     Ok(Ok(new_watch)) => {
-                        let peers = new_watch.snapshot().peers().to_vec();
+                        let snapshot = new_watch.snapshot().clone();
                         if !send_command(
                             &command_tx,
-                            CandidateCommand::ReplaceSource {
+                            CandidateCommand::Snapshot {
                                 source_id: source.source_id().to_string(),
-                                peers,
+                                snapshot,
                                 ttl: source.candidate_ttl(),
                             },
                             &mut shutdown_rx,
@@ -932,6 +999,110 @@ async fn rollback_providers(providers: &[DiscoveryProvider]) {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn identical_observation_renews_lease_but_cached_snapshot_really_expires() {
+        let mut registry = CandidateRegistry::new(2).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_millis(30);
+        let old = DiscoverySnapshot::observed(1, vec![("peer:1".into(), now - ttl / 2)]);
+        let fresh = DiscoverySnapshot::observed(2, vec![("peer:1".into(), now)]);
+        registry
+            .replace_snapshot("file", &old, Some(ttl), now)
+            .unwrap();
+        assert_eq!(registry.next_expiry(), Some(now + ttl / 2));
+        assert!(
+            !registry
+                .replace_snapshot("file", &fresh, Some(ttl), now)
+                .unwrap()
+        );
+        assert_eq!(registry.next_expiry(), Some(now + ttl));
+        assert!(
+            !registry
+                .replace_snapshot("file", &fresh, Some(ttl), now + ttl / 2)
+                .unwrap()
+        );
+        assert_eq!(registry.next_expiry(), Some(now + ttl));
+        let (candidates_tx, mut candidates_rx) = watch::channel(registry.endpoints());
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_candidate_registry(
+            registry,
+            candidates_tx,
+            command_rx,
+            shutdown_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), candidates_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(candidates_rx.borrow_and_update().is_empty());
+        // Even after actual expiry, replay/resubscription cannot resurrect it.
+        command_tx
+            .send(CandidateCommand::Snapshot {
+                source_id: "file".into(),
+                snapshot: fresh,
+                ttl: Some(ttl),
+            })
+            .await
+            .unwrap();
+        let (reply, response) = oneshot::channel();
+        command_tx
+            .send(CandidateCommand::SetLocalEndpoints {
+                endpoints: Vec::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap();
+        assert!(!candidates_rx.has_changed().unwrap());
+        assert!(candidates_rx.borrow().is_empty());
+        shutdown_tx.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_identical_file_reads_keep_candidates_alive_then_invalid_file_expires() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peers");
+        tokio::fs::write(&path, "peer:1\n").await.unwrap();
+        let mut config = crate::FileWatchDiscoveryConfig::new(&path);
+        config.poll_interval = Duration::from_millis(10);
+        let discovery = Arc::new(crate::FileWatchDiscovery::new(config).unwrap());
+        let ttl = Duration::from_millis(150);
+        let provider = DiscoveryProvider::new("file", discovery.clone()).with_candidate_ttl(ttl);
+        let mut coordinator =
+            DiscoveryCoordinator::start(vec![provider], DiscoveryRuntimeConfig::new())
+                .await
+                .unwrap();
+        let mut candidates = coordinator.candidates();
+        let mut observations = crate::PeerDiscovery::watch(discovery.as_ref())
+            .await
+            .unwrap();
+        let until = StdInstant::now() + ttl * 2;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = observations.recv().await.unwrap();
+                let DiscoveryChange::Observed(snapshot) = event.change else {
+                    panic!("missing observation");
+                };
+                if snapshot.observations().unwrap()[0] >= until {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&**candidates.borrow(), &["peer:1"]);
+        assert!(!candidates.has_changed().unwrap());
+        tokio::fs::write(&path, "invalid-endpoint\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), candidates.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(candidates.borrow().is_empty());
+        coordinator.shutdown().await.unwrap();
+    }
 
     struct MutableDiscovery {
         state: StdMutex<(u64, Vec<String>)>,

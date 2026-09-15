@@ -1,13 +1,16 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant as StdInstant};
 
 use async_trait::async_trait;
-use mdns_sd::{DaemonEvent, DnsNameChange, RRType, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{
+    DaemonEvent, DaemonStatus, DnsNameChange, RRType, ServiceDaemon, ServiceEvent, ServiceInfo,
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::dynamic::{AbortOnDropTask, DynamicState};
+use super::dynamic::DynamicState;
 use super::{
     AnnouncementSupport, DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY,
     DEFAULT_MAX_PEER_CANDIDATES, DiscoveryError, DiscoverySnapshot, DiscoveryWatch,
@@ -17,6 +20,7 @@ use super::{
 const PROVIDER: &str = "mdns";
 const SERVICE_BASE: &str = "_numax._tcp.local.";
 const DEFAULT_MAX_INSTANCES: usize = 1024;
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
 
 /// LAN mDNS discovery and announcement limits.
 #[derive(Debug, Clone)]
@@ -45,6 +49,7 @@ struct Lifecycle {
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
     daemon: Option<ServiceDaemon>,
+    completion: Option<watch::Receiver<Option<Result<(), DiscoveryError>>>>,
 }
 
 struct Inner {
@@ -65,21 +70,8 @@ impl Drop for Inner {
         if let Some(shutdown) = lifecycle.shutdown.take() {
             let _ = shutdown.send(true);
         }
-        if let Some(task) = lifecycle.task.take() {
-            task.abort();
-        }
-        if let Some(daemon) = lifecycle.daemon.take() {
-            if let Some(fullname) = self
-                .own_fullname
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                let _ = daemon.unregister(&fullname);
-            }
-            let _ = daemon.stop_browse(&self.service_type);
-            let _ = daemon.shutdown();
-        }
+        // The browse task owns the bounded withdrawal sequence. Do not abort
+        // it when its caller is dropped: it must still consume both ACKs.
     }
 }
 
@@ -106,6 +98,7 @@ impl MdnsDiscovery {
                     shutdown: None,
                     task: None,
                     daemon: None,
+                    completion: None,
                 }),
             }),
         })
@@ -174,27 +167,38 @@ impl MdnsDiscovery {
                 .unwrap_or_else(|error| error.into_inner()) = Some(fullname);
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (completion_tx, completion_rx) = watch::channel(None);
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
         let own_fullname = Arc::clone(&self.inner.own_fullname);
         let own_endpoint = Arc::clone(&self.inner.own_endpoint);
-        let task_daemon = daemon.clone();
-        let service_type = self.inner.service_type.clone();
+        // Construct the guard before spawning: cancellation before the first
+        // task poll must still release the external daemon.
+        let cleanup = DaemonCleanup {
+            daemon: daemon.clone(),
+            service_type: self.inner.service_type.clone(),
+            own_fullname: Arc::clone(&own_fullname),
+            finished: false,
+        };
         lifecycle.shutdown = Some(shutdown);
         lifecycle.daemon = Some(daemon);
+        lifecycle.completion = Some(completion_rx);
         lifecycle.task = Some(tokio::spawn(async move {
-            run_mdns_browse(
+            let result = run_mdns_browse(
                 config,
                 state,
                 own_fullname,
                 own_endpoint,
                 events,
                 monitor,
-                task_daemon,
-                service_type,
+                cleanup,
                 shutdown_rx,
             )
             .await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, provider = PROVIDER, "mDNS cleanup failed");
+            }
+            completion_tx.send_replace(Some(result));
         }));
         Ok(())
     }
@@ -274,76 +278,28 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 
     fn request_shutdown(&self) {
-        let (daemon, fullname) = {
-            let mut lifecycle = self
-                .inner
-                .lifecycle
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if lifecycle.stopped {
-                return;
-            }
-            lifecycle.stopped = true;
-            if let Some(shutdown) = lifecycle.shutdown.as_ref() {
-                let _ = shutdown.send(true);
-            }
-            (
-                lifecycle.daemon.clone(),
-                self.inner
-                    .own_fullname
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take(),
-            )
-        };
-        *self
+        let mut lifecycle = self
             .inner
-            .own_endpoint
+            .lifecycle
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-        self.inner.state.replace(Vec::new());
-        if let Some(daemon) = daemon {
-            if let Some(fullname) = fullname
-                && let Err(error) = daemon.unregister(&fullname)
-            {
-                tracing::warn!(%error, provider = PROVIDER, "cannot request mDNS withdrawal");
-            }
-            if let Err(error) = daemon.stop_browse(&self.inner.service_type) {
-                tracing::debug!(%error, provider = PROVIDER, "cannot request mDNS browse stop");
-            }
-            if let Err(error) = daemon.shutdown() {
-                tracing::warn!(%error, provider = PROVIDER, "cannot request mDNS daemon shutdown");
-            }
+            .unwrap_or_else(|error| error.into_inner());
+        lifecycle.stopped = true;
+        if let Some(shutdown) = &lifecycle.shutdown {
+            shutdown.send_replace(true);
         }
     }
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let task = {
-            let mut lifecycle = self
+        let completion = {
+            let lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            lifecycle.shutdown.take();
-            lifecycle.daemon.take();
-            lifecycle.task.take().map(AbortOnDropTask::new)
+            lifecycle.completion.clone()
         };
-        if let Some(task) = task
-            && let Err(error) = task.join().await
-        {
-            return Err(provider_error(
-                format!("browse task failed: {error}"),
-                false,
-            ));
-        }
-        *self
-            .inner
-            .own_fullname
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-        self.inner.state.replace(Vec::new());
-        Ok(())
+        wait_for_shutdown(completion).await
     }
 }
 
@@ -355,14 +311,17 @@ async fn run_mdns_browse(
     own_endpoint: Arc<StdMutex<Option<String>>>,
     events: mdns_sd::Receiver<ServiceEvent>,
     monitor: mdns_sd::Receiver<DaemonEvent>,
-    daemon: ServiceDaemon,
-    service_type: String,
+    mut cleanup: DaemonCleanup,
     mut shutdown: watch::Receiver<bool>,
-) {
-    let mut instances = HashMap::<String, Vec<String>>::new();
+) -> Result<(), DiscoveryError> {
+    let mut instances = HashMap::<String, InstanceView>::new();
     let mut order = Vec::<String>::new();
     let mut expected_shutdown = false;
     loop {
+        if *shutdown.borrow() {
+            expected_shutdown = true;
+            break;
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -384,23 +343,16 @@ async fn run_mdns_browse(
                         .as_ref().is_some_and(|own| endpoints.contains(own));
                     if matches_fullname || matches_endpoint || service.get_property_val_str("cluster") != Some(config.cluster_id.as_str()) {
                         if remove_instance(&mut instances, &mut order, &fullname) {
-                            state.replace(flatten_instances(&instances, &order, config.max_candidates));
+                            publish_instances(&state, &instances, &order, config.max_candidates);
                         }
                         continue;
                     }
-                    if !instances.contains_key(&fullname) && instances.len() >= config.max_instances {
-                        tracing::warn!(provider = PROVIDER, limit = config.max_instances, "ignoring mDNS instance beyond limit");
-                        continue;
-                    }
-                    if !instances.contains_key(&fullname) {
-                        order.push(fullname.clone());
-                    }
-                    instances.insert(fullname, endpoints);
-                    state.replace(flatten_instances(&instances, &order, config.max_candidates));
+                    store_instance(&mut instances, &mut order, fullname, endpoints, &config);
+                    publish_instances(&state, &instances, &order, config.max_candidates);
                 }
                 Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                     if remove_instance(&mut instances, &mut order, &fullname) {
-                        state.replace(flatten_instances(&instances, &order, config.max_candidates));
+                        publish_instances(&state, &instances, &order, config.max_candidates);
                     }
                 }
                 Ok(ServiceEvent::SearchStopped(_)) => {
@@ -442,15 +394,217 @@ async fn run_mdns_browse(
     if !expected_shutdown {
         state.invalidate_watches();
     }
-    if let Some(fullname) = own_fullname
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-    {
-        let _ = daemon.unregister(fullname);
+    let result = shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET).await;
+    if expected_shutdown {
+        own_endpoint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
-    let _ = daemon.stop_browse(&service_type);
-    let _ = daemon.shutdown();
+    result
+}
+
+async fn wait_for_shutdown(
+    completion: Option<watch::Receiver<Option<Result<(), DiscoveryError>>>>,
+) -> Result<(), DiscoveryError> {
+    let Some(mut completion) = completion else {
+        return Ok(());
+    };
+    loop {
+        if let Some(result) = completion.borrow_and_update().clone() {
+            return result;
+        }
+        completion.changed().await.map_err(|_| {
+            provider_error(
+                "mDNS cleanup task ended without an acknowledgement result",
+                false,
+            )
+        })?;
+    }
+}
+
+#[async_trait]
+trait ShutdownDaemon: Send {
+    async fn unregister(&mut self) -> Result<(), DiscoveryError>;
+    async fn shutdown(&mut self) -> Result<(), DiscoveryError>;
+}
+
+struct DaemonCleanup {
+    daemon: ServiceDaemon,
+    service_type: String,
+    own_fullname: Arc<StdMutex<Option<String>>>,
+    finished: bool,
+}
+
+#[async_trait]
+impl ShutdownDaemon for DaemonCleanup {
+    async fn unregister(&mut self) -> Result<(), DiscoveryError> {
+        let fullname = self
+            .own_fullname
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(fullname) = fullname {
+            let ack = enqueue_daemon_command(|| self.daemon.unregister(&fullname)).await?;
+            // OK and NotFound both mean the registration is no longer owned.
+            ack.recv_async().await.map_err(|error| {
+                provider_error(
+                    format!("mDNS unregister acknowledgement failed: {error}"),
+                    false,
+                )
+            })?;
+            self.own_fullname
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
+        let _ = self.daemon.stop_browse(&self.service_type);
+        let ack = enqueue_daemon_command(|| self.daemon.shutdown()).await?;
+        let status = ack.recv_async().await.map_err(|error| {
+            provider_error(
+                format!("mDNS shutdown acknowledgement failed: {error}"),
+                false,
+            )
+        })?;
+        if status != DaemonStatus::Shutdown {
+            return Err(provider_error(
+                "unexpected mDNS shutdown acknowledgement",
+                false,
+            ));
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+async fn enqueue_daemon_command<T>(
+    mut send: impl FnMut() -> mdns_sd::Result<T>,
+) -> Result<T, DiscoveryError> {
+    loop {
+        match send() {
+            Ok(result) => return Ok(result),
+            // The enclosing ACK deadline also bounds command-queue retries.
+            Err(mdns_sd::Error::Again) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(error) => {
+                return Err(provider_error(
+                    format!("mDNS command failed: {error}"),
+                    false,
+                ));
+            }
+        }
+    }
+}
+
+impl Drop for DaemonCleanup {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Runtime teardown/panic fallback only; normal shutdown has one
+            // owner and awaits ACKs. UDP delivery to every LAN peer is not guaranteed.
+            if let Some(fullname) = self
+                .own_fullname
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_deref()
+            {
+                let _ = self.daemon.unregister(fullname);
+            }
+            let _ = self.daemon.stop_browse(&self.service_type);
+            let _ = self.daemon.shutdown();
+        }
+    }
+}
+
+async fn shutdown_daemon(
+    daemon: &mut impl ShutdownDaemon,
+    budget: Duration,
+) -> Result<(), DiscoveryError> {
+    let now = tokio::time::Instant::now();
+    // Reserve half the common deadline for daemon termination, even when
+    // withdrawal errors or its ACK never arrives.
+    let withdrawal = tokio::time::timeout_at(now + budget / 2, daemon.unregister())
+        .await
+        .unwrap_or_else(|_| {
+            Err(provider_error(
+                "mDNS unregister acknowledgement timed out",
+                false,
+            ))
+        });
+    let shutdown = tokio::time::timeout_at(now + budget, daemon.shutdown())
+        .await
+        .unwrap_or_else(|_| {
+            Err(provider_error(
+                "mDNS shutdown acknowledgement timed out",
+                false,
+            ))
+        });
+    withdrawal.and(shutdown)
+}
+
+struct InstanceView {
+    endpoints: Box<[String]>,
+    observed_at: StdInstant,
+}
+
+fn store_instance(
+    instances: &mut HashMap<String, InstanceView>,
+    order: &mut Vec<String>,
+    fullname: String,
+    mut endpoints: Vec<String>,
+    config: &MdnsDiscoveryConfig,
+) {
+    if !instances.contains_key(&fullname) && instances.len() >= config.max_instances {
+        return;
+    }
+    // Duplicate contributions also consume capacity. A replacement reclaims
+    // its own old allocation before admission; overflow is not retained off-view.
+    let used: usize = instances
+        .iter()
+        .filter(|(name, _)| *name != &fullname)
+        .map(|(_, view)| view.endpoints.len())
+        .sum();
+    endpoints.truncate(config.max_candidates.saturating_sub(used));
+    if endpoints.is_empty() {
+        remove_instance(instances, order, &fullname);
+        return;
+    }
+    if !instances.contains_key(&fullname) {
+        order.push(fullname.clone());
+    }
+    instances.insert(
+        fullname,
+        InstanceView {
+            // Truncating a Vec alone retains its original capacity per instance.
+            // Boxed storage also releases that otherwise multiplicative slack.
+            endpoints: endpoints.into_boxed_slice(),
+            observed_at: StdInstant::now(),
+        },
+    );
+}
+
+fn publish_instances(
+    state: &DynamicState,
+    instances: &HashMap<String, InstanceView>,
+    order: &[String],
+    max_candidates: usize,
+) {
+    let peers = flatten_instances(instances, order, max_candidates);
+    state.observe_at(
+        peers
+            .into_iter()
+            .filter_map(|peer| {
+                let at = instances
+                    .values()
+                    .filter(|view| view.endpoints.contains(&peer))
+                    .map(|view| view.observed_at)
+                    .max()?;
+                Some((peer, at))
+            })
+            .collect(),
+    );
 }
 
 fn update_own_fullname(own_fullname: &StdMutex<Option<String>>, change: &DnsNameChange) -> bool {
@@ -471,7 +625,7 @@ fn update_own_fullname(own_fullname: &StdMutex<Option<String>>, change: &DnsName
 }
 
 fn remove_instance(
-    instances: &mut HashMap<String, Vec<String>>,
+    instances: &mut HashMap<String, InstanceView>,
     order: &mut Vec<String>,
     fullname: &str,
 ) -> bool {
@@ -483,16 +637,16 @@ fn remove_instance(
 }
 
 fn flatten_instances(
-    instances: &HashMap<String, Vec<String>>,
+    instances: &HashMap<String, InstanceView>,
     order: &[String],
     max_candidates: usize,
 ) -> Vec<String> {
     let mut peers = Vec::new();
     for fullname in order {
-        let Some(endpoints) = instances.get(fullname) else {
+        let Some(view) = instances.get(fullname) else {
             continue;
         };
-        for endpoint in endpoints {
+        for endpoint in &view.endpoints {
             if peers.len() == max_candidates {
                 return peers;
             }
@@ -629,6 +783,302 @@ mod tests {
 
     use super::*;
 
+    fn instance(endpoints: Vec<String>) -> InstanceView {
+        InstanceView {
+            endpoints: endpoints.into_boxed_slice(),
+            observed_at: StdInstant::now(),
+        }
+    }
+
+    #[test]
+    fn global_endpoint_budget_counts_duplicates_and_reclaims_removals_and_replacements() {
+        let mut config = MdnsDiscoveryConfig::new("test");
+        config.max_candidates = 32;
+        config.max_instances = 1024;
+        let mut instances = HashMap::new();
+        let mut order = Vec::new();
+        let endpoints: Vec<_> = (1..=16).map(|port| format!("127.0.0.1:{port}")).collect();
+        for index in 0..1024 {
+            store_instance(
+                &mut instances,
+                &mut order,
+                format!("peer-{index}"),
+                endpoints.clone(),
+                &config,
+            );
+            assert!(
+                instances
+                    .values()
+                    .map(|view| view.endpoints.len())
+                    .sum::<usize>()
+                    <= config.max_candidates
+            );
+        }
+        assert_eq!(order, ["peer-0", "peer-1"]);
+        assert_eq!(flatten_instances(&instances, &order, 32), endpoints);
+        store_instance(
+            &mut instances,
+            &mut order,
+            "peer-0".into(),
+            vec!["127.0.0.1:99".into()],
+            &config,
+        );
+        store_instance(
+            &mut instances,
+            &mut order,
+            "replacement".into(),
+            endpoints.clone(),
+            &config,
+        );
+        assert_eq!(
+            instances["replacement"].endpoints.as_ref(),
+            &endpoints[..15]
+        );
+        assert_eq!(
+            instances
+                .values()
+                .map(|view| view.endpoints.len())
+                .sum::<usize>(),
+            32
+        );
+        assert!(remove_instance(&mut instances, &mut order, "peer-1"));
+        store_instance(
+            &mut instances,
+            &mut order,
+            "after-removal".into(),
+            endpoints.clone(),
+            &config,
+        );
+        assert_eq!(
+            instances["after-removal"].endpoints.as_ref(),
+            endpoints.as_slice()
+        );
+        assert_eq!(order, ["peer-0", "replacement", "after-removal"]);
+        assert_eq!(
+            instances
+                .values()
+                .map(|view| view.endpoints.len())
+                .sum::<usize>(),
+            32
+        );
+    }
+
+    #[test]
+    fn removing_one_instance_does_not_renew_other_instances() {
+        let config = MdnsDiscoveryConfig::new("test");
+        let mut instances = HashMap::new();
+        let mut order = Vec::new();
+        store_instance(
+            &mut instances,
+            &mut order,
+            "a".into(),
+            vec!["a:1".into()],
+            &config,
+        );
+        store_instance(
+            &mut instances,
+            &mut order,
+            "b".into(),
+            vec!["b:2".into()],
+            &config,
+        );
+        let observed = instances["a"].observed_at;
+        let state = DynamicState::new(8);
+        publish_instances(&state, &instances, &order, 8);
+        remove_instance(&mut instances, &mut order, "b");
+        publish_instances(&state, &instances, &order, 8);
+        assert_eq!(state.snapshot().observations().unwrap(), [observed]);
+    }
+
+    struct ControlledDaemon {
+        calls: tokio::sync::mpsc::Sender<&'static str>,
+        unregister_ack: Option<tokio::sync::oneshot::Receiver<Result<(), DiscoveryError>>>,
+        shutdown_ack: Option<tokio::sync::oneshot::Receiver<Result<(), DiscoveryError>>>,
+    }
+
+    #[async_trait]
+    impl ShutdownDaemon for ControlledDaemon {
+        async fn unregister(&mut self) -> Result<(), DiscoveryError> {
+            self.calls.send("unregister").await.unwrap();
+            self.unregister_ack
+                .take()
+                .unwrap()
+                .await
+                .map_err(|_| provider_error("unregister ack channel closed", false))?
+        }
+        async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
+            self.calls.send("shutdown").await.unwrap();
+            self.shutdown_ack
+                .take()
+                .unwrap()
+                .await
+                .map_err(|_| provider_error("shutdown ack channel closed", false))?
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_both_acks_and_waiter_cancellation_preserves_the_single_owner() {
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(2);
+        let (unregister_tx, unregister_ack) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_ack) = tokio::sync::oneshot::channel();
+        let mut daemon = ControlledDaemon {
+            calls,
+            unregister_ack: Some(unregister_ack),
+            shutdown_ack: Some(shutdown_ack),
+        };
+        let (complete_tx, complete_rx) = watch::channel(None);
+        let owner = tokio::spawn(async move {
+            complete_tx.send_replace(Some(
+                shutdown_daemon(&mut daemon, Duration::from_secs(2)).await,
+            ));
+        });
+        let waiter_rx = complete_rx.clone();
+        let waiter = tokio::spawn(wait_for_shutdown(Some(waiter_rx)));
+        assert_eq!(call_rx.recv().await, Some("unregister"));
+        assert!(call_rx.try_recv().is_err());
+        assert!(complete_rx.borrow().is_none());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        unregister_tx.send(Ok(())).unwrap();
+        assert_eq!(call_rx.recv().await, Some("shutdown"));
+        assert!(complete_rx.borrow().is_none());
+        shutdown_tx.send(Ok(())).unwrap();
+        wait_for_shutdown(Some(complete_rx.clone())).await.unwrap();
+        wait_for_shutdown(Some(complete_rx)).await.unwrap();
+        owner.await.unwrap();
+        assert!(call_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_provider_signals_cleanup_without_aborting_acknowledgements() {
+        let provider = MdnsDiscovery::new(MdnsDiscoveryConfig::new("drop-test")).unwrap();
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(2);
+        let (unregister_tx, unregister_ack) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_ack) = tokio::sync::oneshot::channel();
+        let mut daemon = ControlledDaemon {
+            calls,
+            unregister_ack: Some(unregister_ack),
+            shutdown_ack: Some(shutdown_ack),
+        };
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (complete_tx, complete_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            cancel_rx.changed().await.unwrap();
+            assert!(*cancel_rx.borrow());
+            complete_tx.send_replace(Some(
+                shutdown_daemon(&mut daemon, Duration::from_secs(2)).await,
+            ));
+        });
+        {
+            let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
+            lifecycle.shutdown = Some(cancel_tx);
+            lifecycle.task = Some(task);
+            lifecycle.completion = Some(complete_rx.clone());
+        }
+        drop(provider);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert_eq!(call_rx.recv().await, Some("unregister"));
+            unregister_tx.send(Ok(())).unwrap();
+            assert_eq!(call_rx.recv().await, Some("shutdown"));
+            shutdown_tx.send(Ok(())).unwrap();
+            wait_for_shutdown(Some(complete_rx)).await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn withdrawal_error_still_awaits_daemon_shutdown_and_reports_error() {
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(2);
+        let (unregister_tx, unregister_ack) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_ack) = tokio::sync::oneshot::channel();
+        let mut daemon = ControlledDaemon {
+            calls,
+            unregister_ack: Some(unregister_ack),
+            shutdown_ack: Some(shutdown_ack),
+        };
+        let task =
+            tokio::spawn(async move { shutdown_daemon(&mut daemon, Duration::from_secs(2)).await });
+        assert_eq!(call_rx.recv().await, Some("unregister"));
+        drop(unregister_tx);
+        assert_eq!(call_rx.recv().await, Some("shutdown"));
+        assert!(!task.is_finished());
+        shutdown_tx.send(Ok(())).unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            Err(provider_error("unregister ack channel closed", false))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ack_deadlines_bound_withdrawal_and_shutdown() {
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(2);
+        let (_unregister_tx, unregister_ack) = tokio::sync::oneshot::channel();
+        let (_shutdown_tx, shutdown_ack) = tokio::sync::oneshot::channel();
+        let mut daemon = ControlledDaemon {
+            calls,
+            unregister_ack: Some(unregister_ack),
+            shutdown_ack: Some(shutdown_ack),
+        };
+        let task =
+            tokio::spawn(
+                async move { shutdown_daemon(&mut daemon, Duration::from_millis(20)).await },
+            );
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(call_rx.recv().await, Some("unregister"));
+        assert_eq!(call_rx.recv().await, Some("shutdown"));
+        assert_eq!(
+            result,
+            Err(provider_error(
+                "mDNS unregister acknowledgement timed out",
+                false
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_ack_error_is_not_reported_as_success() {
+        let (calls, _call_rx) = tokio::sync::mpsc::channel(2);
+        let (unregister_tx, unregister_ack) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_ack) = tokio::sync::oneshot::channel();
+        unregister_tx.send(Ok(())).unwrap();
+        drop(shutdown_tx);
+        let mut daemon = ControlledDaemon {
+            calls,
+            unregister_ack: Some(unregister_ack),
+            shutdown_ack: Some(shutdown_ack),
+        };
+        assert_eq!(
+            shutdown_daemon(&mut daemon, Duration::from_secs(1)).await,
+            Err(provider_error("shutdown ack channel closed", false))
+        );
+    }
+
+    #[tokio::test]
+    async fn full_daemon_queue_is_retried_but_permanent_errors_are_not() {
+        let mut attempts = 0;
+        let value = enqueue_daemon_command(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(mdns_sd::Error::Again)
+            } else {
+                Ok(42)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 2);
+        assert!(
+            enqueue_daemon_command::<()>(|| Err(mdns_sd::Error::DaemonShutdown))
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn cluster_service_types_are_stable_and_isolated() {
         assert_eq!(cluster_service_type("a"), cluster_service_type("a"));
@@ -639,10 +1089,10 @@ mod tests {
     #[test]
     fn reducer_deduplicates_shared_endpoints_and_preserves_instance_order() {
         let instances = HashMap::from([
-            ("a".to_string(), vec!["127.0.0.1:1".to_string()]),
+            ("a".to_string(), instance(vec!["127.0.0.1:1".to_string()])),
             (
                 "b".to_string(),
-                vec!["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()],
+                instance(vec!["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()]),
             ),
         ]);
         assert_eq!(
@@ -681,7 +1131,7 @@ mod tests {
     fn rejected_resolution_removes_a_previously_accepted_instance() {
         let mut instances = HashMap::from([(
             "peer._numax._tcp.local.".into(),
-            vec!["127.0.0.1:9000".into()],
+            instance(vec!["127.0.0.1:9000".into()]),
         )]);
         let mut order = vec!["peer._numax._tcp.local.".into()];
 
@@ -737,8 +1187,8 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if watch.recv().await.unwrap().change
-                    == super::super::DiscoveryChange::Replaced(vec![endpoint.into()])
+                if super::super::observed_peers(watch.recv().await.unwrap().change)
+                    == vec![endpoint.to_string()]
                 {
                     break;
                 }
@@ -750,9 +1200,7 @@ mod tests {
         publisher.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if watch.recv().await.unwrap().change
-                    == super::super::DiscoveryChange::Replaced(Vec::new())
-                {
+                if super::super::observed_peers(watch.recv().await.unwrap().change).is_empty() {
                     break;
                 }
             }

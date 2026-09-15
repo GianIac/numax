@@ -9,8 +9,9 @@ use nx_api::{DEFAULT_MANAGEMENT_LISTEN, DEFAULT_MANAGEMENT_REQUEST_TIMEOUT, Mana
 use nx_core::runtime::RuntimeConfig;
 use nx_core::{
     BootstrapDiscoverySettings, DnsSrvDiscoverySettings, FileDiscoverySettings,
-    MdnsDiscoverySettings, ObservabilityConfig, RuntimeDiscoveryConfig, RuntimeDiscoveryMode,
-    SerializationFormat, SyncConfig, TlsConfig,
+    MAX_BOOTSTRAP_RESPONSE_CAPACITY as MAX_BOOTSTRAP_CANDIDATES, MdnsDiscoverySettings,
+    ObservabilityConfig, RuntimeDiscoveryConfig, RuntimeDiscoveryMode, SerializationFormat,
+    SyncConfig, TlsConfig,
 };
 use serde::Deserialize;
 use tracing::warn;
@@ -246,6 +247,10 @@ impl EffectiveRunConfig {
                 .unwrap_or_default()
         };
         discovery.max_candidates = discovery.max_candidates.max(peers.len());
+        validate_discovery_candidate_capacity(
+            discovery.max_candidates,
+            matches!(discovery.mode, RuntimeDiscoveryMode::Bootstrap(_)),
+        )?;
         let serialization_format = if cli.debug_protocol {
             Some(SerializationFormat::Json)
         } else if let Some(format) = env_config.serialization_format {
@@ -856,9 +861,7 @@ fn resolve_discovery_config(
         "discovery.advertised_endpoint",
         advertised_endpoint.as_deref(),
     )?;
-    if max_candidates == 0 {
-        bail!("discovery.max_candidates must be greater than zero");
-    }
+    validate_discovery_candidate_capacity(max_candidates, mode == DiscoveryMode::Bootstrap)?;
 
     let resolved_mode = match mode {
         DiscoveryMode::Static => RuntimeDiscoveryMode::Static,
@@ -983,6 +986,18 @@ fn resolve_discovery_config(
         max_candidates,
         mode: resolved_mode,
     })
+}
+
+fn validate_discovery_candidate_capacity(max_candidates: usize, bootstrap: bool) -> Result<()> {
+    if max_candidates == 0 {
+        bail!("discovery.max_candidates must be greater than zero");
+    }
+    if bootstrap && max_candidates > MAX_BOOTSTRAP_CANDIDATES {
+        bail!(
+            "discovery.max_candidates must be at most {MAX_BOOTSTRAP_CANDIDATES} when discovery.mode = \"bootstrap\""
+        );
+    }
+    Ok(())
 }
 
 fn resolve_discovery_duration(
@@ -1771,4 +1786,133 @@ pub(crate) fn build_sync_config(
 
     debug_assert!(cfg.is_enabled());
     Ok(Some(cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn discovery_file(mode: &str, max_candidates: usize) -> RunFileConfig {
+        let fields = match mode {
+            "bootstrap" => "seeds = [\"127.0.0.1:9001\"]",
+            "mdns" => "instance_name = \"config-test\"",
+            "dns-srv" => "service_name = \"_numax._tcp.example.org.\"",
+            "file" => "path = \"peers.txt\"",
+            _ => "",
+        };
+        toml::from_str(&format!(
+            "[network]\nlisten = \"127.0.0.1:9000\"\n[discovery]\nmode = \"{mode}\"\nmax_candidates = {max_candidates}\n{fields}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_candidate_capacity_accepts_boundaries_and_rejects_overflow() {
+        for capacity in [1, 4_096] {
+            let effective = EffectiveRunConfig::resolve_with_env(
+                RunCliOptions::default(),
+                EnvRunConfig::default(),
+                &discovery_file("bootstrap", capacity),
+            )
+            .unwrap();
+            assert_eq!(effective.discovery.max_candidates, capacity);
+        }
+        for capacity in [4_097, usize::MAX] {
+            let error = EffectiveRunConfig::resolve_with_env(
+                RunCliOptions::default(),
+                EnvRunConfig {
+                    discovery_max_candidates: Some(capacity),
+                    ..Default::default()
+                },
+                &discovery_file("bootstrap", 1),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("at most 4096"));
+        }
+        assert!(
+            EffectiveRunConfig::resolve_with_env(
+                RunCliOptions::default(),
+                EnvRunConfig::default(),
+                &discovery_file("bootstrap", 4_097),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_capacity_rejects_zero_for_every_mode() {
+        for mode in ["static", "bootstrap", "mdns", "dns-srv", "file"] {
+            let error = EffectiveRunConfig::resolve_with_env(
+                RunCliOptions::default(),
+                EnvRunConfig::default(),
+                &discovery_file(mode, 0),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("greater than zero"), "{mode}");
+        }
+    }
+
+    #[test]
+    fn candidate_capacity_above_bootstrap_bound_is_valid_for_other_modes() {
+        for mode in ["static", "mdns", "dns-srv", "file"] {
+            let effective = EffectiveRunConfig::resolve_with_env(
+                RunCliOptions::default(),
+                EnvRunConfig::default(),
+                &discovery_file(mode, 4_097),
+            )
+            .unwrap();
+            assert_eq!(effective.discovery.max_candidates, 4_097, "{mode}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_capacity_uses_effective_precedence() {
+        let file = discovery_file("bootstrap", 4_097);
+        let effective = EffectiveRunConfig::resolve_with_env(
+            RunCliOptions::default(),
+            EnvRunConfig {
+                discovery_max_candidates: Some(4_096),
+                ..Default::default()
+            },
+            &file,
+        )
+        .unwrap();
+        assert_eq!(effective.discovery.max_candidates, 4_096);
+
+        let effective = EffectiveRunConfig::resolve_with_env(
+            RunCliOptions {
+                discovery_mode: Some(DiscoveryMode::Static),
+                ..Default::default()
+            },
+            EnvRunConfig::default(),
+            &file,
+        )
+        .unwrap();
+        assert_eq!(effective.discovery.max_candidates, 4_097);
+        assert!(matches!(
+            effective.discovery.mode,
+            RuntimeDiscoveryMode::Static
+        ));
+    }
+
+    #[test]
+    fn explicit_peers_cannot_expand_bootstrap_capacity_past_wire_bound() {
+        for mode in ["bootstrap", "static"] {
+            let result = EffectiveRunConfig::resolve_with_env(
+                RunCliOptions {
+                    peers: (1..=4_097)
+                        .map(|port| format!("127.0.0.1:{port}"))
+                        .collect(),
+                    ..Default::default()
+                },
+                EnvRunConfig::default(),
+                &discovery_file(mode, 1),
+            );
+            if mode == "bootstrap" {
+                assert!(result.unwrap_err().to_string().contains("at most 4096"));
+            } else {
+                assert_eq!(result.unwrap().discovery.max_candidates, 4_097);
+            }
+        }
+    }
 }

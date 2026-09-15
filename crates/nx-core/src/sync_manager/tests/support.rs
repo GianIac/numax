@@ -462,6 +462,23 @@ pub(super) async fn wait_for_connected_peer(manager: &SyncManager) {
     }
 }
 
+pub(super) async fn wait_for_pull_request(
+    events: &mut mpsc::Receiver<NodeEvent>,
+) -> (String, Option<String>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let NodeEvent::PullRequested {
+                addr, since_op_id, ..
+            } = events.recv().await.expect("peer event channel closed")
+            {
+                return (addr, since_op_id);
+            }
+        }
+    })
+    .await
+    .expect("peer did not receive an anti-entropy pull")
+}
+
 pub(super) async fn wait_for_peer_health(
     manager: &SyncManager,
     peer: &str,

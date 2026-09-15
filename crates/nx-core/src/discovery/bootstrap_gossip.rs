@@ -283,26 +283,86 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
 struct SeedView {
     endpoints: Vec<String>,
     expires_at: Instant,
+    observed_at: std::time::Instant,
+}
+
+struct SeedSchedule {
+    next_probe: Instant,
+    not_before: Instant,
+    retry_delay: Duration,
+    disabled: bool,
+}
+
+impl SeedSchedule {
+    fn deadline(&self) -> Option<Instant> {
+        (!self.disabled).then_some(self.next_probe.max(self.not_before))
+    }
+
+    fn announce(&mut self, now: Instant) {
+        self.next_probe = now;
+    }
+
+    fn failed(&mut self, config: &BootstrapGossipDiscoveryConfig, error: &NetError, now: Instant) {
+        self.disabled = bootstrap_error_is_fatal(error);
+        // Preserve the configured cap on server-requested backoff, but retain
+        // an absolute barrier independent of view expiry and announcements.
+        self.not_before = now
+            + bootstrap_retry_after(error)
+                .unwrap_or_default()
+                .min(config.retry_max);
+        self.next_probe = now + self.retry_delay;
+        self.retry_delay = self.retry_delay.saturating_mul(2).min(config.retry_max);
+    }
+}
+
+#[async_trait]
+trait SeedClient: Send + Sync {
+    async fn query(
+        &self,
+        seed: &str,
+        request: BootstrapRequest,
+    ) -> Result<nx_net::BootstrapResponse, NetError>;
+}
+
+#[async_trait]
+impl SeedClient for BootstrapClient {
+    async fn query(
+        &self,
+        seed: &str,
+        request: BootstrapRequest,
+    ) -> Result<nx_net::BootstrapResponse, NetError> {
+        BootstrapClient::query(self, seed, request).await
+    }
 }
 
 async fn run_bootstrap(
     config: BootstrapGossipDiscoveryConfig,
-    client: BootstrapClient,
+    client: impl SeedClient,
     state: Arc<DynamicState>,
     mut announcement_rx: watch::Receiver<Option<String>>,
     announced_seeds: Arc<StdMutex<HashSet<String>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut views = HashMap::<String, SeedView>::new();
-    let mut disabled = HashSet::<String>::new();
-    let mut retry_delay = config.retry_initial;
+    let now = Instant::now();
+    let mut schedules: Vec<_> = config
+        .seeds
+        .iter()
+        .map(|_| SeedSchedule {
+            next_probe: now,
+            not_before: now,
+            retry_delay: config.retry_initial,
+            disabled: false,
+        })
+        .collect();
 
     loop {
-        let mut any_success = false;
-        let mut retry_after = None;
         let announcement = announcement_rx.borrow_and_update().clone();
-        for seed in &config.seeds {
-            if disabled.contains(seed) {
+        for (seed, schedule) in config.seeds.iter().zip(&mut schedules) {
+            if schedule
+                .deadline()
+                .is_none_or(|deadline| deadline > Instant::now())
+            {
                 continue;
             }
             let mut request =
@@ -323,7 +383,8 @@ async fn run_bootstrap(
             };
             match result {
                 Ok(response) => {
-                    any_success = true;
+                    schedule.retry_delay = config.retry_initial;
+                    schedule.next_probe = Instant::now() + config.refresh_interval;
                     if announcement.is_some() {
                         announced_seeds
                             .lock()
@@ -342,22 +403,14 @@ async fn run_bootstrap(
                         seed.clone(),
                         SeedView {
                             endpoints,
+                            observed_at: std::time::Instant::now(),
                             expires_at: Instant::now()
                                 + response.candidate_ttl.min(config.stale_after),
                         },
                     );
                 }
                 Err(error) => {
-                    if bootstrap_error_is_fatal(&error) {
-                        disabled.insert(seed.clone());
-                    }
-                    if let Some(delay) = bootstrap_retry_after(&error) {
-                        retry_after = Some(
-                            retry_after
-                                .unwrap_or(Duration::ZERO)
-                                .max(delay.min(config.retry_max)),
-                        );
-                    }
+                    schedule.failed(&config, &error, Instant::now());
                     tracing::debug!(%error, %seed, "bootstrap seed query failed");
                 }
             }
@@ -365,16 +418,12 @@ async fn run_bootstrap(
         }
 
         publish_views(&config, &mut views, &state);
-        let base_delay = next_probe_delay(
-            any_success,
-            config.refresh_interval,
-            retry_delay,
-            retry_after,
-        );
         let next_expiry = views.values().map(|view| view.expires_at).min();
-        let deadline = next_expiry
-            .map(|expiry| expiry.min(Instant::now() + base_delay))
-            .unwrap_or_else(|| Instant::now() + base_delay);
+        let deadline = schedules
+            .iter()
+            .filter_map(SeedSchedule::deadline)
+            .chain(next_expiry)
+            .min();
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -385,29 +434,12 @@ async fn run_bootstrap(
                 if changed.is_err() {
                     break;
                 }
+                let now = Instant::now();
+                for schedule in &mut schedules { schedule.announce(now); }
             }
-            _ = tokio::time::sleep_until(deadline) => {}
+            _ = sleep_until_optional(deadline) => {}
         }
-        retry_delay = if any_success {
-            config.retry_initial
-        } else {
-            retry_delay.saturating_mul(2).min(config.retry_max)
-        };
     }
-}
-
-fn next_probe_delay(
-    any_success: bool,
-    refresh_interval: Duration,
-    retry_delay: Duration,
-    retry_after: Option<Duration>,
-) -> Duration {
-    let delay = if any_success {
-        refresh_interval
-    } else {
-        retry_delay
-    };
-    delay.max(retry_after.unwrap_or(Duration::ZERO))
 }
 
 async fn await_query_with_expiry<F, T>(
@@ -451,7 +483,20 @@ fn publish_views(
 ) {
     let now = Instant::now();
     views.retain(|_, view| view.expires_at > now);
-    state.replace(flatten_views(&config.seeds, views, config.max_candidates));
+    let peers = flatten_views(&config.seeds, views, config.max_candidates);
+    state.observe_at(
+        peers
+            .into_iter()
+            .filter_map(|peer| {
+                let observed_at = views
+                    .values()
+                    .filter(|view| view.endpoints.contains(&peer))
+                    .map(|view| view.observed_at)
+                    .max()?;
+                Some((peer, observed_at))
+            })
+            .collect(),
+    );
 }
 
 fn flatten_views(
@@ -513,6 +558,7 @@ fn validate_config(config: &BootstrapGossipDiscoveryConfig) -> Result<(), Discov
         || config.stale_after.is_zero()
         || config.max_seeds == 0
         || config.max_candidates == 0
+        || config.max_candidates > nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY
         || config.event_capacity == 0
     {
         return Err(invalid("intervals and limits are inconsistent"));
@@ -541,6 +587,139 @@ mod tests {
     use nx_net::{BootstrapServerConfig, Node, NodeConfig};
     use nx_sync::NodeId;
 
+    struct ControlledClient {
+        calls: tokio::sync::mpsc::Sender<(String, Instant)>,
+        limited_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SeedClient for ControlledClient {
+        async fn query(
+            &self,
+            seed: &str,
+            _request: BootstrapRequest,
+        ) -> Result<nx_net::BootstrapResponse, NetError> {
+            self.calls
+                .send((seed.to_string(), Instant::now()))
+                .await
+                .unwrap();
+            if seed == "limited:1"
+                && self
+                    .limited_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    > 0
+            {
+                return Err(NetError::Wire(nx_net::WireError::RateLimited {
+                    retry_after_ms: Some(200),
+                }));
+            }
+            Ok(nx_net::BootstrapResponse {
+                seed_node_id: NodeId::new(seed),
+                endpoints: Vec::new(),
+                candidate_ttl: Duration::from_millis(40),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_survives_actual_view_expiry_and_announcement_while_healthy_seeds_progress()
+    {
+        let mut config =
+            BootstrapGossipDiscoveryConfig::new(vec!["limited:1".into(), "healthy:2".into()]);
+        config.refresh_interval = Duration::from_millis(10);
+        config.retry_initial = Duration::from_millis(10);
+        config.retry_max = Duration::from_millis(100); // configured cap still applies
+        let state = Arc::new(DynamicState::new(128));
+        let mut events = state.watch();
+        let (calls, mut calls_rx) = tokio::sync::mpsc::channel(128);
+        let client = ControlledClient {
+            calls,
+            limited_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (announcement, announcement_rx) = watch::channel(None);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_bootstrap(
+            config,
+            client,
+            state,
+            announcement_rx,
+            Arc::new(StdMutex::new(HashSet::new())),
+            shutdown_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut limited = 0;
+            let limited_at = loop {
+                let (seed, at) = calls_rx.recv().await.unwrap();
+                if seed == "limited:1" {
+                    limited += 1;
+                }
+                if limited == 2 {
+                    break at;
+                }
+            };
+            // Wait for the limited seed's retained view to actually disappear.
+            loop {
+                let peers = super::super::observed_peers(events.recv().await.unwrap().change);
+                if !peers.contains(&"limited:1".to_string()) {
+                    break;
+                }
+            }
+            announcement.send_replace(Some("local:3".into()));
+            let mut healthy_progress = false;
+            loop {
+                let (seed, at) = calls_rx.recv().await.unwrap();
+                if seed == "healthy:2"
+                    && at >= limited_at
+                    && at < limited_at + Duration::from_millis(100)
+                {
+                    healthy_progress = true;
+                }
+                if seed == "limited:1" {
+                    assert!(at >= limited_at + Duration::from_millis(100));
+                    assert!(healthy_progress);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn cached_seed_views_do_not_refresh_observations_on_failure_or_other_seed_expiry() {
+        let config = BootstrapGossipDiscoveryConfig::new(vec!["a:1".into(), "b:2".into()]);
+        let state = DynamicState::new(8);
+        let now = std::time::Instant::now();
+        let mut views = HashMap::from([
+            (
+                "a:1".into(),
+                SeedView {
+                    endpoints: vec!["a:1".into()],
+                    expires_at: Instant::now() + Duration::from_secs(10),
+                    observed_at: now,
+                },
+            ),
+            (
+                "b:2".into(),
+                SeedView {
+                    endpoints: vec!["b:2".into()],
+                    expires_at: Instant::now() + Duration::from_secs(10),
+                    observed_at: now,
+                },
+            ),
+        ]);
+        publish_views(&config, &mut views, &state);
+        let first = state.snapshot();
+        publish_views(&config, &mut views, &state);
+        assert_eq!(first, state.snapshot());
+        views.get_mut("b:2").unwrap().expires_at = Instant::now();
+        publish_views(&config, &mut views, &state);
+        assert_eq!(state.snapshot().peers(), ["a:1"]);
+        assert_eq!(state.snapshot().observations().unwrap(), [now]);
+    }
+
     #[test]
     fn views_are_bounded_deduplicated_and_follow_seed_order() {
         let views = HashMap::from([
@@ -549,6 +728,7 @@ mod tests {
                 SeedView {
                     endpoints: vec!["a:1".into(), "shared:3".into()],
                     expires_at: Instant::now() + Duration::from_secs(1),
+                    observed_at: std::time::Instant::now(),
                 },
             ),
             (
@@ -556,6 +736,7 @@ mod tests {
                 SeedView {
                     endpoints: vec!["b:2".into(), "shared:3".into()],
                     expires_at: Instant::now() + Duration::from_secs(1),
+                    observed_at: std::time::Instant::now(),
                 },
             ),
         ]);
@@ -570,19 +751,36 @@ mod tests {
         let mut config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
         config.max_seeds = 0;
         assert!(validate_config(&config).is_err());
+
+        config.max_seeds = 1;
+        config.max_candidates = nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY;
+        assert!(validate_config(&config).is_ok());
+        config.max_candidates += 1;
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]
-    fn successful_seed_does_not_override_another_seeds_retry_after() {
-        assert_eq!(
-            next_probe_delay(
-                true,
-                Duration::from_secs(5),
-                Duration::from_secs(1),
-                Some(Duration::from_secs(30)),
-            ),
-            Duration::from_secs(30)
-        );
+    fn expiry_and_announcement_do_not_override_a_seeds_not_before() {
+        let now = Instant::now();
+        let mut schedule = SeedSchedule {
+            next_probe: now,
+            not_before: now + Duration::from_secs(30),
+            retry_delay: Duration::from_secs(1),
+            disabled: false,
+        };
+        let mut healthy = SeedSchedule {
+            next_probe: now + Duration::from_secs(5),
+            not_before: now,
+            retry_delay: Duration::from_secs(1),
+            disabled: false,
+        };
+        schedule.announce(now + Duration::from_secs(2));
+        healthy.announce(now + Duration::from_secs(2));
+        assert_eq!(schedule.deadline(), Some(now + Duration::from_secs(30)));
+        assert_eq!(healthy.deadline(), Some(now + Duration::from_secs(2)));
+        // An expiry wakeup never changes the per-seed schedule.
+        let expiry = now + Duration::from_secs(3);
+        assert!(schedule.deadline().unwrap() > expiry);
     }
 
     #[tokio::test]
@@ -596,6 +794,7 @@ mod tests {
             SeedView {
                 endpoints: vec!["peer:9000".into()],
                 expires_at: Instant::now() + Duration::from_millis(10),
+                observed_at: std::time::Instant::now(),
             },
         )]);
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -618,8 +817,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            event.change,
-            super::super::DiscoveryChange::Replaced(Vec::new())
+            super::super::observed_peers(event.change),
+            Vec::<String>::new()
         );
     }
 
@@ -658,8 +857,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            event.change,
-            super::super::DiscoveryChange::Replaced(vec![bound.to_string()])
+            super::super::observed_peers(event.change),
+            vec![bound.to_string()]
         );
         provider.shutdown().await.unwrap();
 
@@ -703,18 +902,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            discovered.change,
-            super::super::DiscoveryChange::Replaced(vec![bound.to_string()])
+            super::super::observed_peers(discovered.change),
+            vec![bound.to_string()]
         );
 
         seed.shutdown().await;
-        let expired = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            expired.change,
-            super::super::DiscoveryChange::Replaced(Vec::new())
+        assert!(
+            super::super::next_changed_peers(&mut watch, &[bound.to_string()])
+                .await
+                .is_empty()
         );
 
         let restarted = Node::new(
@@ -730,8 +926,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            recovered.change,
-            super::super::DiscoveryChange::Replaced(vec![bound.to_string()])
+            super::super::observed_peers(recovered.change),
+            vec![bound.to_string()]
         );
 
         provider.shutdown().await.unwrap();

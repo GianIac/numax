@@ -10,7 +10,7 @@ independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
 
-For the `v0.1.5` development line the value is `5`. Version `5` adds the
+In `v0.1.5`, the current Numax version, the value is `5`. Version `5` adds the
 one-shot bootstrap handshake described below; it is not wire-compatible with
 the version `4` protocol shipped by `v0.1.4`.
 
@@ -121,6 +121,12 @@ cluster ID match. It validates any advertised endpoint before caching it. The
 request's `max_results`, the server response limit and the server cache limit
 bound the exchange independently.
 
+The exported `nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY` is `4096`. Client and
+server response capacities must be in `1..=4096`; the effective CLI
+`discovery.max_candidates` obeys this upper bound only in bootstrap mode.
+This resource limit is independent of the wire version, package version, cache
+capacity and message-byte limit.
+
 The client validates the seed's protocol version, selected format, cluster ID,
 authenticated identity, response length, candidate lease and every endpoint.
 Duplicate endpoints, wildcard hosts, port zero and malformed responses reject
@@ -147,3 +153,9 @@ Both JSON and Bincode round trips, exact-version rejection and Bincode golden
 hashes cover the version `5` message set. Multiprocess compatibility coverage
 uses the previous `v0.1.4` binary to verify safe rejection at the normal
 handshake boundary.
+
+CI resolves the previous binary's source from the explicit
+`refs/tags/v0.1.4` reference and verifies its peeled commit is
+`419d840e2afe780e7ad1f4135e39e9b38a4f30b1` before building it. A branch with the
+same short name is not an acceptable substitute. This test checks rejection,
+not mixed-version replication or unrestricted recovery after history expiry.

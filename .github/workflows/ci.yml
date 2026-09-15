@@ -105,6 +105,29 @@ jobs:
           discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint
           -- --ignored --exact --nocapture
 
+      - name: Build three-node mDNS guests
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --locked --release --target wasm32-unknown-unknown \
+            --manifest-path examples/discovery_lan/Cargo.toml \
+            --target-dir examples/discovery_lan/target/reader
+          cargo build --locked --release --target wasm32-unknown-unknown \
+            --manifest-path examples/discovery_lan/Cargo.toml --features increment \
+            --target-dir examples/discovery_lan/target/writer
+      - name: Run three-node mDNS restart recovery
+        if: matrix.os == 'macos-latest'
+        env:
+          NUMAX_MDNS_E2E: "1"
+        run: |
+          interface="$(route -n get default | awk '/interface:/{print $2; exit}')"
+          test -n "$interface"
+          export NUMAX_MDNS_LAN_IP="$(ipconfig getifaddr "$interface")"
+          test -n "$NUMAX_MDNS_LAN_IP"
+          cargo test --locked -p nx-cli --test multiprocess_smoke \
+            discovery_lan::mdns_three_daemons_recover_missed_crdt_ops_after_restart \
+            -- --ignored --exact --nocapture
+
   build-wasm:
     name: Build WASM Examples
     runs-on: ubuntu-latest
@@ -148,12 +171,21 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
       - name: Build previous release binary
         run: |
-          git worktree add "${RUNNER_TEMP}/numax-v0.1.4" v0.1.4
+          expected_commit=419d840e2afe780e7ad1f4135e39e9b38a4f30b1
+          actual_commit="$(git rev-parse --verify 'refs/tags/v0.1.4^{commit}')"
+          if [ "$actual_commit" != "$expected_commit" ]; then
+            echo "Unexpected v0.1.4 tag commit: $actual_commit (expected $expected_commit)"
+            exit 1
+          fi
+          git worktree add --detach "${RUNNER_TEMP}/numax-v0.1.4" refs/tags/v0.1.4
           cargo build --release --manifest-path "${RUNNER_TEMP}/numax-v0.1.4/Cargo.toml" -p nx-cli
       - name: Run multi-process CLI smoke test
         env:
           NUMAX_PREVIOUS_NX_BIN: ${{ runner.temp }}/numax-v0.1.4/target/release/nx
-        run: cargo test -p nx-cli --test multiprocess_smoke -- --ignored
+        # Real multicast is explicitly opted into in the macOS test job above.
+        run: >-
+          cargo test -p nx-cli --test multiprocess_smoke
+          -- --ignored --skip discovery_lan::
 
   benchmark-tools:
     name: Benchmark Comparator Tests

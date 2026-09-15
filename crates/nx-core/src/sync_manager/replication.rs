@@ -142,6 +142,12 @@ fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
     normalize_reconnect_delay(delay).min(max_delay)
 }
 
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    // Do not return watch::Ref from a select branch: its non-Send guard can
+    // otherwise be retained across an await in another branch's handler.
+    let _ = shutdown_rx.wait_for(|shutdown| *shutdown).await;
+}
+
 pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
     let ReconnectLoopContext {
         node,
@@ -169,7 +175,10 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         )
         .await;
 
-        loop {
+        'reconnect: loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             let mut sleep_for: Option<Duration> = None;
             let now = StdInstant::now();
             let connect_context = ConfiguredPeerConnectContext {
@@ -200,7 +209,14 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     continue;
                 }
 
-                match try_connect_configured_peer(&connect_context, peer_addr).await {
+                // The task owns the dial future: shutdown drops an in-flight
+                // handshake instead of waiting for every candidate's timeout.
+                let outcome = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
+                    outcome = try_connect_configured_peer(&connect_context, peer_addr) => outcome,
+                };
+                match outcome {
                     ConfiguredPeerConnectOutcome::Connected => {
                         info!(peer = %peer_addr, "reconnected configured peer");
                         peer.reset(initial_delay, StdInstant::now());
@@ -237,11 +253,9 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
             let sleep_for = sleep_for.unwrap_or(initial_delay);
 
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!("reconnect loop shutdown requested");
-                        break;
-                    }
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    debug!("reconnect loop shutdown requested");
+                    break;
                 }
                 changed = candidates_rx.changed() => {
                     if changed.is_err() {
@@ -265,7 +279,6 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
     let AntiEntropyLoopContext {
         node,
-        mut candidates_rx,
         interval,
         mut shutdown_rx,
         metrics,
@@ -273,39 +286,35 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
 
     Some(tokio::spawn(async move {
         let interval = normalize_anti_entropy_interval(interval);
+        // Keep the cadence independent of discovery churn and skip missed ticks
+        // rather than issuing bursts after a slow transport write.
+        let mut cadence =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!("anti-entropy loop shutdown requested");
-                        break;
-                    }
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    debug!("anti-entropy loop shutdown requested");
+                    break;
                 }
-                changed = candidates_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    let _ = candidates_rx.borrow_and_update();
-                }
-                _ = tokio::time::sleep(interval) => {
-                    let peers = Arc::clone(&candidates_rx.borrow_and_update());
-                    for peer in peers.iter() {
-                        if !node.is_connected_addr(peer).await {
-                            continue;
-                        }
-
+                _ = async {
+                    cadence.tick().await;
+                    // These are Node's send-address keys, including inbound
+                    // connections and peers no longer present in discovery.
+                    for (peer, _) in node.connected_peers().await {
                         // A single "last seen OpId" is not a safe causal frontier: a peer can
                         // receive a newer op while an older broadcast was dropped. Until the
                         // protocol has contiguous/causal metadata, anti-entropy pulls the bounded
                         // op-log and relies on OpId deduplication on the receiver.
-                        if let Err(e) = node.send_pull_since_to_addr(peer, None).await {
+                        if let Err(e) = node.send_pull_since_to_addr(&peer, None).await {
                             metrics.record_sync_error();
                             debug!(peer = %peer, error = %e, "anti-entropy pull failed");
                         } else {
                             debug!(peer = %peer, "anti-entropy pull requested");
                         }
                     }
-                }
+                } => {}
             }
         }
         debug!("anti-entropy loop terminated");

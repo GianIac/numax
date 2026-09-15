@@ -141,7 +141,6 @@ pub(super) struct ReconnectLoopContext {
 
 pub(super) struct AntiEntropyLoopContext {
     pub(super) node: Arc<Node>,
-    pub(super) candidates_rx: watch::Receiver<Arc<Vec<String>>>,
     pub(super) interval: Duration,
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) metrics: Arc<RuntimeMetrics>,

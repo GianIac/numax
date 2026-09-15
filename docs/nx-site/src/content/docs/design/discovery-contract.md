@@ -5,6 +5,8 @@ description: Snapshot, event delivery, cancellation, and compatibility guarantee
 
 ## Scope and ownership
 
+This contract describes peer discovery in `v0.1.5`, the current Numax version.
+
 The peer discovery abstraction belongs to `nx-core`. It supplies peer endpoint
 candidates to runtime orchestration without moving connection management,
 authentication, or wire-protocol concerns into discovery providers.
@@ -39,10 +41,11 @@ only one effective connection candidate. Invalid legacy `--peer` values are
 logged and skipped instead of making discovery startup fail.
 
 Dynamic providers keep a complete ordered view and publish bounded,
-revisioned `Replaced` events. A replacement changes the provider contribution
+revisioned `Observed(DiscoverySnapshot)` events with per-endpoint observation
+timestamps. A replacement changes the provider contribution
 atomically, including its ordering: consumers never observe a synthetic empty
-view between removals and additions. `Added` and `Removed` remain available for
-incremental providers. Providers deduplicate their own snapshots where their
+view between removals and additions. `Replaced`, `Added` and `Removed` remain
+available for providers without observation metadata. Providers deduplicate their own snapshots where their
 source naturally can repeat endpoints; the coordinator also deduplicates
 across providers. Ordering is deterministic for a given set of provider
 observations, but it is not a membership or authorization guarantee.
@@ -57,13 +60,34 @@ expires, while an unleased source is removed when its watch becomes unavailable.
 A successful resubscription atomically replaces that source from the new watch
 snapshot.
 
-The resulting bounded snapshot is shared by initial dialing, automatic
-reconnection, and anti-entropy. All three preserve its order. An empty startup
-snapshot is valid, and the loops remain alive for later additions. Removing a
-candidate immediately stops new reconnect attempts and anti-entropy requests;
-it does not terminate an already active, admitted connection. Once that
-connection closes it is not re-established unless a source adds the endpoint
-again.
+Freshness is based on successful endpoint observation, not cache publication or
+watch subscription time. `Observed` preserves those timestamps in both events
+and resubscription snapshots. A successful refresh of an unchanged endpoint
+list advances freshness; replaying a cached last-good view after an error does
+not renew its lease. Aggregated bootstrap seed and mDNS instance views preserve
+each endpoint's observation time rather than refreshing unrelated entries.
+
+The resulting bounded snapshot drives initial dialing and automatic
+reconnection in candidate order. An empty startup snapshot is valid, and the
+loops remain alive for later additions. `SyncManager::start()` returns after
+local services and their owned background loops are ready; it does not await
+peer convergence or successful dialing of every candidate. A stalled initial
+handshake therefore does not delay local readiness by one timeout per peer.
+
+Removing a candidate stops new reconnect attempts; it does not terminate an
+already active, admitted connection. Once that connection closes it is not
+re-established unless a source adds the endpoint again. Anti-entropy instead
+uses all active connection send-address keys, including inbound connections
+and peers no longer present in discovery. Its periodic cadence is independent
+of candidate churn, and missed ticks are skipped rather than replayed in a
+burst. Removal from discovery therefore does not disable repair over a live
+connection.
+
+Anti-entropy pulls the bounded operation log and relies on receiver
+deduplication. It is not state transfer and does not guarantee unrestricted
+lossless recovery after a partition or restart: required operations and
+deduplication history must still be retained. Rediscovery alone does not prove
+that a missing-history gap can be repaired.
 
 ## Bounded event delivery
 
@@ -122,7 +146,9 @@ background. Seed addresses are canonicalized and deduplicated while retaining
 their first configured occurrence.
 
 Each request optionally advertises the caller's endpoint and asks for at most
-the configured number of results. A successful view contains the seed itself
+the configured number of results. Response capacity is in `1..=4096`, matching
+`nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY`; bootstrap configuration rejects
+larger capacities before querying a seed. A successful view contains the seed itself
 followed by the seed's bounded, deduplicated suggestions. Views from multiple
 seeds are flattened in configured seed order and deduplicated again. Returned
 entries expire at the earlier of the seed-provided lease and the provider's
@@ -154,20 +180,33 @@ exact `cluster` TXT property match. This two-part filter prevents accidental
 cross-cluster discovery; neither value is authentication evidence.
 
 Resolved instances retain first-observation order. Addresses within an
-instance are sorted, deduplicated and limited to `max_candidates` before they
-enter retained provider state; the instance count and flattened candidate view
-are bounded separately. Port zero, unspecified and multicast addresses, and
+instance are sorted and deduplicated. The application-owned retained endpoint
+contributions are bounded **globally** by `max_candidates`, including duplicate
+contributions from different instances, not by `max_instances * max_candidates`.
+Replacing an instance reclaims its previous allocation before admission; the
+instance count and flattened candidate view are also bounded. Port zero, unspecified and multicast addresses, and
 IPv6 link-local addresses without a usable scope are ignored. A DNS-SD removal
 event removes the complete instance contribution; expiry is delegated to the
 mDNS daemon's cache and removal events.
+
+These are Numax application-state bounds, not a whole-library memory cap.
+`mdns-sd 0.21` does not expose a configurable bound for its internal DNS record
+cache; `max_instances` and `max_candidates` do not bound that cache. Do not
+interpret them as protection against arbitrary untrusted multicast traffic.
 
 mDNS announcement support is required. Announcements accept a concrete IP
 address or a `.local` hostname, never a wildcard host or port zero. The provider
 filters its own DNS-SD fullname and advertised endpoint. Re-announcement updates
 the same service in place, avoiding a withdrawal gap.
-Shutdown sends a goodbye/unregister request, stops browsing, waits within the
-bounded daemon grace period, shuts the daemon down, joins the bridge task, and
-clears the view. This provider is intended for LAN development and demos, not
+Shutdown has one cleanup owner: it requests unregister/goodbye, waits for the
+daemon acknowledgement within a deadline, stops browsing, requests daemon
+shutdown and awaits its acknowledgement, joins the bridge task, and clears the
+view. The common budget reserves time for daemon termination even when
+unregister fails or its acknowledgement never arrives; queue retries are also
+bounded by those deadlines. Cleanup errors are reported, not silently treated
+as success. A daemon acknowledgement does **not** guarantee receipt of a UDP
+goodbye by every LAN peer. Drop is best-effort fallback, not a stronger delivery
+guarantee. This provider is intended for LAN development and demos, not
 untrusted multicast networks.
 
 ### DnsSrvDiscovery
@@ -296,6 +335,12 @@ cancellation-safe shutdown. Provider-specific tests additionally cover:
 - mDNS address and instance bounds, self filtering, removal and service-name
   conflicts.
 
+Regression coverage also exercises observation freshness versus cached replay,
+resubscription timestamps, global mDNS retained-state bounds, bounded shutdown
+acknowledgements, non-blocking startup dialing and anti-entropy over active
+connections independently of discovery churn. Test presence is not evidence
+that every environment-dependent scenario has run successfully.
+
 The ignored
 `discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint`
 test exercises two real DNS-SD daemons over local multicast, including goodbye
@@ -307,5 +352,17 @@ cargo test -p nx-core \
   -- --ignored --exact
 ```
 
-The three-node CRDT LAN demo remains the release closing criterion and is not
-substituted by this two-daemon provider test.
+CI also explicitly selects
+`discovery_lan::mdns_three_daemons_recover_missed_crdt_ops_after_restart` from
+the CLI multiprocess suite on macOS, with `NUMAX_MDNS_E2E=1` and
+`NUMAX_MDNS_LAN_IP` derived from a real local interface. It builds both reader
+and writer variants of the `discovery_lan` guest first. The generic Ubuntu
+ignored-test invocation excludes this multicast-specific module.
+
+That E2E uses three real daemon **processes on one host**, without `--peer`,
+and checks discovery, CRDT replication, missed-operation recovery after restart
+within a configured 128-operation retention bound, stable identities and
+shutdown. It is not evidence of a run on three separate LAN devices or of
+recovery beyond retained history. The three-device LAN demo remains a separate
+release closing check; neither provider-test presence nor CI wiring asserts it
+has passed.

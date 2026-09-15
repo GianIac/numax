@@ -21,6 +21,7 @@ Examples that replicate state across Numax nodes using CRDTs and converge throug
 
 | Example | Description |
 | --- | --- |
+| [`discovery_lan`](discovery_lan/README.md) | Three mDNS-discovered daemons without `--peer`: SDK CRDT writes via authenticated local HTTP, offline operations and recovery; separate same-host test and three-device LAN procedure. |
 | [`distributed_ants`](distributed_ants/README.md) | Distributed Ant Colony Optimization swarm: a shared pheromone trail (PNCounter grid) emerges from many independent nodes. |
 | [`distributed_magnets`](distributed_magnets/README.md) | Distributed Magnetic Optimization Algorithm swarm: particles publish their position (LWW-Register) and pull toward whichever anchor or peer has the most mass. |
 | [`distributed_counter`](distributed_counter/README.md) | Grow-only distributed counter (GCounter). |

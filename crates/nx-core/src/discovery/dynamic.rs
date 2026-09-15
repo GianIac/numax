@@ -40,6 +40,7 @@ pub(super) struct DynamicState {
 struct State {
     revision: u64,
     peers: Vec<String>,
+    observations: Vec<std::time::Instant>,
     events: broadcast::Sender<DiscoveryEvent>,
 }
 
@@ -50,6 +51,7 @@ impl DynamicState {
             inner: Mutex::new(State {
                 revision: 0,
                 peers: Vec::new(),
+                observations: Vec::new(),
                 events,
             }),
             event_capacity: event_capacity.max(1),
@@ -58,7 +60,7 @@ impl DynamicState {
 
     pub(super) fn snapshot(&self) -> DiscoverySnapshot {
         let state = self.lock();
-        DiscoverySnapshot::new(state.revision, state.peers.clone())
+        state.snapshot()
     }
 
     pub(super) fn watch(&self) -> DiscoveryWatch {
@@ -66,10 +68,7 @@ impl DynamicState {
         // so a transition cannot fall into a snapshot/watch gap.
         let state = self.lock();
         let receiver = state.events.subscribe();
-        DiscoveryWatch::new(
-            DiscoverySnapshot::new(state.revision, state.peers.clone()),
-            receiver,
-        )
+        DiscoveryWatch::new(state.snapshot(), receiver)
     }
 
     /// Replace the complete view as one revision so consumers never observe a
@@ -79,15 +78,52 @@ impl DynamicState {
         if state.peers == peers {
             return;
         }
+        let observations = peers
+            .iter()
+            .map(|peer| {
+                state
+                    .peers
+                    .iter()
+                    .position(|old| old == peer)
+                    .map(|index| state.observations[index])
+                    .unwrap_or_else(std::time::Instant::now)
+            })
+            .collect();
+        self.publish(&mut state, peers, observations);
+    }
+
+    /// Successful observation of the entire view, including an identical view.
+    pub(super) fn observe(&self, peers: Vec<String>) {
+        let now = std::time::Instant::now();
+        self.observe_at(peers.into_iter().map(|peer| (peer, now)).collect());
+    }
+
+    /// Aggregate views preserve each endpoint's latest successful observation.
+    pub(super) fn observe_at(&self, peers: Vec<(String, std::time::Instant)>) {
+        let (peers, observations) = peers.into_iter().unzip();
+        let mut state = self.lock();
+        if state.peers == peers && state.observations == observations {
+            return;
+        }
+        self.publish(&mut state, peers, observations);
+    }
+
+    fn publish(
+        &self,
+        state: &mut State,
+        peers: Vec<String>,
+        observations: Vec<std::time::Instant>,
+    ) {
         let Some(revision) = state.revision.checked_add(1) else {
             tracing::error!("discovery revision space exhausted; rejecting provider update");
             return;
         };
-        state.peers = peers.clone();
+        state.peers = peers;
+        state.observations = observations;
         state.revision = revision;
         let event = DiscoveryEvent {
             revision: state.revision,
-            change: DiscoveryChange::Replaced(peers),
+            change: DiscoveryChange::Observed(state.snapshot()),
         };
         let _ = state.events.send(event);
     }
@@ -107,6 +143,19 @@ impl DynamicState {
     }
 }
 
+impl State {
+    fn snapshot(&self) -> DiscoverySnapshot {
+        DiscoverySnapshot::observed(
+            self.revision,
+            self.peers
+                .iter()
+                .cloned()
+                .zip(self.observations.iter().copied())
+                .collect(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +167,34 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn identical_fresh_observations_advance_but_cached_republication_does_not() {
+        let state = DynamicState::new(2);
+        let now = std::time::Instant::now();
+        state.observe_at(vec![("a:1".into(), now)]);
+        let mut watch = state.watch();
+        let snapshot = watch.snapshot().clone();
+        state.replace(vec!["a:1".into()]);
+        assert_eq!(state.snapshot(), snapshot);
+        state.observe_at(vec![("a:1".into(), now + Duration::from_secs(1))]);
+        let event = watch.recv().await.unwrap();
+        assert_eq!(event.revision, snapshot.revision() + 1);
+        let DiscoveryChange::Observed(ref fresh) = event.change else {
+            panic!("missing observation");
+        };
+        assert_eq!(fresh.peers(), snapshot.peers());
+        assert_ne!(fresh.observations(), snapshot.observations());
+        assert_eq!(fresh, state.watch().snapshot());
+        for offset in 2..8 {
+            state.observe_at(vec![("a:1".into(), now + Duration::from_secs(offset))]);
+        }
+        assert!(matches!(
+            watch.recv().await,
+            Err(DiscoveryError::WatchOverflow { .. })
+        ));
+        assert_eq!(state.snapshot(), *state.watch().snapshot());
+    }
+
+    #[tokio::test]
     async fn replacement_has_a_contiguous_watch_stream() {
         let state = DynamicState::new(8);
         state.replace(vec!["a:1".into()]);
@@ -126,10 +203,7 @@ mod tests {
 
         let event = watch.recv().await.unwrap();
         assert_eq!(event.revision, 2);
-        assert_eq!(
-            event.change,
-            DiscoveryChange::Replaced(vec!["b:2".into(), "c:3".into()])
-        );
+        assert_eq!(super::super::observed_peers(event.change), ["b:2", "c:3"]);
         assert_eq!(state.snapshot().peers(), ["b:2", "c:3"]);
     }
 

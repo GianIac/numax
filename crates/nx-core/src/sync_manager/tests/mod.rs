@@ -1875,6 +1875,7 @@ async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
     let discovery = Arc::new(TestDynamicDiscovery::empty());
     let config_a = SyncConfig::new()
         .with_listen_addr(addr_a)
+        .with_anti_entropy_interval(Duration::from_millis(10))
         .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50));
     let mut manager_a = SyncManager::try_new_with_discovery(
         NodeId::generate(),
@@ -1889,7 +1890,7 @@ async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
     assert_eq!(manager_a.connected_peer_count().await, 0);
 
     let config_b = SyncConfig::new().with_listen_addr(addr_b.clone());
-    let (mut manager_b, _handle_b, _store_b) = started_manager_with_config(config_b).await;
+    let (mut manager_b, handle_b, _store_b) = started_manager_with_config(config_b).await;
 
     discovery.add(addr_b.clone());
     wait_for_connected_peer(&manager_a).await;
@@ -1936,8 +1937,288 @@ async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
         "removing a candidate must not terminate an admitted connection"
     );
 
+    // The connection remains an anti-entropy target even after its discovery
+    // contribution is removed. No broadcast can deliver this operation.
+    dropped_local_increment(&manager_b, &handle_b, "removed-candidate", 7).await;
+    wait_for_counter(&manager_a, "removed-candidate", 7).await;
+    assert_eq!(read_materialized(&manager_a.store, "removed-candidate"), 7);
+
     manager_a.shutdown().await.unwrap();
     manager_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
+    let interval = Duration::from_millis(200);
+    // A controlled peer never broadcasts or answers connection-time requests.
+    let source_id = NodeId::generate();
+    let mut source = Node::new(NodeConfig::new(source_id.clone(), "127.0.0.1:0"));
+    let mut source_events = source.take_event_receiver().unwrap();
+    let source_addr = source.start_listener().await.unwrap().to_string();
+    let discovery = Arc::new(TestDynamicDiscovery::empty());
+    discovery.add(source_addr);
+    let mut target = SyncManager::try_new_with_discovery(
+        NodeId::generate(),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_max_peers(1)
+            .with_anti_entropy_interval(interval),
+        temp_store(),
+        metrics(),
+        vec![DiscoveryProvider::new("test-dynamic", discovery.clone())],
+        DiscoveryRuntimeConfig::default(),
+    )
+    .unwrap();
+    target.start().await.unwrap();
+    wait_for_connected_peer(&target).await;
+
+    // Reserve the unused endpoint; churn must not create additional connections.
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused_addr = unused.local_addr().unwrap().to_string();
+    let mut candidates = target.discovery_coordinator.as_ref().unwrap().candidates();
+    let (updates_tx, mut updates_rx) = tokio::sync::watch::channel(Instant::now());
+    let churn = async {
+        let mut cadence = tokio::time::interval(Duration::from_millis(10));
+        cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut added = false;
+        loop {
+            cadence.tick().await;
+            added = !added;
+            if added {
+                discovery.add(unused_addr.clone());
+            } else {
+                discovery.remove(&unused_addr);
+            }
+            // Observe each published change rather than just enqueueing events.
+            candidates
+                .wait_for(|snapshot| snapshot.contains(&unused_addr) == added)
+                .await
+                .unwrap();
+            updates_tx.send_replace(Instant::now());
+        }
+    };
+    let recovery = async {
+        let mut ops = Vec::new();
+        for expected in 1..=3 {
+            ops.push(Op::gcounter_increment(source_id.clone(), "churn", 1));
+            updates_rx.changed().await.unwrap();
+            let first_change = *updates_rx.borrow_and_update();
+            // Observe distinct published changes spanning a full anti-entropy
+            // interval, rather than assuming a scheduler-dependent update count.
+            let last_change = *updates_rx
+                .wait_for(|changed_at| *changed_at >= first_change + interval)
+                .await
+                .unwrap();
+            assert!(last_change.duration_since(first_change) >= interval);
+
+            // Discard all earlier requests, including any eager startup pull.
+            // Only a fresh periodic request may recover this missing operation.
+            while let Ok(event) = source_events.try_recv() {
+                assert!(matches!(
+                    event,
+                    NodeEvent::PeerConnected { .. } | NodeEvent::PullRequested { .. }
+                ));
+            }
+            let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+            assert_eq!(since, None);
+            let change_at_pull = *updates_rx.borrow_and_update();
+            updates_rx.changed().await.unwrap();
+            assert!(*updates_rx.borrow_and_update() > change_at_pull);
+            assert_eq!(target.get_counter_value("churn").await, expected - 1);
+            source
+                .send_ops_to_addr(&reply_addr, ops.clone())
+                .await
+                .unwrap();
+
+            // FIFO on this connection makes the reply to our pull an apply
+            // barrier: the target must have processed the preceding ops first.
+            source
+                .send_pull_since_to_addr(&reply_addr, None)
+                .await
+                .unwrap();
+            loop {
+                match source_events
+                    .recv()
+                    .await
+                    .expect("peer event channel closed")
+                {
+                    NodeEvent::OpsReceived { ops: received, .. } => {
+                        assert_eq!(received, ops);
+                        break;
+                    }
+                    NodeEvent::PullRequested { .. } => {}
+                    event => panic!("unexpected event during recovery: {event:?}"),
+                }
+            }
+            assert_eq!(target.get_counter_value("churn").await, expected);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = churn => unreachable!("churn must continue until recovery completes"),
+            _ = recovery => {}
+        }
+    })
+    .await
+    .expect("anti-entropy did not recover missing ops while candidate updates continued");
+    assert_eq!(target.connected_peer_count().await, 1);
+    assert_eq!(read_materialized(&target.store, "churn"), 3);
+    assert_eq!(target.op_log.read().await.len(), 3);
+    assert_eq!(target.seen_ops.read().await.len(), 3);
+    target.shutdown().await.unwrap();
+    source.shutdown().await;
+}
+
+#[tokio::test]
+async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
+    let addr = free_addr();
+    let (mut target, _, store) = started_manager_with_config(
+        SyncConfig::new()
+            .with_listen_addr(addr.clone())
+            .with_max_peers(1)
+            .with_anti_entropy_interval(Duration::from_millis(10)),
+    )
+    .await;
+    let source_id = NodeId::generate();
+    let mut source = Node::new(NodeConfig::new(source_id.clone(), "127.0.0.1:0"));
+    let mut source_events = source.take_event_receiver().unwrap();
+    source.connect_to_peer(&addr).await.unwrap();
+    wait_for_connected_peer(&target).await;
+    assert!(target.peer_candidates().is_empty());
+    assert_eq!(target.connected_peer_count().await, 1);
+
+    let older = Op::gcounter_increment(source_id.clone(), "missing", 3);
+    let newer = Op::gcounter_increment(source_id.clone(), "received", 7);
+    source
+        .send_ops_to_addr(&addr, vec![newer.clone()])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "received", 7).await;
+    assert_eq!(target.get_counter_value("missing").await, 0);
+    assert_eq!(
+        target.anti_entropy_watermarks.read().await.get(&source_id),
+        Some(&newer.id.as_str().to_string())
+    );
+    let connections = target.handle().active_connections().await;
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].direction, ConnectionDirection::Inbound);
+    assert!(connections[0].dialed_endpoint.is_none());
+
+    // A newer received op must not become a causal frontier. The inbound
+    // transport address (not an advertised candidate) is the only valid target.
+    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+    assert_eq!(since, None);
+    source
+        .send_ops_to_addr(&reply_addr, vec![older.clone(), newer.clone()])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "missing", 3).await;
+
+    // Repeated full bounded-log pulls must still deduplicate previously seen ops.
+    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+    assert_eq!(since, None);
+    let barrier = Op::gcounter_increment(source_id, "barrier", 1);
+    source
+        .send_ops_to_addr(&reply_addr, vec![older, newer, barrier])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "barrier", 1).await;
+    assert_eq!(target.get_counter_value("missing").await, 3);
+    assert_eq!(target.get_counter_value("received").await, 7);
+    assert_eq!(read_materialized(&store, "missing"), 3);
+    assert_eq!(read_durable_gcounter_state(&store, "missing").value(), 3);
+    assert_eq!(target.op_log.read().await.len(), 3);
+    assert_eq!(target.seen_ops.read().await.len(), 3);
+    target.shutdown().await.unwrap();
+    source.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_unresponsive_candidates_do_not_block_startup_or_shutdown() {
+    use tokio::io::AsyncReadExt;
+
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first.local_addr().unwrap().to_string();
+    let second_addr = second.local_addr().unwrap().to_string();
+    let mut manager = SyncManager::new(
+        NodeId::generate(),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(first_addr.clone())
+            .with_peer(second_addr.clone())
+            .with_socket_timeout(Duration::from_secs(60)),
+        temp_store(),
+        metrics(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), manager.start())
+        .await
+        .expect("startup waited for initial peer handshakes")
+        .unwrap();
+    assert!(manager.start().await.is_err(), "start remains one-shot");
+    assert!(manager.event_task.is_some());
+    assert!(manager.broadcast_task.is_some());
+    assert!(manager.reconnect_task.is_some());
+    assert!(manager.anti_entropy_task.is_some());
+
+    let (mut stalled, _) = tokio::time::timeout(Duration::from_secs(1), first.accept())
+        .await
+        .expect("initial reconnect dial did not start")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_exact(&mut [0; 1]))
+        .await
+        .expect("initial dial did not send its Hello")
+        .unwrap();
+    let error = manager.connect_to_peer(&second_addr).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<nx_net::NetError>(),
+        Some(nx_net::NetError::ConnectionAttemptLimitReached(1))
+    ));
+    assert_eq!(manager.connected_peer_count().await, 0);
+
+    // Broadcast persistence and event processing are already running while the
+    // first candidate has stalled and the second has not yet been attempted.
+    local_increment(&manager.handle(), "startup", 1).await;
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown waited for the in-flight dial timeout")
+        .unwrap();
+    assert_eq!(manager.op_log.read().await.len(), 1);
+    assert!(manager.reconnect_task.is_none());
+    assert!(manager.event_task.is_none());
+    assert!(manager.broadcast_task.is_none());
+    assert!(manager.anti_entropy_task.is_none());
+    assert!(
+        manager.start().await.is_err(),
+        "shutdown must not allow restart"
+    );
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_to_end(&mut Vec::new()))
+        .await
+        .expect("canceled dial kept its transport open")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn immediate_shutdown_cancels_initial_dial_before_task_first_poll() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (mut manager, _, _) = started_manager_with_config(
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(listener.local_addr().unwrap().to_string())
+            .with_socket_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("pre-signaled shutdown must not wait for an initial dial")
+        .unwrap();
+    assert!(manager.reconnect_task.is_none());
+    assert_eq!(manager.connected_peer_count().await, 0);
 }
 
 #[tokio::test]

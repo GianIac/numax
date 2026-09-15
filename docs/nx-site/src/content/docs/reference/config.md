@@ -263,14 +263,15 @@ anti_entropy_interval = "60s"
 
 ## [discovery]
 
-Controls how peers are discovered.
+Controls how peers are discovered in `v0.1.5`, the current Numax version.
+Dynamic discovery is available alongside backward-compatible static peer lists.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `mode` | string | `static` | `static`, `bootstrap`, `mdns`, `dns-srv`, or `file` |
 | `cluster_id` | string | `default` | Discovery routing scope; not an authorization boundary |
 | `advertised_endpoint` | string | derived from listener | Concrete endpoint published by bootstrap or mDNS |
-| `max_candidates` | integer | `1024` | Aggregate bound across all discovery sources |
+| `max_candidates` | integer | `1024` | Positive aggregate bound across all discovery sources; at most `4096` in bootstrap mode |
 
 Provider-specific fields are accepted only for their selected mode:
 
@@ -286,6 +287,21 @@ Explicit peers from `[network].peers`, `--peer`, `NX_PEER`, or `NX_PEERS`
 remain an additional static source when a dynamic mode is selected. They never
 become bootstrap seeds. Every non-static mode enables sync and therefore
 requires `[network].listen`, `--listen`, or `NX_LISTEN`.
+
+For compatibility, the effective candidate capacity is raised to at least the
+number of explicit peer entries. In bootstrap mode that effective value must
+also be at most `4096`: a larger explicit peer list is rejected, not silently
+truncated. The bootstrap upper bound does not apply to static, mDNS, DNS-SRV or
+file mode. `NX_DISCOVERY_MAX_CANDIDATES` overrides the TOML value; validation uses
+the resolved mode and capacity.
+
+Successful startup means local services are ready, not that discovery has
+found peers or CRDT state has converged. Candidate expiry stops new dialing but
+does not close admitted connections; periodic anti-entropy continues over those
+active connections. Recovery depends on retained operation and deduplication
+history, not merely on rediscovery. See the
+[discovery contract](/numax/design/discovery-contract/) for freshness, shutdown
+and mDNS resource limits.
 
 ```toml
 [discovery]
