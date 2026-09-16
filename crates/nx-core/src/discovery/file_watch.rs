@@ -8,8 +8,12 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
-use super::dynamic::{AbortOnDropTask, DynamicState};
+use super::dynamic::{
+    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
+    validate_durations,
+};
 use super::{
     DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY, DEFAULT_MAX_PEER_CANDIDATES,
     DiscoveryError, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement, PeerDiscovery,
@@ -47,6 +51,7 @@ struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+    cleanup: Option<OwnedShutdown>,
 }
 
 struct Inner {
@@ -92,6 +97,7 @@ impl FileWatchDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
+                    cleanup: None,
                 }),
             }),
         })
@@ -130,7 +136,11 @@ impl FileWatchDiscovery {
         let state = Arc::clone(&self.inner.state);
         lifecycle.shutdown = Some(shutdown);
         lifecycle.task = Some(tokio::spawn(async move {
-            run_file_watch(config, state, shutdown_rx).await;
+            let cleanup = ClearStateOnDrop(state.clone());
+            if let Err(error) = run_file_watch(config, state, shutdown_rx).await {
+                tracing::error!(%error, "peer file discovery stopped");
+            }
+            drop(cleanup);
         }));
         Ok(())
     }
@@ -173,23 +183,32 @@ impl PeerDiscovery for FileWatchDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let task = {
+        let result = {
             let mut lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             lifecycle.shutdown.take();
-            lifecycle.task.take()
+            let task = lifecycle.task.take().map(AbortOnDropTask::new);
+            lifecycle
+                .cleanup
+                .get_or_insert_with(|| {
+                    let cleanup = ClearStateOnDrop(Arc::clone(&self.inner.state));
+                    OwnedShutdown::new(async move {
+                        let joined = match task {
+                            Some(task) => task.join().await.map_err(|error| {
+                                provider_error(format!("watch task failed: {error}"), false)
+                            }),
+                            None => Ok(()),
+                        };
+                        drop(cleanup);
+                        joined
+                    })
+                })
+                .subscribe()
         };
-        if let Some(task) = task {
-            AbortOnDropTask::new(task)
-                .join()
-                .await
-                .map_err(|error| provider_error(format!("watch task failed: {error}"), false))?;
-        }
-        self.inner.state.replace(Vec::new());
-        Ok(())
+        OwnedShutdown::wait(result, PROVIDER).await
     }
 }
 
@@ -197,23 +216,50 @@ async fn run_file_watch(
     config: FileWatchDiscoveryConfig,
     state: Arc<DynamicState>,
     mut shutdown: watch::Receiver<bool>,
-) {
-    let mut interval = tokio::time::interval(config.poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+) -> Result<(), DiscoveryError> {
     // The initial view was loaded by ensure_started().
-    interval.tick().await;
+    let mut next = checked_deadline(
+        Instant::now(),
+        config.poll_interval,
+        PROVIDER,
+        "poll_interval",
+    )?;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    break;
+                    return Ok(());
                 }
             }
-            _ = interval.tick() => match read_peer_file(&config).await {
-                Ok(peers) => state.observe(peers),
-                Err(error) => tracing::warn!(%error, path = %config.path.display(), "ignoring invalid peer file update"),
+            _ = tokio::time::sleep_until(next) => {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    result = read_peer_file(&config) => match result {
+                        Ok(peers) => state.observe(peers),
+                        Err(error) => tracing::warn!(%error, path = %config.path.display(), "ignoring invalid peer file update"),
+                    }
+                }
+                next = next_poll_deadline(next, Instant::now(), config.poll_interval)?;
             }
         }
+    }
+}
+
+fn next_poll_deadline(
+    previous: Instant,
+    now: Instant,
+    period: Duration,
+) -> Result<Instant, DiscoveryError> {
+    let next = checked_deadline(previous, period, PROVIDER, "poll_interval")?;
+    if next > now {
+        Ok(next)
+    } else {
+        // Skip missed polls without relying on Interval's unchecked addition.
+        checked_deadline(now, period, PROVIDER, "poll_interval")
     }
 }
 
@@ -289,7 +335,7 @@ fn validate_config(config: &FileWatchDiscoveryConfig) -> Result<(), DiscoveryErr
             "limits and event_capacity must be greater than zero",
         ));
     }
-    Ok(())
+    validate_durations(PROVIDER, &[("poll_interval", config.poll_interval)])
 }
 
 fn invalid(message: impl Into<String>) -> DiscoveryError {
@@ -314,6 +360,55 @@ fn io_error(path: &Path, error: std::io::Error) -> DiscoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extreme_poll_interval_is_rejected_before_file_io_or_spawning() {
+        let mut config = FileWatchDiscoveryConfig::new("unused-peers");
+        config.poll_interval = Duration::MAX;
+        assert!(matches!(FileWatchDiscovery::new(config),
+            Err(DiscoveryError::InvalidConfiguration { provider, message })
+                if provider == PROVIDER && message.contains("poll_interval")));
+    }
+
+    #[test]
+    fn runtime_poll_overflow_is_not_an_immediate_retry() {
+        let now = Instant::now();
+        assert!(matches!(
+            next_poll_deadline(now, now, Duration::MAX),
+            Err(DiscoveryError::Provider {
+                retryable: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            next_poll_deadline(now, now + Duration::from_secs(10), Duration::from_secs(1)).unwrap(),
+            now + Duration::from_secs(11)
+        );
+        let boundary = super::super::dynamic::deadline_boundary();
+        let period = Duration::from_secs(1);
+        assert!(next_poll_deadline(boundary, boundary, period).is_err());
+        assert!(next_poll_deadline(boundary - period, boundary, period).is_err());
+    }
+
+    #[tokio::test]
+    async fn panicked_watch_is_reported_after_clearing_snapshot() {
+        let provider =
+            FileWatchDiscovery::new(FileWatchDiscoveryConfig::new("unused-peers")).unwrap();
+        provider
+            .inner
+            .state
+            .observe(vec!["cached.example:9000".into()]);
+        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async {
+            panic!("injected file watch panic");
+        }));
+        let result = provider.shutdown().await;
+        assert!(
+            matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
+            if message.contains("watch task failed"))
+        );
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.inner.state.watch().snapshot().peers().is_empty());
+    }
 
     async fn replace_file(path: &Path, contents: &str) {
         let staging = path.with_extension("staging");

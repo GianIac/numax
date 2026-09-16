@@ -464,8 +464,11 @@ data. Bincode is the default production format; JSON is selected with
 | `PullSince` | Client → Server | Requests operations after a given OpId |
 | `Ping` | Bidirectional | Keepalive |
 | `Pong` | Bidirectional | Response to Ping |
+| `Error` | Bidirectional | Structured rejection or failure |
+| `BootstrapHello` | Client → Seed | One-shot authenticated bootstrap request, cluster and optional endpoint advertisement |
+| `BootstrapAck` | Seed → Client | Seed identity, cluster, negotiated format and bounded endpoint suggestions with a lease |
 
-**Protocol versioning:** version number (`PROTOCOL_VERSION = 4`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity.
+**Protocol versioning:** version number (`PROTOCOL_VERSION = 5`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity. Version `4` belongs to Numax `v0.1.4` and is not wire-compatible with `v0.1.5`.
 
 **Current status:**
 
@@ -475,7 +478,8 @@ data. Bincode is the default production format; JSON is selected with
 - automatic reconnect with exponential backoff, peer health tracking and peer rotation *(Prototype)*;
 - periodic anti-entropy after missed pushes/reconnects *(Prototype)*;
 - bounded OpId deduplication and persisted dedup metadata *(Prototype)*;
-- peer-to-peer gossip with K-fanout: architecture defined, full dynamic discovery/fanout remains future work *(Prototype)*.
+- static, bootstrap, mDNS, DNS-SRV and file discovery through CLI, environment and TOML configuration *(Implemented)*;
+- peer-to-peer gossip with K-fanout: architecture defined, SWIM membership and K-fanout dissemination remain future work *(Prototype)*.
 
 ### 5.5 Channel security *(Implemented)*
 

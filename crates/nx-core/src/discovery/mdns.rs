@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use mdns_sd::{
     DaemonEvent, DaemonStatus, DnsNameChange, RRType, ServiceDaemon, ServiceEvent, ServiceInfo,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::dynamic::DynamicState;
@@ -21,6 +21,12 @@ const PROVIDER: &str = "mdns";
 const SERVICE_BASE: &str = "_numax._tcp.local.";
 const DEFAULT_MAX_INSTANCES: usize = 1024;
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
+const MAX_OWN_HISTORY: usize = 1024;
+
+struct AnnounceRequest {
+    endpoint: String,
+    reply: oneshot::Sender<Result<(), DiscoveryError>>,
+}
 
 /// LAN mDNS discovery and announcement limits.
 #[derive(Debug, Clone)]
@@ -48,7 +54,7 @@ struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
-    daemon: Option<ServiceDaemon>,
+    announcements: Option<mpsc::Sender<AnnounceRequest>>,
     completion: Option<watch::Receiver<Option<Result<(), DiscoveryError>>>>,
 }
 
@@ -56,7 +62,6 @@ struct Inner {
     config: MdnsDiscoveryConfig,
     service_type: String,
     state: Arc<DynamicState>,
-    own_fullname: Arc<StdMutex<Option<String>>>,
     own_endpoint: Arc<StdMutex<Option<String>>>,
     lifecycle: StdMutex<Lifecycle>,
 }
@@ -90,14 +95,13 @@ impl MdnsDiscovery {
             inner: Arc::new(Inner {
                 service_type: cluster_service_type(&config.cluster_id),
                 state: Arc::new(DynamicState::new(config.event_capacity)),
-                own_fullname: Arc::new(StdMutex::new(None)),
                 own_endpoint: Arc::new(StdMutex::new(None)),
                 config,
                 lifecycle: StdMutex::new(Lifecycle {
                     stopped: false,
                     shutdown: None,
                     task: None,
-                    daemon: None,
+                    announcements: None,
                     completion: None,
                 }),
             }),
@@ -118,7 +122,7 @@ impl MdnsDiscovery {
                 return Ok(());
             }
             lifecycle.task.take();
-            lifecycle.daemon.take();
+            lifecycle.announcements.take();
         }
 
         let daemon = ServiceDaemon::new()
@@ -143,6 +147,7 @@ impl MdnsDiscovery {
                 ));
             }
         };
+        let mut owned = OwnedAnnouncements::default();
         if let Some(endpoint) = self
             .inner
             .own_endpoint
@@ -160,38 +165,36 @@ impl MdnsDiscovery {
                     true,
                 ));
             }
-            *self
-                .inner
-                .own_fullname
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(fullname);
+            owned.accept(fullname, endpoint);
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (announcements_tx, announcements_rx) = mpsc::channel(self.inner.config.event_capacity);
         let (completion_tx, completion_rx) = watch::channel(None);
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
-        let own_fullname = Arc::clone(&self.inner.own_fullname);
         let own_endpoint = Arc::clone(&self.inner.own_endpoint);
         // Construct the guard before spawning: cancellation before the first
         // task poll must still release the external daemon.
         let cleanup = DaemonCleanup {
-            daemon: daemon.clone(),
-            service_type: self.inner.service_type.clone(),
-            own_fullname: Arc::clone(&own_fullname),
+            daemon: LiveDaemon {
+                daemon,
+                service_type: self.inner.service_type.clone(),
+            },
+            owned,
             finished: false,
         };
         lifecycle.shutdown = Some(shutdown);
-        lifecycle.daemon = Some(daemon);
+        lifecycle.announcements = Some(announcements_tx);
         lifecycle.completion = Some(completion_rx);
         lifecycle.task = Some(tokio::spawn(async move {
             let result = run_mdns_browse(
                 config,
                 state,
-                own_fullname,
                 own_endpoint,
                 events,
                 monitor,
                 cleanup,
+                announcements_rx,
                 shutdown_rx,
             )
             .await;
@@ -223,53 +226,30 @@ impl PeerDiscovery for MdnsDiscovery {
         self.ensure_started()?;
         let endpoint = crate::sync_manager::canonicalize_endpoint(&announcement.endpoint)
             .map_err(|error| provider_error(error.to_string(), false))?;
-        let (service, fullname) =
-            build_service(&self.inner.config, &self.inner.service_type, &endpoint)?;
-
-        let lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if lifecycle.stopped {
-            return Err(provider_error("provider is shut down", false));
-        }
-        let daemon = lifecycle
-            .daemon
-            .clone()
-            .ok_or_else(|| provider_error("mDNS daemon is unavailable", true))?;
-        // mdns-sd treats registering an existing full name as an in-place
-        // re-announcement. Keeping the previous registration until this command
-        // is accepted avoids a withdrawal gap when an endpoint is updated.
-        let previous_own = self
-            .inner
-            .own_fullname
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .replace(fullname.clone());
-        let previous_endpoint = self
-            .inner
-            .own_endpoint
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .replace(endpoint);
-        if let Err(error) = daemon.register(service) {
-            *self
+        let (reply, response) = oneshot::channel();
+        {
+            let lifecycle = self
                 .inner
-                .own_fullname
+                .lifecycle
                 .lock()
-                .unwrap_or_else(|error| error.into_inner()) = previous_own;
-            *self
-                .inner
-                .own_endpoint
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = previous_endpoint;
-            return Err(provider_error(
-                format!("cannot register mDNS service: {error}"),
-                true,
-            ));
+                .unwrap_or_else(|error| error.into_inner());
+            if lifecycle.stopped {
+                return Err(provider_error("provider is shut down", false));
+            }
+            lifecycle
+                .announcements
+                .as_ref()
+                .ok_or_else(|| provider_error("mDNS daemon is unavailable", true))?
+                .try_send(AnnounceRequest { endpoint, reply })
+                .map_err(|error| {
+                    provider_error(format!("cannot queue mDNS announcement: {error}"), true)
+                })?;
         }
-        Ok(())
+        // Once queued, the browse task owns the transaction, even if this
+        // waiter is cancelled. It also serializes NameChange and shutdown.
+        response
+            .await
+            .map_err(|_| provider_error("mDNS announcement task stopped", true))?
     }
 
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError> {
@@ -303,15 +283,29 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 }
 
+#[async_trait]
+trait MdnsReceiver<T>: Send {
+    async fn next(&mut self) -> Result<T, DiscoveryError>;
+}
+
+#[async_trait]
+impl<T: Send + 'static> MdnsReceiver<T> for mdns_sd::Receiver<T> {
+    async fn next(&mut self) -> Result<T, DiscoveryError> {
+        self.recv_async()
+            .await
+            .map_err(|error| provider_error(format!("mDNS event stream ended: {error}"), true))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_mdns_browse(
+async fn run_mdns_browse<D: RegistrationDaemon>(
     config: MdnsDiscoveryConfig,
     state: Arc<DynamicState>,
-    own_fullname: Arc<StdMutex<Option<String>>>,
     own_endpoint: Arc<StdMutex<Option<String>>>,
-    events: mdns_sd::Receiver<ServiceEvent>,
-    monitor: mdns_sd::Receiver<DaemonEvent>,
-    mut cleanup: DaemonCleanup,
+    mut events: impl MdnsReceiver<ServiceEvent>,
+    mut monitor: impl MdnsReceiver<DaemonEvent>,
+    mut cleanup: DaemonCleanup<D>,
+    mut announcements: mpsc::Receiver<AnnounceRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), DiscoveryError> {
     let mut instances = HashMap::<String, InstanceView>::new();
@@ -329,7 +323,27 @@ async fn run_mdns_browse(
                     break;
                 }
             }
-            event = events.recv_async() => match event {
+            Some(request) = announcements.recv() => {
+                if *shutdown.borrow() {
+                    let _ = request.reply.send(Err(provider_error("provider is shut down", false)));
+                    expected_shutdown = true;
+                    break;
+                }
+                let result = replace_announcement(&mut cleanup, &config, request.endpoint).await;
+                if let Some(current) = &cleanup.owned.current {
+                    *own_endpoint.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(current.endpoint.clone());
+                }
+                remove_owned_instances(&cleanup.owned, &mut instances, &mut order);
+                publish_instances(&state, &instances, &order, config.max_candidates);
+                let _ = request.reply.send(result);
+                // A failed retirement must not accumulate registrations on
+                // subsequent updates. Cleanup still owns both original keys.
+                if cleanup.owned.keys.len() > 1 {
+                    break;
+                }
+            }
+            event = events.next() => match event {
                 Ok(ServiceEvent::ServiceResolved(service)) => {
                     let fullname = service.get_fullname().to_string();
                     let endpoints = bounded_mdns_endpoints(
@@ -337,11 +351,7 @@ async fn run_mdns_browse(
                         service.get_port(),
                         config.max_candidates,
                     );
-                    let matches_fullname = own_fullname.lock().unwrap_or_else(|error| error.into_inner())
-                        .as_ref().is_some_and(|own| own == &fullname);
-                    let matches_endpoint = own_endpoint.lock().unwrap_or_else(|error| error.into_inner())
-                        .as_ref().is_some_and(|own| endpoints.contains(own));
-                    if matches_fullname || matches_endpoint || service.get_property_val_str("cluster") != Some(config.cluster_id.as_str()) {
+                    if cleanup.owned.matches(&fullname, &endpoints) || service.get_property_val_str("cluster") != Some(config.cluster_id.as_str()) {
                         if remove_instance(&mut instances, &mut order, &fullname) {
                             publish_instances(&state, &instances, &order, config.max_candidates);
                         }
@@ -368,9 +378,18 @@ async fn run_mdns_browse(
                 }
                 Ok(_) => {}
             },
-            event = monitor.recv_async() => match event {
+            event = monitor.next() => match event {
                 Ok(DaemonEvent::NameChange(change)) => {
-                    if update_own_fullname(&own_fullname, &change) {
+                    let updated = match cleanup.owned.name_change(&change) {
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            tracing::warn!(%error, "mDNS own-name history exhausted");
+                            break;
+                        }
+                    };
+                    if updated {
+                        remove_owned_instances(&cleanup.owned, &mut instances, &mut order);
+                        publish_instances(&state, &instances, &order, config.max_candidates);
                         tracing::debug!(
                             original = %change.original,
                             new_name = %change.new_name,
@@ -389,6 +408,12 @@ async fn run_mdns_browse(
                 Ok(_) => {}
             }
         }
+    }
+    announcements.close();
+    while let Ok(request) = announcements.try_recv() {
+        let _ = request
+            .reply
+            .send(Err(provider_error("mDNS announcement task stopped", true)));
     }
     state.replace(Vec::new());
     if !expected_shutdown {
@@ -429,39 +454,81 @@ trait ShutdownDaemon: Send {
     async fn shutdown(&mut self) -> Result<(), DiscoveryError>;
 }
 
-struct DaemonCleanup {
+#[async_trait]
+trait RegistrationDaemon: Send {
+    fn register(&mut self, service: ServiceInfo) -> Result<(), DiscoveryError>;
+    async fn withdraw(&mut self, key: &str) -> Result<(), DiscoveryError>;
+    async fn terminate(&mut self) -> Result<(), DiscoveryError>;
+    fn fallback(&mut self, keys: &BTreeSet<String>);
+}
+
+struct LiveDaemon {
     daemon: ServiceDaemon,
     service_type: String,
-    own_fullname: Arc<StdMutex<Option<String>>>,
+}
+
+struct DaemonCleanup<D: RegistrationDaemon = LiveDaemon> {
+    daemon: D,
+    owned: OwnedAnnouncements,
     finished: bool,
 }
 
 #[async_trait]
-impl ShutdownDaemon for DaemonCleanup {
+impl<D: RegistrationDaemon> ShutdownDaemon for DaemonCleanup<D> {
     async fn unregister(&mut self) -> Result<(), DiscoveryError> {
-        let fullname = self
-            .own_fullname
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        if let Some(fullname) = fullname {
-            let ack = enqueue_daemon_command(|| self.daemon.unregister(&fullname)).await?;
-            // OK and NotFound both mean the registration is no longer owned.
-            ack.recv_async().await.map_err(|error| {
-                provider_error(
-                    format!("mDNS unregister acknowledgement failed: {error}"),
-                    false,
-                )
-            })?;
-            self.own_fullname
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
+        let mut result = Ok(());
+        for key in self.owned.keys.clone() {
+            // At most two keys can coexist during replacement. Give each a
+            // slice so one missing ACK cannot prevent trying the other key.
+            let withdrawal = tokio::time::timeout(SHUTDOWN_BUDGET / 4, self.daemon.withdraw(&key))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(provider_error(
+                        "mDNS unregister acknowledgement timed out",
+                        false,
+                    ))
+                });
+            match withdrawal {
+                Ok(()) => {
+                    self.owned.keys.remove(&key);
+                }
+                Err(error) => {
+                    result = result.and(Err(error));
+                }
+            }
         }
-        Ok(())
+        result
     }
 
     async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
+        self.daemon.terminate().await?;
+        self.owned = OwnedAnnouncements::default();
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RegistrationDaemon for LiveDaemon {
+    fn register(&mut self, service: ServiceInfo) -> Result<(), DiscoveryError> {
+        self.daemon
+            .register(service)
+            .map_err(|error| provider_error(format!("cannot register mDNS service: {error}"), true))
+    }
+
+    async fn withdraw(&mut self, key: &str) -> Result<(), DiscoveryError> {
+        let ack = enqueue_daemon_command(|| self.daemon.unregister(key)).await?;
+        // OK and NotFound both mean this original registration key is gone.
+        ack.recv_async().await.map_err(|error| {
+            provider_error(
+                format!("mDNS unregister acknowledgement failed: {error}"),
+                false,
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn terminate(&mut self) -> Result<(), DiscoveryError> {
         let _ = self.daemon.stop_browse(&self.service_type);
         let ack = enqueue_daemon_command(|| self.daemon.shutdown()).await?;
         let status = ack.recv_async().await.map_err(|error| {
@@ -476,8 +543,15 @@ impl ShutdownDaemon for DaemonCleanup {
                 false,
             ));
         }
-        self.finished = true;
         Ok(())
+    }
+
+    fn fallback(&mut self, keys: &BTreeSet<String>) {
+        for key in keys {
+            let _ = self.daemon.unregister(key);
+        }
+        let _ = self.daemon.stop_browse(&self.service_type);
+        let _ = self.daemon.shutdown();
     }
 }
 
@@ -499,21 +573,12 @@ async fn enqueue_daemon_command<T>(
     }
 }
 
-impl Drop for DaemonCleanup {
+impl<D: RegistrationDaemon> Drop for DaemonCleanup<D> {
     fn drop(&mut self) {
         if !self.finished {
             // Runtime teardown/panic fallback only; normal shutdown has one
             // owner and awaits ACKs. UDP delivery to every LAN peer is not guaranteed.
-            if let Some(fullname) = self
-                .own_fullname
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_deref()
-            {
-                let _ = self.daemon.unregister(fullname);
-            }
-            let _ = self.daemon.stop_browse(&self.service_type);
-            let _ = self.daemon.shutdown();
+            self.daemon.fallback(&self.owned.keys);
         }
     }
 }
@@ -607,21 +672,115 @@ fn publish_instances(
     );
 }
 
-fn update_own_fullname(own_fullname: &StdMutex<Option<String>>, change: &DnsNameChange) -> bool {
-    if change.rr_type != RRType::SRV {
-        return false;
+struct CurrentAnnouncement {
+    key: String,
+    endpoint: String,
+}
+
+#[derive(Default)]
+struct OwnedAnnouncements {
+    current: Option<CurrentAnnouncement>,
+    // mdns-sd 0.21.3 register_service/remove_entry use the original lowercase
+    // ServiceInfo fullname. NameChange only updates per-interface wire aliases;
+    // unregister_service resolves those aliases when constructing goodbyes.
+    keys: BTreeSet<String>,
+    // Keep retired names/endpoints until daemon termination: browse and monitor
+    // streams are independent, and cached/queued resolutions can arrive late.
+    names: BTreeSet<String>,
+    endpoints: BTreeSet<String>,
+    generation: usize,
+}
+
+impl OwnedAnnouncements {
+    fn accept(&mut self, fullname: String, endpoint: String) {
+        let key = fullname.to_lowercase();
+        self.keys.insert(key.clone());
+        self.names.insert(key.clone());
+        self.endpoints.insert(endpoint.clone());
+        self.current = Some(CurrentAnnouncement { key, endpoint });
+        self.generation += 1;
     }
-    let mut own = own_fullname
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if !own
-        .as_deref()
-        .is_some_and(|fullname| fullname.eq_ignore_ascii_case(&change.original))
+
+    fn matches(&self, fullname: &str, endpoints: &[String]) -> bool {
+        self.names.contains(&fullname.to_lowercase())
+            || endpoints
+                .iter()
+                .any(|endpoint| self.endpoints.contains(endpoint))
+    }
+
+    fn name_change(&mut self, change: &DnsNameChange) -> Result<bool, DiscoveryError> {
+        if change.rr_type != RRType::SRV || !self.names.contains(&change.original.to_lowercase()) {
+            return Ok(false);
+        }
+        let name = change.new_name.to_lowercase();
+        if !self.names.contains(&name) && self.names.len() >= MAX_OWN_HISTORY {
+            return Err(provider_error("mDNS own-name history limit reached", true));
+        }
+        self.names.insert(name);
+        Ok(true)
+    }
+}
+
+async fn replace_announcement<D: RegistrationDaemon>(
+    cleanup: &mut DaemonCleanup<D>,
+    config: &MdnsDiscoveryConfig,
+    endpoint: String,
+) -> Result<(), DiscoveryError> {
+    if cleanup.owned.names.len() >= MAX_OWN_HISTORY
+        || cleanup.owned.endpoints.len() >= MAX_OWN_HISTORY
+        || cleanup.owned.keys.len() > 1
     {
-        return false;
+        return Err(provider_error(
+            "mDNS announcement history limit reached",
+            true,
+        ));
     }
-    *own = Some(change.new_name.clone());
-    true
+    let mut config = config.clone();
+    if cleanup.owned.current.is_some() {
+        // A distinct ORIGINAL key lets us register first (failure leaves the
+        // old service intact), then withdraw its old ServiceInfo/endpoint.
+        // Reusing the key would overwrite that info before its goodbye; using
+        // an observed alias would unregister NotFound instead of the service.
+        config.instance_name = format!(
+            "nx-{}-{}",
+            &blake3::hash(config.instance_name.as_bytes()).to_hex()[..16],
+            cleanup.owned.generation,
+        );
+    }
+    let (service, fullname) = build_service(
+        &config,
+        &cluster_service_type(&config.cluster_id),
+        &endpoint,
+    )?;
+    if cleanup.owned.names.contains(&fullname.to_lowercase()) {
+        return Err(provider_error(
+            "mDNS replacement key is already owned",
+            true,
+        ));
+    }
+    let previous = cleanup
+        .owned
+        .current
+        .as_ref()
+        .map(|current| current.key.clone());
+    cleanup.daemon.register(service)?;
+    cleanup.owned.accept(fullname, endpoint);
+    if let Some(previous) = previous {
+        tokio::time::timeout(SHUTDOWN_BUDGET / 2, cleanup.daemon.withdraw(&previous))
+            .await
+            .map_err(|_| provider_error("mDNS replacement withdrawal timed out", true))??;
+        cleanup.owned.keys.remove(&previous);
+    }
+    Ok(())
+}
+
+fn remove_owned_instances(
+    owned: &OwnedAnnouncements,
+    instances: &mut HashMap<String, InstanceView>,
+    order: &mut Vec<String>,
+) {
+    instances.retain(|name, view| !owned.matches(name, &view.endpoints));
+    order.retain(|name| instances.contains_key(name));
 }
 
 fn remove_instance(
@@ -1146,7 +1305,8 @@ mod tests {
 
     #[test]
     fn service_name_conflicts_update_the_self_filter() {
-        let own_fullname = StdMutex::new(Some("node._numax._tcp.local.".into()));
+        let mut owned = OwnedAnnouncements::default();
+        owned.accept("node._numax._tcp.local.".into(), "127.0.0.1:9000".into());
         let change = DnsNameChange {
             original: "node._numax._tcp.local.".into(),
             new_name: "node (2)._numax._tcp.local.".into(),
@@ -1154,11 +1314,499 @@ mod tests {
             intf_name: "test".into(),
         };
 
-        assert!(update_own_fullname(&own_fullname, &change));
-        assert_eq!(
-            own_fullname.into_inner().unwrap(),
-            Some("node (2)._numax._tcp.local.".into())
+        assert!(owned.name_change(&change).unwrap());
+        assert!(owned.matches(&change.original.to_uppercase(), &[]));
+        assert!(owned.matches(&change.new_name.to_uppercase(), &[]));
+        assert_eq!(owned.keys, BTreeSet::from([change.original.clone()]));
+        let mut other_interface = change.clone();
+        other_interface.new_name = "node (3)._numax._tcp.local.".into();
+        assert!(owned.name_change(&other_interface).unwrap());
+        assert!(owned.matches(&change.new_name, &[]));
+        assert!(owned.matches(&other_interface.new_name, &[]));
+    }
+
+    #[derive(Default)]
+    struct FakeRegistrations {
+        active: HashMap<String, ServiceInfo>,
+        calls: Vec<String>,
+        fail_register: bool,
+        fail_withdraw: bool,
+    }
+
+    struct FakeDaemon {
+        state: Arc<StdMutex<FakeRegistrations>>,
+        withdrawal: Option<(oneshot::Sender<String>, oneshot::Receiver<()>)>,
+    }
+
+    #[async_trait]
+    impl RegistrationDaemon for FakeDaemon {
+        fn register(&mut self, service: ServiceInfo) -> Result<(), DiscoveryError> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_register {
+                return Err(provider_error("injected register failure", true));
+            }
+            let key = service.get_fullname().to_lowercase();
+            state.calls.push(format!("register:{key}"));
+            state.active.insert(key, service);
+            Ok(())
+        }
+
+        async fn withdraw(&mut self, key: &str) -> Result<(), DiscoveryError> {
+            if let Some((started, ack)) = self.withdrawal.take() {
+                started.send(key.to_string()).unwrap();
+                ack.await
+                    .map_err(|_| provider_error("injected missing ACK", false))?;
+            }
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(format!("unregister:{key}"));
+            if state.fail_withdraw {
+                return Err(provider_error("injected withdrawal failure", false));
+            }
+            // Unlike a wire alias, only the original key removes the record.
+            state.active.remove(key);
+            Ok(())
+        }
+
+        async fn terminate(&mut self) -> Result<(), DiscoveryError> {
+            self.state.lock().unwrap().calls.push("shutdown".into());
+            Ok(())
+        }
+
+        fn fallback(&mut self, keys: &BTreeSet<String>) {
+            let mut state = self.state.lock().unwrap();
+            for key in keys {
+                state.calls.push(format!("fallback:{key}"));
+                state.active.remove(key);
+            }
+        }
+    }
+
+    fn fake_cleanup() -> DaemonCleanup<FakeDaemon> {
+        DaemonCleanup {
+            daemon: FakeDaemon {
+                state: Arc::new(StdMutex::new(FakeRegistrations::default())),
+                withdrawal: None,
+            },
+            owned: OwnedAnnouncements::default(),
+            finished: false,
+        }
+    }
+
+    struct FakeEvents<T> {
+        receiver: mpsc::Receiver<(T, oneshot::Sender<()>)>,
+        processed: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl<T: Send + 'static> MdnsReceiver<T> for FakeEvents<T> {
+        async fn next(&mut self) -> Result<T, DiscoveryError> {
+            // The next poll acknowledges that the previous event's handler
+            // completed, not merely that its input was dequeued.
+            if let Some(processed) = self.processed.take() {
+                let _ = processed.send(());
+            }
+            let (event, processed) = self
+                .receiver
+                .recv()
+                .await
+                .ok_or_else(|| provider_error("fake stream closed", false))?;
+            self.processed = Some(processed);
+            Ok(event)
+        }
+    }
+
+    async fn deliver<T: Send>(sender: &mpsc::Sender<(T, oneshot::Sender<()>)>, event: T) {
+        let (processed, ack) = oneshot::channel();
+        assert!(sender.send((event, processed)).await.is_ok());
+        tokio::time::timeout(Duration::from_secs(2), ack)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_owner_serializes_name_changes_reannouncements_and_shutdown() {
+        let config = MdnsDiscoveryConfig::new("actor");
+        let cleanup = fake_cleanup();
+        let daemon = Arc::clone(&cleanup.daemon.state);
+        let state = Arc::new(DynamicState::new(8));
+        let endpoint = Arc::new(StdMutex::new(None));
+        let (events, event_rx) = mpsc::channel(8);
+        let (monitor, monitor_rx) = mpsc::channel(8);
+        let (announcements, announcement_rx) = mpsc::channel(8);
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_mdns_browse(
+            config.clone(),
+            Arc::clone(&state),
+            Arc::clone(&endpoint),
+            FakeEvents {
+                receiver: event_rx,
+                processed: None,
+            },
+            FakeEvents {
+                receiver: monitor_rx,
+                processed: None,
+            },
+            cleanup,
+            announcement_rx,
+            stop_rx,
+        ));
+        let (reply, response) = oneshot::channel();
+        announcements
+            .send(AnnounceRequest {
+                endpoint: "127.0.0.1:9000".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        let original = daemon.lock().unwrap().active.keys().next().unwrap().clone();
+        let mut alias_config = config.clone();
+        alias_config.instance_name = "actor (2)".into();
+        let (service, alias) = build_service(
+            &alias_config,
+            &cluster_service_type(&config.cluster_id),
+            "127.0.0.2:9000",
+        )
+        .unwrap();
+        let resolved = service.as_resolved_service();
+        // Simulate .local auto-address resolution preceding its monitor event.
+        deliver(
+            &events,
+            ServiceEvent::ServiceResolved(Box::new(resolved.clone())),
+        )
+        .await;
+        assert_eq!(state.snapshot().peers(), ["127.0.0.2:9000"]);
+        deliver(
+            &monitor,
+            DaemonEvent::NameChange(DnsNameChange {
+                original: original.clone(),
+                new_name: alias.clone(),
+                rr_type: RRType::SRV,
+                intf_name: "controlled".into(),
+            }),
+        )
+        .await;
+        assert!(state.snapshot().peers().is_empty());
+        let (reply, response) = oneshot::channel();
+        announcements
+            .send(AnnounceRequest {
+                endpoint: "127.0.0.1:9001".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        assert_eq!(endpoint.lock().unwrap().as_deref(), Some("127.0.0.1:9001"));
+        let replacement = daemon.lock().unwrap().active.keys().next().unwrap().clone();
+        assert_ne!(original, replacement);
+        assert_eq!(daemon.lock().unwrap().active.len(), 1);
+        deliver(&events, ServiceEvent::ServiceResolved(Box::new(resolved))).await;
+        assert!(state.snapshot().peers().is_empty());
+        // Another reannouncement (unchanged endpoint) still retires its key.
+        let (reply, response) = oneshot::channel();
+        announcements
+            .send(AnnounceRequest {
+                endpoint: "127.0.0.1:9001".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        assert_eq!(daemon.lock().unwrap().active.len(), 1);
+        assert!(!daemon.lock().unwrap().active.contains_key(&replacement));
+        stop.send_replace(true);
+        // A request queued concurrently with shutdown must never register.
+        let (reply, response) = oneshot::channel();
+        announcements
+            .send(AnnounceRequest {
+                endpoint: "127.0.0.1:9002".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(response.await.unwrap().is_err());
+        tokio::time::timeout(SHUTDOWN_BUDGET, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(endpoint.lock().unwrap().is_none());
+        let daemon = daemon.lock().unwrap();
+        assert!(daemon.active.is_empty());
+        assert!(
+            !daemon
+                .calls
+                .iter()
+                .any(|call| call == &format!("unregister:{alias}"))
         );
+        assert_eq!(daemon.calls.last().unwrap(), "shutdown");
+    }
+
+    fn rename_event(owned: &mut OwnedAnnouncements, original: &str, alias: &str) {
+        let event = DaemonEvent::NameChange(DnsNameChange {
+            original: original.into(),
+            new_name: alias.into(),
+            rr_type: RRType::SRV,
+            intf_name: "controlled".into(),
+        });
+        if let DaemonEvent::NameChange(change) = event {
+            assert!(owned.name_change(&change).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn renamed_reannouncement_withdraws_original_key_and_filters_late_aliases() {
+        let config = MdnsDiscoveryConfig::new("Node");
+        let mut cleanup = fake_cleanup();
+        let old = "127.0.0.1:9000";
+        let new = "127.0.0.1:9001";
+        replace_announcement(&mut cleanup, &config, old.into())
+            .await
+            .unwrap();
+        let original = cleanup.owned.current.as_ref().unwrap().key.clone();
+        let alias = "Node (2)._numax._tcp.local.";
+        rename_event(&mut cleanup.owned, &original, alias);
+        let mut instances = HashMap::from([
+            (alias.into(), instance(vec![old.into()])),
+            ("foreign".into(), instance(vec!["127.0.0.1:9999".into()])),
+        ]);
+        let mut order = vec![alias.into(), "foreign".into()];
+        replace_announcement(&mut cleanup, &config, new.into())
+            .await
+            .unwrap();
+        let replacement = cleanup.owned.current.as_ref().unwrap().key.clone();
+        assert_ne!(original, replacement);
+        {
+            let daemon = cleanup.daemon.state.lock().unwrap();
+            assert_eq!(daemon.active.len(), 1);
+            assert_eq!(daemon.active[&replacement].get_port(), 9001);
+            assert_eq!(
+                daemon.calls,
+                [
+                    format!("register:{original}"),
+                    format!("register:{replacement}"),
+                    format!("unregister:{original}")
+                ]
+            );
+        }
+        // Delayed per-interface renames must still match the retired original.
+        rename_event(&mut cleanup.owned, &original, "Node (3)._numax._tcp.local.");
+        assert!(cleanup.owned.matches(alias, &[]));
+        assert!(cleanup.owned.matches(&original, &[]));
+        assert!(cleanup.owned.matches(&replacement, &[]));
+        assert!(cleanup.owned.matches("unknown", &[old.into()]));
+        assert!(cleanup.owned.matches("unknown", &[new.into()]));
+        remove_owned_instances(&cleanup.owned, &mut instances, &mut order);
+        assert_eq!(order, ["foreign"]);
+        let state = DynamicState::new(8);
+        publish_instances(&state, &instances, &order, 8);
+        assert_eq!(flatten_instances(&instances, &order, 8), ["127.0.0.1:9999"]);
+        shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET)
+            .await
+            .unwrap();
+        let daemon = cleanup.daemon.state.lock().unwrap();
+        assert!(daemon.active.is_empty());
+        assert_eq!(
+            &daemon.calls[3..],
+            [format!("unregister:{replacement}"), "shutdown".into()]
+        );
+        assert!(cleanup.owned.names.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_registration_preserves_previous_key_endpoint_and_alias() {
+        let config = MdnsDiscoveryConfig::new("rollback");
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        let original = cleanup.owned.current.as_ref().unwrap().key.clone();
+        let alias = "rollback (2)._numax._tcp.local.";
+        rename_event(&mut cleanup.owned, &original, alias);
+        cleanup.daemon.state.lock().unwrap().fail_register = true;
+        assert!(
+            replace_announcement(&mut cleanup, &config, "127.0.0.1:9001".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(cleanup.owned.current.as_ref().unwrap().key, original);
+        assert_eq!(
+            cleanup.owned.current.as_ref().unwrap().endpoint,
+            "127.0.0.1:9000"
+        );
+        assert!(cleanup.owned.matches(alias, &[]));
+        assert!(!cleanup.owned.matches("unknown", &["127.0.0.1:9001".into()]));
+        assert_eq!(
+            cleanup.daemon.state.lock().unwrap().calls,
+            [format!("register:{original}")]
+        );
+        shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET)
+            .await
+            .unwrap();
+        assert!(cleanup.daemon.state.lock().unwrap().active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_retains_both_keys_for_acknowledged_cleanup() {
+        let config = MdnsDiscoveryConfig::new("retirement");
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        cleanup.daemon.state.lock().unwrap().fail_withdraw = true;
+        assert!(
+            replace_announcement(&mut cleanup, &config, "127.0.0.1:9001".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(cleanup.owned.keys.len(), 2);
+        assert!(
+            replace_announcement(&mut cleanup, &config, "127.0.0.1:9002".into())
+                .await
+                .is_err()
+        );
+        let keys = cleanup.owned.keys.clone();
+        cleanup.daemon.state.lock().unwrap().fail_withdraw = false;
+        shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET)
+            .await
+            .unwrap();
+        let daemon = cleanup.daemon.state.lock().unwrap();
+        assert!(daemon.active.is_empty());
+        for key in keys {
+            assert!(daemon.calls[3..].contains(&format!("unregister:{key}")));
+        }
+        assert_eq!(daemon.calls.last().unwrap(), "shutdown");
+    }
+
+    #[tokio::test]
+    async fn cancelled_announcement_waiter_does_not_cancel_retirement_or_shutdown() {
+        let config = MdnsDiscoveryConfig::new("cancel");
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        let original = cleanup.owned.current.as_ref().unwrap().key.clone();
+        rename_event(
+            &mut cleanup.owned,
+            &original,
+            "cancel (2)._numax._tcp.local.",
+        );
+        let (started, entered) = oneshot::channel();
+        let (ack, release) = oneshot::channel();
+        cleanup.daemon.withdrawal = Some((started, release));
+        let state = Arc::clone(&cleanup.daemon.state);
+        let provider = Arc::new(MdnsDiscovery::new(config.clone()).unwrap());
+        let (_events, event_rx) = mpsc::channel(8);
+        let (_monitor, monitor_rx) = mpsc::channel(8);
+        let (announcements, announcement_rx) = mpsc::channel(8);
+        let (stop, stop_rx) = watch::channel(false);
+        let (complete, completion) = watch::channel(None);
+        {
+            let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
+            let task = run_mdns_browse(
+                config,
+                Arc::clone(&provider.inner.state),
+                Arc::clone(&provider.inner.own_endpoint),
+                FakeEvents {
+                    receiver: event_rx,
+                    processed: None,
+                },
+                FakeEvents {
+                    receiver: monitor_rx,
+                    processed: None,
+                },
+                cleanup,
+                announcement_rx,
+                stop_rx,
+            );
+            lifecycle.task = Some(tokio::spawn(async move {
+                complete.send_replace(Some(task.await));
+            }));
+            lifecycle.announcements = Some(announcements);
+            lifecycle.shutdown = Some(stop);
+            lifecycle.completion = Some(completion);
+        }
+        let caller = Arc::clone(&provider);
+        let waiter = tokio::spawn(async move {
+            caller
+                .announce(&PeerAnnouncement {
+                    endpoint: "127.0.0.1:9001".into(),
+                })
+                .await
+        });
+        assert_eq!(entered.await.unwrap(), original);
+        assert_eq!(state.lock().unwrap().active.len(), 2);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        provider.request_shutdown();
+        assert!(
+            provider
+                .announce(&PeerAnnouncement {
+                    endpoint: "127.0.0.1:9002".into()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            !provider
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        ack.send(()).unwrap();
+        tokio::time::timeout(SHUTDOWN_BUDGET, provider.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.active.is_empty());
+        assert_eq!(state.calls.last().unwrap(), "shutdown");
+    }
+
+    #[tokio::test]
+    async fn alias_history_is_bounded_and_does_not_discard_owned_names() {
+        let mut cleanup = fake_cleanup();
+        let config = MdnsDiscoveryConfig::new("bounded");
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        let original = cleanup.owned.current.as_ref().unwrap().key.clone();
+        for index in 1..MAX_OWN_HISTORY {
+            rename_event(
+                &mut cleanup.owned,
+                &original,
+                &format!("bounded ({index})._numax._tcp.local."),
+            );
+        }
+        assert_eq!(cleanup.owned.names.len(), MAX_OWN_HISTORY);
+        assert!(
+            cleanup
+                .owned
+                .name_change(&DnsNameChange {
+                    original: original.clone(),
+                    new_name: "overflow._numax._tcp.local.".into(),
+                    rr_type: RRType::SRV,
+                    intf_name: "controlled".into(),
+                })
+                .is_err()
+        );
+        assert!(
+            replace_announcement(&mut cleanup, &config, "127.0.0.1:9001".into())
+                .await
+                .is_err()
+        );
+        assert!(cleanup.owned.matches(&original, &[]));
+        assert_eq!(cleanup.owned.keys.len(), 1);
+        shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET)
+            .await
+            .unwrap();
+        assert!(cleanup.daemon.state.lock().unwrap().active.is_empty());
     }
 
     #[tokio::test]
@@ -1196,6 +1844,26 @@ mod tests {
         })
         .await
         .unwrap();
+
+        let replacement = "127.0.0.1:43112";
+        publisher
+            .announce(&PeerAnnouncement {
+                endpoint: replacement.into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if super::super::observed_peers(watch.recv().await.unwrap().change)
+                    == vec![replacement.to_string()]
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(publisher.discover().await.unwrap().peers().is_empty());
 
         publisher.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {

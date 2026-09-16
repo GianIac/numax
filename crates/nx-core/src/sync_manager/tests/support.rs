@@ -1,6 +1,66 @@
 use super::*;
 use crate::sync_manager::schema::ensure_sync_schema;
 
+/// Fails even on synchronous metadata/lifecycle access, not just on watch acquisition.
+pub(super) struct UntouchedDiscovery;
+
+#[async_trait::async_trait]
+impl crate::PeerDiscovery for UntouchedDiscovery {
+    fn cluster_id(&self) -> &str {
+        panic!("invalid local configuration must not inspect providers");
+    }
+
+    fn announcement_support(&self) -> crate::AnnouncementSupport {
+        panic!("invalid local configuration must not inspect providers");
+    }
+
+    async fn discover(&self) -> Result<crate::DiscoverySnapshot, crate::DiscoveryError> {
+        panic!("invalid local configuration must not start providers");
+    }
+
+    async fn watch(&self) -> Result<crate::DiscoveryWatch, crate::DiscoveryError> {
+        panic!("invalid local configuration must not start providers");
+    }
+
+    async fn announce(&self, _: &crate::PeerAnnouncement) -> Result<(), crate::DiscoveryError> {
+        panic!("invalid local configuration must not announce");
+    }
+
+    fn request_shutdown(&self) {
+        panic!("unstarted providers must not need rollback");
+    }
+}
+
+pub(super) fn invalid_sync_configs() -> Vec<(&'static str, SyncConfig)> {
+    vec![
+        (
+            "reconnect_initial_delay",
+            SyncConfig::new().with_reconnect_backoff(Duration::MAX, Duration::from_secs(1)),
+        ),
+        (
+            "reconnect_max_delay",
+            SyncConfig::new().with_reconnect_backoff(Duration::from_secs(1), Duration::MAX),
+        ),
+        (
+            "anti_entropy_interval",
+            SyncConfig::new().with_anti_entropy_interval(Duration::MAX),
+        ),
+        (
+            "socket_timeout",
+            SyncConfig::new().with_socket_timeout(Duration::MAX),
+        ),
+        (
+            "socket_timeout",
+            SyncConfig::new().with_socket_timeout(Duration::ZERO),
+        ),
+        (
+            "queued_ops_limit",
+            SyncConfig::new().with_queued_ops_limit(usize::MAX),
+        ),
+        ("max_peers", SyncConfig::new().with_max_peers(usize::MAX)),
+    ]
+}
+
 pub(super) fn temp_store() -> Arc<NxStore> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

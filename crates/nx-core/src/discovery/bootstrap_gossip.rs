@@ -9,7 +9,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::dynamic::{AbortOnDropTask, DynamicState};
+use super::dynamic::{
+    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
+    validate_durations,
+};
 use super::{
     AnnouncementSupport, DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY,
     DEFAULT_MAX_PEER_CANDIDATES, DiscoveryError, DiscoverySnapshot, DiscoveryWatch,
@@ -58,6 +61,7 @@ struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+    cleanup: Option<OwnedShutdown>,
 }
 
 struct Inner {
@@ -129,6 +133,7 @@ impl BootstrapGossipDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
+                    cleanup: None,
                 }),
             }),
         })
@@ -154,6 +159,7 @@ impl BootstrapGossipDiscovery {
         let announced_seeds = Arc::clone(&self.inner.announced_seeds);
         lifecycle.shutdown = Some(shutdown);
         lifecycle.task = Some(tokio::spawn(async move {
+            let cleanup = ClearStateOnDrop(state.clone());
             run_bootstrap(
                 config,
                 client,
@@ -163,6 +169,7 @@ impl BootstrapGossipDiscovery {
                 shutdown_rx,
             )
             .await;
+            drop(cleanup);
         }));
         Ok(())
     }
@@ -184,17 +191,17 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
     }
 
     async fn announce(&self, announcement: &PeerAnnouncement) -> Result<(), DiscoveryError> {
-        if self
+        let lifecycle = self
             .inner
             .lifecycle
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .stopped
-        {
+            .unwrap_or_else(|error| error.into_inner());
+        if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
         let endpoint = crate::sync_manager::canonicalize_endpoint(&announcement.endpoint)
             .map_err(|error| provider_error(error.to_string(), false))?;
+        // Serialize publication with request_shutdown, not just its check.
         self.inner.announcement_tx.send_replace(Some(endpoint));
         Ok(())
     }
@@ -218,46 +225,83 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let task = {
+        let result = {
             let mut lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             lifecycle.shutdown.take();
-            lifecycle.task.take()
+            let task = lifecycle.task.take().map(AbortOnDropTask::new);
+            lifecycle
+                .cleanup
+                .get_or_insert_with(|| {
+                    let cleanup = BootstrapCleanup {
+                        client: self.inner.client.clone(),
+                        cluster_id: self.inner.config.cluster_id.clone(),
+                        announcement_tx: self.inner.announcement_tx.clone(),
+                        announced_seeds: Arc::clone(&self.inner.announced_seeds),
+                        state: Arc::clone(&self.inner.state),
+                    };
+                    OwnedShutdown::new(async move {
+                        let joined = match task {
+                            Some(task) => task.join().await.map_err(|error| {
+                                provider_error(format!("probe task failed: {error}"), false)
+                            }),
+                            None => Ok(()),
+                        };
+                        let withdrawn = cleanup.withdraw().await;
+                        drop(cleanup);
+                        joined.and(withdrawn)
+                    })
+                })
+                .subscribe()
         };
-        if let Some(task) = task {
-            AbortOnDropTask::new(task)
-                .join()
-                .await
-                .map_err(|error| provider_error(format!("probe task failed: {error}"), false))?;
-        }
+        OwnedShutdown::wait(result, PROVIDER).await
+    }
+}
 
-        if self.inner.announcement_tx.borrow().is_some() {
+struct BootstrapCleanup {
+    client: BootstrapClient,
+    cluster_id: String,
+    announcement_tx: watch::Sender<Option<String>>,
+    announced_seeds: Arc<StdMutex<HashSet<String>>>,
+    state: Arc<DynamicState>,
+}
+
+impl BootstrapCleanup {
+    async fn withdraw(&self) -> Result<(), DiscoveryError> {
+        if self.announcement_tx.borrow().is_some() {
             let announced_seeds = self
-                .inner
                 .announced_seeds
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let deadline = Instant::now() + SHUTDOWN_WITHDRAWAL_BUDGET;
+            let deadline = checked_deadline(
+                Instant::now(),
+                SHUTDOWN_WITHDRAWAL_BUDGET,
+                PROVIDER,
+                "withdrawal",
+            )?;
             for (index, seed) in announced_seeds.iter().enumerate() {
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let now = Instant::now();
+                let remaining = deadline.saturating_duration_since(now);
                 if remaining.is_zero() {
                     break;
                 }
                 let remaining_seeds = u32::try_from(announced_seeds.len() - index)
                     .unwrap_or(u32::MAX)
                     .max(1);
-                let request = BootstrapRequest::new(self.inner.config.cluster_id.clone(), 1);
-                match tokio::time::timeout(
+                let request = BootstrapRequest::new(self.cluster_id.clone(), 1);
+                let slot_deadline = checked_deadline(
+                    now,
                     remaining / remaining_seeds,
-                    self.inner.client.query(seed, request),
-                )
-                .await
+                    PROVIDER,
+                    "withdrawal slot",
+                )?;
+                match tokio::time::timeout_at(slot_deadline, self.client.query(seed, request)).await
                 {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
@@ -269,14 +313,18 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
                 }
             }
         }
-        self.inner
-            .announced_seeds
+        Ok(())
+    }
+}
+
+impl Drop for BootstrapCleanup {
+    fn drop(&mut self) {
+        self.announced_seeds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        self.inner.announcement_tx.send_replace(None);
-        self.inner.state.replace(Vec::new());
-        Ok(())
+        self.announcement_tx.send_replace(None);
+        self.state.replace(Vec::new());
     }
 }
 
@@ -302,16 +350,31 @@ impl SeedSchedule {
         self.next_probe = now;
     }
 
-    fn failed(&mut self, config: &BootstrapGossipDiscoveryConfig, error: &NetError, now: Instant) {
+    fn failed(
+        &mut self,
+        config: &BootstrapGossipDiscoveryConfig,
+        error: &NetError,
+        now: Instant,
+    ) -> Result<(), DiscoveryError> {
         self.disabled = bootstrap_error_is_fatal(error);
         // Preserve the configured cap on server-requested backoff, but retain
         // an absolute barrier independent of view expiry and announcements.
-        self.not_before = now
-            + bootstrap_retry_after(error)
+        // Disable before checking: an unrepresentable barrier must never turn
+        // into an immediate retry, including after a new announcement.
+        let was_disabled = self.disabled;
+        self.disabled = true;
+        self.not_before = checked_deadline(
+            now,
+            bootstrap_retry_after(error)
                 .unwrap_or_default()
-                .min(config.retry_max);
-        self.next_probe = now + self.retry_delay;
+                .min(config.retry_max),
+            PROVIDER,
+            "retry_after",
+        )?;
+        self.next_probe = checked_deadline(now, self.retry_delay, PROVIDER, "retry_delay")?;
         self.retry_delay = self.retry_delay.saturating_mul(2).min(config.retry_max);
+        self.disabled = was_disabled;
+        Ok(())
     }
 }
 
@@ -384,13 +447,25 @@ async fn run_bootstrap(
             match result {
                 Ok(response) => {
                     schedule.retry_delay = config.retry_initial;
-                    schedule.next_probe = Instant::now() + config.refresh_interval;
                     if announcement.is_some() {
                         announced_seeds
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(seed.clone());
                     }
+                    let now = Instant::now();
+                    let deadlines = seed_deadlines(now, &config, response.candidate_ttl);
+                    let (refresh, expires_at) = match deadlines {
+                        Ok(deadlines) => deadlines,
+                        Err(error) => {
+                            tracing::error!(%error, %seed, "disabling bootstrap seed schedule");
+                            schedule.disabled = true;
+                            views.remove(seed);
+                            publish_views(&config, &mut views, &state);
+                            continue;
+                        }
+                    };
+                    schedule.next_probe = refresh;
                     let mut endpoints = Vec::with_capacity(response.endpoints.len() + 1);
                     endpoints.push(seed.clone());
                     for endpoint in response.endpoints {
@@ -404,13 +479,14 @@ async fn run_bootstrap(
                         SeedView {
                             endpoints,
                             observed_at: std::time::Instant::now(),
-                            expires_at: Instant::now()
-                                + response.candidate_ttl.min(config.stale_after),
+                            expires_at,
                         },
                     );
                 }
                 Err(error) => {
-                    schedule.failed(&config, &error, Instant::now());
+                    if let Err(error) = schedule.failed(&config, &error, Instant::now()) {
+                        tracing::error!(%error, %seed, "disabling bootstrap seed schedule");
+                    }
                     tracing::debug!(%error, %seed, "bootstrap seed query failed");
                 }
             }
@@ -440,6 +516,21 @@ async fn run_bootstrap(
             _ = sleep_until_optional(deadline) => {}
         }
     }
+}
+
+fn seed_deadlines(
+    now: Instant,
+    config: &BootstrapGossipDiscoveryConfig,
+    candidate_ttl: Duration,
+) -> Result<(Instant, Instant), DiscoveryError> {
+    let refresh = checked_deadline(now, config.refresh_interval, PROVIDER, "refresh_interval")?;
+    let expiry = checked_deadline(
+        now,
+        candidate_ttl.min(config.stale_after),
+        PROVIDER,
+        "candidate_ttl",
+    )?;
+    Ok((refresh, expiry))
 }
 
 async fn await_query_with_expiry<F, T>(
@@ -522,11 +613,12 @@ fn flatten_views(
 }
 
 fn bootstrap_error_is_fatal(error: &NetError) -> bool {
-    matches!(
-        error,
-        NetError::Wire(wire)
-            if matches!(wire.retry_policy(), WireRetryPolicy::Fatal | WireRetryPolicy::RequestFatal)
-    )
+    matches!(error, NetError::InvalidConfig(_))
+        || matches!(
+            error,
+            NetError::Wire(wire)
+                if matches!(wire.retry_policy(), WireRetryPolicy::Fatal | WireRetryPolicy::RequestFatal)
+        )
 }
 
 fn bootstrap_retry_after(error: &NetError) -> Option<Duration> {
@@ -563,7 +655,15 @@ fn validate_config(config: &BootstrapGossipDiscoveryConfig) -> Result<(), Discov
     {
         return Err(invalid("intervals and limits are inconsistent"));
     }
-    Ok(())
+    validate_durations(
+        PROVIDER,
+        &[
+            ("refresh_interval", config.refresh_interval),
+            ("retry_initial", config.retry_initial),
+            ("retry_max", config.retry_max),
+            ("stale_after", config.stale_after),
+        ],
+    )
 }
 
 fn invalid(message: impl Into<String>) -> DiscoveryError {
@@ -586,6 +686,186 @@ mod tests {
     use super::*;
     use nx_net::{BootstrapServerConfig, Node, NodeConfig};
     use nx_sync::NodeId;
+
+    #[test]
+    fn extreme_durations_are_rejected_before_starting() {
+        for field in [
+            "refresh_interval",
+            "retry_initial",
+            "retry_max",
+            "stale_after",
+        ] {
+            let mut config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+            match field {
+                "refresh_interval" => config.refresh_interval = Duration::MAX,
+                "retry_initial" => {
+                    config.retry_initial = Duration::MAX;
+                    config.retry_max = Duration::MAX;
+                }
+                "retry_max" => config.retry_max = Duration::MAX,
+                "stale_after" => config.stale_after = Duration::MAX,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                BootstrapGossipDiscovery::new(config, BootstrapClientConfig::new(NodeId::new("client"))),
+                Err(DiscoveryError::InvalidConfiguration { provider, message })
+                    if provider == PROVIDER && message.contains(field)
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_overflow_disables_retry_even_after_announcement() {
+        let now = Instant::now();
+        let mut config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+        let mut schedule = SeedSchedule {
+            next_probe: now,
+            not_before: now,
+            retry_delay: Duration::MAX,
+            disabled: false,
+        };
+        let error = NetError::Wire(nx_net::WireError::RateLimited {
+            retry_after_ms: Some(200),
+        });
+        assert!(matches!(
+            schedule.failed(&config, &error, now),
+            Err(DiscoveryError::Provider {
+                retryable: false,
+                ..
+            })
+        ));
+        schedule.announce(now);
+        assert_eq!(schedule.deadline(), None);
+        assert!(schedule.not_before >= now + Duration::from_millis(200));
+
+        config.refresh_interval = Duration::MAX;
+        assert!(seed_deadlines(now, &config, Duration::from_secs(1)).is_err());
+        config.refresh_interval = Duration::from_secs(1);
+        config.stale_after = Duration::MAX;
+        assert!(seed_deadlines(now, &config, Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn representable_seed_policy_rejects_overflow_after_clock_advance() {
+        let config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+        validate_config(&config).unwrap();
+        let now = super::super::dynamic::deadline_boundary();
+        let mut schedule = SeedSchedule {
+            next_probe: now,
+            not_before: now,
+            retry_delay: config.retry_initial,
+            disabled: false,
+        };
+        let error = NetError::Wire(nx_net::WireError::RateLimited {
+            retry_after_ms: Some(2000),
+        });
+        assert!(schedule.failed(&config, &error, now).is_err());
+        schedule.announce(now);
+        assert_eq!(schedule.deadline(), None);
+        assert!(seed_deadlines(now, &config, Duration::from_secs(1)).is_err());
+    }
+
+    async fn assert_panicked_shutdown_withdraws(cancel_first_wait: bool) {
+        let seed = Node::try_new(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
+                .with_bootstrap_server(BootstrapServerConfig::new("default").unwrap()),
+        )
+        .unwrap();
+        let bound = seed.start_listener().await.unwrap().to_string();
+        seed.announce_bootstrap_endpoint(bound.clone()).unwrap();
+        let mut config = BootstrapGossipDiscoveryConfig::new(vec![bound.clone()]);
+        config.max_candidates = 4;
+        let provider = BootstrapGossipDiscovery::new(
+            config,
+            BootstrapClientConfig::new(NodeId::new("client")),
+        )
+        .unwrap();
+        let advertised = "127.0.0.1:43111";
+        provider
+            .announce(&PeerAnnouncement {
+                endpoint: advertised.into(),
+            })
+            .await
+            .unwrap();
+        let mut events = provider.watch().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let observer =
+            BootstrapClient::new(BootstrapClientConfig::new(NodeId::new("observer"))).unwrap();
+        let before = observer
+            .query(&bound, BootstrapRequest::new("default", 4))
+            .await
+            .unwrap();
+        assert!(before.endpoints.contains(&advertised.to_string()));
+
+        // Stop the real probe before replacing only its join handle with a
+        // deterministic panic. The real seed still retains the announcement.
+        provider.request_shutdown();
+        let probe = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .take()
+            .unwrap();
+        probe.await.unwrap();
+        provider.inner.state.observe(vec![bound.clone()]);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async move {
+            released.await.unwrap();
+            panic!("injected bootstrap probe panic");
+        }));
+        if cancel_first_wait {
+            let mut shutdown = Box::pin(provider.shutdown());
+            std::future::poll_fn(|cx| {
+                assert!(shutdown.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(shutdown);
+        }
+        release.send(()).unwrap();
+        if cancel_first_wait {
+            // Cleanup must finish without a second shutdown call restarting it.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !provider.inner.state.snapshot().peers().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), provider.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
+            if message.contains("probe task failed"))
+        );
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.inner.state.watch().snapshot().peers().is_empty());
+        assert!(provider.inner.announcement_tx.borrow().is_none());
+        assert!(provider.inner.announced_seeds.lock().unwrap().is_empty());
+        let after = observer
+            .query(&bound, BootstrapRequest::new("default", 4))
+            .await
+            .unwrap();
+        assert_eq!(after.endpoints, [bound]);
+        seed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn panicked_probe_still_withdraws_and_clears_snapshot() {
+        assert_panicked_shutdown_withdraws(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_wait_keeps_withdrawal_owned_and_reports_panic() {
+        assert_panicked_shutdown_withdraws(true).await;
+    }
 
     struct ControlledClient {
         calls: tokio::sync::mpsc::Sender<(String, Instant)>,

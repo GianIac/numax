@@ -27,6 +27,9 @@ pub enum NetError {
     #[error("invalid message: {0}")]
     InvalidMessage(String),
 
+    #[error("invalid node configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("wire error: {0}")]
     Wire(WireError),
 

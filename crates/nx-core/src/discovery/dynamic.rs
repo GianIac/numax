@@ -1,9 +1,111 @@
-use std::sync::{Mutex, MutexGuard};
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::{JoinError, JoinHandle};
+use tokio::time::Instant;
 
-use super::{DiscoveryChange, DiscoveryEvent, DiscoverySnapshot, DiscoveryWatch};
+use super::{DiscoveryChange, DiscoveryError, DiscoveryEvent, DiscoverySnapshot, DiscoveryWatch};
+
+pub(super) fn checked_deadline(
+    now: Instant,
+    duration: Duration,
+    provider: &str,
+    field: &str,
+) -> Result<Instant, DiscoveryError> {
+    now.checked_add(duration)
+        .ok_or_else(|| DiscoveryError::Provider {
+            provider: provider.into(),
+            message: format!("{field} deadline is not representable"),
+            retryable: false,
+        })
+}
+
+pub(super) fn validate_durations(
+    provider: &str,
+    durations: &[(&str, Duration)],
+) -> Result<(), DiscoveryError> {
+    let now = Instant::now();
+    for (field, duration) in durations {
+        if now.checked_add(*duration).is_none() {
+            return Err(DiscoveryError::InvalidConfiguration {
+                provider: provider.into(),
+                message: format!("{field} deadline is not representable"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn deadline_boundary() -> Instant {
+    let now = Instant::now();
+    // Find the platform's actual boundary, rather than inventing a cap.
+    let (mut low, mut high) = (0, u64::MAX);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if now.checked_add(Duration::from_secs(middle)).is_some() {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    now.checked_add(Duration::from_secs(low)).unwrap()
+}
+
+/// The provider, not any individual shutdown caller, owns cleanup. Dropping a
+/// caller leaves cleanup running; dropping the provider aborts its owned task.
+pub(super) struct OwnedShutdown {
+    _task: AbortOnDropTask,
+    result: watch::Receiver<Option<Result<(), DiscoveryError>>>,
+}
+
+impl OwnedShutdown {
+    pub(super) fn new(
+        cleanup: impl Future<Output = Result<(), DiscoveryError>> + Send + 'static,
+    ) -> Self {
+        let (result_tx, result) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            result_tx.send_replace(Some(cleanup.await));
+        });
+        Self {
+            _task: AbortOnDropTask::new(task),
+            result,
+        }
+    }
+
+    pub(super) fn subscribe(&self) -> watch::Receiver<Option<Result<(), DiscoveryError>>> {
+        self.result.clone()
+    }
+
+    pub(super) async fn wait(
+        mut result: watch::Receiver<Option<Result<(), DiscoveryError>>>,
+        provider: &str,
+    ) -> Result<(), DiscoveryError> {
+        loop {
+            if let Some(result) = result.borrow_and_update().clone() {
+                return result;
+            }
+            if result.changed().await.is_err() {
+                return Err(DiscoveryError::Provider {
+                    provider: provider.into(),
+                    message: "shutdown cleanup task failed".into(),
+                    retryable: false,
+                });
+            }
+        }
+    }
+}
+
+/// Also clears state if cleanup is aborted before its first poll.
+pub(super) struct ClearStateOnDrop(pub(super) Arc<DynamicState>);
+
+impl Drop for ClearStateOnDrop {
+    fn drop(&mut self) {
+        self.0.replace(Vec::new());
+    }
+}
 
 /// Aborts a detached Tokio task if the shutdown future owning it is cancelled.
 pub(crate) struct AbortOnDropTask(Option<JoinHandle<()>>);
@@ -165,6 +267,65 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn representable_duration_can_overflow_only_after_the_clock_advances() {
+        let last = deadline_boundary();
+        let one_second = Duration::from_secs(1);
+        assert!(validate_durations("test", &[("delay", one_second)]).is_ok());
+        assert!(checked_deadline(last - one_second, one_second, "test", "delay").is_ok());
+        assert!(matches!(
+            checked_deadline(last, one_second, "test", "delay"),
+            Err(DiscoveryError::Provider {
+                retryable: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_shutdown_waiter_does_not_cancel_owned_cleanup() {
+        let state = Arc::new(DynamicState::new(8));
+        state.observe(vec!["cached:9000".into()]);
+        let cleanup = ClearStateOnDrop(state.clone());
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let owner = OwnedShutdown::new(async move {
+            released.await.unwrap();
+            drop(cleanup);
+            Ok(())
+        });
+        let mut waiter = Box::pin(OwnedShutdown::wait(owner.subscribe(), "test"));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(waiter);
+        release.send(()).unwrap();
+        OwnedShutdown::wait(owner.subscribe(), "test")
+            .await
+            .unwrap();
+        assert!(state.snapshot().peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_shutdown_owner_aborts_cleanup_and_clears_state() {
+        let state = Arc::new(DynamicState::new(8));
+        state.observe(vec!["cached:9000".into()]);
+        let cleanup = ClearStateOnDrop(state.clone());
+        let owner = OwnedShutdown::new(async move {
+            let _cleanup = cleanup;
+            std::future::pending::<Result<(), DiscoveryError>>().await
+        });
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.snapshot().peers().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn identical_fresh_observations_advance_but_cached_republication_does_not() {

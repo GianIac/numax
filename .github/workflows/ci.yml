@@ -90,6 +90,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: matrix.os == 'macos-latest'
+        with:
+          node-version: 22
       - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
         with:
           toolchain: stable
@@ -115,6 +119,13 @@ jobs:
           cargo build --locked --release --target wasm32-unknown-unknown \
             --manifest-path examples/discovery_lan/Cargo.toml --features increment \
             --target-dir examples/discovery_lan/target/writer
+      - name: Run discovery demo script tests including real lifecycle
+        if: matrix.os == 'macos-latest'
+        env:
+          NUMAX_DEMO_E2E: "1"
+        # cargo test built target/debug/nx; both guest variants were built above.
+        # This requires a real local IPv4 interface, not three separate devices.
+        run: node --test examples/discovery_lan/demo.test.mjs
       - name: Run three-node mDNS restart recovery
         if: matrix.os == 'macos-latest'
         env:
@@ -127,6 +138,28 @@ jobs:
           cargo test --locked -p nx-cli --test multiprocess_smoke \
             discovery_lan::mdns_three_daemons_recover_missed_crdt_ops_after_restart \
             -- --ignored --exact --nocapture
+
+  discovery-demo-tests:
+    name: Discovery Demo Arguments and Configuration
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Check local interface prerequisite
+        # Initialization validates an actual interface even though these tests
+        # do not run a daemon or exchange multicast traffic.
+        run: >-
+          node --input-type=module -e
+          "import { networkInterfaces } from 'node:os';
+          import assert from 'node:assert/strict';
+          assert.ok(Object.values(networkInterfaces()).flat().some(a => a?.family === 'IPv4' && !a.internal),
+          'discovery demo configuration tests require a non-loopback local IPv4 interface');"
+      - name: Test demo arguments and private configuration
+        run: >-
+          node --test --test-name-pattern='rejects missing arguments|creates private loopback'
+          examples/discovery_lan/demo.test.mjs
 
   build-wasm:
     name: Build WASM Examples
@@ -307,6 +340,7 @@ jobs:
       - fmt
       - clippy
       - test
+      - discovery-demo-tests
       - build-wasm
       - cli-smoke
       - benchmark-tools
@@ -322,6 +356,7 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.discovery-demo-tests.result }}" != "success" ]] || \
              [[ "${{ needs.build-wasm.result }}" != "success" ]] || \
              [[ "${{ needs.cli-smoke.result }}" != "success" ]] || \
              [[ "${{ needs.benchmark-tools.result }}" != "success" ]] || \

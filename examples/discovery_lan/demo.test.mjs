@@ -19,7 +19,9 @@ test('rejects missing arguments and loopback advertisement', () => {
 });
 
 const lan = Object.values(networkInterfaces()).flat().find(address => address?.family === 'IPv4' && !address.internal)?.address;
-test('creates private loopback management config and refuses to overwrite it', { skip: !lan }, () => {
+test('creates private loopback management config and refuses to overwrite it', () => {
+  // Initialization validates a real interface, but this test runs no daemon.
+  assert.ok(lan, 'configuration tests require a non-loopback local IPv4 interface');
   const root = mkdtempSync(join(tmpdir(), 'numax-demo-test-'));
   try {
     const state = join(root, 'node');

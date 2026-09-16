@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use nx_sync::{NodeId, Op};
@@ -40,6 +40,37 @@ const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 1;
 
 type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
+
+/// Generation identity and cancellation shared by the reader and write snapshots.
+struct ConnectionInstance {
+    closed_tx: watch::Sender<bool>,
+}
+
+impl ConnectionInstance {
+    fn new() -> Self {
+        Self {
+            closed_tx: watch::channel(false).0,
+        }
+    }
+}
+
+async fn wait_for_stop(mut receiver: watch::Receiver<bool>) {
+    // Do not let a watch guard escape into select! branch outputs (it is not Send).
+    let _ = receiver.wait_for(|stopped| *stopped).await;
+}
+
+async fn while_connection_open<T>(
+    closed_rx: &watch::Receiver<bool>,
+    shutdown_rx: &watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = wait_for_stop(closed_rx.clone()) => None,
+        _ = wait_for_stop(shutdown_rx.clone()) => None,
+        result = work => Some(result),
+    }
+}
 
 #[derive(Default)]
 struct TaskRegistry {
@@ -146,6 +177,7 @@ struct ReadLoopContext {
     max_message_size: usize,
     socket_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
+    closed_rx: watch::Receiver<bool>,
 }
 
 enum IncomingHandshake {
@@ -197,6 +229,34 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// Check limits before allocating channels or starting network tasks.
+    /// Zero peers disables admission; event capacity and socket timeout must be positive.
+    pub fn validate(&self) -> NetResult<()> {
+        if self.max_peers > Semaphore::MAX_PERMITS {
+            return Err(NetError::InvalidConfig(format!(
+                "max_peers must not exceed {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.event_channel_capacity == 0 || self.event_channel_capacity > Semaphore::MAX_PERMITS
+        {
+            return Err(NetError::InvalidConfig(format!(
+                "event_channel_capacity must be in 1..={}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.socket_timeout.is_zero()
+            || std::time::Instant::now()
+                .checked_add(self.socket_timeout)
+                .is_none()
+        {
+            return Err(NetError::InvalidConfig(
+                "socket_timeout must be positive and form a representable deadline".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(node_id: NodeId, listen_addr: impl Into<String>) -> Self {
         Self {
             node_id,
@@ -288,11 +348,19 @@ pub enum NodeEvent {
 struct PeerConnection {
     info: PeerInfo,
     connection_info: Option<PeerConnectionInfo>,
-    instance: Arc<()>,
+    instance: Arc<ConnectionInstance>,
     state: PeerState,
     serialization_format: SerializationFormat,
     writer: Option<PeerWriter>,
     _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        // Removal/replacement cancels every user of this generation, even if the
+        // reader is sending an event or waiting for the writer mutex.
+        self.instance.closed_tx.send_replace(true);
+    }
 }
 
 struct ConnectionAttemptGuard {
@@ -340,15 +408,24 @@ pub struct Node {
 }
 
 impl Node {
-    /// crate new node
+    /// Create a node without changing the legacy infallible signature.
+    /// Invalid configurations produce an inert node: network entry points return
+    /// `NetError::InvalidConfig`. Prefer `try_new` to reject them immediately.
     pub fn new(config: NodeConfig) -> Self {
-        let event_channel_capacity = config.event_channel_capacity.max(1);
+        let valid = config.validate().is_ok();
+        // Placeholders only: invalid nodes cannot start networking. Never clamp an
+        // invalid configuration into an operational node with different limits.
+        let event_channel_capacity = if valid {
+            config.event_channel_capacity
+        } else {
+            1
+        };
         let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        let max_peers = config.max_peers;
-        let bootstrap_server = config
-            .bootstrap_server
-            .clone()
+        let max_peers = if valid { config.max_peers } else { 0 };
+        let bootstrap_server = valid
+            .then(|| config.bootstrap_server.clone())
+            .flatten()
             .map(BootstrapServer::new)
             .map(Arc::new);
 
@@ -367,6 +444,12 @@ impl Node {
         }
     }
 
+    /// Validate configuration and create a node, without binding any sockets.
+    pub fn try_new(config: NodeConfig) -> NetResult<Self> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
     /// Gets the event receiver (can only be called once).
     pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<NodeEvent>> {
         self.event_rx.take()
@@ -376,6 +459,7 @@ impl Node {
     ///
     /// Returns the actual bound address (useful when binding to port 0 in tests).
     pub async fn start_listener(&self) -> NetResult<std::net::SocketAddr> {
+        self.config.validate()?;
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         let bound_addr = listener.local_addr()?;
 
@@ -464,6 +548,7 @@ impl Node {
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
+        self.config.validate()?;
         if *self.shutdown_tx.borrow() {
             return Err(NetError::ConnectionFailed("node is shut down".into()));
         }
@@ -546,7 +631,7 @@ impl Node {
 
         // Save connection
         let writer = Arc::new(Mutex::new(writer));
-        let connection_instance = Arc::new(());
+        let connection_instance = Arc::new(ConnectionInstance::new());
         let mut peer_connections = self.peers.write().await;
         let peers_connected = {
             let peers = &mut *peer_connections;
@@ -593,15 +678,20 @@ impl Node {
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
 
         let admitted = spawn_task(&self.tasks, async move {
-            send_node_event(
-                &event_tx,
+            let closed_rx = task_instance.closed_tx.subscribe();
+            while_connection_open(
+                &closed_rx,
                 &shutdown_for_events,
-                "PeerConnected",
-                NodeEvent::PeerConnected {
-                    node_id: peer_node_id.clone(),
-                    addr: addr_owned.clone(),
-                    peers_connected,
-                },
+                send_node_event(
+                    &event_tx,
+                    &shutdown_for_events,
+                    "PeerConnected",
+                    NodeEvent::PeerConnected {
+                        node_id: peer_node_id.clone(),
+                        addr: addr_owned.clone(),
+                        peers_connected,
+                    },
+                ),
             )
             .await;
             let _ = connected_tx.send(());
@@ -617,6 +707,7 @@ impl Node {
                     max_message_size,
                     socket_timeout,
                     shutdown_rx,
+                    closed_rx,
                 },
             )
             .await
@@ -688,6 +779,7 @@ impl Node {
     }
 
     async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
+        self.config.validate()?;
         let writers = {
             let peers = self.peers.read().await;
             peers
@@ -698,7 +790,7 @@ impl Node {
                             conn.writer.as_ref().map(|writer| {
                                 (
                                     addr.clone(),
-                                    Arc::clone(writer),
+                                    Arc::downgrade(writer),
                                     conn.serialization_format,
                                     Arc::clone(&conn.instance),
                                 )
@@ -712,8 +804,10 @@ impl Node {
         let mut failed = Vec::new();
         for (addr, writer, serialization_format, instance) in writers {
             let bytes = msg.to_bytes_with_format(serialization_format)?;
-            let mut writer = writer.lock().await;
-            if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
+            if let Err(e) = self
+                .write_to_connection(&addr, writer, &instance, &bytes)
+                .await
+            {
                 warn!(%addr, error = %e, "failed to send ops");
                 failed.push(addr.clone());
                 if let Some((node_id, peers_connected)) =
@@ -743,6 +837,7 @@ impl Node {
     }
 
     async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
+        self.config.validate()?;
         let peer_writer = {
             let peers = self.peers.read().await;
             peers.get(addr).and_then(|conn| {
@@ -750,7 +845,7 @@ impl Node {
                     .then(|| {
                         conn.writer.as_ref().map(|writer| {
                             (
-                                Arc::clone(writer),
+                                Arc::downgrade(writer),
                                 conn.serialization_format,
                                 Arc::clone(&conn.instance),
                             )
@@ -765,8 +860,10 @@ impl Node {
         };
 
         let bytes = msg.to_bytes_with_format(serialization_format)?;
-        let mut writer = writer.lock().await;
-        if let Err(e) = write_bytes(&mut *writer, &bytes, self.config.socket_timeout).await {
+        if let Err(e) = self
+            .write_to_connection(addr, writer, &instance, &bytes)
+            .await
+        {
             warn!(%addr, error = %e, "failed to send message to peer");
             if let Some((node_id, peers_connected)) = self.mark_peer_failed(addr, &instance).await {
                 let shutdown_for_events = self.shutdown_tx.subscribe();
@@ -786,6 +883,26 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    async fn write_to_connection(
+        &self,
+        addr: &str,
+        writer: Weak<Mutex<WriteHalf<NetStream>>>,
+        instance: &ConnectionInstance,
+        bytes: &[u8],
+    ) -> NetResult<()> {
+        let closed_rx = instance.closed_tx.subscribe();
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        while_connection_open(&closed_rx, &shutdown_rx, async move {
+            let writer = writer
+                .upgrade()
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            let mut writer = writer.lock().await;
+            write_bytes(&mut *writer, bytes, self.config.socket_timeout).await
+        })
+        .await
+        .unwrap_or_else(|| Err(NetError::PeerDisconnected(addr.into())))
     }
 
     /// Returns the number of currently connected peers.
@@ -833,6 +950,7 @@ impl Node {
 
     /// Publish the endpoint returned by this node's bootstrap service.
     pub fn announce_bootstrap_endpoint(&self, endpoint: impl Into<String>) -> NetResult<()> {
+        self.config.validate()?;
         let server = self
             .bootstrap_server
             .as_ref()
@@ -842,6 +960,7 @@ impl Node {
 
     /// Withdraw the endpoint returned by this node's bootstrap service.
     pub fn withdraw_bootstrap_endpoint(&self) -> NetResult<()> {
+        self.config.validate()?;
         let server = self
             .bootstrap_server
             .as_ref()
@@ -849,17 +968,19 @@ impl Node {
         server.withdraw()
     }
 
-    async fn mark_peer_failed(&self, addr: &str, instance: &Arc<()>) -> Option<(NodeId, usize)> {
+    async fn mark_peer_failed(
+        &self,
+        addr: &str,
+        instance: &Arc<ConnectionInstance>,
+    ) -> Option<(NodeId, usize)> {
         let mut peers = self.peers.write().await;
-        let node_id = {
-            let conn = peers.get_mut(addr)?;
-            if !Arc::ptr_eq(&conn.instance, instance) || conn.state != PeerState::Connected {
-                return None;
-            }
-            conn.state = PeerState::Failed;
-            conn.info.node_id.clone()?
-        };
-        Some((node_id, connected_peer_count(&peers)))
+        let removed = remove_connection_if_current(&mut peers, addr, instance)?;
+        let node_id = (removed.state == PeerState::Connected)
+            .then(|| removed.info.node_id.clone())
+            .flatten();
+        // Release admission and signal cancellation before any event queue await.
+        drop(removed);
+        node_id.map(|node_id| (node_id, connected_peer_count(&peers)))
     }
 
     /// Stop admissions, join owned network tasks within one grace period, then
@@ -1130,7 +1251,7 @@ async fn handle_incoming(
     write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
     let writer = Arc::new(Mutex::new(writer));
-    let connection_instance = Arc::new(());
+    let connection_instance = Arc::new(ConnectionInstance::new());
     let peers_connected = {
         let mut peers = peers.write().await;
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
@@ -1160,15 +1281,20 @@ async fn handle_incoming(
     info!(peer = %peer_node_id, serialization_format = ?negotiated_format, "incoming peer connected");
 
     let shutdown_for_events = shutdown_rx.clone();
-    send_node_event(
-        &event_tx,
+    let closed_rx = connection_instance.closed_tx.subscribe();
+    while_connection_open(
+        &closed_rx,
         &shutdown_for_events,
-        "PeerConnected",
-        NodeEvent::PeerConnected {
-            node_id: peer_node_id.clone(),
-            addr: addr.clone(),
-            peers_connected,
-        },
+        send_node_event(
+            &event_tx,
+            &shutdown_for_events,
+            "PeerConnected",
+            NodeEvent::PeerConnected {
+                node_id: peer_node_id.clone(),
+                addr: addr.clone(),
+                peers_connected,
+            },
+        ),
     )
     .await;
 
@@ -1184,6 +1310,7 @@ async fn handle_incoming(
             max_message_size: limits.max_message_size,
             socket_timeout: limits.socket_timeout,
             shutdown_rx,
+            closed_rx,
         },
     )
     .await;
@@ -1230,7 +1357,7 @@ fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
 fn remove_connection_if_current(
     peers: &mut HashMap<String, PeerConnection>,
     addr: &str,
-    instance: &Arc<()>,
+    instance: &Arc<ConnectionInstance>,
 ) -> Option<PeerConnection> {
     peers
         .get(addr)
@@ -1369,7 +1496,20 @@ async fn send_node_event(
     event_name: &'static str,
     event: NodeEvent,
 ) {
-    if let Err(e) = event_tx.send(event).await {
+    // Keep immediately available shutdown notifications, but never wait for a
+    // full queue during shutdown. Disconnect callers release peer resources first.
+    let result = match event_tx.try_send(event) {
+        Ok(()) => return,
+        Err(mpsc::error::TrySendError::Closed(event)) => Err(mpsc::error::SendError(event)),
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            tokio::select! {
+                biased;
+                _ = wait_for_stop(shutdown_rx.clone()) => return,
+                result = event_tx.send(event) => result,
+            }
+        }
+    };
+    if let Err(e) = result {
         if *shutdown_rx.borrow() {
             debug!(
                 event = event_name,
@@ -1384,6 +1524,18 @@ async fn send_node_event(
 
 /// Loop for reading messages from a peer until disconnection
 async fn read_loop(
+    reader: tokio::io::ReadHalf<NetStream>,
+    context: ReadLoopContext,
+) -> NetResult<()> {
+    let closed_rx = context.closed_rx.clone();
+    let shutdown_rx = context.shutdown_rx.clone();
+    // Cover the whole loop, including event backpressure and Ping writer locks.
+    while_connection_open(&closed_rx, &shutdown_rx, read_messages(reader, context))
+        .await
+        .unwrap_or(Ok(()))
+}
+
+async fn read_messages(
     mut reader: tokio::io::ReadHalf<NetStream>,
     context: ReadLoopContext,
 ) -> NetResult<()> {
@@ -1396,6 +1548,7 @@ async fn read_loop(
         max_message_size,
         socket_timeout,
         mut shutdown_rx,
+        closed_rx: _,
     } = context;
     let shutdown_for_events = shutdown_rx.clone();
 
@@ -1514,7 +1667,7 @@ pub(crate) async fn read_message<R: AsyncReadExt + Unpin>(
     Ok(msg)
 }
 
-async fn read_message_with_format<R: AsyncReadExt + Unpin>(
+pub(crate) async fn read_message_with_format<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     max_message_size: usize,
     socket_timeout: Duration,
@@ -1555,6 +1708,334 @@ mod tests {
 
     fn test_slot() -> OwnedSemaphorePermit {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
+    }
+
+    #[test]
+    fn node_config_validates_semaphore_boundaries_without_allocating_them() {
+        let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0");
+        config.clone().with_max_peers(0).validate().unwrap();
+        config
+            .clone()
+            .with_max_peers(Semaphore::MAX_PERMITS)
+            .validate()
+            .unwrap();
+        config
+            .clone()
+            .with_event_channel_capacity(Semaphore::MAX_PERMITS)
+            .validate()
+            .unwrap();
+        for limit in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            assert!(matches!(
+                config.clone().with_max_peers(limit).validate(),
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                config.clone().with_event_channel_capacity(limit).validate(),
+                Err(NetError::InvalidConfig(_))
+            ));
+        }
+        let node = Node::try_new(config).unwrap();
+        assert_eq!(node.connection_slots.available_permits(), DEFAULT_MAX_PEERS);
+        assert_eq!(node.event_tx.max_capacity(), DEFAULT_EVENT_CHANNEL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn invalid_node_configs_are_rejected_or_inert_without_panicking() {
+        let config = NodeConfig::new(NodeId::new("test"), "invalid listen address");
+        for invalid in [
+            config.clone().with_max_peers(Semaphore::MAX_PERMITS + 1),
+            config.clone().with_max_peers(usize::MAX),
+            config
+                .clone()
+                .with_event_channel_capacity(Semaphore::MAX_PERMITS + 1),
+            config.clone().with_event_channel_capacity(usize::MAX),
+            config.clone().with_event_channel_capacity(0),
+            config.clone().with_socket_timeout(Duration::MAX),
+            config.with_socket_timeout(Duration::ZERO),
+        ] {
+            assert!(matches!(
+                Node::try_new(invalid.clone()),
+                Err(NetError::InvalidConfig(_))
+            ));
+            let node = Node::new(invalid);
+            assert_eq!(node.connection_slots.available_permits(), 0);
+            assert!(matches!(
+                node.start_listener().await,
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.connect_to_peer("invalid endpoint").await,
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.broadcast_ops(vec![]).await,
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.send_ops_to_addr("peer", vec![]).await,
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.send_pull_since_to_addr("peer", None).await,
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.announce_bootstrap_endpoint("peer"),
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                node.withdraw_bootstrap_endpoint(),
+                Err(NetError::InvalidConfig(_))
+            ));
+            assert!(node.tasks.lock().unwrap().tasks.is_empty());
+            node.shutdown().await;
+        }
+    }
+
+    async fn open_raw_peer(
+        node: &Node,
+        listener: &TcpListener,
+        incoming_addr: Option<std::net::SocketAddr>,
+    ) -> TcpStream {
+        timeout(Duration::from_secs(3), async {
+            if let Some(addr) = incoming_addr {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                write_message(
+                    &mut stream,
+                    &Message::hello(NodeId::new("raw-peer")),
+                    SerializationFormat::Bincode,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                let ack = read_message(
+                    &mut stream,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(ack.kind, MessageKind::HelloAck { .. }));
+                stream
+            } else {
+                let addr = listener.local_addr().unwrap().to_string();
+                let (connected, stream) = tokio::join!(node.connect_to_peer(&addr), async {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let hello = read_message(
+                        &mut stream,
+                        DEFAULT_MAX_MESSAGE_SIZE,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(hello.kind, MessageKind::Hello { .. }));
+                    write_message(
+                        &mut stream,
+                        &Message::hello_ack_with_format(
+                            NodeId::new("raw-peer"),
+                            SerializationFormat::Bincode,
+                        ),
+                        SerializationFormat::Bincode,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                    stream
+                });
+                connected.unwrap();
+                stream
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_failure_releases_live_reader_and_slot_before_disconnect_event_delivery() {
+        for incoming in [false, true] {
+            for broadcast in [false, true] {
+                let mut node = Node::try_new(
+                    NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                        .with_max_peers(1)
+                        .with_event_channel_capacity(1)
+                        .with_socket_timeout(Duration::from_secs(60)),
+                )
+                .unwrap();
+                let mut events = node.take_event_receiver().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let incoming_addr = if incoming {
+                    Some(node.start_listener().await.unwrap())
+                } else {
+                    None
+                };
+                let mut remote = open_raw_peer(&node, &listener, incoming_addr).await;
+                let Some(NodeEvent::PeerConnected { addr, .. }) = events.recv().await else {
+                    panic!("missing connection event")
+                };
+                let (writer, instance) = {
+                    let peers = node.peers.read().await;
+                    let peer = &peers[&addr];
+                    (
+                        Arc::downgrade(peer.writer.as_ref().unwrap()),
+                        Arc::clone(&peer.instance),
+                    )
+                };
+                assert_eq!(node.connection_slots.available_permits(), 0);
+
+                // Inject a deterministic write-side failure without closing the reader.
+                // The remote sends a request and never reads again after the handshake.
+                writer
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .shutdown()
+                    .await
+                    .unwrap();
+                write_message(
+                    &mut remote,
+                    &Message::pull_since(None),
+                    SerializationFormat::Bincode,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), events.recv())
+                        .await
+                        .unwrap(),
+                    Some(NodeEvent::PullRequested { .. })
+                ));
+                node.event_tx
+                    .try_send(NodeEvent::OpsReceived {
+                        from: NodeId::new("queued"),
+                        ops: vec![],
+                    })
+                    .unwrap();
+
+                let mut send = tokio_test::task::spawn(async {
+                    if broadcast {
+                        node.broadcast_message(Message::ping()).await
+                    } else {
+                        node.send_message_to_addr(&addr, Message::ping()).await
+                    }
+                });
+                // The write has failed and only the bounded disconnect event is blocked.
+                assert!(send.poll().is_pending());
+                assert_eq!(node.connection_slots.available_permits(), 1);
+                assert!(!node.is_connected_addr(&addr).await);
+                assert!(*instance.closed_tx.borrow());
+                timeout(Duration::from_secs(1), async {
+                    while writer.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("reader or failed send retained the socket writer");
+                assert!(matches!(
+                    events.recv().await,
+                    Some(NodeEvent::OpsReceived { .. })
+                ));
+                assert!(send.await.is_err());
+                assert!(matches!(
+                    events.recv().await,
+                    Some(NodeEvent::PeerDisconnected {
+                        peers_connected: 0,
+                        ..
+                    })
+                ));
+                assert!(events.try_recv().is_err(), "duplicate disconnect event");
+
+                // This must actually acquire the released permit and complete a handshake.
+                let _replacement = open_raw_peer(&node, &listener, incoming_addr).await;
+                assert!(matches!(
+                    events.recv().await,
+                    Some(NodeEvent::PeerConnected {
+                        peers_connected: 1,
+                        ..
+                    })
+                ));
+                assert_eq!(node.connection_slots.available_permits(), 0);
+                assert_eq!(node.connected_peer_count().await, 1);
+                assert!(node.mark_peer_failed(&addr, &instance).await.is_none());
+                assert!(events.try_recv().is_err());
+                node.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_loop_cancels_event_backpressure_and_ping_writer_lock() {
+        for blocked_on_ping in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut remote, _) = listener.accept().await.unwrap();
+            let (reader, writer) = tokio::io::split(NetStream::Plain(stream));
+            let writer = Arc::new(Mutex::new(writer));
+            let held_writer = writer.lock().await;
+            let instance = ConnectionInstance::new();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (event_tx, mut events) = mpsc::channel(1);
+            // The first event is an observable barrier; the next frame blocks in
+            // either event delivery or Ping's writer lock, not in socket reading.
+            let mut bytes = Message::pull_since(None).to_bytes().unwrap();
+            bytes.extend(
+                if blocked_on_ping {
+                    Message::ping()
+                } else {
+                    Message::pull_since(Some("blocked".into()))
+                }
+                .to_bytes()
+                .unwrap(),
+            );
+            remote.write_all(&bytes).await.unwrap();
+            let mut read = tokio_test::task::spawn(read_loop(
+                reader,
+                ReadLoopContext {
+                    peer_node_id: NodeId::new("peer"),
+                    addr: "peer".into(),
+                    event_tx,
+                    writer: Arc::clone(&writer),
+                    serialization_format: SerializationFormat::Bincode,
+                    max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                    socket_timeout: Duration::from_secs(60),
+                    shutdown_rx,
+                    closed_rx: instance.closed_tx.subscribe(),
+                },
+            ));
+            timeout(
+                Duration::from_secs(1),
+                std::future::poll_fn(|cx| {
+                    assert!(read.poll().is_pending());
+                    if events.len() == 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            instance.closed_tx.send_replace(true);
+            timeout(Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(Arc::strong_count(&writer), 1, "reader retained its writer");
+            assert!(matches!(
+                events.try_recv(),
+                Ok(NodeEvent::PullRequested {
+                    since_op_id: None,
+                    ..
+                })
+            ));
+            assert!(events.try_recv().is_err());
+            drop(held_writer);
+            drop(shutdown_tx);
+        }
     }
 
     #[tokio::test]
@@ -1615,7 +2096,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
-                instance: Arc::new(()),
+                instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
                 writer: None,
@@ -1636,7 +2117,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
-                instance: Arc::new(()),
+                instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
                 writer: None,
@@ -1650,8 +2131,8 @@ mod tests {
     #[test]
     fn stale_connection_cleanup_cannot_remove_a_replacement() {
         let addr = "127.0.0.1:9001";
-        let current = Arc::new(());
-        let stale = Arc::new(());
+        let current = Arc::new(ConnectionInstance::new());
+        let stale = Arc::new(ConnectionInstance::new());
         let mut peers = HashMap::from([(
             addr.to_string(),
             PeerConnection {
@@ -1681,7 +2162,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1693,7 +2174,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -1947,7 +2428,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new("old")),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: Some(Arc::clone(&writer)),
@@ -1963,7 +2444,8 @@ mod tests {
             });
             // The snapshot has been taken, but writing is blocked on our writer lock.
             assert!(send.poll().is_pending());
-            let replacement = Arc::new(());
+            let stale = Arc::clone(&node.peers.read().await[addr].instance);
+            let replacement = Arc::new(ConnectionInstance::new());
             node.peers.write().await.insert(
                 addr.into(),
                 PeerConnection {
@@ -1976,8 +2458,15 @@ mod tests {
                     _slot: test_slot(),
                 },
             );
+            // Cancellation must release the snapshot without acquiring this lock.
+            assert!(
+                timeout(Duration::from_secs(1), send)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(node.mark_peer_failed(addr, &stale).await.is_none());
             drop(held_writer);
-            assert!(send.await.is_err());
             assert!(node.is_connected_addr(addr).await);
             assert_eq!(
                 node.connected_peers().await,
@@ -2002,7 +2491,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -2014,7 +2503,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Failed,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,
@@ -2041,7 +2530,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new(addr)),
                     connection_info: None,
-                    instance: Arc::new(()),
+                    instance: Arc::new(ConnectionInstance::new()),
                     state,
                     serialization_format: SerializationFormat::Bincode,
                     writer: None,

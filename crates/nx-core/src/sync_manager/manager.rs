@@ -211,21 +211,20 @@ pub struct SyncManager {
 }
 
 impl SyncManager {
-    /// Create a SyncManager, panicking if the persisted schema is invalid.
+    /// Create a SyncManager, panicking if configuration or persistence is invalid.
     ///
-    /// Runtime integrations should prefer [`Self::try_new`] so schema errors
-    /// can be reported without terminating the process.
+    /// Runtime integrations should prefer [`Self::try_new`] so configuration and
+    /// schema errors can be reported without terminating the process.
     pub fn new(
         node_id: NodeId,
         config: SyncConfig,
         store: Arc<NxStore>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
-        Self::try_new(node_id, config, store, metrics)
-            .expect("failed to initialize SyncManager persistence")
+        Self::try_new(node_id, config, store, metrics).expect("failed to initialize SyncManager")
     }
 
-    /// Create a SyncManager after validating all managed persistence schemas.
+    /// Create a SyncManager after validating configuration and managed persistence schemas.
     pub fn try_new(
         node_id: NodeId,
         config: SyncConfig,
@@ -257,6 +256,7 @@ impl SyncManager {
         discovery_providers: Vec<DiscoveryProvider>,
         discovery_config: DiscoveryRuntimeConfig,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
         ensure_sync_schema(&store)?;
 
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
@@ -360,6 +360,7 @@ impl SyncManager {
     /// Initial peers are dialed in the background. Success means local services
     /// are started, not that a peer is connected or replication has settled.
     pub async fn start(&mut self) -> anyhow::Result<()> {
+        self.config.validate()?;
         let listen_addr = match &self.config.listen_addr {
             Some(addr) => addr.clone(),
             None => {
@@ -372,19 +373,9 @@ impl SyncManager {
             anyhow::bail!("sync manager is already started");
         }
 
-        // Provider watches are acquired before binding so discovery startup is
-        // atomic with respect to network resources.
-        let mut discovery_coordinator = DiscoveryCoordinator::start(
-            self.discovery_providers.clone(),
-            self.discovery_config.clone(),
-        )
-        .await?;
-        let candidates_rx = discovery_coordinator.candidates();
-        let initial_candidates = Arc::clone(&candidates_rx.borrow());
-
-        // Build the network node.
+        // Reject local configuration before acquiring provider watches or tasks.
+        // The reconnect loop consumes live candidates, not NodeConfig::initial_peers.
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
-            .with_peers(initial_candidates.as_ref().clone())
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
             .with_socket_timeout(self.config.socket_timeout)
@@ -392,18 +383,30 @@ impl SyncManager {
             .with_event_channel_capacity(self.config.queued_ops_limit.max(1));
         let bootstrap_server = BootstrapServerConfig::new(self.discovery_config.cluster_id())?
             .with_max_cached_candidates(self.discovery_config.max_candidates())?
-            .with_max_response_candidates(self.discovery_config.max_candidates())?;
+            .with_max_response_candidates(
+                self.discovery_config
+                    .max_candidates()
+                    .min(nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY),
+            )?;
         node_config = node_config.with_bootstrap_server(bootstrap_server);
 
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);
         }
 
-        let mut node = Node::new(node_config);
+        let mut node = Node::try_new(node_config)?;
         let Some(mut event_rx) = node.take_event_receiver() else {
-            rollback_discovery(&mut discovery_coordinator).await;
             anyhow::bail!("network event receiver is unavailable");
         };
+
+        // Provider watches are acquired before binding so discovery startup is
+        // atomic with respect to network resources. All later failures roll back.
+        let mut discovery_coordinator = DiscoveryCoordinator::start(
+            self.discovery_providers.clone(),
+            self.discovery_config.clone(),
+        )
+        .await?;
+        let candidates_rx = discovery_coordinator.candidates();
 
         let bound_addr = match node.start_listener().await {
             Ok(bound_addr) => bound_addr,

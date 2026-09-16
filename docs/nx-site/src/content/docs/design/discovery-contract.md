@@ -148,9 +148,14 @@ their first configured occurrence.
 Each request optionally advertises the caller's endpoint and asks for at most
 the configured number of results. Response capacity is in `1..=4096`, matching
 `nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY`; bootstrap configuration rejects
-larger capacities before querying a seed. A successful view contains the seed itself
-followed by the seed's bounded, deduplicated suggestions. Views from multiple
-seeds are flattened in configured seed order and deduplicated again. Returned
+larger capacities before querying a seed. This is a bootstrap response bound,
+not a universal cap on the aggregate runtime snapshot from all discovery sources.
+The bootstrap provider's `max_candidates` must also fit the client's response
+capacity. Each retained seed view includes the seed itself first, followed by
+deduplicated suggestions, truncated to that provider limit. Views from multiple
+seeds are flattened in configured seed order, deduplicated again and capped by
+the provider's `max_candidates`. The coordinator applies its separate global
+candidate limit after combining sources. Returned
 entries expire at the earlier of the seed-provided lease and the provider's
 `stale_after` bound. Failed probes retain an unexpired last valid view; expired
 views are removed at their deadline even while another seed query is still in
@@ -196,12 +201,26 @@ interpret them as protection against arbitrary untrusted multicast traffic.
 
 mDNS announcement support is required. Announcements accept a concrete IP
 address or a `.local` hostname, never a wildcard host or port zero. The provider
-filters its own DNS-SD fullname and advertised endpoint. Re-announcement updates
-the same service in place, avoiding a withdrawal gap.
+filters its own DNS-SD names and advertised endpoints. Original registration
+keys remain distinct from per-interface aliases reported by DNS-SD name-conflict
+events: unregister uses the original key, not the renamed wire alias.
+Re-announcement registers a replacement under a distinct original key before
+withdrawing the previous registration and awaiting its acknowledgement.
+A rejected registration leaves the previous one owned; failed withdrawal stops
+the browse loop and starts checked cleanup rather than accumulating more
+registrations. At most two original registrations are owned during replacement.
+Own-name history (including aliases) and endpoint history each retain at most
+1024 entries until daemon termination, so late cached resolutions are still
+self-filtered. History exhaustion rejects an announcement or terminates browsing
+on a new alias that cannot be retained; it does not silently evict self-filtering
+history. Once queued, the browse task owns announcement completion even if the
+calling future is cancelled.
+
 Shutdown has one cleanup owner: it requests unregister/goodbye, waits for the
 daemon acknowledgement within a deadline, stops browsing, requests daemon
 shutdown and awaits its acknowledgement, joins the bridge task, and clears the
-view. The common budget reserves time for daemon termination even when
+view. It attempts each owned original key with its own bounded acknowledgement
+wait. The common budget reserves time for daemon termination even when
 unregister fails or its acknowledgement never arrives; queue retries are also
 bounded by those deadlines. Cleanup errors are reported, not silently treated
 as success. A daemon acknowledgement does **not** guarantee receipt of a UDP

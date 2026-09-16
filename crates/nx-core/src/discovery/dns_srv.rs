@@ -10,7 +10,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::dynamic::{AbortOnDropTask, DynamicState};
+use super::dynamic::{
+    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
+    validate_durations,
+};
 use super::{
     DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY, DEFAULT_MAX_PEER_CANDIDATES,
     DiscoveryError, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement, PeerDiscovery,
@@ -68,6 +71,7 @@ struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+    cleanup: Option<OwnedShutdown>,
 }
 
 struct Inner {
@@ -129,6 +133,7 @@ impl DnsSrvDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
+                    cleanup: None,
                 }),
             }),
         }
@@ -153,7 +158,11 @@ impl DnsSrvDiscovery {
         let state = Arc::clone(&self.inner.state);
         lifecycle.shutdown = Some(shutdown);
         lifecycle.task = Some(tokio::spawn(async move {
-            run_dns_refresh(config, resolver, state, shutdown_rx).await;
+            let cleanup = ClearStateOnDrop(state.clone());
+            if let Err(error) = run_dns_refresh(config, resolver, state, shutdown_rx).await {
+                tracing::error!(%error, "DNS-SRV discovery stopped");
+            }
+            drop(cleanup);
         }));
         Ok(())
     }
@@ -196,23 +205,32 @@ impl PeerDiscovery for DnsSrvDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let task = {
+        let result = {
             let mut lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             lifecycle.shutdown.take();
-            lifecycle.task.take()
+            let task = lifecycle.task.take().map(AbortOnDropTask::new);
+            lifecycle
+                .cleanup
+                .get_or_insert_with(|| {
+                    let cleanup = ClearStateOnDrop(Arc::clone(&self.inner.state));
+                    OwnedShutdown::new(async move {
+                        let joined = match task {
+                            Some(task) => task.join().await.map_err(|error| {
+                                provider_error(format!("refresh task failed: {error}"), false)
+                            }),
+                            None => Ok(()),
+                        };
+                        drop(cleanup);
+                        joined
+                    })
+                })
+                .subscribe()
         };
-        if let Some(task) = task {
-            AbortOnDropTask::new(task)
-                .join()
-                .await
-                .map_err(|error| provider_error(format!("refresh task failed: {error}"), false))?;
-        }
-        self.inner.state.replace(Vec::new());
-        Ok(())
+        OwnedShutdown::wait(result, PROVIDER).await
     }
 }
 
@@ -221,7 +239,7 @@ async fn run_dns_refresh(
     resolver: Arc<dyn SrvResolver>,
     state: Arc<DynamicState>,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> Result<(), DiscoveryError> {
     let mut valid_until = None;
     let mut next_refresh = Instant::now();
     loop {
@@ -236,7 +254,7 @@ async fn run_dns_refresh(
                     tokio::select! {
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
-                                return;
+                                return Ok(());
                             }
                         }
                         result = &mut query => break result,
@@ -248,7 +266,7 @@ async fn run_dns_refresh(
                 };
                 match result {
                     Ok(answer) => {
-                        (valid_until, next_refresh) = apply_dns_answer(&config, &state, answer, valid_until);
+                        (valid_until, next_refresh) = apply_dns_answer(&config, &state, answer, valid_until)?;
                     }
                     Err(error) => {
                         let now = Instant::now();
@@ -256,12 +274,16 @@ async fn run_dns_refresh(
                             state.replace(Vec::new());
                         }
                         tracing::warn!(%error, name = %config.service_name, "DNS-SRV discovery refresh failed");
-                        next_refresh = retry_deadline(now, config.retry_interval, valid_until);
+                        if matches!(error, DiscoveryError::Provider { retryable: false, .. }) {
+                            return Err(error);
+                        }
+                        next_refresh = retry_deadline(now, config.retry_interval, valid_until)?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn apply_dns_answer(
@@ -269,12 +291,21 @@ fn apply_dns_answer(
     state: &DynamicState,
     answer: SrvAnswer,
     previous_valid_until: Option<Instant>,
-) -> (Option<Instant>, Instant) {
+) -> Result<(Option<Instant>, Instant), DiscoveryError> {
     let now = Instant::now();
     if answer.valid_until <= now {
         state.replace(Vec::new());
-        return (None, now + config.retry_interval);
+        return Ok((
+            None,
+            checked_deadline(now, config.retry_interval, PROVIDER, "retry_interval")?,
+        ));
     }
+    let refresh = checked_deadline(
+        now,
+        config.max_refresh_interval,
+        PROVIDER,
+        "max_refresh_interval",
+    )?;
     let peers = records_to_peers(answer.records, config.max_candidates);
     if previous_valid_until.is_some_and(|previous| answer.valid_until <= previous) {
         // Hickory can return the same cached answer before its original expiry.
@@ -283,10 +314,7 @@ fn apply_dns_answer(
     } else {
         state.observe(peers);
     }
-    (
-        Some(answer.valid_until),
-        answer.valid_until.min(now + config.max_refresh_interval),
-    )
+    Ok((Some(answer.valid_until), answer.valid_until.min(refresh)))
 }
 
 async fn wait_for_dns_expiry(deadline: Option<Instant>) {
@@ -307,7 +335,12 @@ async fn lookup(
                 bounded_negative_ttl(no_records.negative_ttl, config.max_refresh_interval);
             Ok(SrvAnswer {
                 records: Vec::new(),
-                valid_until: Instant::now() + negative_ttl,
+                valid_until: checked_deadline(
+                    Instant::now(),
+                    negative_ttl,
+                    PROVIDER,
+                    "negative_ttl",
+                )?,
             })
         }
         Err(error) => Err(provider_error(
@@ -317,11 +350,16 @@ async fn lookup(
     }
 }
 
-fn retry_deadline(now: Instant, retry_interval: Duration, valid_until: Option<Instant>) -> Instant {
-    valid_until
+fn retry_deadline(
+    now: Instant,
+    retry_interval: Duration,
+    valid_until: Option<Instant>,
+) -> Result<Instant, DiscoveryError> {
+    let retry = checked_deadline(now, retry_interval, PROVIDER, "retry_interval")?;
+    Ok(valid_until
         .filter(|deadline| *deadline > now)
-        .map(|deadline| deadline.min(now + retry_interval))
-        .unwrap_or(now + retry_interval)
+        .map(|deadline| deadline.min(retry))
+        .unwrap_or(retry))
 }
 
 fn bounded_negative_ttl(negative_ttl: Option<u32>, max_refresh_interval: Duration) -> Duration {
@@ -420,7 +458,13 @@ fn validate_config(config: &DnsSrvDiscoveryConfig) -> Result<(), DiscoveryError>
     {
         return Err(invalid("intervals and limits must be greater than zero"));
     }
-    Ok(())
+    validate_durations(
+        PROVIDER,
+        &[
+            ("retry_interval", config.retry_interval),
+            ("max_refresh_interval", config.max_refresh_interval),
+        ],
+    )
 }
 
 fn invalid(message: impl Into<String>) -> DiscoveryError {
@@ -446,6 +490,104 @@ mod tests {
     use hickory_resolver::proto::rr::Name;
 
     use super::*;
+
+    #[test]
+    fn extreme_durations_are_rejected_before_resolver_construction() {
+        for field in ["retry_interval", "max_refresh_interval"] {
+            let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+            if field == "retry_interval" {
+                config.retry_interval = Duration::MAX;
+            } else {
+                config.max_refresh_interval = Duration::MAX;
+            }
+            assert!(matches!(DnsSrvDiscovery::new(config),
+                Err(DiscoveryError::InvalidConfiguration { provider, message })
+                    if provider == PROVIDER && message.contains(field)));
+        }
+    }
+
+    #[test]
+    fn runtime_deadline_overflow_does_not_publish_or_renew_cached_answers() {
+        let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        let now = Instant::now();
+        let state = DynamicState::new(8);
+        state.observe_at(vec![("peer.example:9000".into(), now.into_std())]);
+        let cached = state.snapshot();
+        let valid_until = now + Duration::from_secs(10);
+        config.max_refresh_interval = Duration::MAX;
+        let error = apply_dns_answer(
+            &config,
+            &state,
+            SrvAnswer {
+                records: vec![SRV::new(
+                    0,
+                    0,
+                    9000,
+                    Name::from_ascii("peer.example.").unwrap(),
+                )],
+                valid_until,
+            },
+            Some(valid_until),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DiscoveryError::Provider {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(state.snapshot(), cached);
+        assert!(retry_deadline(now, Duration::MAX, Some(valid_until)).is_err());
+        assert!(retry_deadline(now, Duration::MAX, None).is_err());
+        let boundary = super::super::dynamic::deadline_boundary();
+        assert!(retry_deadline(boundary, config.retry_interval, None).is_err());
+        assert!(
+            checked_deadline(
+                now,
+                bounded_negative_ttl(None, Duration::MAX),
+                PROVIDER,
+                "negative_ttl"
+            )
+            .is_err()
+        );
+        config.retry_interval = Duration::MAX;
+        assert!(
+            apply_dns_answer(
+                &config,
+                &state,
+                SrvAnswer {
+                    records: Vec::new(),
+                    valid_until: now,
+                },
+                Some(valid_until)
+            )
+            .is_err()
+        );
+        assert!(state.snapshot().peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn panicked_refresh_is_reported_after_clearing_snapshot() {
+        let provider = DnsSrvDiscovery::with_resolver(
+            DnsSrvDiscoveryConfig::new("_numax._tcp.example."),
+            Arc::new(PendingResolver),
+        );
+        provider
+            .inner
+            .state
+            .observe(vec!["cached.example:9000".into()]);
+        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async {
+            panic!("injected DNS refresh panic");
+        }));
+        let result = provider.shutdown().await;
+        assert!(
+            matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
+            if message.contains("refresh task failed"))
+        );
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.inner.state.watch().snapshot().peers().is_empty());
+    }
 
     enum ResolverStep {
         Success(Vec<SRV>, Duration),
@@ -504,7 +646,8 @@ mod tests {
                 valid_until,
             },
             None,
-        );
+        )
+        .unwrap();
         let fresh = state.snapshot();
         assert_eq!(fresh.peers(), ["peer.example:9000"]);
         assert!(fresh.observations().unwrap()[0] > old);
@@ -516,7 +659,8 @@ mod tests {
                 valid_until,
             },
             Some(valid_until),
-        );
+        )
+        .unwrap();
         assert_eq!(state.snapshot(), fresh);
     }
 
@@ -592,11 +736,11 @@ mod tests {
         let valid_until = now + Duration::from_secs(2);
 
         assert_eq!(
-            retry_deadline(now, Duration::from_secs(30), Some(valid_until)),
+            retry_deadline(now, Duration::from_secs(30), Some(valid_until)).unwrap(),
             valid_until
         );
         assert_eq!(
-            retry_deadline(now, Duration::from_secs(1), Some(valid_until)),
+            retry_deadline(now, Duration::from_secs(1), Some(valid_until)).unwrap(),
             now + Duration::from_secs(1)
         );
     }
@@ -632,7 +776,7 @@ mod tests {
             valid_until: Instant::now(),
         };
 
-        let (valid_until, _) = apply_dns_answer(&config, &state, answer, None);
+        let (valid_until, _) = apply_dns_answer(&config, &state, answer, None).unwrap();
 
         assert!(valid_until.is_none());
         assert!(state.snapshot().peers().is_empty());

@@ -37,8 +37,10 @@ Each operation has a globally unique `OpId`, the node that produced it, and the 
 The current data-replication implementation remains intentionally simple and
 deterministic. A node obtains endpoint candidates from static, bootstrap, mDNS,
 DNS-SRV or file providers. The same bounded, updateable candidate snapshot feeds
-initial dialing, reconnect and anti-entropy. Starting with no candidates is
-valid; later provider updates wake the connection machinery.
+initial dialing and reconnect. Anti-entropy uses all active connections,
+including inbound peers and connections whose candidates have been removed.
+Starting with no candidates is valid; later provider updates wake the
+connection machinery. Local readiness does not imply peer convergence.
 
 Candidates are not members or peers yet. A candidate becomes an active peer
 only after connection admission, the normal wire handshake, TLS identity
@@ -175,8 +177,10 @@ If a peer is disconnected, it does not receive the immediate push. That is why a
 
 Anti-entropy is the repair loop.
 
-Every `anti_entropy_interval` seconds, a node asks each connected current
-candidate for retained operations using `PullSince`.
+Every `anti_entropy_interval`, a node asks each active connection for retained
+operations using `PullSince`. This cadence is independent of discovery churn;
+missed ticks are skipped rather than replayed in a burst. Candidate removal
+stops future reconnect attempts, not repair over an already admitted connection.
 
 Today the request is conservative: it asks for the bounded op-log rather than relying on a single "last seen op id" as a causal frontier. That matters because one newer operation does not prove that every older operation arrived.
 
@@ -198,7 +202,9 @@ node B returns retained ops
 node A applies only unseen OpIds
 ```
 
-The op-log is bounded, so anti-entropy is a practical catch-up mechanism, not an infinite historical archive.
+The op-log and deduplication history are bounded, so anti-entropy is a practical
+catch-up mechanism, not an infinite historical archive or state transfer.
+Rediscovery alone cannot guarantee recovery when the required history is gone.
 
 ---
 
@@ -221,7 +227,8 @@ Reconnect uses exponential backoff:
 | Dead after failures | `3` |
 | Anti-entropy interval | `30s` |
 
-This is simple failure tracking for configured peers. It is not a full membership protocol yet.
+This is simple failure tracking for discovery candidates, including configured
+peers. It is not a full membership protocol yet.
 
 ---
 
@@ -244,9 +251,10 @@ repair path. Bootstrap suggestions are not membership state.
 
 ---
 
-## What comes next
+## Current foundations and next steps
 
-Peer discovery is planned in two steps.
+Peer discovery foundations are implemented in the current `v0.1.5` release;
+membership and K-fanout remain planned for `v0.1.6`.
 
 ### v0.1.5 - Peer Discovery: Foundations
 
@@ -256,10 +264,12 @@ DNS-SRV and an externally updated peer file. Snapshot/watch handoff is atomic,
 delivery is bounded with explicit overflow, and provider tasks are owned and
 stopped by runtime shutdown.
 
-CLI, environment and `numax.toml` selection for the four new dynamic providers
-is not available yet. Existing `--peer` input continues through
-`StaticDiscovery`; embedders can compose the public providers through the
-`nx-core` Rust API. The detailed semantics are in the
+All five modes (`static`, `bootstrap`, `mdns`, `dns-srv`, `file`) are selectable
+through `--discovery-mode`, `NX_DISCOVERY_MODE` and the `[discovery]` TOML section,
+with precedence CLI > environment > TOML > defaults. Explicit `--peer` entries
+continue to contribute a static source alongside the selected dynamic provider;
+they are not reinterpreted as bootstrap seeds. Embedders can also compose the
+public providers through the `nx-core` Rust API. The detailed semantics are in the
 [Peer Discovery Contract](/numax/design/discovery-contract/).
 
 ### v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout
@@ -294,7 +304,10 @@ Gossip is the fast path. It spreads new operations quickly.
 
 Anti-entropy is the repair path. It catches up nodes that were offline, partitioned, slow, or unlucky.
 
-Numax needs both because local-first systems must tolerate temporary disconnection. CRDTs make the merge safe. Gossip moves operations quickly. Anti-entropy makes missed operations recoverable.
+Numax needs both because local-first systems must tolerate temporary
+disconnection. CRDTs define convergence semantics; dissemination moves
+operations between peers, and anti-entropy repairs missed operations while the
+required operation and deduplication history remains available.
 
 ---
 

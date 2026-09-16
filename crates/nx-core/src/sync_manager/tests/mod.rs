@@ -303,7 +303,7 @@ fn peer_reconnect_state_tracks_next_attempt_per_peer() {
     let mut state = PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
 
     let first_delay = state.record_failure(Duration::from_secs(5), now);
-    assert_eq!(first_delay, Duration::from_millis(500));
+    assert_eq!(first_delay, Some(Duration::from_millis(500)));
     assert_eq!(state.delay, Duration::from_secs(1));
     assert_eq!(state.next_attempt_at, now + Duration::from_millis(500));
 
@@ -319,7 +319,9 @@ fn peer_reconnect_state_schedules_backoff_from_failure_time() {
     let mut state =
         PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), started_at);
 
-    state.record_failure(Duration::from_secs(5), failed_at);
+    state
+        .record_failure(Duration::from_secs(5), failed_at)
+        .unwrap();
 
     assert_eq!(
         state.next_attempt_at,
@@ -1525,18 +1527,195 @@ fn manager_rejects_corrupted_durable_crdt_state() {
     }
 }
 
-#[test]
-fn static_peer_lists_keep_their_historical_finite_size() {
-    let peers = (0..=crate::DEFAULT_MAX_PEER_CANDIDATES)
-        .map(|index| format!("peer-{index}.example:9000"))
+#[tokio::test]
+async fn static_peer_lists_keep_their_historical_finite_size_at_startup() {
+    let peers = (0..=nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY)
+        .map(|index| format!("peer-{index}.invalid:9000"))
         .collect::<Vec<_>>();
-    let mut config = SyncConfig::new();
+    // Disable outbound admission: this tests real candidate retention, not DNS/dials.
+    let mut config = SyncConfig::new()
+        .with_listen_addr("127.0.0.1:0")
+        .with_max_peers(0);
     config.peers = peers.clone();
 
-    let manager =
+    let mut manager =
         SyncManager::try_new(NodeId::new("local-node"), config, temp_store(), metrics()).unwrap();
 
     assert_eq!(manager.discovery_config.max_candidates(), peers.len());
+    manager.start().await.unwrap();
+    assert_eq!(manager.peer_candidates(), peers);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dynamic_provider_modes_accept_aggregate_capacity_above_bootstrap_response_limit() {
+    let peers = vec![
+        "peer-a.invalid:9000".to_string(),
+        "peer-b.invalid:9000".to_string(),
+    ];
+    // Controlled snapshots isolate the manager contract from platform discovery I/O.
+    for mode in ["mdns", "dns-srv", "file"] {
+        let discovery = Arc::new(TestDynamicDiscovery::empty());
+        discovery.state.lock().unwrap().1 = peers.clone();
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new()
+                .with_listen_addr("127.0.0.1:0")
+                .with_max_peers(0),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(mode, discovery)],
+            DiscoveryRuntimeConfig::default()
+                .with_max_candidates(nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY + 1),
+        )
+        .unwrap();
+
+        manager.start().await.unwrap();
+        assert_eq!(manager.peer_candidates(), peers, "{mode}");
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_responses_are_capped_without_reducing_the_aggregate_cache() {
+    use nx_net::{BootstrapClient, BootstrapClientConfig, BootstrapRequest};
+    let cap = nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY;
+    let discovery_config = DiscoveryRuntimeConfig::default().with_max_candidates(cap + 1);
+    let cluster = discovery_config.cluster_id().to_string();
+    let addr = free_addr();
+    let mut manager = SyncManager::try_new_with_discovery(
+        NodeId::new("bootstrap-seed"),
+        SyncConfig::new().with_listen_addr(&addr),
+        temp_store(),
+        metrics(),
+        vec![],
+        discovery_config,
+    )
+    .unwrap();
+    manager.start().await.unwrap();
+
+    let client = |index: usize| {
+        let mut config =
+            BootstrapClientConfig::new(NodeId::new(format!("bootstrap-client-{index}")));
+        config.max_response_candidates = cap;
+        BootstrapClient::new(config).unwrap()
+    };
+    // Fill the actual server cache through one-shot handshakes, requesting only
+    // one result while filling so the regression does not transfer quadratic data.
+    for index in 0..=cap {
+        client(index)
+            .query(
+                &addr,
+                BootstrapRequest::new(&cluster, 1)
+                    .with_advertised_endpoint(format!("peer-{index}.invalid:9000")),
+            )
+            .await
+            .unwrap();
+    }
+    let response = client(cap + 1)
+        .query(&addr, BootstrapRequest::new(&cluster, cap))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoints.len(), cap);
+    assert!(
+        !response
+            .endpoints
+            .contains(&format!("peer-{cap}.invalid:9000"))
+    );
+
+    // Free two earlier entries. The last contribution must emerge; a cache
+    // incorrectly clamped to 4096 would have discarded it during admission.
+    client(0)
+        .query(&addr, BootstrapRequest::new(&cluster, 1))
+        .await
+        .unwrap();
+    let response = client(1)
+        .query(&addr, BootstrapRequest::new(&cluster, cap))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoints.len(), cap);
+    assert!(
+        response
+            .endpoints
+            .contains(&format!("peer-{cap}.invalid:9000"))
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[test]
+fn manager_rejects_invalid_public_sync_config_before_channel_allocation() {
+    let store = temp_store();
+    for (field, config) in invalid_sync_configs() {
+        let Err(error) = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            config,
+            Arc::clone(&store),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            DiscoveryRuntimeConfig::default(),
+        ) else {
+            panic!("invalid {field} was accepted");
+        };
+        assert!(matches!(
+            error.downcast_ref::<nx_net::NetError>(),
+            Some(nx_net::NetError::InvalidConfig(_))
+        ));
+        assert!(error.to_string().contains(field), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn manager_revalidates_timer_and_node_limits_before_touching_providers() {
+    for (field, config) in invalid_sync_configs() {
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            DiscoveryRuntimeConfig::default(),
+        )
+        .unwrap();
+        manager.config = config.with_listen_addr("127.0.0.1:0");
+        let error = manager.start().await.unwrap_err();
+        assert!(error.to_string().contains(field), "{error}");
+        assert!(manager.node.is_none());
+        assert!(manager.discovery_coordinator.is_none());
+        assert!(manager.op_rx.is_some());
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manager_rejects_invalid_bootstrap_policy_before_touching_providers() {
+    for discovery_config in [
+        DiscoveryRuntimeConfig::default().with_cluster_id("x".repeat(256)),
+        DiscoveryRuntimeConfig::default().with_max_candidates(0),
+    ] {
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new().with_listen_addr("127.0.0.1:0"),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            discovery_config,
+        )
+        .unwrap();
+        assert!(manager.start().await.is_err());
+        assert!(manager.node.is_none());
+        assert!(manager.discovery_coordinator.is_none());
+        assert!(manager.op_rx.is_some());
+        manager.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

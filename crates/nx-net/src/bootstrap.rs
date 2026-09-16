@@ -8,7 +8,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::message::{Message, MessageKind, PROTOCOL_VERSION};
 use crate::node::{
-    connect_transport, read_message, supported_formats_for, verify_peer_identity, write_message,
+    connect_transport, read_message_with_format, supported_formats_for, verify_peer_identity,
+    write_message,
 };
 use crate::{NetError, NetResult, SerializationFormat, TlsConfig};
 
@@ -152,12 +153,18 @@ impl BootstrapClientConfig {
                 "bootstrap socket timeout must be greater than zero".into(),
             ));
         }
+        if Instant::now().checked_add(self.socket_timeout).is_none() {
+            return Err(NetError::InvalidMessage(
+                "bootstrap socket timeout exceeds the supported deadline range".into(),
+            ));
+        }
         validate_response_capacity(self.max_response_candidates)?;
         validate_candidate_ttl(self.max_candidate_ttl)?;
-        if self.max_concurrent_queries == 0 {
-            return Err(NetError::InvalidMessage(
-                "bootstrap concurrent query limit must be greater than zero".into(),
-            ));
+        if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_queries) {
+            return Err(NetError::InvalidMessage(format!(
+                "bootstrap concurrent query limit must be in 1..={}",
+                Semaphore::MAX_PERMITS
+            )));
         }
         Ok(())
     }
@@ -287,7 +294,7 @@ impl BootstrapClient {
         )
         .await?;
 
-        let response = read_message(
+        let (response_format, response) = read_message_with_format(
             &mut reader,
             self.config.max_message_size,
             self.config.socket_timeout,
@@ -326,6 +333,12 @@ impl BootstrapClient {
             return Err(NetError::InvalidMessage(format!(
                 "bootstrap seed selected unsupported serialization format: {selected_format:?}"
             )));
+        }
+        if response_format != selected_format {
+            return Err(NetError::InvalidMessage(
+                "bootstrap ACK frame format does not match the selected serialization format"
+                    .into(),
+            ));
         }
         verify_peer_identity(
             &self.config.node_id,
@@ -439,16 +452,21 @@ impl BootstrapServer {
         match requester_endpoint {
             Some(endpoint) => {
                 let endpoint = canonicalize_advertised_endpoint(&endpoint)?;
+                let expires_at = now.checked_add(self.config.candidate_ttl).ok_or_else(|| {
+                    NetError::InvalidMessage(
+                        "bootstrap candidate TTL exceeds the supported deadline range".into(),
+                    )
+                })?;
                 if let Some(entry) = cache.by_node.get_mut(requester) {
                     entry.endpoint = endpoint;
-                    entry.expires_at = now + self.config.candidate_ttl;
+                    entry.expires_at = expires_at;
                 } else if cache.by_node.len() < self.config.max_cached_candidates {
                     cache.order.push(requester.clone());
                     cache.by_node.insert(
                         requester.clone(),
                         CachedCandidate {
                             endpoint,
-                            expires_at: now + self.config.candidate_ttl,
+                            expires_at,
                         },
                     );
                 }
@@ -637,11 +655,83 @@ fn validate_candidate_ttl(ttl: Duration) -> NetResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::read_message;
     use crate::{Node, NodeConfig, TestPki};
 
     fn certificate_node_id(path: &std::path::Path) -> NodeId {
         let certificate = crate::TlsConfig::load_certs(path).unwrap().remove(0);
         crate::tls::derive_protocol_node_id_from_cert(&certificate).unwrap()
+    }
+
+    #[test]
+    fn concurrent_query_capacity_is_validated_before_semaphore_construction() {
+        for limit in [0, Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+            config.max_concurrent_queries = limit;
+            assert!(matches!(
+                config.validate(),
+                Err(NetError::InvalidMessage(_))
+            ));
+            assert!(matches!(
+                BootstrapClient::new(config),
+                Err(NetError::InvalidMessage(_))
+            ));
+        }
+        // A semaphore stores a permit count, not an allocation per permit.
+        for limit in [1, Semaphore::MAX_PERMITS - 1, Semaphore::MAX_PERMITS] {
+            let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+            config.max_concurrent_queries = limit;
+            config.validate().unwrap();
+            let client = BootstrapClient::new(config).unwrap();
+            let permit = client.acquire_query_slot().unwrap();
+            assert_eq!(client.query_slots.available_permits(), limit - 1);
+            drop(permit);
+            assert_eq!(client.query_slots.available_permits(), limit);
+        }
+    }
+
+    #[test]
+    fn socket_timeout_must_have_a_representable_nonzero_deadline() {
+        for socket_timeout in [Duration::ZERO, Duration::MAX] {
+            let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+            config.socket_timeout = socket_timeout;
+            assert!(matches!(
+                config.validate(),
+                Err(NetError::InvalidMessage(_))
+            ));
+            assert!(matches!(
+                BootstrapClient::new(config),
+                Err(NetError::InvalidMessage(_))
+            ));
+        }
+        for socket_timeout in [Duration::from_nanos(1), crate::DEFAULT_SOCKET_TIMEOUT] {
+            let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+            config.socket_timeout = socket_timeout;
+            BootstrapClient::new(config).unwrap();
+        }
+    }
+
+    #[test]
+    fn overflowing_candidate_deadline_rejects_insertion_and_preserves_existing_lease() {
+        let mut server = BootstrapServer::new(BootstrapServerConfig::new("cluster-a").unwrap());
+        let requester = NodeId::new("client");
+        server
+            .exchange(&requester, Some("old.example:9000".into()), 1)
+            .unwrap();
+        let original_expiry = server.cache.lock().unwrap().by_node[&requester].expires_at;
+        // Bypass public validation to exercise the defensive deadline calculation.
+        server.config.candidate_ttl = Duration::MAX;
+        for node_id in [&requester, &NodeId::new("new-client")] {
+            assert!(matches!(
+                server.exchange(node_id, Some("new.example:9000".into()), 1),
+                Err(NetError::InvalidMessage(_))
+            ));
+        }
+        let cache = server.cache.lock().unwrap();
+        assert_eq!(cache.by_node.len(), 1);
+        assert_eq!(cache.order.as_slice(), std::slice::from_ref(&requester));
+        assert_eq!(cache.by_node[&requester].endpoint, "old.example:9000");
+        assert_eq!(cache.by_node[&requester].expires_at, original_expiry);
     }
 
     #[test]
@@ -683,6 +773,8 @@ mod tests {
     fn huge_request_reserves_only_available_candidates() {
         let server = BootstrapServer::new(
             BootstrapServerConfig::new("cluster-a")
+                .unwrap()
+                .with_max_cached_candidates(usize::MAX)
                 .unwrap()
                 .with_max_response_candidates(MAX_BOOTSTRAP_RESPONSE_CAPACITY)
                 .unwrap(),
@@ -880,8 +972,74 @@ mod tests {
         node.shutdown().await;
     }
 
+    async fn query_ack_with_formats(
+        selected_format: SerializationFormat,
+        frame_format: SerializationFormat,
+    ) -> NetResult<BootstrapResponse> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let seed = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let hello = read_message(&mut stream, 4096, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(matches!(
+                hello.kind,
+                MessageKind::BootstrapHello {
+                    protocol_version: 5,
+                    ..
+                }
+            ));
+            let ack = Message::bootstrap_ack(
+                NodeId::new("seed"),
+                selected_format,
+                "cluster-a".into(),
+                vec!["seed.example:9000".into()],
+                1_000,
+            );
+            write_message(&mut stream, &ack, frame_format, Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+        let mut config = BootstrapClientConfig::new(NodeId::new("client"));
+        config.socket_timeout = Duration::from_secs(1);
+        let result = BootstrapClient::new(config)
+            .unwrap()
+            .query(&bound.to_string(), BootstrapRequest::new("cluster-a", 1))
+            .await;
+        seed.await.unwrap();
+        result
+    }
+
     #[tokio::test]
-    async fn bootstrap_seed_allowlist_is_checked_before_announcement_disclosure() {
+    async fn bootstrap_ack_rejects_mismatched_frame_format_in_both_encodings() {
+        for (selected, frame) in [
+            (SerializationFormat::Json, SerializationFormat::Bincode),
+            (SerializationFormat::Bincode, SerializationFormat::Json),
+        ] {
+            let error = query_ack_with_formats(selected, frame).await.unwrap_err();
+            assert!(matches!(
+                error,
+                NetError::InvalidMessage(reason) if reason.contains("ACK frame format")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ack_accepts_matching_frame_format_in_both_encodings() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let response = query_ack_with_formats(format, format).await.unwrap();
+            assert_eq!(response.seed_node_id, NodeId::new("seed"));
+            assert_eq!(response.endpoints, ["seed.example:9000"]);
+            assert_eq!(response.candidate_ttl, Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_client_allowlist_rejects_seed_before_announcement_disclosure() {
         let pki = TestPki::generate().unwrap();
         let seed_id = certificate_node_id(&pki.dir_path().join("node1.pem"));
         let client_id = certificate_node_id(&pki.dir_path().join("node2.pem"));
@@ -918,6 +1076,80 @@ mod tests {
             .unwrap();
         assert_eq!(response.seed_node_id, seed_id);
         assert_eq!(response.endpoints, [bound.to_string()]);
+        seed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seed_allowlist_rejects_ca_trusted_requester_without_caching_endpoint() {
+        let pki = TestPki::generate().unwrap();
+        let seed_id = certificate_node_id(&pki.dir_path().join("node1.pem"));
+        let denied_id = certificate_node_id(&pki.dir_path().join("node2.pem"));
+        let (allowed_cert, allowed_key) =
+            crate::tls::generate_signed(&pki.ca_cert, &pki.ca_key, "allowed-client").unwrap();
+        let cert_path = pki.dir_path().join("allowed.pem");
+        let key_path = pki.dir_path().join("allowed-key.pem");
+        crate::tls::write_cert_files(&allowed_cert, &allowed_key, &cert_path, &key_path).unwrap();
+        let allowed_id = certificate_node_id(&cert_path);
+        assert_ne!(allowed_id, denied_id);
+        let seed_tls = pki
+            .node1_config()
+            .with_allowed_peers(HashSet::from([allowed_id.to_string()]));
+        assert!(!seed_tls.is_peer_allowed(&denied_id.to_string()));
+        let seed = Node::new(
+            NodeConfig::new(seed_id.clone(), "127.0.0.1:0")
+                .with_tls(seed_tls)
+                .with_bootstrap_server(BootstrapServerConfig::new("cluster-a").unwrap()),
+        );
+        let bound = seed.start_listener().await.unwrap();
+        seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
+        let seed_endpoint = format!("localhost:{}", bound.port());
+        let socket_timeout = Duration::from_secs(2);
+
+        // Complete CA-verified TLS first: rejection must be at the node allowlist,
+        // not at certificate validation or a client-side seed allowlist.
+        let (mut denied_stream, _) =
+            connect_transport(&seed_endpoint, Some(&pki.node2_config()), socket_timeout)
+                .await
+                .unwrap();
+        let denied_hello = Message::bootstrap_hello(
+            denied_id,
+            vec![SerializationFormat::Bincode],
+            SerializationFormat::Bincode,
+            "cluster-a".into(),
+            Some("denied.example:43111".into()),
+            4,
+        );
+        write_message(
+            &mut denied_stream,
+            &denied_hello,
+            SerializationFormat::Bincode,
+            socket_timeout,
+        )
+        .await
+        .unwrap();
+        let error = read_message(&mut denied_stream, 4096, socket_timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NetError::Io(_)), "{error:?}");
+        drop(denied_stream);
+
+        // Use a different authenticated identity: a query without an announcement
+        // must not withdraw (and thereby hide) a cached entry for the denied node.
+        let mut allowed_config = BootstrapClientConfig::new(allowed_id);
+        allowed_config.tls = Some(TlsConfig::new(
+            cert_path.to_string_lossy(),
+            key_path.to_string_lossy(),
+            pki.dir_path().join("ca.pem").to_string_lossy(),
+        ));
+        allowed_config.socket_timeout = socket_timeout;
+        let response = BootstrapClient::new(allowed_config)
+            .unwrap()
+            .query(&seed_endpoint, BootstrapRequest::new("cluster-a", 4))
+            .await
+            .unwrap();
+        assert_eq!(response.seed_node_id, seed_id);
+        assert_eq!(response.endpoints, [bound.to_string()]);
+        assert_eq!(seed.connected_peer_count().await, 0);
         seed.shutdown().await;
     }
 }

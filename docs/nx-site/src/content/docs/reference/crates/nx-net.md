@@ -64,10 +64,22 @@ NodeConfig::new(node_id, "0.0.0.0:9000")
     .with_bootstrap_server(BootstrapServerConfig::new("cluster-a")?)
 ```
 
+`NodeConfig::validate()` checks limits before channel/semaphore allocation or
+network startup: `max_peers` cannot exceed Tokio's semaphore capacity,
+`event_channel_capacity` must be positive and within that capacity, and
+`socket_timeout` must be positive and form a representable deadline.
+`max_peers = 0` is valid and disables connection admission.
+
+Prefer `Node::try_new(config)`, which returns `NetError::InvalidConfig` for these
+invalid limits without binding sockets. The legacy infallible `Node::new(config)`
+remains available: an invalid configuration produces an inert node whose network
+entry points reject it, not a working node with silently clamped limits.
+Validation does not establish that a listen address can be bound or a peer reached.
+
 ### Node lifecycle
 
 ```
-Node::new(config)
+Node::try_new(config)?          validate before constructing; no socket binding yet
   └── take_event_receiver()     take the event channel before starting
   └── start_listener()          bind TCP, spawn listener task, returns bound SocketAddr
   └── connect_to_peer(addr)     dial, TLS, handshake, register, spawn read loop
@@ -318,6 +330,7 @@ pub enum NetError {
     BinaryDeserialization(wincode::ReadError),
     ConnectionFailed(String),
     PeerDisconnected(String),
+    InvalidConfig(String),
     InvalidMessage(String),
     Wire(WireError),
     MessageTooLarge { len: usize, limit: usize },
@@ -345,6 +358,7 @@ pub enum NetError {
 | `DEFAULT_EVENT_CHANNEL_CAPACITY` | 1024 | Event channel buffer size |
 | `DEFAULT_BOOTSTRAP_CACHE_CAPACITY` | 1024 | Seed-side advertised endpoint cache |
 | `DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY` | 128 | Results returned by one bootstrap exchange |
+| `MAX_BOOTSTRAP_RESPONSE_CAPACITY` | 4096 | Hard limit for one bootstrap response, not the combined discovery snapshot |
 | `DEFAULT_BOOTSTRAP_CANDIDATE_TTL` | 60s | Seed-side advertisement lease |
 | `DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES` | 1 | Simultaneous queries per bootstrap client |
 | `TASK_SHUTDOWN_GRACE` | 3s | Cooperative shutdown grace per task |
