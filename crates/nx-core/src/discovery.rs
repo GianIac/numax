@@ -26,6 +26,19 @@ pub use mdns::{MdnsDiscovery, MdnsDiscoveryConfig};
 /// Default number of discovery events retained for each provider watch channel.
 pub const DEFAULT_DISCOVERY_EVENT_CAPACITY: usize = 128;
 
+/// Maximum configurable capacity of a discovery provider's event channel.
+pub const MAX_DISCOVERY_EVENT_CAPACITY: usize = 4096;
+
+fn validate_event_capacity(provider: &str, event_capacity: usize) -> Result<(), DiscoveryError> {
+    if !(1..=MAX_DISCOVERY_EVENT_CAPACITY).contains(&event_capacity) {
+        return Err(DiscoveryError::InvalidConfiguration {
+            provider: provider.to_string(),
+            message: format!("event_capacity must be in 1..={MAX_DISCOVERY_EVENT_CAPACITY}"),
+        });
+    }
+    Ok(())
+}
+
 /// Default maximum number of peer candidates retained by the coordinator.
 pub const DEFAULT_MAX_PEER_CANDIDATES: usize = 1024;
 
@@ -626,9 +639,27 @@ impl StaticDiscovery {
         Self::with_event_capacity(peers, DEFAULT_DISCOVERY_EVENT_CAPACITY)
     }
 
+    /// Construct without validation errors, preserving peer order and duplicates.
+    ///
+    /// Capacity is clamped to `1..=MAX_DISCOVERY_EVENT_CAPACITY`: zero becomes
+    /// one and larger values become the maximum. For strict validation, use
+    /// [`Self::try_with_event_capacity`].
     pub fn with_event_capacity(peers: Vec<String>, event_capacity: usize) -> Self {
-        let (event_tx, _) = broadcast::channel(event_capacity.max(1));
+        let (event_tx, _) =
+            broadcast::channel(event_capacity.clamp(1, MAX_DISCOVERY_EVENT_CAPACITY));
         Self { peers, event_tx }
+    }
+
+    /// Construct with capacity in `1..=MAX_DISCOVERY_EVENT_CAPACITY`.
+    ///
+    /// Returns [`DiscoveryError::InvalidConfiguration`] outside that range,
+    /// before allocating the channel. Peer order and duplicates are preserved.
+    pub fn try_with_event_capacity(
+        peers: Vec<String>,
+        event_capacity: usize,
+    ) -> Result<Self, DiscoveryError> {
+        validate_event_capacity("static", event_capacity)?;
+        Ok(Self::with_event_capacity(peers, event_capacity))
     }
 
     fn snapshot(&self) -> DiscoverySnapshot {
@@ -663,6 +694,126 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn assert_event_capacity_bounds(
+        provider: &str,
+        construct: impl Fn(usize) -> Result<(), DiscoveryError>,
+    ) {
+        for capacity in [0, MAX_DISCOVERY_EVENT_CAPACITY + 1, usize::MAX] {
+            assert_eq!(
+                construct(capacity),
+                Err(DiscoveryError::InvalidConfiguration {
+                    provider: provider.to_string(),
+                    message: format!(
+                        "event_capacity must be in 1..={MAX_DISCOVERY_EVENT_CAPACITY}"
+                    ),
+                }),
+                "{provider}: capacity {capacity} must be rejected",
+            );
+        }
+        for capacity in [
+            1,
+            DEFAULT_DISCOVERY_EVENT_CAPACITY,
+            MAX_DISCOVERY_EVENT_CAPACITY,
+        ] {
+            assert_eq!(
+                construct(capacity),
+                Ok(()),
+                "{provider}: capacity {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_event_capacity_bounds() {
+        assert_event_capacity_bounds("bootstrap", |capacity| {
+            let mut config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+            config.event_capacity = capacity;
+            let mut client = BootstrapClientConfig::new(NodeId::new("client"));
+            client.max_response_candidates = config.max_candidates;
+            BootstrapGossipDiscovery::new(config, client).map(drop)
+        });
+    }
+
+    #[test]
+    fn mdns_event_capacity_bounds() {
+        assert_event_capacity_bounds("mdns", |capacity| {
+            let mut config = MdnsDiscoveryConfig::new("capacity-test");
+            config.event_capacity = capacity;
+            MdnsDiscovery::new(config).map(drop)
+        });
+    }
+
+    #[tokio::test]
+    async fn dns_srv_event_capacity_bounds() {
+        assert_event_capacity_bounds("dns-srv", |capacity| {
+            let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+            config.event_capacity = capacity;
+            DnsSrvDiscovery::new(config).map(drop)
+        });
+    }
+
+    #[test]
+    fn file_event_capacity_bounds() {
+        assert_event_capacity_bounds("file", |capacity| {
+            let mut config = FileWatchDiscoveryConfig::new("unused-capacity-test-peers");
+            config.event_capacity = capacity;
+            FileWatchDiscovery::new(config).map(drop)
+        });
+    }
+
+    #[test]
+    fn static_try_event_capacity_bounds() {
+        let peers = vec![
+            "peer-b:9000".into(),
+            "peer-a:9000".into(),
+            "peer-b:9000".into(),
+        ];
+        assert_event_capacity_bounds("static", |capacity| {
+            StaticDiscovery::try_with_event_capacity(peers.clone(), capacity).map(|provider| {
+                assert_eq!(provider.snapshot().peers(), peers);
+            })
+        });
+    }
+
+    #[tokio::test]
+    async fn static_legacy_event_capacity_normalizes_extremes_and_preserves_peers() {
+        let peers = vec![
+            "peer-b:9000".into(),
+            "peer-a:9000".into(),
+            "peer-b:9000".into(),
+        ];
+        for (capacity, normalized) in [
+            (0, 1),
+            (1, 1),
+            (MAX_DISCOVERY_EVENT_CAPACITY, MAX_DISCOVERY_EVENT_CAPACITY),
+            (
+                MAX_DISCOVERY_EVENT_CAPACITY + 1,
+                MAX_DISCOVERY_EVENT_CAPACITY,
+            ),
+            (usize::MAX, MAX_DISCOVERY_EVENT_CAPACITY),
+        ] {
+            let provider = StaticDiscovery::with_event_capacity(peers.clone(), capacity);
+            let mut events = provider.watch().await.unwrap();
+            assert_eq!(provider.discover().await.unwrap().peers(), peers);
+            assert_eq!(events.snapshot().peers(), peers);
+            // Static providers never publish in production. Inject events here
+            // to verify the actual allocated channel bound, not just no panic.
+            for revision in 1..=normalized + 1 {
+                provider
+                    .event_tx
+                    .send(DiscoveryEvent {
+                        revision: revision as u64,
+                        change: DiscoveryChange::Replaced(Vec::new()),
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                events.recv().await,
+                Err(DiscoveryError::WatchOverflow { missed: 1 })
+            );
+        }
+    }
 
     #[test]
     fn runtime_factory_composes_explicit_peers_with_dynamic_discovery() {

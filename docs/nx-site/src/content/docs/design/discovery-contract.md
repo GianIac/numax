@@ -91,6 +91,17 @@ that a missing-history gap can be repaired.
 
 ## Bounded event delivery
 
+The public Rust constant `MAX_DISCOVERY_EVENT_CAPACITY` is 4096; the default
+`DEFAULT_DISCOVERY_EVENT_CAPACITY` remains 128. Both are exported from
+`nx_core::discovery` and the `nx_core` crate root. All four dynamic provider
+constructors validate `event_capacity` in `1..=4096` before channel/state
+allocation, spawning or provider I/O, returning
+`DiscoveryError::InvalidConfiguration` outside that range. The bound is on
+event slots, not on total process memory or the aggregate candidate snapshot.
+Tokio broadcast channels may round the requested capacity up to a power of
+two; the common maximum still bounds that rounded capacity. mDNS also uses
+the validated capacity for its bounded announcement-request channel.
+
 Watch delivery is bounded. A provider must not grow an unbounded queue when a
 consumer is slow. If changes exceed the available capacity, overflow is exposed
 to the consumer as an explicit provider error rather than silently dropping
@@ -119,10 +130,31 @@ calls every provider shutdown hook during normal shutdown and partial-startup
 rollback. Provider operations have a finite timeout so a stuck implementation
 cannot keep runtime shutdown alive indefinitely.
 
-`shutdown()` is idempotent. After shutdown, a provider cannot be restarted.
-Dropping a provider is also a cancellation boundary: implementations that own
-background work signal or abort it rather than leaving detached discovery
-activity alive.
+`request_shutdown()` makes a dynamic provider permanently stopped; subsequent
+`shutdown()` calls wait for the same owned completion and can report the same
+failure. Explicit shutdown is terminal, not a restart request. Dropping a
+shutdown waiter does not cancel generation cleanup. Dropping the provider
+signals cancellation; the supervisor owns bounded cleanup while the runtime
+remains alive. Runtime teardown is not a guarantee of external withdrawal.
+
+Unexpected worker exit is different from explicit shutdown. The supervisor
+joins the worker, clears its stale view, invalidates existing watches and
+completes provider-specific cleanup before admitting any replacement generation.
+Watch invalidation or a finished worker alone is not a restart barrier. During
+finalization, a fresh `discover()` or `watch()` fails rather than subscribing to
+the exited producer. After successful cleanup, a later operation may start one
+new generation if the worker outcome permits recovery (including a worker
+panic or retryable error); a fatal worker error blocks restart. A cleanup error
+or panic also blocks restart, even when that cleanup error is marked retryable.
+Concurrent subscribers share restart admission rather than starting overlapping
+generations. Worker errors and panics remain observable during shutdown, even
+when they race a stop request.
+
+Bootstrap and mDNS retain desired announcement intent across recoverable
+unexpected exits, but do not retain stale candidate views. Explicit shutdown
+clears that intent, including when requested after unexpected finalization.
+Successful cleanup means the provider's local cleanup contract completed; it
+does not imply that every remote peer received a withdrawal or goodbye.
 
 ## Provider contracts
 
@@ -136,6 +168,15 @@ sources are combined.
 peers. It performs no I/O, never refreshes or expires entries, preserves the
 input list byte-for-byte, and does not support announcements. An empty list is
 valid.
+
+`StaticDiscovery::with_event_capacity(peers, capacity)` remains infallible and
+clamps capacity to `[1, 4096]`: zero becomes one, and values above the maximum
+(including `usize::MAX`) become 4096. It does not truncate or reorder peers or
+remove duplicates. `StaticDiscovery::try_with_event_capacity(peers, capacity)`
+is the strict alternative: it returns `Result<Self, DiscoveryError>` and rejects
+zero or values above `MAX_DISCOVERY_EVENT_CAPACITY` with
+`InvalidConfiguration` before channel allocation. Valid inputs preserve the
+same peer snapshot semantics. Static discovery has no dynamic worker lifecycle.
 
 ### BootstrapGossipDiscovery
 
@@ -165,10 +206,22 @@ remaining seeds in the refresh pass.
 Probe failures use exponential retry bounded by `retry_initial` and
 `retry_max`; a success restores `refresh_interval`. Fatal wire failures such as
 protocol mismatch or bootstrap request rejection disable that seed for the
-provider lifetime. Bootstrap announcement support is required. Shutdown stops
-and joins the probe loop, performs bounded best-effort withdrawal from every
-seed that accepted the announcement, and clears the local view. An unreachable
-seed retains at most its bounded advertisement lease.
+current worker generation. Bootstrap announcement support is required. A seed
+is tracked conservatively for withdrawal before an advertising query is
+awaited: the seed may have accepted the endpoint even if the response is lost,
+decoding fails, or the query is cancelled. Tracking is therefore not restricted
+to acknowledged successful announcements and is bounded by the configured
+seed list.
+
+Cleanup stops and joins the probe loop, then attempts withdrawal from tracked
+seeds within a shared four-second budget, dividing the remaining time among
+remaining seeds. This is **bounded best effort**, not guaranteed delivery to
+every seed: query failures and timeouts are logged, the budget may expire, and
+an `Ok(())` cleanup result does not prove remote withdrawal. Local tracking and
+the candidate view are cleared even after a worker panic or a cancelled
+shutdown waiter. A seed that misses withdrawal can retain the advertisement
+until its bounded lease expires. This best-effort bootstrap contract is distinct
+from mDNS's checked daemon-acknowledgement cleanup below.
 
 The seed authenticates the requester before caching its advertisement, and the
 client authenticates the responding seed according to the normal TLS and
@@ -357,7 +410,12 @@ cancellation-safe shutdown. Provider-specific tests additionally cover:
 Regression coverage also exercises observation freshness versus cached replay,
 resubscription timestamps, global mDNS retained-state bounds, bounded shutdown
 acknowledgements, non-blocking startup dialing and anti-entropy over active
-connections independently of discovery churn. Test presence is not evidence
+connections independently of discovery churn. Capacity tests cover the accepted
+maximum, rejection of zero, maximum-plus-one and `usize::MAX`, legacy static
+normalization with ordered duplicate peers, and defensive internal channel
+rotation. Lifecycle tests cover delayed cleanup as a restart barrier, worker
+and cleanup panics, concurrent resubscription, and terminal explicit shutdown.
+Test presence is not evidence
 that every environment-dependent scenario has run successfully.
 
 The ignored

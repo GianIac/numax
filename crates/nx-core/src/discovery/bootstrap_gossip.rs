@@ -6,17 +6,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nx_net::{BootstrapClient, BootstrapClientConfig, BootstrapRequest, NetError, WireRetryPolicy};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::dynamic::{
-    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
-    validate_durations,
-};
+use super::dynamic::{DynamicState, ProviderTask, checked_deadline, validate_durations};
 use super::{
     AnnouncementSupport, DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY,
     DEFAULT_MAX_PEER_CANDIDATES, DiscoveryError, DiscoverySnapshot, DiscoveryWatch,
-    PeerAnnouncement, PeerDiscovery,
+    PeerAnnouncement, PeerDiscovery, validate_event_capacity,
 };
 
 const PROVIDER: &str = "bootstrap";
@@ -38,6 +34,8 @@ pub struct BootstrapGossipDiscoveryConfig {
     pub stale_after: Duration,
     pub max_seeds: usize,
     pub max_candidates: usize,
+    /// Event channel capacity in `1..=super::MAX_DISCOVERY_EVENT_CAPACITY`.
+    /// Defaults to [`DEFAULT_DISCOVERY_EVENT_CAPACITY`]; validated by the provider constructor.
     pub event_capacity: usize,
 }
 
@@ -60,8 +58,7 @@ impl BootstrapGossipDiscoveryConfig {
 struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
-    task: Option<JoinHandle<()>>,
-    cleanup: Option<OwnedShutdown>,
+    task: Option<ProviderTask>,
 }
 
 struct Inner {
@@ -81,9 +78,6 @@ impl Drop for Inner {
             .unwrap_or_else(|error| error.into_inner());
         if let Some(shutdown) = lifecycle.shutdown.take() {
             let _ = shutdown.send(true);
-        }
-        if let Some(task) = lifecycle.task.take() {
-            task.abort();
         }
     }
 }
@@ -133,7 +127,6 @@ impl BootstrapGossipDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
-                    cleanup: None,
                 }),
             }),
         })
@@ -148,7 +141,9 @@ impl BootstrapGossipDiscovery {
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
-        if lifecycle.task.is_some() {
+        if let Some(task) = lifecycle.task.as_ref()
+            && task.running(PROVIDER, &self.inner.state)?
+        {
             return Ok(());
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -157,20 +152,40 @@ impl BootstrapGossipDiscovery {
         let state = Arc::clone(&self.inner.state);
         let announcement_rx = self.inner.announcement_tx.subscribe();
         let announced_seeds = Arc::clone(&self.inner.announced_seeds);
+        let mut cleanup = BootstrapCleanup {
+            client: self.inner.client.clone(),
+            cluster_id: self.inner.config.cluster_id.clone(),
+            announcement_tx: self.inner.announcement_tx.clone(),
+            announced_seeds: Arc::clone(&self.inner.announced_seeds),
+            state: Arc::clone(&self.inner.state),
+            preserve_announcement: true,
+        };
+        let cleanup_shutdown = shutdown_rx.clone();
         lifecycle.shutdown = Some(shutdown);
-        lifecycle.task = Some(tokio::spawn(async move {
-            let cleanup = ClearStateOnDrop(state.clone());
-            run_bootstrap(
-                config,
-                client,
-                state,
-                announcement_rx,
-                announced_seeds,
-                shutdown_rx,
-            )
-            .await;
-            drop(cleanup);
-        }));
+        lifecycle.task = Some(ProviderTask::spawn(
+            PROVIDER,
+            state.clone(),
+            shutdown_rx.clone(),
+            async move {
+                run_bootstrap(
+                    config,
+                    client,
+                    state,
+                    announcement_rx,
+                    announced_seeds,
+                    shutdown_rx,
+                )
+                .await;
+                Ok(())
+            },
+            move || async move {
+                let result = cleanup.withdraw().await;
+                cleanup.preserve_announcement =
+                    !*cleanup_shutdown.borrow() && cleanup_shutdown.has_changed().is_ok();
+                drop(cleanup);
+                result
+            },
+        ));
         Ok(())
     }
 }
@@ -208,7 +223,7 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
 
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError> {
         self.ensure_started()?;
-        Ok(self.inner.state.watch())
+        self.inner.state.live_watch()
     }
 
     fn request_shutdown(&self) {
@@ -225,51 +240,33 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let result = {
-            let mut lifecycle = self
+        let task = {
+            let lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            lifecycle.shutdown.take();
-            let task = lifecycle.task.take().map(AbortOnDropTask::new);
-            lifecycle
-                .cleanup
-                .get_or_insert_with(|| {
-                    let cleanup = BootstrapCleanup {
-                        client: self.inner.client.clone(),
-                        cluster_id: self.inner.config.cluster_id.clone(),
-                        announcement_tx: self.inner.announcement_tx.clone(),
-                        announced_seeds: Arc::clone(&self.inner.announced_seeds),
-                        state: Arc::clone(&self.inner.state),
-                    };
-                    OwnedShutdown::new(async move {
-                        let joined = match task {
-                            Some(task) => task.join().await.map_err(|error| {
-                                provider_error(format!("probe task failed: {error}"), false)
-                            }),
-                            None => Ok(()),
-                        };
-                        let withdrawn = cleanup.withdraw().await;
-                        drop(cleanup);
-                        joined.and(withdrawn)
-                    })
-                })
-                .subscribe()
+            lifecycle.task.clone()
         };
-        OwnedShutdown::wait(result, PROVIDER).await
+        let result = match task {
+            Some(task) => task.join().await,
+            None => Ok(()),
+        };
+        self.inner.announcement_tx.send_replace(None);
+        result
     }
 }
 
-struct BootstrapCleanup {
-    client: BootstrapClient,
+struct BootstrapCleanup<C: SeedClient = BootstrapClient> {
+    preserve_announcement: bool,
+    client: C,
     cluster_id: String,
     announcement_tx: watch::Sender<Option<String>>,
     announced_seeds: Arc<StdMutex<HashSet<String>>>,
     state: Arc<DynamicState>,
 }
 
-impl BootstrapCleanup {
+impl<C: SeedClient> BootstrapCleanup<C> {
     async fn withdraw(&self) -> Result<(), DiscoveryError> {
         if self.announcement_tx.borrow().is_some() {
             let announced_seeds = self
@@ -317,13 +314,15 @@ impl BootstrapCleanup {
     }
 }
 
-impl Drop for BootstrapCleanup {
+impl<C: SeedClient> Drop for BootstrapCleanup<C> {
     fn drop(&mut self) {
         self.announced_seeds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        self.announcement_tx.send_replace(None);
+        if !self.preserve_announcement {
+            self.announcement_tx.send_replace(None);
+        }
         self.state.replace(Vec::new());
     }
 }
@@ -420,6 +419,9 @@ async fn run_bootstrap(
         .collect();
 
     loop {
+        if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
+            return;
+        }
         let announcement = announcement_rx.borrow_and_update().clone();
         for (seed, schedule) in config.seeds.iter().zip(&mut schedules) {
             if schedule
@@ -432,6 +434,12 @@ async fn run_bootstrap(
                 BootstrapRequest::new(config.cluster_id.clone(), config.max_candidates);
             if let Some(endpoint) = &announcement {
                 request = request.with_advertised_endpoint(endpoint.clone());
+                // Sending may apply the announcement even when the response
+                // is lost, the query is cancelled, or decoding fails.
+                announced_seeds
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(seed.clone());
             }
             let Some(result) = await_query_with_expiry(
                 client.query(seed, request),
@@ -447,12 +455,6 @@ async fn run_bootstrap(
             match result {
                 Ok(response) => {
                     schedule.retry_delay = config.retry_initial;
-                    if announcement.is_some() {
-                        announced_seeds
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .insert(seed.clone());
-                    }
                     let now = Instant::now();
                     let deadlines = seed_deadlines(now, &config, response.candidate_ttl);
                     let (refresh, expires_at) = match deadlines {
@@ -545,6 +547,9 @@ where
 {
     tokio::pin!(query);
     loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return None;
+        }
         let next_expiry = views.values().map(|view| view.expires_at).min();
         tokio::select! {
             changed = shutdown.changed() => {
@@ -632,6 +637,7 @@ fn bootstrap_retry_after(error: &NetError) -> Option<Duration> {
 }
 
 fn validate_config(config: &BootstrapGossipDiscoveryConfig) -> Result<(), DiscoveryError> {
+    validate_event_capacity(PROVIDER, config.event_capacity)?;
     if config.seeds.is_empty() {
         return Err(invalid("at least one bootstrap seed is required"));
     }
@@ -651,7 +657,6 @@ fn validate_config(config: &BootstrapGossipDiscoveryConfig) -> Result<(), Discov
         || config.max_seeds == 0
         || config.max_candidates == 0
         || config.max_candidates > nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY
-        || config.event_capacity == 0
     {
         return Err(invalid("intervals and limits are inconsistent"));
     }
@@ -765,7 +770,7 @@ mod tests {
         assert!(seed_deadlines(now, &config, Duration::from_secs(1)).is_err());
     }
 
-    async fn assert_panicked_shutdown_withdraws(cancel_first_wait: bool) {
+    async fn assert_panicked_shutdown_withdraws(restart: bool) {
         let seed = Node::try_new(
             NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
                 .with_bootstrap_server(BootstrapServerConfig::new("default").unwrap()),
@@ -775,6 +780,7 @@ mod tests {
         seed.announce_bootstrap_endpoint(bound.clone()).unwrap();
         let mut config = BootstrapGossipDiscoveryConfig::new(vec![bound.clone()]);
         config.max_candidates = 4;
+        config.refresh_interval = Duration::from_millis(10);
         let provider = BootstrapGossipDiscovery::new(
             config,
             BootstrapClientConfig::new(NodeId::new("client")),
@@ -800,60 +806,72 @@ mod tests {
             .unwrap();
         assert!(before.endpoints.contains(&advertised.to_string()));
 
-        // Stop the real probe before replacing only its join handle with a
-        // deterministic panic. The real seed still retains the announcement.
-        provider.request_shutdown();
-        let probe = provider
+        let old = provider
             .inner
             .lifecycle
             .lock()
             .unwrap()
             .task
-            .take()
+            .clone()
             .unwrap();
-        probe.await.unwrap();
-        provider.inner.state.observe(vec![bound.clone()]);
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async move {
-            released.await.unwrap();
-            panic!("injected bootstrap probe panic");
-        }));
-        if cancel_first_wait {
-            let mut shutdown = Box::pin(provider.shutdown());
-            std::future::poll_fn(|cx| {
-                assert!(shutdown.as_mut().poll(cx).is_pending());
-                std::task::Poll::Ready(())
-            })
-            .await;
-            drop(shutdown);
-        }
-        release.send(()).unwrap();
-        if cancel_first_wait {
-            // Cleanup must finish without a second shutdown call restarting it.
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !provider.inner.state.snapshot().peers().is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-        }
-        let result = tokio::time::timeout(Duration::from_secs(5), provider.shutdown())
+        provider.inner.state.panic_on_next_observation();
+        super::super::dynamic::assert_invalidated(&mut events).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), old.clone().join())
             .await
             .unwrap();
         assert!(
             matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
-            if message.contains("probe task failed"))
+            if message.contains("provider task failed") && message.contains("panic"))
         );
         assert!(provider.inner.state.snapshot().peers().is_empty());
         assert!(provider.inner.state.watch().snapshot().peers().is_empty());
-        assert!(provider.inner.announcement_tx.borrow().is_none());
         assert!(provider.inner.announced_seeds.lock().unwrap().is_empty());
         let after = observer
             .query(&bound, BootstrapRequest::new("default", 4))
             .await
             .unwrap();
-        assert_eq!(after.endpoints, [bound]);
+        assert_eq!(after.endpoints, std::slice::from_ref(&bound));
+        if restart {
+            let (first, second) = tokio::join!(provider.watch(), provider.watch());
+            let mut first = first.unwrap();
+            second.unwrap();
+            let current = provider
+                .inner
+                .lifecycle
+                .lock()
+                .unwrap()
+                .task
+                .clone()
+                .unwrap();
+            assert!(!old.same_generation(&current));
+            provider.watch().await.unwrap();
+            assert!(
+                current.same_generation(
+                    provider
+                        .inner
+                        .lifecycle
+                        .lock()
+                        .unwrap()
+                        .task
+                        .as_ref()
+                        .unwrap()
+                )
+            );
+            tokio::time::timeout(Duration::from_secs(2), first.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let renewed = observer
+                .query(&bound, BootstrapRequest::new("default", 4))
+                .await
+                .unwrap();
+            assert!(renewed.endpoints.contains(&advertised.to_string()));
+            provider.shutdown().await.unwrap();
+        } else {
+            assert!(provider.shutdown().await.is_err());
+        }
+        assert!(provider.watch().await.is_err());
+        assert!(provider.inner.announcement_tx.borrow().is_none());
         seed.shutdown().await;
     }
 
@@ -863,8 +881,217 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_shutdown_wait_keeps_withdrawal_owned_and_reports_panic() {
+    async fn panic_invalidates_and_concurrent_subscribers_restart_one_bootstrap_generation() {
         assert_panicked_shutdown_withdraws(true).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum AnnouncementAck {
+        Pending,
+        Panic,
+        Lost,
+    }
+
+    #[derive(Clone)]
+    struct AppliedWithoutAck {
+        applied: Arc<StdMutex<Option<String>>>,
+        calls: tokio::sync::mpsc::Sender<&'static str>,
+        withdrawal_ack: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        announcement_ack: AnnouncementAck,
+    }
+
+    #[async_trait]
+    impl SeedClient for AppliedWithoutAck {
+        async fn query(
+            &self,
+            _seed: &str,
+            request: BootstrapRequest,
+        ) -> Result<nx_net::BootstrapResponse, NetError> {
+            if let Some(endpoint) = request.advertised_endpoint {
+                *self.applied.lock().unwrap() = Some(endpoint);
+                self.calls.send("applied-without-ack").await.unwrap();
+                return match self.announcement_ack {
+                    AnnouncementAck::Pending => pending().await,
+                    AnnouncementAck::Panic => panic!("injected probe panic after seed application"),
+                    AnnouncementAck::Lost => Err(NetError::Timeout),
+                };
+            }
+            self.applied.lock().unwrap().take();
+            self.calls.send("withdrawal-applied").await.unwrap();
+            if let Some(ack) = self.withdrawal_ack.lock().await.take() {
+                ack.await.unwrap();
+            }
+            Ok(nx_net::BootstrapResponse {
+                seed_node_id: NodeId::new("seed"),
+                endpoints: Vec::new(),
+                candidate_ttl: Duration::from_secs(30),
+            })
+        }
+    }
+
+    async fn assert_lost_ack_is_withdrawn(announcement_ack: AnnouncementAck, drop_provider: bool) {
+        let panic = matches!(announcement_ack, AnnouncementAck::Panic);
+        let mut config = BootstrapGossipDiscoveryConfig::new(vec!["seed:9000".into()]);
+        config.max_candidates = 4;
+        let provider = BootstrapGossipDiscovery::new(
+            config.clone(),
+            BootstrapClientConfig::new(NodeId::new("client")),
+        )
+        .unwrap();
+        provider
+            .announce(&PeerAnnouncement {
+                endpoint: "local:9000".into(),
+            })
+            .await
+            .unwrap();
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(8);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let client = AppliedWithoutAck {
+            applied: Arc::new(StdMutex::new(None)),
+            calls,
+            withdrawal_ack: Arc::new(tokio::sync::Mutex::new(Some(released))),
+            announcement_ack,
+        };
+        let cleanup = BootstrapCleanup {
+            client: client.clone(),
+            cluster_id: config.cluster_id.clone(),
+            announcement_tx: provider.inner.announcement_tx.clone(),
+            announced_seeds: provider.inner.announced_seeds.clone(),
+            state: provider.inner.state.clone(),
+            preserve_announcement: false,
+        };
+        let (stop, stop_rx) = watch::channel(false);
+        // A full prior view must be cleared even if query panics before any ACK.
+        provider.inner.state.observe(vec!["cached:9000".into()]);
+        let mut events = provider.inner.state.watch();
+        let state = provider.inner.state.clone();
+        let announcement = provider.inner.announcement_tx.subscribe();
+        let seeds = provider.inner.announced_seeds.clone();
+        let worker_client = client.clone();
+        let task = ProviderTask::spawn(
+            PROVIDER,
+            state.clone(),
+            stop_rx.clone(),
+            async move {
+                run_bootstrap(config, worker_client, state, announcement, seeds, stop_rx).await;
+                Ok(())
+            },
+            move || async move { cleanup.withdraw().await },
+        );
+        let completion = task.clone();
+        {
+            let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
+            lifecycle.shutdown = Some(stop);
+            lifecycle.task = Some(task);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert_eq!(call_rx.recv().await, Some("applied-without-ack"));
+            assert!(provider.inner.announced_seeds.lock().unwrap().contains("seed:9000"));
+            if panic {
+                super::super::dynamic::assert_invalidated(&mut events).await;
+            } else {
+                assert_eq!(client.applied.lock().unwrap().as_deref(), Some("local:9000"));
+            }
+            if matches!(announcement_ack, AnnouncementAck::Lost) {
+                // Publication follows processing the failed query. The seed
+                // must remain tracked even after the timeout result is handled.
+                assert!(super::super::observed_peers(events.recv().await.unwrap().change).is_empty());
+                assert!(provider.inner.announced_seeds.lock().unwrap().contains("seed:9000"));
+            }
+            if drop_provider {
+                let state = provider.inner.state.clone();
+                let seeds = provider.inner.announced_seeds.clone();
+                let announcement = provider.inner.announcement_tx.clone();
+                drop(provider);
+                assert_eq!(call_rx.recv().await, Some("withdrawal-applied"));
+                assert!(!completion.completion_ready());
+                release.send(()).unwrap();
+                completion.join().await.unwrap();
+                assert!(client.applied.lock().unwrap().is_none());
+                assert!(state.snapshot().peers().is_empty());
+                assert!(seeds.lock().unwrap().is_empty());
+                assert!(announcement.borrow().is_none());
+                return;
+            }
+            let mut waiter = Box::pin(provider.shutdown());
+            std::future::poll_fn(|cx| {
+                assert!(waiter.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            }).await;
+            assert_eq!(call_rx.recv().await, Some("withdrawal-applied"));
+            drop(waiter);
+            assert!(!completion.completion_ready());
+            // The seed applied withdrawal; only its ACK is deliberately held.
+            assert!(client.applied.lock().unwrap().is_none());
+            release.send(()).unwrap();
+            let result = completion.join().await;
+            if panic {
+                assert!(matches!(result, Err(DiscoveryError::Provider { message, .. }) if message.contains("panic")));
+                assert!(provider.shutdown().await.is_err());
+            } else {
+                result.unwrap();
+                provider.shutdown().await.unwrap();
+            }
+            assert!(provider.inner.state.snapshot().peers().is_empty());
+            assert!(provider.inner.announced_seeds.lock().unwrap().is_empty());
+            assert!(provider.inner.announcement_tx.borrow().is_none());
+            assert!(call_rx.try_recv().is_err());
+            assert!(provider.watch().await.is_err());
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_announcement_ack_is_withdrawn_after_cancelled_shutdown_wait() {
+        assert_lost_ack_is_withdrawn(AnnouncementAck::Pending, false).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_announcement_ack_keeps_seed_tracked_for_withdrawal() {
+        assert_lost_ack_is_withdrawn(AnnouncementAck::Lost, false).await;
+    }
+
+    #[tokio::test]
+    async fn panic_after_seed_application_still_withdraws_without_announcement_ack() {
+        assert_lost_ack_is_withdrawn(AnnouncementAck::Panic, false).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_provider_still_withdraws_an_announcement_without_ack() {
+        assert_lost_ack_is_withdrawn(AnnouncementAck::Pending, true).await;
+    }
+
+    #[tokio::test]
+    async fn missing_withdrawal_ack_remains_bounded_best_effort_and_idempotent() {
+        let (calls, mut call_rx) = tokio::sync::mpsc::channel(8);
+        let (_release, released) = tokio::sync::oneshot::channel();
+        let client = AppliedWithoutAck {
+            applied: Arc::new(StdMutex::new(Some("local:9000".into()))),
+            calls,
+            withdrawal_ack: Arc::new(tokio::sync::Mutex::new(Some(released))),
+            announcement_ack: AnnouncementAck::Pending,
+        };
+        let (announcement_tx, _) = watch::channel(Some("local:9000".into()));
+        let cleanup = BootstrapCleanup {
+            client: client.clone(),
+            cluster_id: "default".into(),
+            announcement_tx,
+            announced_seeds: Arc::new(StdMutex::new(HashSet::from(["seed:9000".into()]))),
+            state: Arc::new(DynamicState::new(8)),
+            preserve_announcement: false,
+        };
+        tokio::time::timeout(
+            SHUTDOWN_WITHDRAWAL_BUDGET + Duration::from_secs(1),
+            cleanup.withdraw(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(call_rx.recv().await, Some("withdrawal-applied"));
+        assert!(client.applied.lock().unwrap().is_none());
+        // Repeating removal of the same NodeId remains harmless.
+        cleanup.withdraw().await.unwrap();
+        assert_eq!(call_rx.recv().await, Some("withdrawal-applied"));
+        assert!(client.applied.lock().unwrap().is_none());
     }
 
     struct ControlledClient {
@@ -1141,6 +1368,11 @@ mod tests {
             vec![bound.to_string()]
         );
         provider.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.inner.announced_seeds.lock().unwrap().is_empty());
+        assert!(provider.inner.announcement_tx.borrow().is_none());
+        assert!(provider.watch().await.is_err());
 
         let observer =
             BootstrapClient::new(BootstrapClientConfig::new(NodeId::new("observer"))).unwrap();

@@ -193,5 +193,5 @@ nx-sdk ────────────────────────�
 ## Where to go next
 
 - [Host API](/numax/reference/host-api/) - the functions `nx-sdk` calls and `nx-core` implements
-- [Configuration](/numax/reference/configuration/) - how `nx-cli` resolves config before passing it to `nx-core`
+- [Configuration](/numax/reference/config/) - how `nx-cli` resolves config before passing it to `nx-core`
 - [CLI](/numax/reference/cli/) - the user-facing `nx` command surface

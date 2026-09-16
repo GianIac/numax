@@ -437,7 +437,7 @@ mode = "static"
 
 Provider selectors are `seeds` for bootstrap, `instance_name` for mDNS,
 `service_name` for DNS-SRV, and `path` for file discovery. See the
-[configuration reference](/numax/reference/configuration/) for all tuning fields and environment variables.
+[configuration reference](/numax/reference/config/) for all tuning fields and environment variables.
 
 ---
 

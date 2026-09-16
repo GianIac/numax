@@ -7,16 +7,13 @@ use hickory_resolver::net::{DnsError, NetError as DnsNetError};
 use hickory_resolver::proto::rr::rdata::SRV;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::dynamic::{
-    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
-    validate_durations,
-};
+use super::dynamic::{DynamicState, ProviderTask, checked_deadline, validate_durations};
 use super::{
     DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY, DEFAULT_MAX_PEER_CANDIDATES,
     DiscoveryError, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement, PeerDiscovery,
+    validate_event_capacity,
 };
 
 const PROVIDER: &str = "dns-srv";
@@ -31,6 +28,8 @@ pub struct DnsSrvDiscoveryConfig {
     pub retry_interval: Duration,
     pub max_refresh_interval: Duration,
     pub max_candidates: usize,
+    /// Event channel capacity in `1..=super::MAX_DISCOVERY_EVENT_CAPACITY`.
+    /// Defaults to [`DEFAULT_DISCOVERY_EVENT_CAPACITY`]; validated by the provider constructor.
     pub event_capacity: usize,
 }
 
@@ -70,8 +69,7 @@ impl SrvResolver for HickorySrvResolver {
 struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
-    task: Option<JoinHandle<()>>,
-    cleanup: Option<OwnedShutdown>,
+    task: Option<ProviderTask>,
 }
 
 struct Inner {
@@ -89,9 +87,6 @@ impl Drop for Inner {
             .unwrap_or_else(|error| error.into_inner());
         if let Some(shutdown) = lifecycle.shutdown.take() {
             let _ = shutdown.send(true);
-        }
-        if let Some(task) = lifecycle.task.take() {
-            task.abort();
         }
     }
 }
@@ -133,7 +128,6 @@ impl DnsSrvDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
-                    cleanup: None,
                 }),
             }),
         }
@@ -148,7 +142,9 @@ impl DnsSrvDiscovery {
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
-        if lifecycle.task.is_some() {
+        if let Some(task) = lifecycle.task.as_ref()
+            && task.running(PROVIDER, &self.inner.state)?
+        {
             return Ok(());
         }
 
@@ -157,13 +153,13 @@ impl DnsSrvDiscovery {
         let resolver = self.inner.resolver.clone();
         let state = Arc::clone(&self.inner.state);
         lifecycle.shutdown = Some(shutdown);
-        lifecycle.task = Some(tokio::spawn(async move {
-            let cleanup = ClearStateOnDrop(state.clone());
-            if let Err(error) = run_dns_refresh(config, resolver, state, shutdown_rx).await {
-                tracing::error!(%error, "DNS-SRV discovery stopped");
-            }
-            drop(cleanup);
-        }));
+        lifecycle.task = Some(ProviderTask::spawn(
+            PROVIDER,
+            state.clone(),
+            shutdown_rx.clone(),
+            run_dns_refresh(config, resolver, state, shutdown_rx),
+            || async { Ok(()) },
+        ));
         Ok(())
     }
 }
@@ -188,7 +184,7 @@ impl PeerDiscovery for DnsSrvDiscovery {
 
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError> {
         self.ensure_started().await?;
-        Ok(self.inner.state.watch())
+        self.inner.state.live_watch()
     }
 
     fn request_shutdown(&self) {
@@ -205,32 +201,18 @@ impl PeerDiscovery for DnsSrvDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let result = {
-            let mut lifecycle = self
+        let task = {
+            let lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            lifecycle.shutdown.take();
-            let task = lifecycle.task.take().map(AbortOnDropTask::new);
-            lifecycle
-                .cleanup
-                .get_or_insert_with(|| {
-                    let cleanup = ClearStateOnDrop(Arc::clone(&self.inner.state));
-                    OwnedShutdown::new(async move {
-                        let joined = match task {
-                            Some(task) => task.join().await.map_err(|error| {
-                                provider_error(format!("refresh task failed: {error}"), false)
-                            }),
-                            None => Ok(()),
-                        };
-                        drop(cleanup);
-                        joined
-                    })
-                })
-                .subscribe()
+            lifecycle.task.clone()
         };
-        OwnedShutdown::wait(result, PROVIDER).await
+        match task {
+            Some(task) => task.join().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -243,6 +225,9 @@ async fn run_dns_refresh(
     let mut valid_until = None;
     let mut next_refresh = Instant::now();
     loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Ok(());
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break; }
@@ -420,6 +405,7 @@ fn records_to_peers(mut records: Vec<SRV>, max_candidates: usize) -> Vec<String>
 }
 
 fn validate_config(config: &DnsSrvDiscoveryConfig) -> Result<(), DiscoveryError> {
+    validate_event_capacity(PROVIDER, config.event_capacity)?;
     if !config.service_name.ends_with('.') {
         return Err(invalid(
             "service_name must be a fully-qualified name ending with '.'",
@@ -454,7 +440,6 @@ fn validate_config(config: &DnsSrvDiscoveryConfig) -> Result<(), DiscoveryError>
     if config.retry_interval.is_zero()
         || config.max_refresh_interval.is_zero()
         || config.max_candidates == 0
-        || config.event_capacity == 0
     {
         return Err(invalid("intervals and limits must be greater than zero"));
     }
@@ -569,29 +554,145 @@ mod tests {
 
     #[tokio::test]
     async fn panicked_refresh_is_reported_after_clearing_snapshot() {
-        let provider = DnsSrvDiscovery::with_resolver(
-            DnsSrvDiscoveryConfig::new("_numax._tcp.example."),
-            Arc::new(PendingResolver),
-        );
-        provider
-            .inner
-            .state
-            .observe(vec!["cached.example:9000".into()]);
-        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async {
-            panic!("injected DNS refresh panic");
-        }));
+        let (provider, mut events) = panic_provider().await;
+        super::super::dynamic::assert_invalidated(&mut events).await;
         let result = provider.shutdown().await;
         assert!(
             matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
-            if message.contains("refresh task failed"))
+            if message.contains("provider task failed") && message.contains("panic"))
         );
         assert!(provider.inner.state.snapshot().peers().is_empty());
         assert!(provider.inner.state.watch().snapshot().peers().is_empty());
+        assert!(provider.watch().await.is_err());
+    }
+
+    async fn panic_provider() -> (DnsSrvDiscovery, DiscoveryWatch) {
+        let record = SRV::new(0, 0, 9000, Name::from_ascii("cached.example.").unwrap());
+        let resolver = Arc::new(SequenceResolver {
+            steps: Mutex::new(VecDeque::from([
+                ResolverStep::Success(vec![record.clone()], Duration::from_secs(30)),
+                ResolverStep::Panic,
+                ResolverStep::Success(vec![record], Duration::from_secs(30)),
+            ])),
+        });
+        let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        config.max_refresh_interval = Duration::from_millis(10);
+        let provider = DnsSrvDiscovery::with_resolver(config, resolver);
+        let mut events = provider.watch().await.unwrap();
+        assert_eq!(
+            super::super::next_changed_peers(&mut events, &[]).await,
+            ["cached.example:9000"]
+        );
+        (provider, events)
+    }
+
+    #[tokio::test]
+    async fn panic_invalidates_and_concurrent_subscribers_restart_one_dns_generation() {
+        let (provider, mut events) = panic_provider().await;
+        let old = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        super::super::dynamic::assert_invalidated(&mut events).await;
+        assert!(old.clone().join().await.is_err());
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        let (first, second) = tokio::join!(provider.watch(), provider.watch());
+        let mut first = first.unwrap();
+        second.unwrap();
+        let current = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        assert!(!old.same_generation(&current));
+        provider.watch().await.unwrap();
+        assert!(
+            current.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            super::super::next_changed_peers(&mut first, &[]).await,
+            ["cached.example:9000"]
+        );
+        provider.shutdown().await.unwrap();
+        assert!(provider.watch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fatal_refresh_error_invalidates_but_does_not_restart() {
+        let record = SRV::new(0, 0, 9000, Name::from_ascii("cached.example.").unwrap());
+        let resolver = Arc::new(SequenceResolver {
+            steps: Mutex::new(VecDeque::from([
+                ResolverStep::Success(vec![record], Duration::from_secs(30)),
+                ResolverStep::Fatal,
+                ResolverStep::Panic,
+            ])),
+        });
+        let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
+        config.max_refresh_interval = Duration::from_millis(10);
+        let provider = DnsSrvDiscovery::with_resolver(config, resolver.clone());
+        let mut events = provider.watch().await.unwrap();
+        assert_eq!(
+            super::super::next_changed_peers(&mut events, &[]).await,
+            ["cached.example:9000"]
+        );
+        super::super::dynamic::assert_invalidated(&mut events).await;
+        let task = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        assert_eq!(
+            task.clone().join().await,
+            Err(provider_error("injected fatal resolver error", false))
+        );
+        assert!(matches!(
+            provider.watch().await,
+            Err(DiscoveryError::Provider {
+                retryable: false,
+                ..
+            })
+        ));
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(
+            task.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        assert_eq!(resolver.steps.lock().unwrap().len(), 1);
+        assert!(provider.shutdown().await.is_err());
     }
 
     enum ResolverStep {
         Success(Vec<SRV>, Duration),
         TransientFailure,
+        Panic,
+        Fatal,
     }
 
     struct SequenceResolver {
@@ -606,6 +707,10 @@ mod tests {
         ) -> Result<SrvAnswer, DiscoveryError> {
             let step = self.steps.lock().unwrap().pop_front();
             match step {
+                Some(ResolverStep::Panic) => panic!("injected DNS refresh panic"),
+                Some(ResolverStep::Fatal) => {
+                    Err(provider_error("injected fatal resolver error", false))
+                }
                 Some(ResolverStep::Success(records, ttl)) => Ok(SrvAnswer {
                     records,
                     valid_until: Instant::now() + ttl,
@@ -824,6 +929,40 @@ mod tests {
         );
 
         provider.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_clears_populated_snapshot_and_is_terminal() {
+        let resolver = Arc::new(SequenceResolver {
+            steps: Mutex::new(VecDeque::from([ResolverStep::Success(
+                vec![SRV::new(
+                    0,
+                    0,
+                    9000,
+                    Name::from_ascii("cached.example.").unwrap(),
+                )],
+                Duration::from_secs(30),
+            )])),
+        });
+        let provider = DnsSrvDiscovery::with_resolver(
+            DnsSrvDiscoveryConfig::new("_numax._tcp.example."),
+            resolver,
+        );
+        let mut events = provider.watch().await.unwrap();
+        assert_eq!(
+            super::super::next_changed_peers(&mut events, &[]).await,
+            ["cached.example:9000"]
+        );
+        provider.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(
+            super::super::next_changed_peers(&mut events, &["cached.example:9000".into()])
+                .await
+                .is_empty()
+        );
+        assert!(provider.watch().await.is_err());
+        assert!(provider.discover().await.is_err());
     }
 
     #[tokio::test]

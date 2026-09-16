@@ -19,16 +19,19 @@ const DISCOVERY_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const DISCOVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct CandidateContribution {
     expires_at: Option<StdInstant>,
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct CandidateRecord {
     sources: HashMap<String, CandidateContribution>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct CandidateRegistry {
     max_candidates: usize,
     order: Vec<String>,
@@ -36,6 +39,8 @@ struct CandidateRegistry {
     source_candidates: HashMap<String, Vec<String>>,
     records: HashMap<String, CandidateRecord>,
     local_endpoints: HashSet<String>,
+    #[cfg(test)]
+    order_rebuilds: usize,
 }
 
 impl CandidateRegistry {
@@ -53,6 +58,8 @@ impl CandidateRegistry {
             source_candidates: HashMap::new(),
             records: HashMap::new(),
             local_endpoints: HashSet::new(),
+            #[cfg(test)]
+            order_rebuilds: 0,
         })
     }
 
@@ -101,31 +108,26 @@ impl CandidateRegistry {
                 canonical.push(endpoint);
             }
         }
-        if canonical.len() > self.max_candidates {
-            return Err(configuration_error(
-                "coordinator",
-                format!(
-                    "discovery snapshot exceeds the {} candidate limit",
-                    self.max_candidates
-                ),
-            ));
-        }
-
-        let before = self.endpoints();
-        let mut updated = self.clone();
-        updated.register_source(source_id);
-        updated
-            .source_candidates
-            .insert(source_id.to_string(), canonical.clone());
-        let retained = canonical.iter().cloned().collect::<HashSet<_>>();
-        updated.remove_source_except(source_id, &retained);
-        for endpoint in canonical {
-            updated.add(source_id, endpoint, ttl, now)?;
-        }
-        updated.rebuild_order();
-        let changed = updated.endpoints() != before;
-        *self = updated;
-        Ok(changed)
+        // Empty, invalid-only and local-only snapshots do not acquire a lease.
+        let expires_at = match ttl {
+            Some(ttl)
+                if canonical
+                    .iter()
+                    .any(|peer| !self.local_endpoints.contains(peer)) =>
+            {
+                Some(now.checked_add(ttl).ok_or_else(|| {
+                    configuration_error(source_id, "candidate_ttl exceeds the platform time range")
+                })?)
+            }
+            _ => None,
+        };
+        self.replace_contributions(
+            source_id,
+            canonical
+                .into_iter()
+                .map(|endpoint| (endpoint, CandidateContribution { expires_at }))
+                .collect(),
+        )
     }
 
     fn replace_snapshot(
@@ -144,32 +146,74 @@ impl CandidateRegistry {
                 "discovery snapshot exceeds candidate limit",
             ));
         }
-        let mut observed = HashMap::<String, StdInstant>::new();
-        let mut peers = Vec::new();
+        let mut positions = HashMap::<String, usize>::new();
+        let mut contributions: Vec<(String, CandidateContribution)> = Vec::new();
         for (peer, at) in snapshot.peers().iter().zip(observations) {
-            if let Some(ttl) = ttl {
+            let expires_at = if let Some(ttl) = ttl {
                 let deadline = at.checked_add(ttl).ok_or_else(|| {
                     configuration_error(source_id, "candidate_ttl exceeds the platform time range")
                 })?;
                 if deadline <= now {
                     continue;
                 }
-            }
+                Some(deadline)
+            } else {
+                None
+            };
             if let Ok(peer) = canonicalize_endpoint(peer) {
-                peers.push(peer.clone());
-                observed
-                    .entry(peer)
-                    .and_modify(|old| *old = (*old).max(*at))
-                    .or_insert(*at);
+                if let Some(&position) = positions.get(&peer) {
+                    // Keep the first live occurrence's position and the newest lease.
+                    let contribution = &mut contributions[position].1;
+                    contribution.expires_at = contribution.expires_at.max(expires_at);
+                } else {
+                    positions.insert(peer.clone(), contributions.len());
+                    contributions.push((peer, CandidateContribution { expires_at }));
+                }
             }
         }
-        let before = self.endpoints();
+        self.replace_contributions(source_id, contributions)
+    }
+
+    fn replace_contributions(
+        &mut self,
+        source_id: &str,
+        contributions: Vec<(String, CandidateContribution)>,
+    ) -> Result<bool, DiscoveryError> {
+        // Prepare the entire replacement off-registry: a global capacity error
+        // must not publish removals, reordered sources or partially renewed leases.
         let mut updated = self.clone();
-        updated.replace_source(source_id, &peers, None, now)?;
-        for (peer, at) in observed {
-            updated.add(source_id, peer, ttl, at)?;
+        updated.register_source(source_id);
+        let retained = contributions
+            .iter()
+            .map(|(endpoint, _)| endpoint.clone())
+            .collect::<HashSet<_>>();
+        updated.remove_source_except(source_id, &retained);
+        let mut candidates = Vec::with_capacity(contributions.len());
+        for (endpoint, contribution) in contributions {
+            candidates.push(endpoint.clone());
+            if updated.local_endpoints.contains(&endpoint) {
+                continue;
+            }
+            if !updated.records.contains_key(&endpoint)
+                && updated.records.len() >= updated.max_candidates
+            {
+                return Err(configuration_error(
+                    "coordinator",
+                    format!("peer candidate limit reached: {}", updated.max_candidates),
+                ));
+            }
+            updated
+                .records
+                .entry(endpoint)
+                .or_default()
+                .sources
+                .insert(source_id.to_string(), contribution);
         }
-        let changed = updated.endpoints() != before;
+        updated
+            .source_candidates
+            .insert(source_id.to_string(), candidates);
+        updated.rebuild_order();
+        let changed = updated.order != self.order;
         *self = updated;
         Ok(changed)
     }
@@ -312,7 +356,12 @@ impl CandidateRegistry {
     }
 
     fn rebuild_order(&mut self) {
+        #[cfg(test)]
+        {
+            self.order_rebuilds += 1;
+        }
         let mut order = Vec::with_capacity(self.records.len());
+        let mut seen = HashSet::with_capacity(self.records.len());
         for source_id in &self.source_order {
             let Some(candidates) = self.source_candidates.get(source_id) else {
                 continue;
@@ -322,7 +371,7 @@ impl CandidateRegistry {
                     .records
                     .get(endpoint)
                     .is_some_and(|record| record.sources.contains_key(source_id))
-                    && !order.contains(endpoint)
+                    && seen.insert(endpoint)
                 {
                     order.push(endpoint.clone());
                 }
@@ -1000,6 +1049,366 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    #[test]
+    fn bulk_replacement_preserves_canonical_first_occurrence_and_source_priority() {
+        let mut registry = CandidateRegistry::new(8).unwrap();
+        let now = StdInstant::now();
+        registry.set_local_endpoints(vec!["local:1".into()]);
+        registry
+            .replace_source("first", &["old:1".into(), "shared:1".into()], None, now)
+            .unwrap();
+        registry
+            .replace_source("second", &["other:1".into(), "shared:1".into()], None, now)
+            .unwrap();
+
+        assert!(
+            registry
+                .replace_source(
+                    "first",
+                    &[
+                        "B.:1".into(),
+                        "Shared:1".into(),
+                        "b:1".into(),
+                        "A:1".into(),
+                        "shared.:1".into(),
+                        "Local.:1".into(),
+                        "invalid".into(),
+                    ],
+                    None,
+                    now,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            &*registry.endpoints(),
+            &["b:1", "shared:1", "a:1", "other:1"]
+        );
+        assert_eq!(
+            registry.source_candidates["first"],
+            ["b:1", "shared:1", "a:1", "local:1"]
+        );
+        assert_eq!(registry.records["shared:1"].sources.len(), 2);
+        assert!(!registry.records.contains_key("old:1"));
+        assert!(!registry.records.contains_key("local:1"));
+
+        assert!(registry.replace_source("first", &[], None, now).unwrap());
+        assert_eq!(&*registry.endpoints(), &["other:1", "shared:1"]);
+        assert_eq!(registry.records["shared:1"].sources.len(), 1);
+        registry
+            .replace_source("first", &["shared:1".into()], None, now)
+            .unwrap();
+        assert_eq!(&*registry.endpoints(), &["shared:1", "other:1"]);
+        assert_eq!(registry.source_order, ["first", "second"]);
+    }
+
+    #[test]
+    fn bulk_limits_count_raw_duplicates_invalid_local_and_expired_entries() {
+        let mut registry = CandidateRegistry::new(2).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(10);
+        registry.set_local_endpoints(vec!["local:1".into()]);
+        registry
+            .replace_source("existing", &["old:1".into()], Some(ttl), now)
+            .unwrap();
+        let before = registry.clone();
+        for peers in [
+            vec!["Peer:1".into(), "peer.:1".into(), "peer:1".into()],
+            vec!["invalid".into(), "local:1".into(), "expired:1".into()],
+        ] {
+            for source in ["existing", "new"] {
+                assert!(
+                    registry
+                        .replace_source(source, &peers, Some(ttl), now)
+                        .is_err()
+                );
+                assert_eq!(registry, before);
+                let snapshot = DiscoverySnapshot::observed(
+                    1,
+                    peers
+                        .iter()
+                        .cloned()
+                        .map(|peer| (peer, now - ttl))
+                        .collect(),
+                );
+                assert!(
+                    registry
+                        .replace_snapshot(source, &snapshot, Some(ttl), now)
+                        .is_err()
+                );
+                assert_eq!(registry, before);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_global_limit_rolls_back_removal_reordering_and_lease_renewal() {
+        let mut registry = CandidateRegistry::new(3).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(10);
+        registry
+            .replace_source(
+                "first",
+                &["old:1".into(), "shared:1".into()],
+                Some(ttl),
+                now,
+            )
+            .unwrap();
+        registry
+            .replace_source("second", &["other:1".into(), "shared:1".into()], None, now)
+            .unwrap();
+        let before = registry.clone();
+        let peers = vec!["shared:1".into(), "new:1".into(), "overflow:1".into()];
+        let later = now + ttl / 2;
+        let snapshot = DiscoverySnapshot::observed(
+            1,
+            peers.iter().cloned().map(|peer| (peer, later)).collect(),
+        );
+        for source in ["first", "new-source"] {
+            assert!(
+                registry
+                    .replace_source(source, &peers, Some(ttl), later)
+                    .is_err()
+            );
+            assert_eq!(registry, before);
+            assert!(
+                registry
+                    .replace_snapshot(source, &snapshot, Some(ttl), later)
+                    .is_err()
+            );
+            assert_eq!(registry, before);
+        }
+        assert!(
+            registry
+                .add("new-source", "overflow:1".into(), None, now)
+                .is_err()
+        );
+        assert_eq!(registry, before);
+
+        // Replacing an exclusive contribution releases its slot before admission.
+        assert!(
+            registry
+                .replace_source("first", &peers[..2], Some(ttl), later)
+                .unwrap()
+        );
+        assert_eq!(&*registry.endpoints(), &["shared:1", "new:1", "other:1"]);
+        assert_eq!(registry.records["shared:1"].sources.len(), 2);
+        assert_eq!(registry.next_expiry(), Some(later + ttl));
+    }
+
+    #[test]
+    fn bulk_ttl_overflow_leaves_all_registry_state_unchanged() {
+        let mut registry = CandidateRegistry::new(3).unwrap();
+        let now = StdInstant::now();
+        registry
+            .replace_source(
+                "first",
+                &["old:1".into()],
+                Some(Duration::from_secs(10)),
+                now,
+            )
+            .unwrap();
+        registry.set_local_endpoints(vec!["local:1".into()]);
+        let before = registry.clone();
+        for source in ["first", "new-source"] {
+            assert!(
+                registry
+                    .replace_source(source, &["new:1".into()], Some(Duration::MAX), now)
+                    .is_err()
+            );
+            assert_eq!(registry, before);
+            assert!(
+                registry
+                    .add(source, "old:1".into(), Some(Duration::MAX), now)
+                    .is_err()
+            );
+            assert_eq!(registry, before);
+            // Observations validate time arithmetic even for invalid/local entries.
+            for peer in ["new:1", "invalid", "local:1"] {
+                let snapshot = DiscoverySnapshot::observed(1, vec![(peer.into(), now)]);
+                assert!(
+                    registry
+                        .replace_snapshot(source, &snapshot, Some(Duration::MAX), now)
+                        .is_err()
+                );
+                assert_eq!(registry, before);
+            }
+        }
+        // Plain snapshots, unlike observations, never lease filtered entries.
+        assert!(
+            registry
+                .replace_source(
+                    "first",
+                    &["invalid".into(), "local:1".into()],
+                    Some(Duration::MAX),
+                    now
+                )
+                .unwrap()
+        );
+        assert!(registry.records.is_empty());
+        assert!(
+            !registry
+                .replace_source("first", &[], Some(Duration::MAX), now)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn bulk_observations_keep_first_live_order_and_newest_per_endpoint_lease() {
+        let mut registry = CandidateRegistry::new(8).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(10);
+        registry.set_local_endpoints(vec!["local:1".into()]);
+        registry
+            .replace_source("observed", &["old:1".into()], None, now)
+            .unwrap();
+        registry
+            .replace_source("static", &["persistent:1".into(), "a:1".into()], None, now)
+            .unwrap();
+        let snapshot = DiscoverySnapshot::observed(
+            1,
+            vec![
+                ("B:1".into(), now - ttl),
+                ("A.:1".into(), now - Duration::from_secs(3)),
+                ("b:1".into(), now - Duration::from_secs(2)),
+                ("a:1".into(), now - Duration::from_secs(1)),
+                ("A:1".into(), now - Duration::from_secs(2)),
+                ("local:1".into(), now),
+                ("invalid".into(), now),
+                ("expired:1".into(), now - ttl),
+            ],
+        );
+        assert!(
+            registry
+                .replace_snapshot("observed", &snapshot, Some(ttl), now)
+                .unwrap()
+        );
+        assert_eq!(&*registry.endpoints(), &["a:1", "b:1", "persistent:1"]);
+        let first_deadline = now + ttl - Duration::from_secs(2);
+        let last_deadline = now + ttl - Duration::from_secs(1);
+        assert_eq!(registry.next_expiry(), Some(first_deadline));
+        assert_eq!(
+            registry.records["b:1"].sources["observed"].expires_at,
+            Some(first_deadline)
+        );
+        assert_eq!(
+            registry.records["a:1"].sources["observed"].expires_at,
+            Some(last_deadline)
+        );
+        assert!(
+            !registry
+                .replace_snapshot("observed", &snapshot, Some(ttl), now + ttl / 2)
+                .unwrap()
+        );
+        assert_eq!(registry.next_expiry(), Some(first_deadline));
+        assert!(!registry.source_unavailable("observed", true));
+        assert!(!registry.expire(first_deadline - Duration::from_nanos(1)));
+        assert!(registry.expire(first_deadline));
+        assert_eq!(&*registry.endpoints(), &["a:1", "persistent:1"]);
+        assert_eq!(registry.next_expiry(), Some(last_deadline));
+        assert!(registry.expire(last_deadline));
+        assert_eq!(&*registry.endpoints(), &["persistent:1", "a:1"]);
+        assert_eq!(registry.next_expiry(), None);
+        assert!(
+            !registry
+                .replace_snapshot("observed", &snapshot, Some(ttl), now + ttl)
+                .unwrap()
+        );
+        assert_eq!(&*registry.endpoints(), &["persistent:1", "a:1"]);
+    }
+
+    #[test]
+    fn bulk_unleased_observations_and_plain_refresh_preserve_lease_semantics() {
+        let mut registry = CandidateRegistry::new(3).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(10);
+        let peers = vec!["b:1".into(), "a:1".into()];
+        registry
+            .replace_source("first", &peers, Some(ttl), now)
+            .unwrap();
+        assert!(
+            !registry
+                .replace_source("first", &peers, Some(ttl), now + ttl / 2)
+                .unwrap()
+        );
+        assert_eq!(registry.next_expiry(), Some(now + ttl * 3 / 2));
+        let snapshot = DiscoverySnapshot::observed(
+            1,
+            vec![
+                ("B.:1".into(), now - ttl * 2),
+                ("a:1".into(), now - ttl),
+                ("b:1".into(), now),
+            ],
+        );
+        assert!(
+            !registry
+                .replace_snapshot("first", &snapshot, None, now)
+                .unwrap()
+        );
+        assert_eq!(&*registry.endpoints(), &["b:1", "a:1"]);
+        assert_eq!(registry.next_expiry(), None);
+        assert!(!registry.expire(now + ttl * 10));
+        assert!(registry.source_unavailable("first", false));
+        assert!(registry.records.is_empty());
+    }
+
+    #[test]
+    fn bulk_4097_candidates_rebuild_order_once_per_replacement() {
+        let count = 4097;
+        let mut registry = CandidateRegistry::new(count).unwrap();
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(10);
+        let peers = (0..count)
+            .map(|index| format!("peer-{index}.invalid:9000"))
+            .collect::<Vec<_>>();
+        assert!(
+            registry
+                .replace_source("first", &peers, Some(ttl), now)
+                .unwrap()
+        );
+        assert_eq!(registry.order_rebuilds, 1);
+        assert_eq!(&*registry.endpoints(), &peers);
+        assert!(
+            !registry
+                .replace_source("second", &peers, None, now)
+                .unwrap()
+        );
+        assert_eq!(registry.order_rebuilds, 2);
+
+        let reversed = peers.iter().rev().cloned().collect::<Vec<_>>();
+        let snapshot = DiscoverySnapshot::observed(
+            1,
+            reversed.iter().cloned().map(|peer| (peer, now)).collect(),
+        );
+        assert!(
+            registry
+                .replace_snapshot("first", &snapshot, Some(ttl), now)
+                .unwrap()
+        );
+        assert_eq!(registry.order_rebuilds, 3);
+        assert_eq!(&*registry.endpoints(), &reversed);
+        assert!(
+            registry
+                .records
+                .values()
+                .all(|record| record.sources.len() == 2)
+        );
+        assert!(
+            !registry
+                .replace_snapshot("first", &snapshot, Some(ttl), now + ttl / 2)
+                .unwrap()
+        );
+        assert_eq!(registry.order_rebuilds, 4);
+        assert_eq!(registry.next_expiry(), Some(now + ttl));
+        assert!(registry.expire(now + ttl));
+        assert_eq!(&*registry.endpoints(), &peers);
+        assert!(
+            registry
+                .records
+                .values()
+                .all(|record| record.sources.len() == 1)
+        );
+    }
+
     #[tokio::test]
     async fn identical_observation_renews_lease_but_cached_snapshot_really_expires() {
         let mut registry = CandidateRegistry::new(2).unwrap();
@@ -1102,6 +1511,41 @@ mod tests {
             .unwrap();
         assert!(candidates.borrow().is_empty());
         coordinator.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovers_a_real_file_provider_after_worker_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peers");
+        tokio::fs::write(&path, "before:9000\n").await.unwrap();
+        let mut config = crate::FileWatchDiscoveryConfig::new(&path);
+        config.poll_interval = Duration::from_millis(10);
+        let discovery = Arc::new(crate::FileWatchDiscovery::new(config).unwrap());
+        let source = DiscoveryProvider::new("file", discovery.clone());
+        let mut coordinator =
+            DiscoveryCoordinator::start(vec![source], DiscoveryRuntimeConfig::new())
+                .await
+                .unwrap();
+        let mut candidates = coordinator.candidates();
+        assert_eq!(&**candidates.borrow_and_update(), &["before:9000"]);
+        discovery.panic_on_next_observation();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            candidates.changed().await.unwrap();
+            assert!(candidates.borrow_and_update().is_empty());
+            // Only the coordinator may restart the provider. Do not mask a
+            // dead subscription by calling discover/watch from this test.
+            tokio::fs::write(&path, "after:9000\n").await.unwrap();
+            candidates.changed().await.unwrap();
+            assert_eq!(&**candidates.borrow_and_update(), &["after:9000"]);
+        })
+        .await
+        .unwrap();
+        coordinator.shutdown().await.unwrap();
+        assert!(
+            crate::PeerDiscovery::watch(discovery.as_ref())
+                .await
+                .is_err()
+        );
     }
 
     struct MutableDiscovery {

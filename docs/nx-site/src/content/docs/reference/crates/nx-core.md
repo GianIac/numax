@@ -216,9 +216,9 @@ required announcement support make sync startup fail when the bound listener
 cannot yield a concrete advertised endpoint.
 
 `DiscoveryWatch` bundles an atomic snapshot with its subsequent bounded event
-stream. Dynamic providers use one `DiscoveryChange::Replaced` revision for a
-complete ordered replacement, so reconnect and anti-entropy cannot observe a
-temporary empty list. Lag or a revision gap invalidates the watch explicitly;
+stream. Dynamic providers use one `DiscoveryChange::Observed` revision for a
+complete ordered replacement with per-endpoint observation timestamps, rather
+than publishing a temporary empty list. Lag or a revision gap invalidates the watch explicitly;
 the coordinator resubscribes and atomically installs the new bundled snapshot.
 
 Provider-specific defaults are:
@@ -229,6 +229,28 @@ Provider-specific defaults are:
 | mDNS | daemon-driven TTL/removal | 1024 instances; 1024 candidates; 128 events |
 | DNS-SRV | retry 5s; maximum refresh interval 300s | 1024 candidates; 128 events |
 | File | poll 2s | 1 MiB file; 1024 candidates; 128 events |
+
+#### Event capacity API
+
+`DEFAULT_DISCOVERY_EVENT_CAPACITY` (128) and `MAX_DISCOVERY_EVENT_CAPACITY`
+(4096) are public in both `nx_core::discovery` and the crate root. The
+`event_capacity` fields in `BootstrapGossipDiscoveryConfig`,
+`MdnsDiscoveryConfig`, `DnsSrvDiscoveryConfig` and `FileWatchDiscoveryConfig`
+accept only `1..=MAX_DISCOVERY_EVENT_CAPACITY`. Their provider constructors
+return `DiscoveryError::InvalidConfiguration` for zero or larger values,
+including `usize::MAX`, before allocating channels/state, starting work or
+performing provider I/O. mDNS applies the same capacity to announcement requests.
+The limit counts event slots, not candidates or total bytes; Tokio may round
+broadcast capacity up to a power of two, still no larger than 4096.
+
+| Static constructor | Result and capacity policy |
+|---|---|
+| `StaticDiscovery::new(peers)` | `Self`, default capacity 128 |
+| `StaticDiscovery::with_event_capacity(peers, capacity)` | `Self`, clamps to `[1, 4096]`; zero becomes one, oversized values become 4096 |
+| `StaticDiscovery::try_with_event_capacity(peers, capacity)` | `Result<Self, DiscoveryError>`, rejects capacity outside `1..=4096` with `InvalidConfiguration` before channel allocation |
+
+All static constructors preserve peer order and duplicates without truncation.
+Capacity is a Rust provider API setting, not an additional CLI/TOML field.
 
 Bootstrap uses the same `NodeId`, TLS configuration, message-size limit, socket
 timeout and serialization policy as the runtime when its
@@ -245,6 +267,17 @@ providers and the listener on partial startup, and invokes every provider's
 idempotent shutdown hook. Bootstrap withdrawal and mDNS goodbye are attempted
 during shutdown; provider tasks are joined within the runtime's bounded
 operation policy.
+
+Explicit `request_shutdown()`/`shutdown()` is terminal for dynamic providers.
+Unexpected exit may instead be recovered by a later discovery/watch operation,
+but only after the old worker is joined and its cleanup completes successfully;
+a finished worker or invalidated watch alone does not authorize restart. Fatal
+worker errors and cleanup failures block restart. Cleanup remains owned if a
+shutdown waiter is cancelled. Bootstrap conservatively tracks seeds before an
+advertising query is awaited, including queries whose responses never arrive;
+withdrawal is bounded best effort and does not promise remote delivery. mDNS
+reports daemon cleanup acknowledgement errors, but an acknowledgement likewise
+does not prove every LAN peer received the goodbye.
 
 `Runtime::new_with_discovery` accepts the resolved `RuntimeDiscoveryConfig`
 after the durable `NodeId` is loaded, then constructs the selected provider.

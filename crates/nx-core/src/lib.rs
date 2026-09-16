@@ -16,8 +16,9 @@ pub use discovery::{
     DEFAULT_MAX_PEER_CANDIDATES, DiscoveryChange, DiscoveryError, DiscoveryEvent,
     DiscoveryProvider, DiscoveryRuntimeConfig, DiscoverySnapshot, DiscoveryWatch, DnsSrvDiscovery,
     DnsSrvDiscoveryConfig, DnsSrvDiscoverySettings, FileDiscoverySettings, FileWatchDiscovery,
-    FileWatchDiscoveryConfig, MdnsDiscovery, MdnsDiscoveryConfig, MdnsDiscoverySettings,
-    PeerAnnouncement, PeerDiscovery, RuntimeDiscoveryConfig, RuntimeDiscoveryMode, StaticDiscovery,
+    FileWatchDiscoveryConfig, MAX_DISCOVERY_EVENT_CAPACITY, MdnsDiscovery, MdnsDiscoveryConfig,
+    MdnsDiscoverySettings, PeerAnnouncement, PeerDiscovery, RuntimeDiscoveryConfig,
+    RuntimeDiscoveryMode, StaticDiscovery,
 };
 pub use nx_net::{
     BootstrapClientConfig, ConnectionDirection, MAX_BOOTSTRAP_RESPONSE_CAPACITY,

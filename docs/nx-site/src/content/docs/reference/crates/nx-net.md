@@ -410,5 +410,5 @@ Use this page together with the sync model and runtime docs:
 
 - [nx-sync crate](/numax/reference/crates/nx-sync/) - `Op` and `NodeId` types used by the wire protocol
 - [nx-core crate](/numax/reference/crates/nx-core/) - the sync manager that drives `Node`
-- [Configuration](/numax/reference/configuration/) - TLS fields and limits that become `NodeConfig`
+- [Configuration](/numax/reference/config/) - TLS fields and limits that become `NodeConfig`
 - [Crates overview](/numax/reference/crates/) - where `nx-net` fits in the dependency graph

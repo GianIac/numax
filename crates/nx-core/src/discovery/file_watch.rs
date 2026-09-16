@@ -7,16 +7,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::dynamic::{
-    AbortOnDropTask, ClearStateOnDrop, DynamicState, OwnedShutdown, checked_deadline,
-    validate_durations,
-};
+use super::dynamic::{DynamicState, ProviderTask, checked_deadline, validate_durations};
 use super::{
     DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY, DEFAULT_MAX_PEER_CANDIDATES,
     DiscoveryError, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement, PeerDiscovery,
+    validate_event_capacity,
 };
 
 const PROVIDER: &str = "file";
@@ -31,6 +28,8 @@ pub struct FileWatchDiscoveryConfig {
     pub poll_interval: Duration,
     pub max_file_bytes: usize,
     pub max_candidates: usize,
+    /// Event channel capacity in `1..=super::MAX_DISCOVERY_EVENT_CAPACITY`.
+    /// Defaults to [`DEFAULT_DISCOVERY_EVENT_CAPACITY`]; validated by the provider constructor.
     pub event_capacity: usize,
 }
 
@@ -50,8 +49,7 @@ impl FileWatchDiscoveryConfig {
 struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
-    task: Option<JoinHandle<()>>,
-    cleanup: Option<OwnedShutdown>,
+    task: Option<ProviderTask>,
 }
 
 struct Inner {
@@ -69,9 +67,6 @@ impl Drop for Inner {
         if let Some(shutdown) = lifecycle.shutdown.take() {
             let _ = shutdown.send(true);
         }
-        if let Some(task) = lifecycle.task.take() {
-            task.abort();
-        }
     }
 }
 
@@ -87,6 +82,11 @@ pub struct FileWatchDiscovery {
 }
 
 impl FileWatchDiscovery {
+    #[cfg(test)]
+    pub(crate) fn panic_on_next_observation(&self) {
+        self.inner.state.panic_on_next_observation();
+    }
+
     pub fn new(config: FileWatchDiscoveryConfig) -> Result<Self, DiscoveryError> {
         validate_config(&config)?;
         Ok(Self {
@@ -97,7 +97,6 @@ impl FileWatchDiscovery {
                     stopped: false,
                     shutdown: None,
                     task: None,
-                    cleanup: None,
                 }),
             }),
         })
@@ -113,7 +112,9 @@ impl FileWatchDiscovery {
             if lifecycle.stopped {
                 return Err(provider_error("provider is shut down", false));
             }
-            if lifecycle.task.is_some() {
+            if let Some(task) = lifecycle.task.as_ref()
+                && task.running(PROVIDER, &self.inner.state)?
+            {
                 return Ok(());
             }
         }
@@ -127,7 +128,9 @@ impl FileWatchDiscovery {
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
-        if lifecycle.task.is_some() {
+        if let Some(task) = lifecycle.task.as_ref()
+            && task.running(PROVIDER, &self.inner.state)?
+        {
             return Ok(());
         }
         self.inner.state.observe(initial);
@@ -135,13 +138,13 @@ impl FileWatchDiscovery {
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
         lifecycle.shutdown = Some(shutdown);
-        lifecycle.task = Some(tokio::spawn(async move {
-            let cleanup = ClearStateOnDrop(state.clone());
-            if let Err(error) = run_file_watch(config, state, shutdown_rx).await {
-                tracing::error!(%error, "peer file discovery stopped");
-            }
-            drop(cleanup);
-        }));
+        lifecycle.task = Some(ProviderTask::spawn(
+            PROVIDER,
+            state.clone(),
+            shutdown_rx.clone(),
+            run_file_watch(config, state, shutdown_rx),
+            || async { Ok(()) },
+        ));
         Ok(())
     }
 }
@@ -166,7 +169,7 @@ impl PeerDiscovery for FileWatchDiscovery {
 
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError> {
         self.ensure_started().await?;
-        Ok(self.inner.state.watch())
+        self.inner.state.live_watch()
     }
 
     fn request_shutdown(&self) {
@@ -183,32 +186,18 @@ impl PeerDiscovery for FileWatchDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        let result = {
-            let mut lifecycle = self
+        let task = {
+            let lifecycle = self
                 .inner
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            lifecycle.shutdown.take();
-            let task = lifecycle.task.take().map(AbortOnDropTask::new);
-            lifecycle
-                .cleanup
-                .get_or_insert_with(|| {
-                    let cleanup = ClearStateOnDrop(Arc::clone(&self.inner.state));
-                    OwnedShutdown::new(async move {
-                        let joined = match task {
-                            Some(task) => task.join().await.map_err(|error| {
-                                provider_error(format!("watch task failed: {error}"), false)
-                            }),
-                            None => Ok(()),
-                        };
-                        drop(cleanup);
-                        joined
-                    })
-                })
-                .subscribe()
+            lifecycle.task.clone()
         };
-        OwnedShutdown::wait(result, PROVIDER).await
+        match task {
+            Some(task) => task.join().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -225,6 +214,9 @@ async fn run_file_watch(
         "poll_interval",
     )?;
     loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Ok(());
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -321,6 +313,7 @@ fn parse_peer_file(contents: &str, max_candidates: usize) -> Result<Vec<String>,
 }
 
 fn validate_config(config: &FileWatchDiscoveryConfig) -> Result<(), DiscoveryError> {
+    validate_event_capacity(PROVIDER, config.event_capacity)?;
     if config.path.as_os_str().is_empty() {
         return Err(invalid("path must not be empty"));
     }
@@ -330,10 +323,8 @@ fn validate_config(config: &FileWatchDiscoveryConfig) -> Result<(), DiscoveryErr
     if config.poll_interval.is_zero() {
         return Err(invalid("poll_interval must be greater than zero"));
     }
-    if config.max_file_bytes == 0 || config.max_candidates == 0 || config.event_capacity == 0 {
-        return Err(invalid(
-            "limits and event_capacity must be greater than zero",
-        ));
+    if config.max_file_bytes == 0 || config.max_candidates == 0 {
+        return Err(invalid("limits must be greater than zero"));
     }
     validate_durations(PROVIDER, &[("poll_interval", config.poll_interval)])
 }
@@ -392,22 +383,81 @@ mod tests {
 
     #[tokio::test]
     async fn panicked_watch_is_reported_after_clearing_snapshot() {
-        let provider =
-            FileWatchDiscovery::new(FileWatchDiscoveryConfig::new("unused-peers")).unwrap();
-        provider
-            .inner
-            .state
-            .observe(vec!["cached.example:9000".into()]);
-        provider.inner.lifecycle.lock().unwrap().task = Some(tokio::spawn(async {
-            panic!("injected file watch panic");
-        }));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peers");
+        tokio::fs::write(&path, "cached.example:9000")
+            .await
+            .unwrap();
+        let mut config = FileWatchDiscoveryConfig::new(path);
+        config.poll_interval = Duration::from_millis(10);
+        let provider = FileWatchDiscovery::new(config).unwrap();
+        let mut events = provider.watch().await.unwrap();
+        assert_eq!(events.snapshot().peers(), ["cached.example:9000"]);
+        provider.inner.state.panic_on_next_observation();
+        super::super::dynamic::assert_invalidated(&mut events).await;
         let result = provider.shutdown().await;
         assert!(
             matches!(result, Err(DiscoveryError::Provider { retryable: false, message, .. })
-            if message.contains("watch task failed"))
+            if message.contains("provider task failed") && message.contains("panic"))
         );
         assert!(provider.inner.state.snapshot().peers().is_empty());
         assert!(provider.inner.state.watch().snapshot().peers().is_empty());
+        assert!(provider.watch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn panic_invalidates_and_concurrent_subscribers_restart_one_file_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peers");
+        tokio::fs::write(&path, "cached.example:9000")
+            .await
+            .unwrap();
+        let mut config = FileWatchDiscoveryConfig::new(path);
+        config.poll_interval = Duration::from_millis(10);
+        let provider = FileWatchDiscovery::new(config).unwrap();
+        let mut events = provider.watch().await.unwrap();
+        let old = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        provider.inner.state.panic_on_next_observation();
+        super::super::dynamic::assert_invalidated(&mut events).await;
+        assert!(old.clone().join().await.is_err());
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        let (first, second) = tokio::join!(provider.watch(), provider.watch());
+        assert_eq!(first.unwrap().snapshot().peers(), ["cached.example:9000"]);
+        assert_eq!(second.unwrap().snapshot().peers(), ["cached.example:9000"]);
+        let current = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        assert!(!old.same_generation(&current));
+        provider.watch().await.unwrap();
+        assert!(
+            current.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        provider.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.watch().await.is_err());
+        assert!(provider.discover().await.is_err());
     }
 
     async fn replace_file(path: &Path, contents: &str) {

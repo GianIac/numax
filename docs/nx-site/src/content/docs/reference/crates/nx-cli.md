@@ -303,6 +303,6 @@ cargo test -p nx-cli
 Use this page together with the user-facing CLI and config docs:
 
 - [CLI reference](/numax/reference/cli/) - flags and subcommands exposed by `nx`
-- [Configuration](/numax/reference/configuration/) - TOML and environment variable reference
+- [Configuration](/numax/reference/config/) - TOML and environment variable reference
 - [nx-core crate](/numax/reference/crates/nx-core/) - the runtime layer `nx-cli` calls into
 - [Crates overview](/numax/reference/crates/) - where `nx-cli` fits in the dependency graph

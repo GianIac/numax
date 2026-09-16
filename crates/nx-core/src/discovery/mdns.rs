@@ -8,13 +8,12 @@ use mdns_sd::{
     DaemonEvent, DaemonStatus, DnsNameChange, RRType, ServiceDaemon, ServiceEvent, ServiceInfo,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 
-use super::dynamic::DynamicState;
+use super::dynamic::{DynamicState, ProviderTask};
 use super::{
     AnnouncementSupport, DEFAULT_DISCOVERY_CLUSTER, DEFAULT_DISCOVERY_EVENT_CAPACITY,
     DEFAULT_MAX_PEER_CANDIDATES, DiscoveryError, DiscoverySnapshot, DiscoveryWatch,
-    PeerAnnouncement, PeerDiscovery,
+    PeerAnnouncement, PeerDiscovery, validate_event_capacity,
 };
 
 const PROVIDER: &str = "mdns";
@@ -35,6 +34,8 @@ pub struct MdnsDiscoveryConfig {
     pub cluster_id: String,
     pub max_instances: usize,
     pub max_candidates: usize,
+    /// Event and announcement channel capacity in `1..=super::MAX_DISCOVERY_EVENT_CAPACITY`.
+    /// Defaults to [`DEFAULT_DISCOVERY_EVENT_CAPACITY`]; validated by the provider constructor.
     pub event_capacity: usize,
 }
 
@@ -53,9 +54,14 @@ impl MdnsDiscoveryConfig {
 struct Lifecycle {
     stopped: bool,
     shutdown: Option<watch::Sender<bool>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<ProviderTask>,
     announcements: Option<mpsc::Sender<AnnounceRequest>>,
-    completion: Option<watch::Receiver<Option<Result<(), DiscoveryError>>>>,
+}
+
+struct MdnsGeneration {
+    shutdown: watch::Sender<bool>,
+    announcements: mpsc::Sender<AnnounceRequest>,
+    task: ProviderTask,
 }
 
 struct Inner {
@@ -102,13 +108,19 @@ impl MdnsDiscovery {
                     shutdown: None,
                     task: None,
                     announcements: None,
-                    completion: None,
                 }),
             }),
         })
     }
 
     fn ensure_started(&self) -> Result<(), DiscoveryError> {
+        self.ensure_started_with(|| self.start_generation())
+    }
+
+    fn ensure_started_with(
+        &self,
+        start: impl FnOnce() -> Result<MdnsGeneration, DiscoveryError>,
+    ) -> Result<(), DiscoveryError> {
         let mut lifecycle = self
             .inner
             .lifecycle
@@ -117,14 +129,20 @@ impl MdnsDiscovery {
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
-        if let Some(task) = lifecycle.task.as_ref() {
-            if !task.is_finished() {
-                return Ok(());
-            }
-            lifecycle.task.take();
-            lifecycle.announcements.take();
+        if let Some(task) = lifecycle.task.as_ref()
+            && task.running(PROVIDER, &self.inner.state)?
+        {
+            return Ok(());
         }
 
+        let generation = start()?;
+        lifecycle.shutdown = Some(generation.shutdown);
+        lifecycle.announcements = Some(generation.announcements);
+        lifecycle.task = Some(generation.task);
+        Ok(())
+    }
+
+    fn start_generation(&self) -> Result<MdnsGeneration, DiscoveryError> {
         let daemon = ServiceDaemon::new()
             .map_err(|error| provider_error(format!("cannot start mDNS daemon: {error}"), false))?;
         let monitor = match daemon.monitor() {
@@ -169,7 +187,6 @@ impl MdnsDiscovery {
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (announcements_tx, announcements_rx) = mpsc::channel(self.inner.config.event_capacity);
-        let (completion_tx, completion_rx) = watch::channel(None);
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
         let own_endpoint = Arc::clone(&self.inner.own_endpoint);
@@ -183,27 +200,21 @@ impl MdnsDiscovery {
             owned,
             finished: false,
         };
-        lifecycle.shutdown = Some(shutdown);
-        lifecycle.announcements = Some(announcements_tx);
-        lifecycle.completion = Some(completion_rx);
-        lifecycle.task = Some(tokio::spawn(async move {
-            let result = run_mdns_browse(
-                config,
-                state,
-                own_endpoint,
-                events,
-                monitor,
-                cleanup,
-                announcements_rx,
-                shutdown_rx,
-            )
-            .await;
-            if let Err(error) = &result {
-                tracing::warn!(%error, provider = PROVIDER, "mDNS cleanup failed");
-            }
-            completion_tx.send_replace(Some(result));
-        }));
-        Ok(())
+        let task = start_mdns_task(
+            config,
+            state,
+            own_endpoint,
+            events,
+            monitor,
+            cleanup,
+            announcements_rx,
+            shutdown_rx,
+        );
+        Ok(MdnsGeneration {
+            shutdown,
+            announcements: announcements_tx,
+            task,
+        })
     }
 }
 
@@ -254,7 +265,7 @@ impl PeerDiscovery for MdnsDiscovery {
 
     async fn watch(&self) -> Result<DiscoveryWatch, DiscoveryError> {
         self.ensure_started()?;
-        Ok(self.inner.state.watch())
+        self.inner.state.live_watch()
     }
 
     fn request_shutdown(&self) {
@@ -267,6 +278,15 @@ impl PeerDiscovery for MdnsDiscovery {
         if let Some(shutdown) = &lifecycle.shutdown {
             shutdown.send_replace(true);
         }
+        // An already finalized unexpected generation preserved this value for
+        // restart. Clear it even when no cleanup task remains to observe stop.
+        // A live worker may finish a queued transaction; its supervised cleanup
+        // clears the value again after joining that worker.
+        self.inner
+            .own_endpoint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
@@ -277,9 +297,12 @@ impl PeerDiscovery for MdnsDiscovery {
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            lifecycle.completion.clone()
+            lifecycle.task.clone()
         };
-        wait_for_shutdown(completion).await
+        match completion {
+            Some(task) => task.join().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -298,13 +321,64 @@ impl<T: Send + 'static> MdnsReceiver<T> for mdns_sd::Receiver<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_mdns_browse<D: RegistrationDaemon>(
+fn start_mdns_task<D: RegistrationDaemon + 'static>(
+    config: MdnsDiscoveryConfig,
+    state: Arc<DynamicState>,
+    own_endpoint: Arc<StdMutex<Option<String>>>,
+    events: impl MdnsReceiver<ServiceEvent> + 'static,
+    monitor: impl MdnsReceiver<DaemonEvent> + 'static,
+    cleanup: DaemonCleanup<D>,
+    announcements: mpsc::Receiver<AnnounceRequest>,
+    shutdown: watch::Receiver<bool>,
+) -> ProviderTask {
+    let cleanup = Arc::new(tokio::sync::Mutex::new(cleanup));
+    let worker_cleanup = cleanup.clone();
+    let worker_state = state.clone();
+    let worker_endpoint = own_endpoint.clone();
+    let worker_shutdown = shutdown.clone();
+    ProviderTask::spawn(
+        PROVIDER,
+        state,
+        shutdown.clone(),
+        async move {
+            let mut cleanup = worker_cleanup.lock().await;
+            run_mdns_events(
+                config,
+                worker_state,
+                worker_endpoint,
+                events,
+                monitor,
+                &mut *cleanup,
+                announcements,
+                worker_shutdown,
+            )
+            .await
+        },
+        move || async move {
+            // The worker has been joined, including after panic. Its async lock
+            // guard is gone, while original registration keys remain owned here.
+            let result = shutdown_daemon(&mut *cleanup.lock().await, SHUTDOWN_BUDGET).await;
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                own_endpoint
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+            }
+            // DaemonCleanup's fallback must also finish before restart admission.
+            drop(cleanup);
+            result
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mdns_events<D: RegistrationDaemon>(
     config: MdnsDiscoveryConfig,
     state: Arc<DynamicState>,
     own_endpoint: Arc<StdMutex<Option<String>>>,
     mut events: impl MdnsReceiver<ServiceEvent>,
     mut monitor: impl MdnsReceiver<DaemonEvent>,
-    mut cleanup: DaemonCleanup<D>,
+    cleanup: &mut DaemonCleanup<D>,
     mut announcements: mpsc::Receiver<AnnounceRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), DiscoveryError> {
@@ -329,7 +403,7 @@ async fn run_mdns_browse<D: RegistrationDaemon>(
                     expected_shutdown = true;
                     break;
                 }
-                let result = replace_announcement(&mut cleanup, &config, request.endpoint).await;
+                let result = replace_announcement(cleanup, &config, request.endpoint).await;
                 if let Some(current) = &cleanup.owned.current {
                     *own_endpoint.lock().unwrap_or_else(|error| error.into_inner()) =
                         Some(current.endpoint.clone());
@@ -415,20 +489,14 @@ async fn run_mdns_browse<D: RegistrationDaemon>(
             .reply
             .send(Err(provider_error("mDNS announcement task stopped", true)));
     }
-    state.replace(Vec::new());
-    if !expected_shutdown {
-        state.invalidate_watches();
-    }
-    let result = shutdown_daemon(&mut cleanup, SHUTDOWN_BUDGET).await;
     if expected_shutdown {
-        own_endpoint
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        Ok(())
+    } else {
+        Err(provider_error("mDNS browse ended unexpectedly", true))
     }
-    result
 }
 
+#[cfg(test)]
 async fn wait_for_shutdown(
     completion: Option<watch::Receiver<Option<Result<(), DiscoveryError>>>>,
 ) -> Result<(), DiscoveryError> {
@@ -904,6 +972,7 @@ fn build_service(
 }
 
 fn validate_config(config: &MdnsDiscoveryConfig) -> Result<(), DiscoveryError> {
+    validate_event_capacity(PROVIDER, config.event_capacity)?;
     if config.instance_name.is_empty() || config.instance_name.len() > 63 {
         return Err(invalid("instance_name length must be in 1..=63 bytes"));
     }
@@ -913,10 +982,8 @@ fn validate_config(config: &MdnsDiscoveryConfig) -> Result<(), DiscoveryError> {
     if config.cluster_id.is_empty() || config.cluster_id.len() > 128 {
         return Err(invalid("cluster_id length must be in 1..=128 bytes"));
     }
-    if config.max_instances == 0 || config.max_candidates == 0 || config.event_capacity == 0 {
-        return Err(invalid(
-            "limits and event_capacity must be greater than zero",
-        ));
+    if config.max_instances == 0 || config.max_candidates == 0 {
+        return Err(invalid("limits must be greater than zero"));
     }
     Ok(())
 }
@@ -1120,19 +1187,22 @@ mod tests {
             shutdown_ack: Some(shutdown_ack),
         };
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        let (complete_tx, complete_rx) = watch::channel(None);
-        let task = tokio::spawn(async move {
-            cancel_rx.changed().await.unwrap();
-            assert!(*cancel_rx.borrow());
-            complete_tx.send_replace(Some(
-                shutdown_daemon(&mut daemon, Duration::from_secs(2)).await,
-            ));
-        });
+        let task = ProviderTask::spawn(
+            PROVIDER,
+            provider.inner.state.clone(),
+            cancel_rx.clone(),
+            async move {
+                cancel_rx.changed().await.unwrap();
+                assert!(*cancel_rx.borrow());
+                Ok(())
+            },
+            move || async move { shutdown_daemon(&mut daemon, Duration::from_secs(2)).await },
+        );
+        let completion = task.clone();
         {
             let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
             lifecycle.shutdown = Some(cancel_tx);
             lifecycle.task = Some(task);
-            lifecycle.completion = Some(complete_rx.clone());
         }
         drop(provider);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1140,7 +1210,7 @@ mod tests {
             unregister_tx.send(Ok(())).unwrap();
             assert_eq!(call_rx.recv().await, Some("shutdown"));
             shutdown_tx.send(Ok(())).unwrap();
-            wait_for_shutdown(Some(complete_rx)).await.unwrap();
+            completion.join().await.unwrap();
         })
         .await
         .unwrap();
@@ -1336,6 +1406,7 @@ mod tests {
     struct FakeDaemon {
         state: Arc<StdMutex<FakeRegistrations>>,
         withdrawal: Option<(oneshot::Sender<String>, oneshot::Receiver<()>)>,
+        termination: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     }
 
     #[async_trait]
@@ -1369,6 +1440,11 @@ mod tests {
 
         async fn terminate(&mut self) -> Result<(), DiscoveryError> {
             self.state.lock().unwrap().calls.push("shutdown".into());
+            if let Some((started, ack)) = self.termination.take() {
+                started.send(()).unwrap();
+                ack.await
+                    .map_err(|_| provider_error("injected missing shutdown ACK", false))?;
+            }
             Ok(())
         }
 
@@ -1386,6 +1462,7 @@ mod tests {
             daemon: FakeDaemon {
                 state: Arc::new(StdMutex::new(FakeRegistrations::default())),
                 withdrawal: None,
+                termination: None,
             },
             owned: OwnedAnnouncements::default(),
             finished: false,
@@ -1424,6 +1501,207 @@ mod tests {
             .unwrap();
     }
 
+    type EventSender<T> = mpsc::Sender<(T, oneshot::Sender<()>)>;
+
+    fn fake_generation(
+        provider: &MdnsDiscovery,
+        cleanup: DaemonCleanup<FakeDaemon>,
+    ) -> (
+        MdnsGeneration,
+        EventSender<ServiceEvent>,
+        EventSender<DaemonEvent>,
+    ) {
+        let (events, event_rx) = mpsc::channel(8);
+        let (monitor, monitor_rx) = mpsc::channel(8);
+        let (announcements, announcement_rx) = mpsc::channel(8);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = start_mdns_task(
+            provider.inner.config.clone(),
+            provider.inner.state.clone(),
+            provider.inner.own_endpoint.clone(),
+            FakeEvents {
+                receiver: event_rx,
+                processed: None,
+            },
+            FakeEvents {
+                receiver: monitor_rx,
+                processed: None,
+            },
+            cleanup,
+            announcement_rx,
+            shutdown_rx,
+        );
+        (
+            MdnsGeneration {
+                task,
+                shutdown,
+                announcements,
+            },
+            events,
+            monitor,
+        )
+    }
+
+    async fn assert_mdns_finalization_blocks_restart(panic: bool) {
+        let config = MdnsDiscoveryConfig::new("supervised");
+        let provider = MdnsDiscovery::new(config.clone()).unwrap();
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        let registrations = cleanup.daemon.state.clone();
+        let (entered, termination) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        cleanup.daemon.termination = Some((entered, released));
+        let (generation, events, _monitor) = fake_generation(&provider, cleanup);
+        let old = generation.task.clone();
+        provider.ensure_started_with(|| Ok(generation)).unwrap();
+        let mut observed = provider.watch().await.unwrap();
+        let mut foreign = config.clone();
+        foreign.instance_name = "foreign".into();
+        let (service, _) =
+            build_service(&foreign, &provider.inner.service_type, "127.0.0.2:9000").unwrap();
+        let service = service.as_resolved_service();
+        deliver(
+            &events,
+            ServiceEvent::ServiceResolved(Box::new(service.clone())),
+        )
+        .await;
+        assert_eq!(
+            super::super::next_changed_peers(&mut observed, &[]).await,
+            ["127.0.0.2:9000"]
+        );
+        assert_eq!(provider.inner.state.snapshot().peers(), ["127.0.0.2:9000"]);
+        let event = if panic {
+            provider.inner.state.panic_on_next_observation();
+            ServiceEvent::ServiceResolved(Box::new(service.clone()))
+        } else {
+            ServiceEvent::SearchStopped(provider.inner.service_type.clone())
+        };
+        let (processed, _ack) = oneshot::channel();
+        events.send((event, processed)).await.unwrap();
+        super::super::dynamic::assert_invalidated(&mut observed).await;
+        termination.await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        // Longer than the coordinator's first 500ms retry. A resubscription
+        // must keep failing instead of attaching to the dying generation.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), old.clone().join())
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .ensure_started_with(|| panic!("cleanup is still running"))
+                .is_err()
+        );
+        let (first, second) = tokio::join!(provider.watch(), provider.watch());
+        assert!(matches!(first, Err(DiscoveryError::WatchClosed)));
+        assert!(matches!(second, Err(DiscoveryError::WatchClosed)));
+        assert!(!old.completion_ready());
+        release.send(()).unwrap();
+        let error = old.clone().join().await.unwrap_err();
+        if panic {
+            assert!(
+                matches!(error, DiscoveryError::Provider { message, retryable: false, .. }
+                    if message.contains("provider task failed") && message.contains("panic"))
+            );
+        } else {
+            assert!(matches!(
+                error,
+                DiscoveryError::Provider {
+                    retryable: true,
+                    ..
+                }
+            ));
+        }
+        assert!(registrations.lock().unwrap().active.is_empty());
+        assert_eq!(
+            registrations.lock().unwrap().calls.last().unwrap(),
+            "shutdown"
+        );
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let retained = StdMutex::new(Vec::new());
+        let start = || {
+            // Admission is serialized with shutdown and only follows cleanup.
+            starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(registrations.lock().unwrap().active.is_empty());
+            let (generation, events, monitor) = fake_generation(&provider, fake_cleanup());
+            retained.lock().unwrap().push((events, monitor));
+            Ok(generation)
+        };
+        let (first, second) = tokio::join!(async { provider.ensure_started_with(start) }, async {
+            provider.ensure_started_with(start)
+        },);
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !old.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        let mut fresh = provider.watch().await.unwrap();
+        assert!(fresh.snapshot().peers().is_empty());
+        let sender = retained.lock().unwrap()[0].0.clone();
+        deliver(&sender, ServiceEvent::ServiceResolved(Box::new(service))).await;
+        assert_eq!(
+            super::super::next_changed_peers(&mut fresh, &[]).await,
+            ["127.0.0.2:9000"]
+        );
+        provider.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        assert!(provider.inner.own_endpoint.lock().unwrap().is_none());
+        assert!(
+            provider
+                .ensure_started_with(|| panic!("shutdown is terminal"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_unexpected_finalization_clears_preserved_announcement() {
+        let provider = MdnsDiscovery::new(MdnsDiscoveryConfig::new("late-shutdown")).unwrap();
+        let cleanup = fake_cleanup();
+        let registrations = cleanup.daemon.state.clone();
+        let (generation, events, _monitor) = fake_generation(&provider, cleanup);
+        let task = generation.task.clone();
+        provider.ensure_started_with(|| Ok(generation)).unwrap();
+        provider
+            .announce(&PeerAnnouncement {
+                endpoint: "127.0.0.1:9000".into(),
+            })
+            .await
+            .unwrap();
+        drop(events);
+        assert!(task.join().await.is_err());
+        assert!(registrations.lock().unwrap().active.is_empty());
+        // Unexpected exit preserves the desired endpoint for a possible restart.
+        assert!(provider.inner.own_endpoint.lock().unwrap().is_some());
+        assert!(provider.shutdown().await.is_err());
+        assert!(provider.inner.own_endpoint.lock().unwrap().is_none());
+        assert!(provider.shutdown().await.is_err());
+        assert!(provider.watch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn panic_clears_snapshot_and_delayed_cleanup_blocks_restart_until_one_new_generation() {
+        assert_mdns_finalization_blocks_restart(true).await;
+    }
+
+    #[tokio::test]
+    async fn controlled_browse_error_blocks_restart_until_delayed_cleanup_finishes() {
+        assert_mdns_finalization_blocks_restart(false).await;
+    }
+
     #[tokio::test]
     async fn browse_owner_serializes_name_changes_reannouncements_and_shutdown() {
         let config = MdnsDiscoveryConfig::new("actor");
@@ -1435,7 +1713,7 @@ mod tests {
         let (monitor, monitor_rx) = mpsc::channel(8);
         let (announcements, announcement_rx) = mpsc::channel(8);
         let (stop, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(run_mdns_browse(
+        let task = start_mdns_task(
             config.clone(),
             Arc::clone(&state),
             Arc::clone(&endpoint),
@@ -1450,7 +1728,7 @@ mod tests {
             cleanup,
             announcement_rx,
             stop_rx,
-        ));
+        );
         let (reply, response) = oneshot::channel();
         announcements
             .send(AnnounceRequest {
@@ -1526,9 +1804,8 @@ mod tests {
             .await
             .unwrap();
         assert!(response.await.unwrap().is_err());
-        tokio::time::timeout(SHUTDOWN_BUDGET, task)
+        tokio::time::timeout(SHUTDOWN_BUDGET, task.join())
             .await
-            .unwrap()
             .unwrap()
             .unwrap();
         assert!(endpoint.lock().unwrap().is_none());
@@ -1701,10 +1978,9 @@ mod tests {
         let (_monitor, monitor_rx) = mpsc::channel(8);
         let (announcements, announcement_rx) = mpsc::channel(8);
         let (stop, stop_rx) = watch::channel(false);
-        let (complete, completion) = watch::channel(None);
         {
             let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
-            let task = run_mdns_browse(
+            let task = start_mdns_task(
                 config,
                 Arc::clone(&provider.inner.state),
                 Arc::clone(&provider.inner.own_endpoint),
@@ -1720,12 +1996,9 @@ mod tests {
                 announcement_rx,
                 stop_rx,
             );
-            lifecycle.task = Some(tokio::spawn(async move {
-                complete.send_replace(Some(task.await));
-            }));
+            lifecycle.task = Some(task);
             lifecycle.announcements = Some(announcements);
             lifecycle.shutdown = Some(stop);
-            lifecycle.completion = Some(completion);
         }
         let caller = Arc::clone(&provider);
         let waiter = tokio::spawn(async move {
@@ -1757,7 +2030,7 @@ mod tests {
                 .task
                 .as_ref()
                 .unwrap()
-                .is_finished()
+                .completion_ready()
         );
         ack.send(()).unwrap();
         tokio::time::timeout(SHUTDOWN_BUDGET, provider.shutdown())
