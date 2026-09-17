@@ -404,7 +404,7 @@ fn records_to_peers(mut records: Vec<SRV>, max_candidates: usize) -> Vec<String>
         })
 }
 
-fn validate_config(config: &DnsSrvDiscoveryConfig) -> Result<(), DiscoveryError> {
+pub(super) fn validate_config(config: &DnsSrvDiscoveryConfig) -> Result<(), DiscoveryError> {
     validate_event_capacity(PROVIDER, config.event_capacity)?;
     if !config.service_name.ends_with('.') {
         return Err(invalid(

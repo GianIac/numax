@@ -1660,8 +1660,8 @@ fn manager_rejects_invalid_public_sync_config_before_channel_allocation() {
             panic!("invalid {field} was accepted");
         };
         assert!(matches!(
-            error.downcast_ref::<nx_net::NetError>(),
-            Some(nx_net::NetError::InvalidConfig(_))
+            error.downcast_ref::<crate::SyncConfigError>(),
+            Some(crate::SyncConfigError::Invalid(_))
         ));
         assert!(error.to_string().contains(field), "{error}");
     }
@@ -2351,7 +2351,8 @@ async fn initial_unresponsive_candidates_do_not_block_startup_or_shutdown() {
     let error = manager.connect_to_peer(&second_addr).await.unwrap_err();
     assert!(matches!(
         error.downcast_ref::<nx_net::NetError>(),
-        Some(nx_net::NetError::ConnectionAttemptLimitReached(1))
+        Some(nx_net::NetError::ConnectionFailed(message))
+            if message.contains("outbound connection attempt limit reached: 1")
     ));
     assert_eq!(manager.connected_peer_count().await, 0);
 

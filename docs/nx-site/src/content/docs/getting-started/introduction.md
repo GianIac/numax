@@ -65,7 +65,7 @@ collaborative tools, config propagation across nodes, small multiplayer state.
   More primitives are coming.
 - **General-purpose database with rich queries** - not what Numax is.
 - **Critical production workloads** - Numax is at `v0.1.x`, tested and usable, but still early.
-  The remaining limits are documented in the [Roadmap](/roadmap/).
+  The remaining limits are documented in the [Roadmap](/numax/roadmap/).
 
 These are current limits, not permanent ones. If something is blocking you,
 [open an issue](https://github.com/GianIac/numax/issues/new) - that's exactly how priorities get shaped.
@@ -93,14 +93,14 @@ Sync uses gossip with periodic anti-entropy for recovery.
 `v0.1.x` - first stable release line, intended for controlled and non-critical workloads.
 
 It works. The examples run. The two nodes converge.
-The remaining limits are documented in the [Roadmap](/roadmap/).
+The remaining limits are documented in the [Roadmap](/numax/roadmap/).
 
 ---
 
 ## Where to go next
 
-- Never touched Numax before - [Quickstart: 5 Minutes](/getting-started/quickstart-5-min/)
-- Want to write a module - [Your First Module](/getting-started/your-first-module/)
-- Words like CRDT or gossip are new - [Foundations](/concepts/foundations/)
-- Want to understand the full vision - [Whitepaper](/whitepaper/)
-- Want to see where the project is going - [Roadmap](/roadmap/)
+- Never touched Numax before - [Quickstart: 5 Minutes](/numax/getting-started/quickstart-5-min/)
+- Want to write a module - [Your First Module](/numax/getting-started/your-first-module/)
+- Words like CRDT or gossip are new - [Foundations](/numax/concepts/foundations/)
+- Want to understand the full vision - [Whitepaper](/numax/whitepaper/)
+- Want to see where the project is going - [Roadmap](/numax/roadmap/)

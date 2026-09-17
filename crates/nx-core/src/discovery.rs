@@ -744,12 +744,12 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn dns_srv_event_capacity_bounds() {
+    #[test]
+    fn dns_srv_event_capacity_bounds() {
         assert_event_capacity_bounds("dns-srv", |capacity| {
             let mut config = DnsSrvDiscoveryConfig::new("_numax._tcp.example.");
             config.event_capacity = capacity;
-            DnsSrvDiscovery::new(config).map(drop)
+            dns_srv::validate_config(&config)
         });
     }
 

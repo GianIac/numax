@@ -388,13 +388,11 @@ impl SyncManager {
                     .max_candidates()
                     .min(nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY),
             )?;
-        node_config = node_config.with_bootstrap_server(bootstrap_server);
-
         if let Some(tls) = self.config.tls.clone() {
             node_config = node_config.with_tls(tls);
         }
 
-        let mut node = Node::try_new(node_config)?;
+        let mut node = Node::try_new_with_bootstrap_server(node_config, bootstrap_server)?;
         let Some(mut event_rx) = node.take_event_receiver() else {
             anyhow::bail!("network event receiver is unavailable");
         };

@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 use nx_sync::NodeId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::message::{Message, MessageKind, PROTOCOL_VERSION};
+use crate::message::{PROTOCOL_VERSION, ProtocolWireError, WireMessage, WireMessageKind};
 use crate::node::{
-    connect_transport, read_message_with_format, supported_formats_for, verify_peer_identity,
+    connect_transport, read_wire_message_with_format, supported_formats_for, verify_peer_identity,
     write_message,
 };
-use crate::{NetError, NetResult, SerializationFormat, TlsConfig};
+use crate::{BootstrapError, BootstrapResult, NetError, NetResult, SerializationFormat, TlsConfig};
 
 /// Default maximum number of endpoint suggestions retained by a bootstrap seed.
 pub const DEFAULT_BOOTSTRAP_CACHE_CAPACITY: usize = 1_024;
@@ -40,7 +40,7 @@ pub struct BootstrapServerConfig {
 }
 
 impl BootstrapServerConfig {
-    pub fn new(cluster_id: impl Into<String>) -> NetResult<Self> {
+    pub fn new(cluster_id: impl Into<String>) -> BootstrapResult<Self> {
         let config = Self {
             cluster_id: cluster_id.into(),
             advertised_endpoint: None,
@@ -52,15 +52,19 @@ impl BootstrapServerConfig {
         Ok(config)
     }
 
-    pub fn with_advertised_endpoint(mut self, endpoint: impl Into<String>) -> NetResult<Self> {
+    pub fn with_advertised_endpoint(
+        mut self,
+        endpoint: impl Into<String>,
+    ) -> BootstrapResult<Self> {
         let endpoint = endpoint.into();
-        self.advertised_endpoint = Some(canonicalize_advertised_endpoint(&endpoint)?);
+        self.advertised_endpoint =
+            Some(canonicalize_advertised_endpoint(&endpoint).map_err(bootstrap_config_error)?);
         Ok(self)
     }
 
-    pub fn with_max_cached_candidates(mut self, limit: usize) -> NetResult<Self> {
+    pub fn with_max_cached_candidates(mut self, limit: usize) -> BootstrapResult<Self> {
         if limit == 0 {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidConfig(
                 "bootstrap cache capacity must be greater than zero".into(),
             ));
         }
@@ -68,14 +72,14 @@ impl BootstrapServerConfig {
         Ok(self)
     }
 
-    pub fn with_max_response_candidates(mut self, limit: usize) -> NetResult<Self> {
-        validate_response_capacity(limit)?;
+    pub fn with_max_response_candidates(mut self, limit: usize) -> BootstrapResult<Self> {
+        validate_response_capacity(limit).map_err(bootstrap_config_error)?;
         self.max_response_candidates = limit;
         Ok(self)
     }
 
-    pub fn with_candidate_ttl(mut self, ttl: Duration) -> NetResult<Self> {
-        validate_candidate_ttl(ttl)?;
+    pub fn with_candidate_ttl(mut self, ttl: Duration) -> BootstrapResult<Self> {
+        validate_candidate_ttl(ttl).map_err(bootstrap_config_error)?;
         self.candidate_ttl = ttl;
         Ok(self)
     }
@@ -100,18 +104,18 @@ impl BootstrapServerConfig {
         self.candidate_ttl
     }
 
-    pub(crate) fn validate(&self) -> NetResult<()> {
-        validate_cluster_id(&self.cluster_id)?;
+    pub(crate) fn validate(&self) -> BootstrapResult<()> {
+        validate_cluster_id(&self.cluster_id).map_err(bootstrap_config_error)?;
         if let Some(endpoint) = &self.advertised_endpoint {
-            validate_advertised_endpoint(endpoint)?;
+            validate_advertised_endpoint(endpoint).map_err(bootstrap_config_error)?;
         }
         if self.max_cached_candidates == 0 {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidConfig(
                 "bootstrap cache capacity must be greater than zero".into(),
             ));
         }
-        validate_response_capacity(self.max_response_candidates)?;
-        validate_candidate_ttl(self.candidate_ttl)
+        validate_response_capacity(self.max_response_candidates).map_err(bootstrap_config_error)?;
+        validate_candidate_ttl(self.candidate_ttl).map_err(bootstrap_config_error)
     }
 }
 
@@ -142,26 +146,26 @@ impl BootstrapClientConfig {
         }
     }
 
-    pub(crate) fn validate(&self) -> NetResult<()> {
+    pub(crate) fn validate(&self) -> BootstrapResult<()> {
         if self.max_message_size == 0 {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidConfig(
                 "bootstrap maximum message size must be greater than zero".into(),
             ));
         }
         if self.socket_timeout.is_zero() {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidConfig(
                 "bootstrap socket timeout must be greater than zero".into(),
             ));
         }
         if Instant::now().checked_add(self.socket_timeout).is_none() {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidConfig(
                 "bootstrap socket timeout exceeds the supported deadline range".into(),
             ));
         }
-        validate_response_capacity(self.max_response_candidates)?;
-        validate_candidate_ttl(self.max_candidate_ttl)?;
+        validate_response_capacity(self.max_response_candidates).map_err(bootstrap_config_error)?;
+        validate_candidate_ttl(self.max_candidate_ttl).map_err(bootstrap_config_error)?;
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_queries) {
-            return Err(NetError::InvalidMessage(format!(
+            return Err(BootstrapError::InvalidConfig(format!(
                 "bootstrap concurrent query limit must be in 1..={}",
                 Semaphore::MAX_PERMITS
             )));
@@ -212,7 +216,7 @@ pub struct BootstrapClient {
 }
 
 impl BootstrapClient {
-    pub fn new(config: BootstrapClientConfig) -> NetResult<Self> {
+    pub fn new(config: BootstrapClientConfig) -> BootstrapResult<Self> {
         config.validate()?;
         let max_concurrent_queries = config.max_concurrent_queries;
         Ok(Self {
@@ -221,11 +225,11 @@ impl BootstrapClient {
         })
     }
 
-    pub(crate) fn acquire_query_slot(&self) -> NetResult<OwnedSemaphorePermit> {
+    pub(crate) fn acquire_query_slot(&self) -> BootstrapResult<OwnedSemaphorePermit> {
         Arc::clone(&self.query_slots)
             .try_acquire_owned()
-            .map_err(|_| {
-                NetError::ConnectionAttemptLimitReached(self.config.max_concurrent_queries)
+            .map_err(|_| BootstrapError::ConcurrencyLimitReached {
+                limit: self.config.max_concurrent_queries,
             })
     }
 
@@ -237,19 +241,19 @@ impl BootstrapClient {
         &self,
         seed: &str,
         request: BootstrapRequest,
-    ) -> NetResult<BootstrapResponse> {
-        validate_cluster_id(&request.cluster_id)?;
+    ) -> BootstrapResult<BootstrapResponse> {
+        validate_cluster_id(&request.cluster_id).map_err(bootstrap_config_error)?;
         if request.max_results == 0
             || request.max_results > self.config.max_response_candidates
             || u32::try_from(request.max_results).is_err()
         {
-            return Err(NetError::InvalidMessage(format!(
+            return Err(BootstrapError::InvalidConfig(format!(
                 "bootstrap max_results must be in 1..={}",
                 self.config.max_response_candidates
             )));
         }
         if let Some(endpoint) = &request.advertised_endpoint {
-            validate_advertised_endpoint(endpoint)?;
+            validate_advertised_endpoint(endpoint).map_err(bootstrap_config_error)?;
         }
 
         let _query_slot = self.acquire_query_slot()?;
@@ -278,7 +282,7 @@ impl BootstrapClient {
         }
         let (mut reader, mut writer) = tokio::io::split(stream);
         let supported_formats = supported_formats_for(self.config.serialization_format);
-        let hello = Message::bootstrap_hello(
+        let hello = WireMessage::bootstrap_hello(
             self.config.node_id.clone(),
             supported_formats.clone(),
             self.config.serialization_format,
@@ -294,14 +298,14 @@ impl BootstrapClient {
         )
         .await?;
 
-        let (response_format, response) = read_message_with_format(
+        let (response_format, response) = read_wire_message_with_format(
             &mut reader,
             self.config.max_message_size,
             self.config.socket_timeout,
         )
         .await?;
         let (seed_node_id, selected_format, candidates, candidate_ttl_ms) = match response.kind {
-            MessageKind::BootstrapAck {
+            WireMessageKind::BootstrapAck {
                 node_id,
                 protocol_version,
                 selected_format,
@@ -312,30 +316,37 @@ impl BootstrapClient {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(NetError::Wire(crate::WireError::protocol_mismatch(
                         protocol_version,
-                    )));
+                    ))
+                    .into());
                 }
                 if cluster_id != request.cluster_id {
-                    return Err(NetError::InvalidMessage(
+                    return Err(BootstrapError::InvalidResponse(
                         "bootstrap response cluster ID does not match the request".into(),
                     ));
                 }
                 (node_id, selected_format, candidates, candidate_ttl_ms)
             }
-            MessageKind::Error { error } => return Err(NetError::Wire(error)),
+            WireMessageKind::Error {
+                error: ProtocolWireError::BootstrapRejected { reason },
+            } => return Err(BootstrapError::Rejected { reason }),
+            WireMessageKind::Error { error } => {
+                let error = crate::WireError::try_from(error).map_err(BootstrapError::from)?;
+                return Err(NetError::Wire(error).into());
+            }
             _ => {
-                return Err(NetError::InvalidMessage(
+                return Err(BootstrapError::InvalidResponse(
                     "expected BootstrapAck from bootstrap seed".into(),
                 ));
             }
         };
 
         if !supported_formats.contains(&selected_format) {
-            return Err(NetError::InvalidMessage(format!(
+            return Err(BootstrapError::InvalidResponse(format!(
                 "bootstrap seed selected unsupported serialization format: {selected_format:?}"
             )));
         }
         if response_format != selected_format {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidResponse(
                 "bootstrap ACK frame format does not match the selected serialization format"
                     .into(),
             ));
@@ -349,22 +360,23 @@ impl BootstrapClient {
         if candidates.len() > request.max_results
             || candidates.len() > self.config.max_response_candidates
         {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidResponse(
                 "bootstrap response exceeds the negotiated candidate limit".into(),
             ));
         }
         let candidate_ttl = Duration::from_millis(candidate_ttl_ms);
         if candidate_ttl.is_zero() || candidate_ttl > self.config.max_candidate_ttl {
-            return Err(NetError::InvalidMessage(
+            return Err(BootstrapError::InvalidResponse(
                 "bootstrap response contains an invalid candidate TTL".into(),
             ));
         }
         let mut seen = HashSet::new();
         let mut normalized_candidates = Vec::with_capacity(candidates.len());
         for endpoint in candidates {
-            let endpoint = canonicalize_advertised_endpoint(&endpoint)?;
+            let endpoint = canonicalize_advertised_endpoint(&endpoint)
+                .map_err(|error| BootstrapError::InvalidResponse(error.to_string()))?;
             if !seen.insert(endpoint.clone()) {
-                return Err(NetError::InvalidMessage(
+                return Err(BootstrapError::InvalidResponse(
                     "bootstrap response contains duplicate endpoints".into(),
                 ));
             }
@@ -377,6 +389,10 @@ impl BootstrapClient {
             candidate_ttl,
         })
     }
+}
+
+fn bootstrap_config_error(error: NetError) -> BootstrapError {
+    BootstrapError::InvalidConfig(error.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -655,7 +671,7 @@ fn validate_candidate_ttl(ttl: Duration) -> NetResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::read_message;
+    use crate::node::read_wire_message_with_format;
     use crate::{Node, NodeConfig, TestPki};
 
     fn certificate_node_id(path: &std::path::Path) -> NodeId {
@@ -670,11 +686,11 @@ mod tests {
             config.max_concurrent_queries = limit;
             assert!(matches!(
                 config.validate(),
-                Err(NetError::InvalidMessage(_))
+                Err(BootstrapError::InvalidConfig(_))
             ));
             assert!(matches!(
                 BootstrapClient::new(config),
-                Err(NetError::InvalidMessage(_))
+                Err(BootstrapError::InvalidConfig(_))
             ));
         }
         // A semaphore stores a permit count, not an allocation per permit.
@@ -697,11 +713,11 @@ mod tests {
             config.socket_timeout = socket_timeout;
             assert!(matches!(
                 config.validate(),
-                Err(NetError::InvalidMessage(_))
+                Err(BootstrapError::InvalidConfig(_))
             ));
             assert!(matches!(
                 BootstrapClient::new(config),
-                Err(NetError::InvalidMessage(_))
+                Err(BootstrapError::InvalidConfig(_))
             ));
         }
         for socket_timeout in [Duration::from_nanos(1), crate::DEFAULT_SOCKET_TIMEOUT] {
@@ -805,18 +821,18 @@ mod tests {
     #[tokio::test]
     async fn remote_u32_max_request_returns_a_bounded_v5_response() {
         for format in [SerializationFormat::Bincode, SerializationFormat::Json] {
-            let node = Node::new(
-                NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0").with_bootstrap_server(
-                    BootstrapServerConfig::new("cluster-a")
-                        .unwrap()
-                        .with_max_response_candidates(MAX_BOOTSTRAP_RESPONSE_CAPACITY)
-                        .unwrap(),
-                ),
-            );
+            let node = Node::try_new_with_bootstrap_server(
+                NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+                BootstrapServerConfig::new("cluster-a")
+                    .unwrap()
+                    .with_max_response_candidates(MAX_BOOTSTRAP_RESPONSE_CAPACITY)
+                    .unwrap(),
+            )
+            .unwrap();
             let bound = node.start_listener().await.unwrap();
             node.announce_bootstrap_endpoint(bound.to_string()).unwrap();
             let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
-            let request = Message::bootstrap_hello(
+            let request = WireMessage::bootstrap_hello(
                 NodeId::new("client"),
                 vec![format],
                 format,
@@ -827,11 +843,12 @@ mod tests {
             write_message(&mut stream, &request, format, Duration::from_secs(1))
                 .await
                 .unwrap();
-            let response = read_message(&mut stream, 1024, Duration::from_secs(1))
-                .await
-                .unwrap();
+            let (_, response) =
+                read_wire_message_with_format(&mut stream, 1024, Duration::from_secs(1))
+                    .await
+                    .unwrap();
             match response.kind {
-                MessageKind::BootstrapAck {
+                WireMessageKind::BootstrapAck {
                     protocol_version,
                     candidates,
                     ..
@@ -892,10 +909,11 @@ mod tests {
             .unwrap()
             .with_max_response_candidates(4)
             .unwrap();
-        let mut node = Node::new(
-            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
-                .with_bootstrap_server(server_config),
-        );
+        let mut node = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+            server_config,
+        )
+        .unwrap();
         let mut events = node.take_event_receiver().unwrap();
         let bound = node.start_listener().await.unwrap();
         node.announce_bootstrap_endpoint(bound.to_string()).unwrap();
@@ -924,11 +942,12 @@ mod tests {
     #[tokio::test]
     async fn one_shot_query_supports_json_negotiation() {
         let server_config = BootstrapServerConfig::new("cluster-a").unwrap();
-        let node = Node::new(
+        let node = Node::try_new_with_bootstrap_server(
             NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
-                .with_serialization_format(SerializationFormat::Json)
-                .with_bootstrap_server(server_config),
-        );
+                .with_serialization_format(SerializationFormat::Json),
+            server_config,
+        )
+        .unwrap();
         let bound = node.start_listener().await.unwrap();
         node.announce_bootstrap_endpoint(bound.to_string()).unwrap();
         let mut client_config = BootstrapClientConfig::new(NodeId::new("client"));
@@ -948,10 +967,11 @@ mod tests {
     #[tokio::test]
     async fn cluster_mismatch_is_rejected_without_populating_the_cache() {
         let server_config = BootstrapServerConfig::new("cluster-a").unwrap();
-        let node = Node::new(
-            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
-                .with_bootstrap_server(server_config),
-        );
+        let node = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+            server_config,
+        )
+        .unwrap();
         let bound = node.start_listener().await.unwrap();
         let client =
             BootstrapClient::new(BootstrapClientConfig::new(NodeId::new("client"))).unwrap();
@@ -964,10 +984,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            NetError::Wire(crate::WireError::BootstrapRejected { .. })
-        ));
+        assert!(matches!(error, BootstrapError::Rejected { .. }));
         assert_eq!(node.connected_peer_count().await, 0);
         node.shutdown().await;
     }
@@ -975,7 +992,7 @@ mod tests {
     async fn query_ack_with_formats(
         selected_format: SerializationFormat,
         frame_format: SerializationFormat,
-    ) -> NetResult<BootstrapResponse> {
+    ) -> BootstrapResult<BootstrapResponse> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();
         let seed = tokio::spawn(async move {
@@ -983,17 +1000,18 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let hello = read_message(&mut stream, 4096, Duration::from_secs(1))
-                .await
-                .unwrap();
+            let (_, hello) =
+                read_wire_message_with_format(&mut stream, 4096, Duration::from_secs(1))
+                    .await
+                    .unwrap();
             assert!(matches!(
                 hello.kind,
-                MessageKind::BootstrapHello {
+                WireMessageKind::BootstrapHello {
                     protocol_version: 5,
                     ..
                 }
             ));
-            let ack = Message::bootstrap_ack(
+            let ack = WireMessage::bootstrap_ack(
                 NodeId::new("seed"),
                 selected_format,
                 "cluster-a".into(),
@@ -1023,7 +1041,7 @@ mod tests {
             let error = query_ack_with_formats(selected, frame).await.unwrap_err();
             assert!(matches!(
                 error,
-                NetError::InvalidMessage(reason) if reason.contains("ACK frame format")
+                BootstrapError::InvalidResponse(reason) if reason.contains("ACK frame format")
             ));
         }
     }
@@ -1043,11 +1061,11 @@ mod tests {
         let pki = TestPki::generate().unwrap();
         let seed_id = certificate_node_id(&pki.dir_path().join("node1.pem"));
         let client_id = certificate_node_id(&pki.dir_path().join("node2.pem"));
-        let seed = Node::new(
-            NodeConfig::new(seed_id.clone(), "127.0.0.1:0")
-                .with_tls(pki.node1_config())
-                .with_bootstrap_server(BootstrapServerConfig::new("cluster-a").unwrap()),
-        );
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(seed_id.clone(), "127.0.0.1:0").with_tls(pki.node1_config()),
+            BootstrapServerConfig::new("cluster-a").unwrap(),
+        )
+        .unwrap();
         let bound = seed.start_listener().await.unwrap();
         seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
         let seed_endpoint = format!("localhost:{}", bound.port());
@@ -1065,7 +1083,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, NetError::TlsError(_)));
+        assert!(matches!(
+            error,
+            BootstrapError::Transport(NetError::TlsError(_))
+        ));
 
         let mut allowed_config = BootstrapClientConfig::new(client_id);
         allowed_config.tls = Some(pki.node2_config());
@@ -1095,11 +1116,11 @@ mod tests {
             .node1_config()
             .with_allowed_peers(HashSet::from([allowed_id.to_string()]));
         assert!(!seed_tls.is_peer_allowed(&denied_id.to_string()));
-        let seed = Node::new(
-            NodeConfig::new(seed_id.clone(), "127.0.0.1:0")
-                .with_tls(seed_tls)
-                .with_bootstrap_server(BootstrapServerConfig::new("cluster-a").unwrap()),
-        );
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(seed_id.clone(), "127.0.0.1:0").with_tls(seed_tls),
+            BootstrapServerConfig::new("cluster-a").unwrap(),
+        )
+        .unwrap();
         let bound = seed.start_listener().await.unwrap();
         seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
         let seed_endpoint = format!("localhost:{}", bound.port());
@@ -1111,7 +1132,7 @@ mod tests {
             connect_transport(&seed_endpoint, Some(&pki.node2_config()), socket_timeout)
                 .await
                 .unwrap();
-        let denied_hello = Message::bootstrap_hello(
+        let denied_hello = WireMessage::bootstrap_hello(
             denied_id,
             vec![SerializationFormat::Bincode],
             SerializationFormat::Bincode,
@@ -1127,7 +1148,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let error = read_message(&mut denied_stream, 4096, socket_timeout)
+        let error = read_wire_message_with_format(&mut denied_stream, 4096, socket_timeout)
             .await
             .unwrap_err();
         assert!(matches!(error, NetError::Io(_)), "{error:?}");

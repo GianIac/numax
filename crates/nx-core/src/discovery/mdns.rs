@@ -53,13 +53,18 @@ impl MdnsDiscoveryConfig {
 
 struct Lifecycle {
     stopped: bool,
-    shutdown: Option<watch::Sender<bool>>,
+    shutdown: Option<ShutdownRequest>,
     task: Option<ProviderTask>,
     announcements: Option<mpsc::Sender<AnnounceRequest>>,
 }
 
+struct ShutdownRequest {
+    requested: watch::Sender<bool>,
+    deadline: watch::Sender<Option<tokio::time::Instant>>,
+}
+
 struct MdnsGeneration {
-    shutdown: watch::Sender<bool>,
+    shutdown: ShutdownRequest,
     announcements: mpsc::Sender<AnnounceRequest>,
     task: ProviderTask,
 }
@@ -79,7 +84,7 @@ impl Drop for Inner {
             .get_mut()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(shutdown) = lifecycle.shutdown.take() {
-            let _ = shutdown.send(true);
+            request_shutdown(&shutdown, SHUTDOWN_BUDGET);
         }
         // The browse task owns the bounded withdrawal sequence. Do not abort
         // it when its caller is dropped: it must still consume both ACKs.
@@ -185,7 +190,7 @@ impl MdnsDiscovery {
             }
             owned.accept(fullname, endpoint);
         }
-        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (shutdown, shutdown_rx, shutdown_deadline_rx) = shutdown_channels();
         let (announcements_tx, announcements_rx) = mpsc::channel(self.inner.config.event_capacity);
         let config = self.inner.config.clone();
         let state = Arc::clone(&self.inner.state);
@@ -209,12 +214,30 @@ impl MdnsDiscovery {
             cleanup,
             announcements_rx,
             shutdown_rx,
+            shutdown_deadline_rx,
         );
         Ok(MdnsGeneration {
             shutdown,
             announcements: announcements_tx,
             task,
         })
+    }
+
+    fn request_shutdown_with_budget(&self, budget: Duration) {
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        lifecycle.stopped = true;
+        if let Some(shutdown) = &lifecycle.shutdown {
+            request_shutdown(shutdown, budget);
+        }
+        self.inner
+            .own_endpoint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 }
 
@@ -269,24 +292,7 @@ impl PeerDiscovery for MdnsDiscovery {
     }
 
     fn request_shutdown(&self) {
-        let mut lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        lifecycle.stopped = true;
-        if let Some(shutdown) = &lifecycle.shutdown {
-            shutdown.send_replace(true);
-        }
-        // An already finalized unexpected generation preserved this value for
-        // restart. Clear it even when no cleanup task remains to observe stop.
-        // A live worker may finish a queued transaction; its supervised cleanup
-        // clears the value again after joining that worker.
-        self.inner
-            .own_endpoint
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        self.request_shutdown_with_budget(SHUTDOWN_BUDGET);
     }
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
@@ -304,6 +310,38 @@ impl PeerDiscovery for MdnsDiscovery {
             None => Ok(()),
         }
     }
+}
+
+fn request_shutdown(shutdown: &ShutdownRequest, budget: Duration) {
+    // Publish the stop intent before the worker-visible deadline. Otherwise the
+    // worker could exit between the two notifications and be misclassified by
+    // the supervisor as an unexpected termination.
+    shutdown.requested.send_replace(true);
+    if shutdown.deadline.borrow().is_none() {
+        shutdown.deadline.send_replace(Some(deadline_after(budget)));
+    }
+}
+
+fn deadline_after(budget: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(budget).unwrap_or(now)
+}
+
+fn shutdown_channels() -> (
+    ShutdownRequest,
+    watch::Receiver<bool>,
+    watch::Receiver<Option<tokio::time::Instant>>,
+) {
+    let (requested, requested_rx) = watch::channel(false);
+    let (deadline, deadline_rx) = watch::channel(None);
+    (
+        ShutdownRequest {
+            requested,
+            deadline,
+        },
+        requested_rx,
+        deadline_rx,
+    )
 }
 
 #[async_trait]
@@ -330,12 +368,13 @@ fn start_mdns_task<D: RegistrationDaemon + 'static>(
     cleanup: DaemonCleanup<D>,
     announcements: mpsc::Receiver<AnnounceRequest>,
     shutdown: watch::Receiver<bool>,
+    shutdown_deadline: watch::Receiver<Option<tokio::time::Instant>>,
 ) -> ProviderTask {
     let cleanup = Arc::new(tokio::sync::Mutex::new(cleanup));
     let worker_cleanup = cleanup.clone();
     let worker_state = state.clone();
     let worker_endpoint = own_endpoint.clone();
-    let worker_shutdown = shutdown.clone();
+    let worker_shutdown_deadline = shutdown_deadline.clone();
     ProviderTask::spawn(
         PROVIDER,
         state,
@@ -350,14 +389,17 @@ fn start_mdns_task<D: RegistrationDaemon + 'static>(
                 monitor,
                 &mut *cleanup,
                 announcements,
-                worker_shutdown,
+                worker_shutdown_deadline,
             )
             .await
         },
         move || async move {
             // The worker has been joined, including after panic. Its async lock
             // guard is gone, while original registration keys remain owned here.
-            let result = shutdown_daemon(&mut *cleanup.lock().await, SHUTDOWN_BUDGET).await;
+            let deadline = shutdown_deadline
+                .borrow()
+                .unwrap_or_else(|| deadline_after(SHUTDOWN_BUDGET));
+            let result = shutdown_daemon_until(&mut *cleanup.lock().await, deadline).await;
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 own_endpoint
                     .lock()
@@ -380,30 +422,35 @@ async fn run_mdns_events<D: RegistrationDaemon>(
     mut monitor: impl MdnsReceiver<DaemonEvent>,
     cleanup: &mut DaemonCleanup<D>,
     mut announcements: mpsc::Receiver<AnnounceRequest>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), DiscoveryError> {
     let mut instances = HashMap::<String, InstanceView>::new();
     let mut order = Vec::<String>::new();
     let mut expected_shutdown = false;
     loop {
-        if *shutdown.borrow() {
+        if shutdown.borrow().is_some() {
             expected_shutdown = true;
             break;
         }
         tokio::select! {
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown.borrow().is_some() {
                     expected_shutdown = true;
                     break;
                 }
             }
             Some(request) = announcements.recv() => {
-                if *shutdown.borrow() {
+                if shutdown.borrow().is_some() {
                     let _ = request.reply.send(Err(provider_error("provider is shut down", false)));
                     expected_shutdown = true;
                     break;
                 }
-                let result = replace_announcement(cleanup, &config, request.endpoint).await;
+                let result = replace_announcement_with_shutdown(
+                    cleanup,
+                    &config,
+                    request.endpoint,
+                    &mut shutdown,
+                ).await;
                 if let Some(current) = &cleanup.owned.current {
                     *own_endpoint.lock().unwrap_or_else(|error| error.into_inner()) =
                         Some(current.endpoint.clone());
@@ -413,7 +460,8 @@ async fn run_mdns_events<D: RegistrationDaemon>(
                 let _ = request.reply.send(result);
                 // A failed retirement must not accumulate registrations on
                 // subsequent updates. Cleanup still owns both original keys.
-                if cleanup.owned.keys.len() > 1 {
+                expected_shutdown = shutdown.borrow().is_some();
+                if expected_shutdown || cleanup.owned.keys.len() > 1 {
                     break;
                 }
             }
@@ -440,7 +488,7 @@ async fn run_mdns_events<D: RegistrationDaemon>(
                     }
                 }
                 Ok(ServiceEvent::SearchStopped(_)) => {
-                    expected_shutdown = *shutdown.borrow();
+                    expected_shutdown = shutdown.borrow().is_some();
                     if !expected_shutdown {
                         tracing::warn!(provider = PROVIDER, "mDNS browse stopped unexpectedly");
                     }
@@ -485,9 +533,12 @@ async fn run_mdns_events<D: RegistrationDaemon>(
     }
     announcements.close();
     while let Ok(request) = announcements.try_recv() {
-        let _ = request
-            .reply
-            .send(Err(provider_error("mDNS announcement task stopped", true)));
+        let error = if expected_shutdown || shutdown.borrow().is_some() {
+            provider_error("provider is shut down", false)
+        } else {
+            provider_error("mDNS announcement task stopped", true)
+        };
+        let _ = request.reply.send(Err(error));
     }
     if expected_shutdown {
         Ok(())
@@ -518,7 +569,7 @@ async fn wait_for_shutdown(
 
 #[async_trait]
 trait ShutdownDaemon: Send {
-    async fn unregister(&mut self) -> Result<(), DiscoveryError>;
+    async fn unregister(&mut self, deadline: tokio::time::Instant) -> Result<(), DiscoveryError>;
     async fn shutdown(&mut self) -> Result<(), DiscoveryError>;
 }
 
@@ -543,12 +594,17 @@ struct DaemonCleanup<D: RegistrationDaemon = LiveDaemon> {
 
 #[async_trait]
 impl<D: RegistrationDaemon> ShutdownDaemon for DaemonCleanup<D> {
-    async fn unregister(&mut self) -> Result<(), DiscoveryError> {
+    async fn unregister(&mut self, deadline: tokio::time::Instant) -> Result<(), DiscoveryError> {
         let mut result = Ok(());
-        for key in self.owned.keys.clone() {
-            // At most two keys can coexist during replacement. Give each a
-            // slice so one missing ACK cannot prevent trying the other key.
-            let withdrawal = tokio::time::timeout(SHUTDOWN_BUDGET / 4, self.daemon.withdraw(&key))
+        let keys = self.owned.keys.clone();
+        for (index, key) in keys.iter().enumerate() {
+            let remaining_keys = (keys.len() - index) as u32;
+            let now = tokio::time::Instant::now();
+            let key_deadline = now
+                .checked_add(deadline.saturating_duration_since(now) / remaining_keys)
+                .unwrap_or(deadline)
+                .min(deadline);
+            let withdrawal = tokio::time::timeout_at(key_deadline, self.daemon.withdraw(key))
                 .await
                 .unwrap_or_else(|_| {
                     Err(provider_error(
@@ -558,7 +614,7 @@ impl<D: RegistrationDaemon> ShutdownDaemon for DaemonCleanup<D> {
                 });
             match withdrawal {
                 Ok(()) => {
-                    self.owned.keys.remove(&key);
+                    self.owned.keys.remove(key);
                 }
                 Err(error) => {
                     result = result.and(Err(error));
@@ -651,30 +707,45 @@ impl<D: RegistrationDaemon> Drop for DaemonCleanup<D> {
     }
 }
 
-async fn shutdown_daemon(
+async fn shutdown_daemon_until(
     daemon: &mut impl ShutdownDaemon,
-    budget: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<(), DiscoveryError> {
     let now = tokio::time::Instant::now();
     // Reserve half the common deadline for daemon termination, even when
     // withdrawal errors or its ACK never arrives.
-    let withdrawal = tokio::time::timeout_at(now + budget / 2, daemon.unregister())
-        .await
-        .unwrap_or_else(|_| {
-            Err(provider_error(
-                "mDNS unregister acknowledgement timed out",
-                false,
-            ))
-        });
-    let shutdown = tokio::time::timeout_at(now + budget, daemon.shutdown())
-        .await
-        .unwrap_or_else(|_| {
-            Err(provider_error(
-                "mDNS shutdown acknowledgement timed out",
-                false,
-            ))
-        });
+    let withdrawal_deadline = now
+        .checked_add(deadline.saturating_duration_since(now) / 2)
+        .unwrap_or(deadline)
+        .min(deadline);
+    let withdrawal =
+        tokio::time::timeout_at(withdrawal_deadline, daemon.unregister(withdrawal_deadline))
+            .await
+            .unwrap_or_else(|_| {
+                Err(provider_error(
+                    "mDNS unregister acknowledgement timed out",
+                    false,
+                ))
+            });
+    let shutdown = daemon.shutdown();
+    tokio::pin!(shutdown);
+    let shutdown = tokio::select! {
+        biased;
+        result = &mut shutdown => result,
+        () = tokio::time::sleep_until(deadline) => Err(provider_error(
+            "mDNS shutdown acknowledgement timed out",
+            false,
+        )),
+    };
     withdrawal.and(shutdown)
+}
+
+#[cfg(test)]
+async fn shutdown_daemon(
+    daemon: &mut impl ShutdownDaemon,
+    budget: Duration,
+) -> Result<(), DiscoveryError> {
+    shutdown_daemon_until(daemon, deadline_after(budget)).await
 }
 
 struct InstanceView {
@@ -789,10 +860,21 @@ impl OwnedAnnouncements {
     }
 }
 
+#[cfg(test)]
 async fn replace_announcement<D: RegistrationDaemon>(
     cleanup: &mut DaemonCleanup<D>,
     config: &MdnsDiscoveryConfig,
     endpoint: String,
+) -> Result<(), DiscoveryError> {
+    let (_shutdown, mut shutdown) = watch::channel(None);
+    replace_announcement_with_shutdown(cleanup, config, endpoint, &mut shutdown).await
+}
+
+async fn replace_announcement_with_shutdown<D: RegistrationDaemon>(
+    cleanup: &mut DaemonCleanup<D>,
+    config: &MdnsDiscoveryConfig,
+    endpoint: String,
+    shutdown: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), DiscoveryError> {
     if cleanup.owned.names.len() >= MAX_OWN_HISTORY
         || cleanup.owned.endpoints.len() >= MAX_OWN_HISTORY
@@ -834,9 +916,25 @@ async fn replace_announcement<D: RegistrationDaemon>(
     cleanup.daemon.register(service)?;
     cleanup.owned.accept(fullname, endpoint);
     if let Some(previous) = previous {
-        tokio::time::timeout(SHUTDOWN_BUDGET / 2, cleanup.daemon.withdraw(&previous))
-            .await
-            .map_err(|_| provider_error("mDNS replacement withdrawal timed out", true))??;
+        let withdrawal = cleanup.daemon.withdraw(&previous);
+        tokio::pin!(withdrawal);
+        let timeout = tokio::time::sleep(SHUTDOWN_BUDGET / 2);
+        tokio::pin!(timeout);
+        let result = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || shutdown.borrow().is_some() {
+                    Err(provider_error("provider is shut down", false))
+                } else {
+                    Err(provider_error("mDNS announcement task stopped", true))
+                }
+            }
+            result = &mut withdrawal => result,
+            () = &mut timeout => {
+                Err(provider_error("mDNS replacement withdrawal timed out", true))
+            }
+        };
+        result?;
         cleanup.owned.keys.remove(&previous);
     }
     Ok(())
@@ -1124,7 +1222,10 @@ mod tests {
 
     #[async_trait]
     impl ShutdownDaemon for ControlledDaemon {
-        async fn unregister(&mut self) -> Result<(), DiscoveryError> {
+        async fn unregister(
+            &mut self,
+            _deadline: tokio::time::Instant,
+        ) -> Result<(), DiscoveryError> {
             self.calls.send("unregister").await.unwrap();
             self.unregister_ack
                 .take()
@@ -1186,7 +1287,7 @@ mod tests {
             unregister_ack: Some(unregister_ack),
             shutdown_ack: Some(shutdown_ack),
         };
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (shutdown, mut cancel_rx, _deadline_rx) = shutdown_channels();
         let task = ProviderTask::spawn(
             PROVIDER,
             provider.inner.state.clone(),
@@ -1201,7 +1302,7 @@ mod tests {
         let completion = task.clone();
         {
             let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
-            lifecycle.shutdown = Some(cancel_tx);
+            lifecycle.shutdown = Some(shutdown);
             lifecycle.task = Some(task);
         }
         drop(provider);
@@ -1406,6 +1507,7 @@ mod tests {
     struct FakeDaemon {
         state: Arc<StdMutex<FakeRegistrations>>,
         withdrawal: Option<(oneshot::Sender<String>, oneshot::Receiver<()>)>,
+        missing_withdraw_acks: bool,
         termination: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     }
 
@@ -1428,11 +1530,17 @@ mod tests {
                 ack.await
                     .map_err(|_| provider_error("injected missing ACK", false))?;
             }
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(format!("unregister:{key}"));
-            if state.fail_withdraw {
-                return Err(provider_error("injected withdrawal failure", false));
+            {
+                let mut state = self.state.lock().unwrap();
+                state.calls.push(format!("unregister:{key}"));
+                if state.fail_withdraw {
+                    return Err(provider_error("injected withdrawal failure", false));
+                }
             }
+            if self.missing_withdraw_acks {
+                std::future::pending::<()>().await;
+            }
+            let mut state = self.state.lock().unwrap();
             // Unlike a wire alias, only the original key removes the record.
             state.active.remove(key);
             Ok(())
@@ -1445,6 +1553,9 @@ mod tests {
                 ack.await
                     .map_err(|_| provider_error("injected missing shutdown ACK", false))?;
             }
+            // A confirmed daemon termination retires every registration, even
+            // if an individual unregister ACK was lost.
+            self.state.lock().unwrap().active.clear();
             Ok(())
         }
 
@@ -1462,6 +1573,7 @@ mod tests {
             daemon: FakeDaemon {
                 state: Arc::new(StdMutex::new(FakeRegistrations::default())),
                 withdrawal: None,
+                missing_withdraw_acks: false,
                 termination: None,
             },
             owned: OwnedAnnouncements::default(),
@@ -1514,7 +1626,7 @@ mod tests {
         let (events, event_rx) = mpsc::channel(8);
         let (monitor, monitor_rx) = mpsc::channel(8);
         let (announcements, announcement_rx) = mpsc::channel(8);
-        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (shutdown, shutdown_rx, shutdown_deadline_rx) = shutdown_channels();
         let task = start_mdns_task(
             provider.inner.config.clone(),
             provider.inner.state.clone(),
@@ -1530,6 +1642,7 @@ mod tests {
             cleanup,
             announcement_rx,
             shutdown_rx,
+            shutdown_deadline_rx,
         );
         (
             MdnsGeneration {
@@ -1712,7 +1825,7 @@ mod tests {
         let (events, event_rx) = mpsc::channel(8);
         let (monitor, monitor_rx) = mpsc::channel(8);
         let (announcements, announcement_rx) = mpsc::channel(8);
-        let (stop, stop_rx) = watch::channel(false);
+        let (stop, stop_rx, stop_deadline_rx) = shutdown_channels();
         let task = start_mdns_task(
             config.clone(),
             Arc::clone(&state),
@@ -1728,6 +1841,7 @@ mod tests {
             cleanup,
             announcement_rx,
             stop_rx,
+            stop_deadline_rx,
         );
         let (reply, response) = oneshot::channel();
         announcements
@@ -1793,7 +1907,7 @@ mod tests {
         response.await.unwrap().unwrap();
         assert_eq!(daemon.lock().unwrap().active.len(), 1);
         assert!(!daemon.lock().unwrap().active.contains_key(&replacement));
-        stop.send_replace(true);
+        request_shutdown(&stop, SHUTDOWN_BUDGET);
         // A request queued concurrently with shutdown must never register.
         let (reply, response) = oneshot::channel();
         announcements
@@ -1977,7 +2091,7 @@ mod tests {
         let (_events, event_rx) = mpsc::channel(8);
         let (_monitor, monitor_rx) = mpsc::channel(8);
         let (announcements, announcement_rx) = mpsc::channel(8);
-        let (stop, stop_rx) = watch::channel(false);
+        let (stop, stop_rx, stop_deadline_rx) = shutdown_channels();
         {
             let mut lifecycle = provider.inner.lifecycle.lock().unwrap();
             let task = start_mdns_task(
@@ -1995,6 +2109,7 @@ mod tests {
                 cleanup,
                 announcement_rx,
                 stop_rx,
+                stop_deadline_rx,
             );
             lifecycle.task = Some(task);
             lifecycle.announcements = Some(announcements);
@@ -2040,6 +2155,79 @@ mod tests {
         let state = state.lock().unwrap();
         assert!(state.active.is_empty());
         assert_eq!(state.calls.last().unwrap(), "shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_replacement_uses_one_deadline_and_cleans_both_keys() {
+        let config = MdnsDiscoveryConfig::new("shared-deadline");
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        let original = cleanup.owned.current.as_ref().unwrap().key.clone();
+        let (started, entered) = oneshot::channel();
+        let (_ack, missing_ack) = oneshot::channel();
+        cleanup.daemon.withdrawal = Some((started, missing_ack));
+        cleanup.daemon.missing_withdraw_acks = true;
+        let registrations = Arc::clone(&cleanup.daemon.state);
+        let provider = Arc::new(MdnsDiscovery::new(config).unwrap());
+        let (generation, _events, _monitor) = fake_generation(&provider, cleanup);
+        let completion = generation.task.clone();
+        provider.ensure_started_with(|| Ok(generation)).unwrap();
+
+        let caller = Arc::clone(&provider);
+        let announcement = tokio::spawn(async move {
+            caller
+                .announce(&PeerAnnouncement {
+                    endpoint: "127.0.0.1:9001".into(),
+                })
+                .await
+        });
+        assert_eq!(entered.await.unwrap(), original);
+        assert_eq!(registrations.lock().unwrap().active.len(), 2);
+
+        let budget = Duration::from_millis(120);
+        provider.request_shutdown_with_budget(budget);
+        let first_deadline = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .shutdown
+            .as_ref()
+            .and_then(|shutdown| *shutdown.deadline.borrow())
+            .unwrap();
+        assert_eq!(
+            announcement.await.unwrap(),
+            Err(provider_error("provider is shut down", false))
+        );
+        provider.request_shutdown_with_budget(Duration::from_secs(30));
+        let repeated_deadline = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .shutdown
+            .as_ref()
+            .and_then(|shutdown| *shutdown.deadline.borrow())
+            .unwrap();
+        assert_eq!(repeated_deadline, first_deadline);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), provider.shutdown())
+            .await
+            .expect("shutdown renewed its deadline");
+        assert!(result.is_err());
+        assert!(completion.completion_ready());
+        let state = registrations.lock().unwrap();
+        let unregisters: Vec<_> = state
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("unregister:"))
+            .collect();
+        assert_eq!(unregisters.len(), 2);
+        assert_ne!(unregisters[0], unregisters[1]);
+        assert_eq!(state.calls.last().unwrap(), "shutdown");
+        assert!(state.active.is_empty());
     }
 
     #[tokio::test]

@@ -25,4 +25,4 @@ pub use nx_net::{
     PeerConnectionInfo, PeerIdentity, PeerIdentityVerification, SerializationFormat, TlsConfig,
 };
 pub use observability::ObservabilityConfig;
-pub use sync_config::SyncConfig;
+pub use sync_config::{SyncConfig, SyncConfigError};

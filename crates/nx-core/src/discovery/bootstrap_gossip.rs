@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nx_net::{BootstrapClient, BootstrapClientConfig, BootstrapRequest, NetError, WireRetryPolicy};
+use nx_net::{
+    BootstrapClient, BootstrapClientConfig, BootstrapError, BootstrapRequest, NetError,
+    WireRetryPolicy,
+};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -352,7 +355,7 @@ impl SeedSchedule {
     fn failed(
         &mut self,
         config: &BootstrapGossipDiscoveryConfig,
-        error: &NetError,
+        error: &BootstrapError,
         now: Instant,
     ) -> Result<(), DiscoveryError> {
         self.disabled = bootstrap_error_is_fatal(error);
@@ -383,7 +386,7 @@ trait SeedClient: Send + Sync {
         &self,
         seed: &str,
         request: BootstrapRequest,
-    ) -> Result<nx_net::BootstrapResponse, NetError>;
+    ) -> Result<nx_net::BootstrapResponse, BootstrapError>;
 }
 
 #[async_trait]
@@ -392,7 +395,7 @@ impl SeedClient for BootstrapClient {
         &self,
         seed: &str,
         request: BootstrapRequest,
-    ) -> Result<nx_net::BootstrapResponse, NetError> {
+    ) -> Result<nx_net::BootstrapResponse, BootstrapError> {
         BootstrapClient::query(self, seed, request).await
     }
 }
@@ -617,18 +620,23 @@ fn flatten_views(
     result
 }
 
-fn bootstrap_error_is_fatal(error: &NetError) -> bool {
-    matches!(error, NetError::InvalidConfig(_))
-        || matches!(
-            error,
-            NetError::Wire(wire)
-                if matches!(wire.retry_policy(), WireRetryPolicy::Fatal | WireRetryPolicy::RequestFatal)
-        )
+fn bootstrap_error_is_fatal(error: &BootstrapError) -> bool {
+    matches!(
+        error,
+        BootstrapError::InvalidConfig(_)
+            | BootstrapError::Rejected { .. }
+            | BootstrapError::InvalidResponse(_)
+            | BootstrapError::NodeConfig(_)
+    ) || matches!(
+        error,
+        BootstrapError::Transport(NetError::Wire(wire))
+            if matches!(wire.retry_policy(), WireRetryPolicy::Fatal | WireRetryPolicy::RequestFatal)
+    )
 }
 
-fn bootstrap_retry_after(error: &NetError) -> Option<Duration> {
+fn bootstrap_retry_after(error: &BootstrapError) -> Option<Duration> {
     match error {
-        NetError::Wire(wire) => match wire.retry_policy() {
+        BootstrapError::Transport(NetError::Wire(wire)) => match wire.retry_policy() {
             WireRetryPolicy::RetryAfter(delay) => Some(delay),
             _ => None,
         },
@@ -729,9 +737,9 @@ mod tests {
             retry_delay: Duration::MAX,
             disabled: false,
         };
-        let error = NetError::Wire(nx_net::WireError::RateLimited {
+        let error = BootstrapError::from(NetError::Wire(nx_net::WireError::RateLimited {
             retry_after_ms: Some(200),
-        });
+        }));
         assert!(matches!(
             schedule.failed(&config, &error, now),
             Err(DiscoveryError::Provider {
@@ -761,9 +769,9 @@ mod tests {
             retry_delay: config.retry_initial,
             disabled: false,
         };
-        let error = NetError::Wire(nx_net::WireError::RateLimited {
+        let error = BootstrapError::from(NetError::Wire(nx_net::WireError::RateLimited {
             retry_after_ms: Some(2000),
-        });
+        }));
         assert!(schedule.failed(&config, &error, now).is_err());
         schedule.announce(now);
         assert_eq!(schedule.deadline(), None);
@@ -771,9 +779,9 @@ mod tests {
     }
 
     async fn assert_panicked_shutdown_withdraws(restart: bool) {
-        let seed = Node::try_new(
-            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
-                .with_bootstrap_server(BootstrapServerConfig::new("default").unwrap()),
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+            BootstrapServerConfig::new("default").unwrap(),
         )
         .unwrap();
         let bound = seed.start_listener().await.unwrap().to_string();
@@ -906,14 +914,14 @@ mod tests {
             &self,
             _seed: &str,
             request: BootstrapRequest,
-        ) -> Result<nx_net::BootstrapResponse, NetError> {
+        ) -> Result<nx_net::BootstrapResponse, BootstrapError> {
             if let Some(endpoint) = request.advertised_endpoint {
                 *self.applied.lock().unwrap() = Some(endpoint);
                 self.calls.send("applied-without-ack").await.unwrap();
                 return match self.announcement_ack {
                     AnnouncementAck::Pending => pending().await,
                     AnnouncementAck::Panic => panic!("injected probe panic after seed application"),
-                    AnnouncementAck::Lost => Err(NetError::Timeout),
+                    AnnouncementAck::Lost => Err(NetError::Timeout.into()),
                 };
             }
             self.applied.lock().unwrap().take();
@@ -1105,7 +1113,7 @@ mod tests {
             &self,
             seed: &str,
             _request: BootstrapRequest,
-        ) -> Result<nx_net::BootstrapResponse, NetError> {
+        ) -> Result<nx_net::BootstrapResponse, BootstrapError> {
             self.calls
                 .send((seed.to_string(), Instant::now()))
                 .await
@@ -1118,7 +1126,8 @@ mod tests {
             {
                 return Err(NetError::Wire(nx_net::WireError::RateLimited {
                     retry_after_ms: Some(200),
-                }));
+                })
+                .into());
             }
             Ok(nx_net::BootstrapResponse {
                 seed_node_id: NodeId::new(seed),
@@ -1331,14 +1340,14 @@ mod tests {
 
     #[tokio::test]
     async fn provider_learns_candidates_and_withdraws_its_announcement() {
-        let seed = Node::new(
-            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0").with_bootstrap_server(
-                BootstrapServerConfig::new("cluster-a")
-                    .unwrap()
-                    .with_max_response_candidates(4)
-                    .unwrap(),
-            ),
-        );
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+            BootstrapServerConfig::new("cluster-a")
+                .unwrap()
+                .with_max_response_candidates(4)
+                .unwrap(),
+        )
+        .unwrap();
         let bound = seed.start_listener().await.unwrap();
         seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
 
@@ -1390,10 +1399,11 @@ mod tests {
             .unwrap()
             .with_candidate_ttl(Duration::from_millis(40))
             .unwrap();
-        let seed = Node::new(
-            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0")
-                .with_bootstrap_server(server_config.clone()),
-        );
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
+            server_config.clone(),
+        )
+        .unwrap();
         let bound = seed.start_listener().await.unwrap();
         seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
 
@@ -1425,10 +1435,11 @@ mod tests {
                 .is_empty()
         );
 
-        let restarted = Node::new(
-            NodeConfig::new(NodeId::new("seed-restarted"), bound.to_string())
-                .with_bootstrap_server(server_config),
-        );
+        let restarted = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("seed-restarted"), bound.to_string()),
+            server_config,
+        )
+        .unwrap();
         restarted.start_listener().await.unwrap();
         restarted
             .announce_bootstrap_endpoint(bound.to_string())

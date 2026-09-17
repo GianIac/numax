@@ -269,14 +269,17 @@ on a new alias that cannot be retained; it does not silently evict self-filterin
 history. Once queued, the browse task owns announcement completion even if the
 calling future is cancelled.
 
-Shutdown has one cleanup owner: it requests unregister/goodbye, waits for the
-daemon acknowledgement within a deadline, stops browsing, requests daemon
-shutdown and awaits its acknowledgement, joins the bridge task, and clears the
-view. It attempts each owned original key with its own bounded acknowledgement
-wait. The common budget reserves time for daemon termination even when
-unregister fails or its acknowledgement never arrives; queue retries are also
-bounded by those deadlines. Cleanup errors are reported, not silently treated
-as success. A daemon acknowledgement does **not** guarantee receipt of a UDP
+Shutdown has one cleanup owner and one absolute four-second deadline measured
+from the first shutdown request. A replacement withdrawal in progress selects
+on that request; cancellation retains both original keys for cleanup instead of
+losing ownership. Cleanup requests unregister/goodbye for every owned key, stops
+browsing, requests daemon shutdown, awaits its acknowledgement, joins the bridge
+task, and clears the view. Repeated shutdown calls cannot renew the deadline.
+The common budget reserves time for daemon termination even when unregister
+fails or its acknowledgement never arrives; queue retries are also bounded by
+that same deadline. The coordinator's five-second provider timeout therefore
+exceeds the complete provider-owned sequence. Cleanup errors are reported, not
+silently treated as success. A daemon acknowledgement does **not** guarantee receipt of a UDP
 goodbye by every LAN peer. Drop is best-effort fallback, not a stronger delivery
 guarantee. This provider is intended for LAN development and demos, not
 untrusted multicast networks.
@@ -405,7 +408,8 @@ cancellation-safe shutdown. Provider-specific tests additionally cover:
 - file creation and removal, atomic replacement, malformed and non-UTF-8
   updates, last-good retention, recovery and shutdown;
 - mDNS address and instance bounds, self filtering, removal and service-name
-  conflicts.
+  conflicts, shutdown during replacement, missing withdrawal acknowledgements,
+  preservation of both owned keys and non-renewable cleanup deadlines.
 
 Regression coverage also exercises observation freshness versus cached replay,
 resubscription timestamps, global mDNS retained-state bounds, bounded shutdown

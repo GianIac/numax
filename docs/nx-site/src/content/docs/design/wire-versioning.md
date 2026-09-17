@@ -88,8 +88,9 @@ Never reuse a protocol version for a different wire contract.
 
 ## Protocol 5 bootstrap exchange
 
-Protocol `5` adds `BootstrapHello` and `BootstrapAck` after the existing
-`MessageKind` variants and adds `WireError::BootstrapRejected`. A bootstrap
+Protocol `5` adds private wire variants `BootstrapHello` and `BootstrapAck` after
+the legacy public `MessageKind` layout and adds a private
+`BootstrapRejected` wire error after the legacy public `WireError` layout. A bootstrap
 exchange is an alternative one-shot handshake on the normal peer listener; it
 does not turn into a replication connection.
 
@@ -149,8 +150,9 @@ structured mismatch; this is still a safe rejection and never admits a peer.
 Static peer configuration remains source-compatible but does not make mixed
 version `4`/`5` clusters wire-compatible.
 
-Both JSON and Bincode round trips, exact-version rejection and Bincode golden
-hashes cover the version `5` message set. Multiprocess compatibility coverage
+JSON and Bincode round trips cover the complete private version `5` message set.
+Bincode golden hashes and direct public/private byte comparisons protect every
+legacy public variant, while exact-version and multiprocess compatibility coverage
 uses the previous `v0.1.4` binary to verify safe rejection at the normal
 handshake boundary.
 

@@ -423,5 +423,5 @@ nx run my_module.wasm --config node-b.toml --settle-for 5s
 
 ## Related
 
-- [CLI reference](/reference/cli/) - full flag and subcommand reference
-- [Host API](/reference/host-api/) - functions available to WASM modules
+- [CLI reference](/numax/reference/cli/) - full flag and subcommand reference
+- [Host API](/numax/reference/host-api/) - functions available to WASM modules

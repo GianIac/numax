@@ -11,7 +11,7 @@ pub use bootstrap::{
     DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY, DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES,
     MAX_BOOTSTRAP_CANDIDATE_TTL, MAX_BOOTSTRAP_RESPONSE_CAPACITY,
 };
-pub use error::{NetError, NetResult};
+pub use error::{BootstrapError, BootstrapResult, NetError, NetResult, NodeConfigError};
 pub use message::{
     Message, MessageKind, PROTOCOL_VERSION, SerializationFormat, WireError, WireRetryPolicy,
 };

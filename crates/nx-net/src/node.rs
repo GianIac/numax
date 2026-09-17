@@ -12,10 +12,10 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::bootstrap::{BootstrapServer, BootstrapServerConfig};
-use crate::error::{NetError, NetResult};
+use crate::error::{BootstrapResult, NetError, NetResult, NodeConfigError};
 use crate::message::{
-    DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, SerializationFormat,
-    WireError, validate_payload_len,
+    DEFAULT_SUPPORTED_FORMATS, Message, MessageKind, PROTOCOL_VERSION, ProtocolWireError,
+    SerializationFormat, WireError, WireMessage, WireMessageKind, validate_payload_len,
 };
 use crate::peer::{
     ConnectionDirection, PeerConnectionInfo, PeerIdentity, PeerIdentityVerification, PeerInfo,
@@ -223,36 +223,29 @@ pub struct NodeConfig {
 
     /// Number of node events buffered for the runtime event loop.
     pub event_channel_capacity: usize,
-
-    /// Optional policy for authenticated one-shot bootstrap requests.
-    pub bootstrap_server: Option<BootstrapServerConfig>,
 }
 
 impl NodeConfig {
     /// Check limits before allocating channels or starting network tasks.
     /// Zero peers disables admission; event capacity and socket timeout must be positive.
-    pub fn validate(&self) -> NetResult<()> {
+    pub fn validate(&self) -> Result<(), NodeConfigError> {
         if self.max_peers > Semaphore::MAX_PERMITS {
-            return Err(NetError::InvalidConfig(format!(
-                "max_peers must not exceed {}",
-                Semaphore::MAX_PERMITS
-            )));
+            return Err(NodeConfigError::MaxPeersTooLarge {
+                limit: Semaphore::MAX_PERMITS,
+            });
         }
         if self.event_channel_capacity == 0 || self.event_channel_capacity > Semaphore::MAX_PERMITS
         {
-            return Err(NetError::InvalidConfig(format!(
-                "event_channel_capacity must be in 1..={}",
-                Semaphore::MAX_PERMITS
-            )));
+            return Err(NodeConfigError::InvalidEventChannelCapacity {
+                limit: Semaphore::MAX_PERMITS,
+            });
         }
         if self.socket_timeout.is_zero()
             || std::time::Instant::now()
                 .checked_add(self.socket_timeout)
                 .is_none()
         {
-            return Err(NetError::InvalidConfig(
-                "socket_timeout must be positive and form a representable deadline".into(),
-            ));
+            return Err(NodeConfigError::InvalidSocketTimeout);
         }
         Ok(())
     }
@@ -268,7 +261,6 @@ impl NodeConfig {
             socket_timeout: DEFAULT_SOCKET_TIMEOUT,
             serialization_format: SerializationFormat::Bincode,
             event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
-            bootstrap_server: None,
         }
     }
 
@@ -304,11 +296,6 @@ impl NodeConfig {
 
     pub fn with_event_channel_capacity(mut self, event_channel_capacity: usize) -> Self {
         self.event_channel_capacity = event_channel_capacity;
-        self
-    }
-
-    pub fn with_bootstrap_server(mut self, config: BootstrapServerConfig) -> Self {
-        self.bootstrap_server = Some(config);
         self
     }
 }
@@ -374,7 +361,9 @@ impl ConnectionAttemptGuard {
             NetError::ConnectionFailed("outbound attempt registry is poisoned".to_string())
         })?;
         if !active.insert(endpoint.to_string()) {
-            return Err(NetError::ConnectionInProgress(endpoint.to_string()));
+            return Err(NetError::ConnectionFailed(format!(
+                "connection attempt already in progress for peer: {endpoint}"
+            )));
         }
         drop(active);
         Ok(Self {
@@ -408,26 +397,12 @@ pub struct Node {
 }
 
 impl Node {
-    /// Create a node without changing the legacy infallible signature.
-    /// Invalid configurations produce an inert node: network entry points return
-    /// `NetError::InvalidConfig`. Prefer `try_new` to reject them immediately.
+    /// Create a node using the legacy infallible constructor.
     pub fn new(config: NodeConfig) -> Self {
-        let valid = config.validate().is_ok();
-        // Placeholders only: invalid nodes cannot start networking. Never clamp an
-        // invalid configuration into an operational node with different limits.
-        let event_channel_capacity = if valid {
-            config.event_channel_capacity
-        } else {
-            1
-        };
+        let event_channel_capacity = config.event_channel_capacity.max(1);
         let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        let max_peers = if valid { config.max_peers } else { 0 };
-        let bootstrap_server = valid
-            .then(|| config.bootstrap_server.clone())
-            .flatten()
-            .map(BootstrapServer::new)
-            .map(Arc::new);
+        let max_peers = config.max_peers;
 
         Self {
             config,
@@ -440,14 +415,26 @@ impl Node {
             outbound_attempts: Arc::new(StdMutex::new(HashSet::new())),
             tasks: Arc::new(StdMutex::new(TaskRegistry::default())),
             shutdown_lock: Mutex::new(()),
-            bootstrap_server,
+            bootstrap_server: None,
         }
     }
 
     /// Validate configuration and create a node, without binding any sockets.
-    pub fn try_new(config: NodeConfig) -> NetResult<Self> {
+    pub fn try_new(config: NodeConfig) -> Result<Self, NodeConfigError> {
         config.validate()?;
         Ok(Self::new(config))
+    }
+
+    /// Validate node and bootstrap policy, then create a bootstrap-capable node.
+    pub fn try_new_with_bootstrap_server(
+        config: NodeConfig,
+        bootstrap_server: BootstrapServerConfig,
+    ) -> BootstrapResult<Self> {
+        config.validate()?;
+        bootstrap_server.validate()?;
+        let mut node = Self::new(config);
+        node.bootstrap_server = Some(Arc::new(BootstrapServer::new(bootstrap_server)));
+        Ok(node)
     }
 
     /// Gets the event receiver (can only be called once).
@@ -459,7 +446,6 @@ impl Node {
     ///
     /// Returns the actual bound address (useful when binding to port 0 in tests).
     pub async fn start_listener(&self) -> NetResult<std::net::SocketAddr> {
-        self.config.validate()?;
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         let bound_addr = listener.local_addr()?;
 
@@ -548,7 +534,6 @@ impl Node {
 
     /// Conncet to a peer
     pub async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
-        self.config.validate()?;
         if *self.shutdown_tx.borrow() {
             return Err(NetError::ConnectionFailed("node is shut down".into()));
         }
@@ -559,7 +544,9 @@ impl Node {
         let _attempt_slot = Arc::clone(&self.outbound_attempt_slots)
             .try_acquire_owned()
             .map_err(|_| {
-                NetError::ConnectionAttemptLimitReached(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)
+                NetError::ConnectionFailed(format!(
+                    "outbound connection attempt limit reached: {MAX_CONCURRENT_OUTBOUND_ATTEMPTS}"
+                ))
             })?;
         let slot = Arc::clone(&self.connection_slots)
             .try_acquire_owned()
@@ -779,7 +766,6 @@ impl Node {
     }
 
     async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
-        self.config.validate()?;
         let writers = {
             let peers = self.peers.read().await;
             peers
@@ -837,7 +823,6 @@ impl Node {
     }
 
     async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
-        self.config.validate()?;
         let peer_writer = {
             let peers = self.peers.read().await;
             peers.get(addr).and_then(|conn| {
@@ -950,7 +935,6 @@ impl Node {
 
     /// Publish the endpoint returned by this node's bootstrap service.
     pub fn announce_bootstrap_endpoint(&self, endpoint: impl Into<String>) -> NetResult<()> {
-        self.config.validate()?;
         let server = self
             .bootstrap_server
             .as_ref()
@@ -960,7 +944,6 @@ impl Node {
 
     /// Withdraw the endpoint returned by this node's bootstrap service.
     pub fn withdraw_bootstrap_endpoint(&self) -> NetResult<()> {
-        self.config.validate()?;
         let server = self
             .bootstrap_server
             .as_ref()
@@ -1055,10 +1038,10 @@ async fn handle_incoming(
 
     // Wait for HELLO
     let (hello_format, msg) =
-        read_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
+        read_wire_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
             .await?;
     let handshake = match msg.kind {
-        MessageKind::Hello {
+        WireMessageKind::Hello {
             node_id,
             protocol_version,
             supported_formats,
@@ -1068,7 +1051,7 @@ async fn handle_incoming(
                 let error = WireError::protocol_mismatch(protocol_version);
                 let _ = write_message(
                     &mut writer,
-                    &Message::wire_error(error),
+                    &WireMessage::wire_error(error.into()),
                     hello_format,
                     limits.socket_timeout,
                 )
@@ -1095,7 +1078,7 @@ async fn handle_incoming(
                 format: negotiated_format,
             }
         }
-        MessageKind::BootstrapHello {
+        WireMessageKind::BootstrapHello {
             node_id,
             protocol_version,
             supported_formats,
@@ -1108,7 +1091,7 @@ async fn handle_incoming(
                 let error = WireError::protocol_mismatch(protocol_version);
                 let _ = write_message(
                     &mut writer,
-                    &Message::wire_error(error),
+                    &WireMessage::wire_error(error.into()),
                     hello_format,
                     limits.socket_timeout,
                 )
@@ -1138,8 +1121,8 @@ async fn handle_incoming(
                 max_results: max_results as usize,
             }
         }
-        MessageKind::Error { error } => {
-            return Err(NetError::Wire(error));
+        WireMessageKind::Error { error } => {
+            return Err(NetError::Wire(error.try_into()?));
         }
         _ => {
             return Err(NetError::InvalidMessage(
@@ -1166,64 +1149,64 @@ async fn handle_incoming(
         let server = match bootstrap_server {
             Some(server) => server,
             None => {
-                let error = WireError::BootstrapRejected {
+                let error = ProtocolWireError::BootstrapRejected {
                     reason: "bootstrap service is disabled".into(),
                 };
                 let _ = write_message(
                     &mut writer,
-                    &Message::wire_error(error.clone()),
+                    &WireMessage::wire_error(error.clone()),
                     format,
                     limits.socket_timeout,
                 )
                 .await;
-                return Err(NetError::Wire(error));
+                return Err(NetError::InvalidMessage(error.to_string()));
             }
         };
         if cluster_id != server.cluster_id() {
-            let error = WireError::BootstrapRejected {
+            let error = ProtocolWireError::BootstrapRejected {
                 reason: "cluster ID does not match this bootstrap seed".into(),
             };
             let _ = write_message(
                 &mut writer,
-                &Message::wire_error(error.clone()),
+                &WireMessage::wire_error(error.clone()),
                 format,
                 limits.socket_timeout,
             )
             .await;
-            return Err(NetError::Wire(error));
+            return Err(NetError::InvalidMessage(error.to_string()));
         }
         if max_results == 0 {
-            let error = WireError::BootstrapRejected {
+            let error = ProtocolWireError::BootstrapRejected {
                 reason: "max_results must be greater than zero".into(),
             };
             let _ = write_message(
                 &mut writer,
-                &Message::wire_error(error.clone()),
+                &WireMessage::wire_error(error.clone()),
                 format,
                 limits.socket_timeout,
             )
             .await;
-            return Err(NetError::Wire(error));
+            return Err(NetError::InvalidMessage(error.to_string()));
         }
         let candidates = match server.exchange(&node_id, advertised_endpoint, max_results) {
             Ok(candidates) => candidates,
             Err(error) => {
-                let wire_error = WireError::BootstrapRejected {
+                let wire_error = ProtocolWireError::BootstrapRejected {
                     reason: error.to_string(),
                 };
                 let _ = write_message(
                     &mut writer,
-                    &Message::wire_error(wire_error.clone()),
+                    &WireMessage::wire_error(wire_error.clone()),
                     format,
                     limits.socket_timeout,
                 )
                 .await;
-                return Err(NetError::Wire(wire_error));
+                return Err(NetError::InvalidMessage(wire_error.to_string()));
             }
         };
         let candidate_ttl_ms =
             u64::try_from(server.candidate_ttl().as_millis()).unwrap_or(u64::MAX);
-        let ack = Message::bootstrap_ack(
+        let ack = WireMessage::bootstrap_ack(
             our_node_id,
             format,
             cluster_id,
@@ -1412,7 +1395,9 @@ pub(crate) fn verify_peer_identity(
     tls: Option<&TlsConfig>,
 ) -> NetResult<()> {
     if peer_node_id == our_node_id {
-        return Err(NetError::SelfConnection(peer_node_id.to_string()));
+        return Err(NetError::ConnectionFailed(format!(
+            "refusing connection to local node ID: {peer_node_id}"
+        )));
     }
 
     if let Some(tls_config) = tls
@@ -1632,13 +1617,33 @@ async fn read_messages(
 }
 
 /// Writes a message to a stream.
-pub(crate) async fn write_message<W: AsyncWriteExt + Unpin>(
+pub(crate) trait WireEncode {
+    fn encode_wire(&self, format: SerializationFormat) -> NetResult<Vec<u8>>;
+}
+
+impl WireEncode for Message {
+    fn encode_wire(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
+        self.to_bytes_with_format(format)
+    }
+}
+
+impl WireEncode for WireMessage {
+    fn encode_wire(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
+        self.to_bytes_with_format(format)
+    }
+}
+
+pub(crate) async fn write_message<W, M>(
     writer: &mut W,
-    msg: &Message,
+    msg: &M,
     serialization_format: SerializationFormat,
     socket_timeout: Duration,
-) -> NetResult<()> {
-    let bytes = msg.to_bytes_with_format(serialization_format)?;
+) -> NetResult<()>
+where
+    W: AsyncWriteExt + Unpin,
+    M: WireEncode,
+{
+    let bytes = msg.encode_wire(serialization_format)?;
     write_bytes(writer, &bytes, socket_timeout).await?;
     Ok(())
 }
@@ -1672,6 +1677,16 @@ pub(crate) async fn read_message_with_format<R: AsyncReadExt + Unpin>(
     max_message_size: usize,
     socket_timeout: Duration,
 ) -> NetResult<(SerializationFormat, Message)> {
+    let (format, message) =
+        read_wire_message_with_format(reader, max_message_size, socket_timeout).await?;
+    Ok((format, message.try_into()?))
+}
+
+pub(crate) async fn read_wire_message_with_format<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    max_message_size: usize,
+    socket_timeout: Duration,
+) -> NetResult<(SerializationFormat, WireMessage)> {
     // Read length (4 bytes)
     let mut len_buf = [0u8; 4];
     timeout(socket_timeout, reader.read_exact(&mut len_buf))
@@ -1687,7 +1702,7 @@ pub(crate) async fn read_message_with_format<R: AsyncReadExt + Unpin>(
         .await
         .map_err(|_| NetError::Timeout)??;
 
-    Message::from_bytes_with_format(&buf)
+    WireMessage::from_bytes_with_format(&buf)
 }
 
 /// Fuzzing-only entry point for the production stream framing path.
@@ -1727,11 +1742,11 @@ mod tests {
         for limit in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
             assert!(matches!(
                 config.clone().with_max_peers(limit).validate(),
-                Err(NetError::InvalidConfig(_))
+                Err(NodeConfigError::MaxPeersTooLarge { .. })
             ));
             assert!(matches!(
                 config.clone().with_event_channel_capacity(limit).validate(),
-                Err(NetError::InvalidConfig(_))
+                Err(NodeConfigError::InvalidEventChannelCapacity { .. })
             ));
         }
         let node = Node::try_new(config).unwrap();
@@ -1740,7 +1755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_node_configs_are_rejected_or_inert_without_panicking() {
+    async fn strict_constructor_rejects_invalid_node_configs() {
         let config = NodeConfig::new(NodeId::new("test"), "invalid listen address");
         for invalid in [
             config.clone().with_max_peers(Semaphore::MAX_PERMITS + 1),
@@ -1751,45 +1766,17 @@ mod tests {
             config.clone().with_event_channel_capacity(usize::MAX),
             config.clone().with_event_channel_capacity(0),
             config.clone().with_socket_timeout(Duration::MAX),
-            config.with_socket_timeout(Duration::ZERO),
+            config.clone().with_socket_timeout(Duration::ZERO),
         ] {
-            assert!(matches!(
-                Node::try_new(invalid.clone()),
-                Err(NetError::InvalidConfig(_))
-            ));
-            let node = Node::new(invalid);
-            assert_eq!(node.connection_slots.available_permits(), 0);
-            assert!(matches!(
-                node.start_listener().await,
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.connect_to_peer("invalid endpoint").await,
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.broadcast_ops(vec![]).await,
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.send_ops_to_addr("peer", vec![]).await,
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.send_pull_since_to_addr("peer", None).await,
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.announce_bootstrap_endpoint("peer"),
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                node.withdraw_bootstrap_endpoint(),
-                Err(NetError::InvalidConfig(_))
-            ));
-            assert!(node.tasks.lock().unwrap().tasks.is_empty());
-            node.shutdown().await;
+            assert!(Node::try_new(invalid).is_err());
         }
+
+        // Preserve the 0.1.4 constructor behavior for existing callers: a zero
+        // event capacity is clamped to one by the infallible legacy path.
+        let node = Node::new(config.with_event_channel_capacity(0));
+        assert_eq!(node.event_tx.max_capacity(), 1);
+        assert_eq!(node.connection_slots.available_permits(), DEFAULT_MAX_PEERS);
+        node.shutdown().await;
     }
 
     async fn open_raw_peer(
@@ -2950,7 +2937,9 @@ mod tests {
 
         assert!(matches!(
             node.connect_to_peer(&addr).await,
-            Err(NetError::ConnectionInProgress(endpoint)) if endpoint == addr
+            Err(NetError::ConnectionFailed(message))
+                if message.contains("connection attempt already in progress")
+                    && message.contains(&addr)
         ));
 
         let _ = release_tx.send(());

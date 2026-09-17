@@ -61,7 +61,6 @@ NodeConfig::new(node_id, "0.0.0.0:9000")
     .with_socket_timeout(Duration::from_secs(30))
     .with_serialization_format(SerializationFormat::Bincode)
     .with_event_channel_capacity(1024)
-    .with_bootstrap_server(BootstrapServerConfig::new("cluster-a")?)
 ```
 
 `NodeConfig::validate()` checks limits before channel/semaphore allocation or
@@ -70,16 +69,17 @@ network startup: `max_peers` cannot exceed Tokio's semaphore capacity,
 `socket_timeout` must be positive and form a representable deadline.
 `max_peers = 0` is valid and disables connection admission.
 
-Prefer `Node::try_new(config)`, which returns `NetError::InvalidConfig` for these
-invalid limits without binding sockets. The legacy infallible `Node::new(config)`
-remains available: an invalid configuration produces an inert node whose network
-entry points reject it, not a working node with silently clamped limits.
-Validation does not establish that a listen address can be bound or a peer reached.
+Prefer `Node::try_new(config)`, which returns `NodeConfigError` for invalid limits
+without binding sockets. The legacy infallible `Node::new(config)` retains its
+0.1.4 signature and behavior for source compatibility. Validation does not
+establish that a listen address can be bound or a peer reached.
 
 ### Node lifecycle
 
 ```
 Node::try_new(config)?          validate before constructing; no socket binding yet
+Node::try_new_with_bootstrap_server(config, bootstrap)?
+                               validate and enable the one-shot bootstrap service
   └── take_event_receiver()     take the event channel before starting
   └── start_listener()          bind TCP, spawn listener task, returns bound SocketAddr
   └── connect_to_peer(addr)     dial, TLS, handshake, register, spawn read loop
@@ -160,12 +160,15 @@ Every message is framed as:
 
 - Length is the total of `format byte + payload`, encoded as big-endian `u32`.
 - Format byte: `0x01` = JSON, `0x02` = bincode.
-- Payload is the serialized `Message` struct.
+- Payload is the serialized internal protocol message. For normal replication
+  frames its layout is byte-for-byte equivalent to the public `Message`; the
+  bootstrap-only variants remain private so the exhaustive public enums retain
+  their 0.1.4 source-compatible shape.
 
 `PROTOCOL_VERSION = 5`. Version mismatch during a recognized handshake causes a structured
 `WireError::ProtocolMismatch` and immediate disconnect.
 
-### MessageKind variants
+### Protocol message variants
 
 | Variant | Direction | Purpose |
 |---|---|---|
@@ -176,8 +179,8 @@ Every message is framed as:
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
 | `Ping` / `Pong` | both | Keepalive |
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
-| `BootstrapHello` | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
-| `BootstrapAck` | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
+| `BootstrapHello` *(private wire variant)* | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
+| `BootstrapAck` *(private wire variant)* | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
 
 ### WireError semantics
 
@@ -187,7 +190,7 @@ Every message is framed as:
 | `NotAuthorized` | Fatal for that peer/config | Credentials, certificate identity, or allowlist must change before retrying. |
 | `RateLimited` | Retryable | Back off. Use `retry_after_ms` when present, otherwise use normal reconnect backoff. |
 | `OpRejected` | Fatal for those ops | Do not resend the same rejected ops unchanged. Current generic error handling closes the peer connection. |
-| `BootstrapRejected` | Fatal for that request | Bootstrap is disabled or its cluster, advertisement or request bounds are invalid. |
+| `BootstrapRejected` *(private wire error)* | Fatal for that request | Bootstrap is disabled or its cluster, advertisement or request bounds are invalid. |
 | `Internal` | Retryable with backoff | Treat as transient unless it repeats; record metrics/logs. |
 
 The configured-peer reconnect loop uses this policy: fatal wire errors stop
@@ -218,7 +221,9 @@ returns `BootstrapResponse`. `BootstrapClientConfig` reuses `NodeId`, optional
 defaults permit one concurrent query, at most 128 returned candidates and a
 maximum accepted candidate TTL of 300s.
 
-The server is enabled through `NodeConfig::with_bootstrap_server`. By default it
+The server is enabled through `Node::try_new_with_bootstrap_server`. Keeping the
+bootstrap policy outside `NodeConfig` preserves source compatibility with 0.1.4
+struct literals. By default it
 retains at most 1024 authenticated requester advertisements for 60s and returns
 at most 128 candidates. Its own advertised endpoint is returned first, followed
 by cached requester endpoints in stable insertion order; responses are
@@ -330,7 +335,6 @@ pub enum NetError {
     BinaryDeserialization(wincode::ReadError),
     ConnectionFailed(String),
     PeerDisconnected(String),
-    InvalidConfig(String),
     InvalidMessage(String),
     Wire(WireError),
     MessageTooLarge { len: usize, limit: usize },
@@ -339,12 +343,16 @@ pub enum NetError {
     TlsError(String),
     PeerNotAllowed(String),
     PeerLimitReached(usize),
-    ConnectionAttemptLimitReached(usize),
-    ConnectionInProgress(String),
-    SelfConnection(String),
     NodeIdMismatch { expected: String, got: String },
 }
 ```
+
+Configuration validation uses the additive, `#[non_exhaustive]`
+`NodeConfigError`. Bootstrap-only construction and queries use the additive,
+`#[non_exhaustive]` `BootstrapError`, which distinguishes invalid configuration,
+query concurrency, authenticated rejection, invalid responses, node
+configuration and transport failures. `NetError` retains exactly its 0.1.4
+variants so existing exhaustive matches remain source-compatible.
 
 ---
 
