@@ -460,10 +460,14 @@ mod tests {
         assert!(provider.discover().await.is_err());
     }
 
-    async fn replace_file(path: &Path, contents: &str) {
+    async fn replace_file_bytes(path: &Path, bytes: &[u8]) {
         let staging = path.with_extension("staging");
-        tokio::fs::write(&staging, contents).await.unwrap();
+        tokio::fs::write(&staging, bytes).await.unwrap();
         tokio::fs::rename(staging, path).await.unwrap();
+    }
+
+    async fn replace_file(path: &Path, contents: &str) {
+        replace_file_bytes(path, contents.as_bytes()).await;
     }
 
     #[test]
@@ -506,7 +510,7 @@ mod tests {
         replace_file(&path, "valid.example:3\nnot-an-endpoint\n").await;
         assert!(read_peer_file(&discovery.inner.config).await.is_err());
 
-        tokio::fs::write(&path, [0xff, 0xfe]).await.unwrap();
+        replace_file_bytes(&path, &[0xff, 0xfe]).await;
         assert!(read_peer_file(&discovery.inner.config).await.is_err());
         replace_file(&path, "recovered.example:5\n").await;
         let recovered = super::super::next_changed_peers(&mut watch, &peers).await;
