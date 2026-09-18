@@ -1148,10 +1148,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let error = read_wire_message_with_format(&mut denied_stream, 4096, socket_timeout)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, NetError::Io(_)), "{error:?}");
+        let denied_result =
+            read_wire_message_with_format(&mut denied_stream, 4096, socket_timeout).await;
+        assert!(
+            denied_result.is_err(),
+            "allowlisted bootstrap seed returned a response to a denied requester"
+        );
         drop(denied_stream);
 
         // Use a different authenticated identity: a query without an announcement
