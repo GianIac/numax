@@ -140,6 +140,7 @@ jobs:
               exit 1
               ;;
           esac
+          sudo route add -net 224.0.0.0/4 -interface "$interface" || true
           echo "Using mDNS interface: $interface ($ip)"
           echo "NUMAX_MDNS_LAN_IP=$ip" >> "$GITHUB_ENV"
       - name: Run three-node mDNS restart recovery
@@ -150,7 +151,7 @@ jobs:
         run: |
           cargo test --locked -p nx-cli --test multiprocess_smoke \
             discovery_lan::mdns_three_daemons_recover_missed_crdt_ops_after_restart \
-            -- --ignored --exact --nocapture
+            -- --ignored --exact --nocapture --test-threads=1
 
   discovery-demo-tests:
     name: Discovery Demo Arguments and Configuration

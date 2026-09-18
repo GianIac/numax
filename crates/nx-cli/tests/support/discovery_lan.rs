@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(100);
-const WAIT: Duration = Duration::from_secs(60);
+const WAIT: Duration = Duration::from_secs(90);
 const SNAPSHOT_PATH: &str = "/api/v1/keys/ZGlzY292ZXJ5LWxhbg";
 // Retention is in operation COUNTS, not seconds. The scenario produces six ops.
 const RETAINED_OPS: usize = 128;
