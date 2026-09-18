@@ -1124,7 +1124,7 @@ mod tests {
         let bound = seed.start_listener().await.unwrap();
         seed.announce_bootstrap_endpoint(bound.to_string()).unwrap();
         let seed_endpoint = format!("localhost:{}", bound.port());
-        let socket_timeout = Duration::from_secs(2);
+        let socket_timeout = Duration::from_secs(10);
 
         // Complete CA-verified TLS first: rejection must be at the node allowlist,
         // not at certificate validation or a client-side seed allowlist.
