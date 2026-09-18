@@ -34,6 +34,22 @@ discovery/replication. Advertise the real local LAN IPv4, not loopback or `0.0.0
 No NAT/WAN, routed multicast, device power loss, or recovery beyond retention is
 claimed here.
 
+## Understanding `--listen` vs `--advertised-endpoint`
+
+In static clustering (`v0.1.4`), every node had to know all other nodes' IP addresses in advance via repeated `--peer` flags ($O(N^2)$ configuration).
+
+With discovery in `v0.1.5`+, each node only describes **itself** ($O(1)$ configuration per node):
+
+- `--listen <ip:port>`: The local socket address the daemon binds to (where the OS listens for incoming TCP connections).
+- `--advertised-endpoint <ip:port>`: The address published over mDNS/Gossip for remote peers to dial back via TCP.
+
+### Why is `--advertised-endpoint` needed?
+1. **Wildcard binding (`0.0.0.0`)**: If a node listens on `0.0.0.0:7000`, remote peers cannot dial `0.0.0.0`. The node must advertise its reachable unicast IP (e.g. `192.168.1.20:7000`).
+2. **Multiple network interfaces**: When Wi-Fi, Ethernet, Docker, or VPN interfaces coexist, advertising explicitly prevents publishing an unreachable local interface.
+3. **Multiple nodes on the same host**: When running several daemons locally on `127.0.0.1`, each daemon binds and advertises a distinct port (e.g. `127.0.0.1:7001`, `127.0.0.1:7002`), allowing automatic discovery without collisions.
+
+*Note: If `--listen` binds directly to a specific concrete IP (such as `192.168.1.20:7000`), Numax automatically derives the advertised endpoint if omitted.*
+
 ## Execute in 5 minutes
 
 The [build](#build-repository-root) must already be complete on all three

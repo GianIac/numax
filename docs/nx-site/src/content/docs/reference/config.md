@@ -311,6 +311,14 @@ advertised_endpoint = "10.0.0.12:9000"
 seeds = ["10.0.0.10:9000", "10.0.0.11:9000"]
 ```
 
+### Advertised endpoint resolution rules
+
+The `advertised_endpoint` specifies the dialable address announced to peers through dynamic discovery providers (mDNS, bootstrap gossip, etc.):
+
+- **Explicit unicast listener**: When `[network].listen` specifies a concrete IP address (e.g., `192.168.1.50:9000`), `advertised_endpoint` defaults to that address and is optional.
+- **Wildcard listener (`0.0.0.0` or `[::]`)**: An explicit `advertised_endpoint` is **required** because wildcard addresses are not dialable by remote peers.
+- **Dynamic port binding (`:0`)**: If configured with port zero (e.g., `192.168.1.50:0`), Numax automatically resolves the port to the actual ephemeral port assigned by the OS upon binding.
+
 ---
 
 ## Environment variables
