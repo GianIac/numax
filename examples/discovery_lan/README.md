@@ -34,6 +34,128 @@ discovery/replication. Advertise the real local LAN IPv4, not loopback or `0.0.0
 No NAT/WAN, routed multicast, device power loss, or recovery beyond retention is
 claimed here.
 
+## Execute in 5 minutes
+
+The [build](#build-repository-root) must already be complete on all three
+devices. Use the same source revision and `CLUSTER`. Replace the example IPs.
+
+On A:
+
+```sh
+export STATE="$HOME/numax-lan-a-015"
+export LAN_IP="192.168.1.20"
+export CLUSTER="numax-release-015-unique"
+export INSTANCE="device-a"
+```
+
+On B:
+
+```sh
+export STATE="$HOME/numax-lan-b-015"
+export LAN_IP="192.168.1.21"
+export CLUSTER="numax-release-015-unique"
+export INSTANCE="device-b"
+```
+
+On C:
+
+```sh
+export STATE="$HOME/numax-lan-c-015"
+export LAN_IP="192.168.1.22"
+export CLUSTER="numax-release-015-unique"
+export INSTANCE="device-c"
+```
+
+On A, B and C:
+
+```sh
+node examples/discovery_lan/demo.mjs init \
+  --state "$STATE" \
+  --lan-ip "$LAN_IP" \
+  --cluster "$CLUSTER" \
+  --instance "$INSTANCE"
+```
+
+Start a daemon on each device and leave it running:
+
+```sh
+node examples/discovery_lan/demo.mjs start \
+  --state "$STATE" \
+  --nx "$PWD/target/release/nx"
+```
+
+Open a second terminal on each device, export its `STATE` again, then run:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 2 --value 0
+```
+
+On A, B and C, increment once:
+
+```sh
+node examples/discovery_lan/demo.mjs increment --state "$STATE"
+```
+
+After all three increments, on A, B and C:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 2 --value 3
+```
+
+Stop C with Ctrl-C. On A and B, wait for its removal:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 1 --value 3
+```
+
+After both waits complete, increment once on A and B:
+
+```sh
+node examples/discovery_lan/demo.mjs increment --state "$STATE"
+```
+
+Then on A and B:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 1 --value 5
+```
+
+Restart C with the same `STATE`:
+
+```sh
+node examples/discovery_lan/demo.mjs start \
+  --state "$STATE" \
+  --nx "$PWD/target/release/nx"
+```
+
+On A, B and C:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 2 --value 5
+```
+
+Increment once on C:
+
+```sh
+node examples/discovery_lan/demo.mjs increment --state "$STATE"
+```
+
+Then on A, B and C:
+
+```sh
+node examples/discovery_lan/demo.mjs wait --state "$STATE" --peers 2 --value 6
+```
+
+Stop every daemon with Ctrl-C. The test passes if:
+
+- every node finds two peers without `--peer`;
+- values reach `0`, `3`, `5` and `6`;
+- C keeps the same NodeId after restart;
+- C recovers the two offline writes;
+- all three daemons exit cleanly.
+
+Keep the `wait` output. Do not publish token files or state directories.
+
 ## Build (repository root)
 
 ```sh
