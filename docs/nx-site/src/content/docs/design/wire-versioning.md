@@ -5,10 +5,14 @@ description: Rules for evolving the Numax peer protocol safely.
 
 ## Purpose
 
-`PROTOCOL_VERSION` identifies the wire contract used between Numax peers and It is
+`PROTOCOL_VERSION` identifies the wire contract used between Numax peers and is
 independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
+
+In `v0.1.5`, the current Numax version, the value is `5`. Version `5` adds the
+one-shot bootstrap handshake described below; it is not wire-compatible with
+the version `4` protocol shipped by `v0.1.4`.
 
 ## Compatibility policy
 
@@ -81,3 +85,79 @@ Numax supports bincode and JSON, compatibility must be evaluated for both:
   is established.
 
 Never reuse a protocol version for a different wire contract.
+
+## Protocol 5 bootstrap exchange
+
+Protocol `5` adds private wire variants `BootstrapHello` and `BootstrapAck` after
+the legacy public `MessageKind` layout and adds a private
+`BootstrapRejected` wire error after the legacy public `WireError` layout. A bootstrap
+exchange is an alternative one-shot handshake on the normal peer listener; it
+does not turn into a replication connection.
+
+```text
+client -> seed: BootstrapHello {
+  node_id,
+  protocol_version: 5,
+  supported_formats,
+  preferred_format,
+  cluster_id,
+  advertised_endpoint?,
+  max_results
+}
+
+seed -> client: BootstrapAck {
+  node_id,
+  protocol_version: 5,
+  selected_format,
+  cluster_id,
+  candidates,
+  candidate_ttl_ms
+}
+```
+
+The seed validates the exact protocol version, negotiates JSON or Bincode,
+authenticates the requester's claimed `NodeId` through the same TLS certificate
+binding and allowlist policy as a normal handshake, and requires an exact
+cluster ID match. It validates any advertised endpoint before caching it. The
+request's `max_results`, the server response limit and the server cache limit
+bound the exchange independently.
+
+The exported `nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY` is `4096`. Client and
+server response capacities must be in `1..=4096`; the effective CLI
+`discovery.max_candidates` obeys this upper bound only in bootstrap mode.
+This resource limit is independent of the wire version, package version, cache
+capacity and message-byte limit.
+
+The client validates the seed's protocol version, selected format, cluster ID,
+authenticated identity, response length, candidate lease and every endpoint.
+Duplicate endpoints, wildcard hosts, port zero and malformed responses reject
+the complete response. Successful completion closes the one-shot connection;
+it neither registers the seed as an active replication peer nor emits a peer
+connection event.
+
+Only the requester's identity and the responding seed's identity are covered by
+that exchange. The returned endpoint strings are untrusted discovery
+candidates. Dialing one later requires a new normal `Hello`/`HelloAck`, TLS
+identity check, allowlist decision and connection-slot admission.
+
+### Version 4 boundary
+
+Normal `Hello` exchanges between versions `4` and `5` carry a readable version
+field and are rejected with `ProtocolMismatch` before peer registration or CRDT
+traffic. A version `4` decoder does not know the new bootstrap variants and may
+close a `BootstrapHello` as an invalid message rather than returning a
+structured mismatch; this is still a safe rejection and never admits a peer.
+Static peer configuration remains source-compatible but does not make mixed
+version `4`/`5` clusters wire-compatible.
+
+JSON and Bincode round trips cover the complete private version `5` message set.
+Bincode golden hashes and direct public/private byte comparisons protect every
+legacy public variant, while exact-version and multiprocess compatibility coverage
+uses the previous `v0.1.4` binary to verify safe rejection at the normal
+handshake boundary.
+
+CI resolves the previous binary's source from the explicit
+`refs/tags/v0.1.4` reference and verifies its peeled commit is
+`419d840e2afe780e7ad1f4135e39e9b38a4f30b1` before building it. A branch with the
+same short name is not an acceptable substitute. This test checks rejection,
+not mixed-version replication or unrestricted recovery after history expiry.

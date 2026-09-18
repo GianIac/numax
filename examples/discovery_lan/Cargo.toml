@@ -1,0 +1,22 @@
+[package]
+name = "discovery_lan"
+version = "0.1.5"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+increment = []
+
+[dependencies]
+nx-sdk = { version = "0.1.5", path = "../../crates/nx-sdk" }
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+
+[workspace]

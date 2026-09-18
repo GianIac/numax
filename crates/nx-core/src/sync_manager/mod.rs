@@ -1,4 +1,6 @@
 mod apply;
+mod candidates;
+pub(crate) use candidates::canonicalize_endpoint;
 mod manager;
 mod migration;
 mod peer;

@@ -20,7 +20,7 @@ and hands a fully-built `RuntimeConfig` to `nx-core`. It never contains runtime 
 | Read environment variables | `config.rs` - `EnvRunConfig::from_env` |
 | Resolve precedence (CLI > env > file > defaults) | `config.rs` - `EffectiveRunConfig::resolve` |
 | Validate flag combinations (TLS, sync, settle) | `config.rs` - `validate_tls_flags`, `validate_settle_mode`, etc. |
-| Build runtime and Management API configuration | `config.rs` - `build_sync_config`, `build_tls_config`, `build_observability_config`, `build_management_config` |
+| Build runtime, discovery and Management API configuration | `config.rs` - `build_sync_config`, `resolve_discovery_config`, `build_tls_config`, `build_observability_config`, `build_management_config` |
 | Coordinate daemon and Management API lifecycle | `main.rs` - `Cli::Serve` |
 | Initialize logging and optional Tokio Console diagnostics | `config.rs` - `init_logging` |
 | Generate `numax.toml` template | `config.rs` - `CONFIG_TEMPLATE`, `init_config_file` |
@@ -93,6 +93,11 @@ pub struct RunCliOptions {
     pub verbose: bool,
     pub log_level: Option<String>,
     pub log_format: Option<LogFormat>,
+    pub discovery_mode: Option<DiscoveryMode>,
+    pub bootstrap_seeds: Vec<String>,
+    pub mdns_instance: Option<String>,
+    pub dns_srv_name: Option<String>,
+    pub peer_file: Option<PathBuf>,
 }
 ```
 
@@ -117,6 +122,7 @@ Built by `EnvRunConfig::from_env()`. Each field maps to one env var:
 | `serialization_format` | `NX_SERIALIZATION_FORMAT` | `bincode` or `json` |
 | `log_level` | `NX_LOG_LEVEL` | |
 | `log_format` | `NX_LOG_FORMAT` | `text` or `json` |
+| discovery settings | `NX_DISCOVERY_*` | Mode and provider-specific values |
 
 **`RunFileConfig`** - what came from `numax.toml`. Sections:
 
@@ -143,6 +149,7 @@ pub struct EffectiveRunConfig {
     pub sync:           Option<SyncConfig>,
     pub observability:  Option<ObservabilityConfig>,
     pub management:     Option<ManagementConfig>,
+    pub discovery:      RuntimeDiscoveryConfig,
     pub log_level:      String,
     pub log_format:     LogFormat,
 }
@@ -158,9 +165,9 @@ Sync is not always enabled. `build_sync_config` decides:
 - If any sync-related field is present (env, file, TLS, format) but `listen` is missing → **error**. Dialer-only mode is not supported.
 - If `listen` is set → sync enabled, `SyncConfig` is built and returned.
 
-`force_enabled` is `true` when the config file has `[network]`, `[tls]`, or `[limits]` sections,
-or when env vars provide sync inputs. This makes `nx config show --effective` work correctly
-even without CLI `--listen`.
+`force_enabled` is also `true` for dynamic discovery. Dynamic modes therefore
+require a listen address. Explicit peers remain a separate static provider and
+are composed with the selected dynamic provider.
 
 ---
 
@@ -296,6 +303,6 @@ cargo test -p nx-cli
 Use this page together with the user-facing CLI and config docs:
 
 - [CLI reference](/numax/reference/cli/) - flags and subcommands exposed by `nx`
-- [Configuration](/numax/reference/configuration/) - TOML and environment variable reference
+- [Configuration](/numax/reference/config/) - TOML and environment variable reference
 - [nx-core crate](/numax/reference/crates/nx-core/) - the runtime layer `nx-cli` calls into
 - [Crates overview](/numax/reference/crates/) - where `nx-cli` fits in the dependency graph

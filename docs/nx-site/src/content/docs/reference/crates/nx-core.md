@@ -22,6 +22,7 @@ Everything below that boundary lives here or in the crates it composes.
 | Remote operation application | `sync_manager/apply.rs` |
 | Durable CRDT state and startup hydration | `sync_manager/storage.rs` |
 | Anti-entropy, peer broadcast and reconnect handling | `sync_manager/replication.rs` + `nx-net` |
+| Peer discovery contract and candidate coordination | `discovery.rs`, `sync_manager/candidates.rs` |
 | Schema headers and offline migration support | `sync_manager/schema.rs`, `sync_manager/migration.rs` |
 | Peer health tracking | `sync_manager/peer.rs` |
 | NodeId persistence | `runtime.rs` - `load_or_create_node_id` |
@@ -98,7 +99,7 @@ Runtime::new(config)
 | `new(config)` | Opens sled store, builds wasmtime engine + linker with all host API functions registered, creates `SyncManager` if configured |
 | `start_observability()` | Binds the HTTP metrics endpoint. No-op if not configured |
 | `start_sync()` | Calls `SyncManager::start()`, starts TCP listener + dial loop. No-op if sync disabled |
-| `wait_before_run(dur)` | Repeatedly reconnects configured peers until the deadline. No-op if sync disabled |
+| `wait_before_run(dur)` | Repeatedly reconnects current discovery candidates until the deadline. No-op if sync disabled |
 | `run_module(bytes)` | Compiles or retrieves cached module, builds `HostState`, instantiates, calls `run()` or `_start()` |
 | `control_handle()` | Returns the shared introspection and management handle used by transport adapters |
 | `settle_for(dur)` | Sleeps for `dur`, keeping sync alive. No-op if sync disabled |
@@ -186,6 +187,106 @@ Peers alone do not enable sync - a node must also listen.
 
 `SyncManager` owns the runtime side of replication. It is the bridge between host API calls
 from guest modules and the network layer in `nx-net`.
+
+The default constructor wraps configured peers in `StaticDiscovery` and remains
+backward-compatible. Integrations can use `SyncManager::try_new_with_discovery`
+with named `DiscoveryProvider` values and `DiscoveryRuntimeConfig`. The manager
+keeps one bounded candidate snapshot shared by initial connection, reconnect and
+anti-entropy, while `SyncHandle::active_connections()` exposes transport and
+identity-verification details separately.
+
+### Peer discovery API
+
+`nx-core` publicly exports the discovery contract and all five initial
+providers:
+
+| Provider | Constructor input | Announcement | Update/removal source |
+|---|---|---|---|
+| `StaticDiscovery` | `Vec<String>` | unsupported | immutable |
+| `BootstrapGossipDiscovery` | seed config + `BootstrapClientConfig` | required | seed refresh and bounded lease expiry |
+| `MdnsDiscovery` | instance and cluster config | required | DNS-SD resolve/remove events |
+| `DnsSrvDiscovery` | fully qualified SRV name | unsupported | DNS TTL refresh, empty response or expiry |
+| `FileWatchDiscovery` | peer-file path | unsupported | periodic complete-file replacement |
+
+Each `DiscoveryProvider` has a unique source ID and may add a coordinator-level
+candidate TTL. `DiscoveryRuntimeConfig` supplies the cluster ID, optional local
+advertised endpoint and aggregate candidate bound. Its defaults are cluster
+`default`, no explicit advertised endpoint and 1024 candidates. Providers with
+required announcement support make sync startup fail when the bound listener
+cannot yield a concrete advertised endpoint.
+
+`DiscoveryWatch` bundles an atomic snapshot with its subsequent bounded event
+stream. Dynamic providers use one `DiscoveryChange::Observed` revision for a
+complete ordered replacement with per-endpoint observation timestamps, rather
+than publishing a temporary empty list. Lag or a revision gap invalidates the watch explicitly;
+the coordinator resubscribes and atomically installs the new bundled snapshot.
+
+Provider-specific defaults are:
+
+| Provider | Refresh/retry defaults | Provider bounds |
+|---|---|---|
+| Bootstrap | refresh 20s; retry 500ms to 30s; stale after 120s | 32 seeds; 1024 candidates; 128 events |
+| mDNS | daemon-driven TTL/removal | 1024 instances; 1024 candidates; 128 events |
+| DNS-SRV | retry 5s; maximum refresh interval 300s | 1024 candidates; 128 events |
+| File | poll 2s | 1 MiB file; 1024 candidates; 128 events |
+
+#### Event capacity API
+
+`DEFAULT_DISCOVERY_EVENT_CAPACITY` (128) and `MAX_DISCOVERY_EVENT_CAPACITY`
+(4096) are public in both `nx_core::discovery` and the crate root. The
+`event_capacity` fields in `BootstrapGossipDiscoveryConfig`,
+`MdnsDiscoveryConfig`, `DnsSrvDiscoveryConfig` and `FileWatchDiscoveryConfig`
+accept only `1..=MAX_DISCOVERY_EVENT_CAPACITY`. Their provider constructors
+return `DiscoveryError::InvalidConfiguration` for zero or larger values,
+including `usize::MAX`, before allocating channels/state, starting work or
+performing provider I/O. mDNS applies the same capacity to announcement requests.
+The limit counts event slots, not candidates or total bytes; Tokio may round
+broadcast capacity up to a power of two, still no larger than 4096.
+
+| Static constructor | Result and capacity policy |
+|---|---|
+| `StaticDiscovery::new(peers)` | `Self`, default capacity 128 |
+| `StaticDiscovery::with_event_capacity(peers, capacity)` | `Self`, clamps to `[1, 4096]`; zero becomes one, oversized values become 4096 |
+| `StaticDiscovery::try_with_event_capacity(peers, capacity)` | `Result<Self, DiscoveryError>`, rejects capacity outside `1..=4096` with `InvalidConfiguration` before channel allocation |
+
+All static constructors preserve peer order and duplicates without truncation.
+Capacity is a Rust provider API setting, not an additional CLI/TOML field.
+
+Bootstrap uses the same `NodeId`, TLS configuration, message-size limit, socket
+timeout and serialization policy as the runtime when its
+`BootstrapClientConfig` is built. It authenticates the seed, but its returned
+endpoints remain candidates that pass the normal connection handshake later.
+mDNS scopes browse and announcement by cluster, DNS-SRV relies on the supplied
+record name, and file/static providers report their configured runtime cluster.
+In every case discovery scope is separate from TLS identity and allowlist
+authorization.
+
+The coordinator owns provider lifecycle. It starts watches before binding the
+listener, announces only after the actual bound address is known, rolls back
+providers and the listener on partial startup, and invokes every provider's
+idempotent shutdown hook. Bootstrap withdrawal and mDNS goodbye are attempted
+during shutdown; provider tasks are joined within the runtime's bounded
+operation policy.
+
+Explicit `request_shutdown()`/`shutdown()` is terminal for dynamic providers.
+Unexpected exit may instead be recovered by a later discovery/watch operation,
+but only after the old worker is joined and its cleanup completes successfully;
+a finished worker or invalidated watch alone does not authorize restart. Fatal
+worker errors and cleanup failures block restart. Cleanup remains owned if a
+shutdown waiter is cancelled. Bootstrap conservatively tracks seeds before an
+advertising query is awaited, including queries whose responses never arrive;
+withdrawal is bounded best effort and does not promise remote delivery. mDNS
+reports daemon cleanup acknowledgement errors, but an acknowledgement likewise
+does not prove every LAN peer received the goodbye.
+
+`Runtime::new_with_discovery` accepts the resolved `RuntimeDiscoveryConfig`
+after the durable `NodeId` is loaded, then constructs the selected provider.
+The bootstrap client inherits the runtime TLS, message-size, socket-timeout and
+serialization settings. `Runtime::new` remains the backward-compatible static
+constructor for Rust embedders.
+
+For exact snapshot, expiry, ordering and security semantics, see the
+[Peer Discovery Contract](/numax/design/discovery-contract/).
 
 Since `v0.1.1`, its implementation is split by responsibility under `sync_manager/`:
 orchestration in `manager.rs`, remote application in `apply.rs`, replication in

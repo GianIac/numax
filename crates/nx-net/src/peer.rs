@@ -5,6 +5,41 @@ use std::net::SocketAddr;
 /// Identifier of a peer (based on NodeId).
 pub type PeerId = NodeId;
 
+/// Direction in which an active transport connection was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionDirection {
+    Inbound,
+    Outbound,
+}
+
+/// Evidence binding the handshake NodeId to the transport peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerIdentityVerification {
+    /// The NodeId was derived from and matched against the TLS certificate.
+    CertificateBound,
+    /// The transport did not cryptographically bind the claimed NodeId.
+    Unverified,
+}
+
+/// Identity learned during the wire handshake and how it was verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentity {
+    pub node_id: NodeId,
+    pub verification: PeerIdentityVerification,
+}
+
+/// Immutable facts about one active connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConnectionInfo {
+    /// Actual remote TCP endpoint.
+    pub transport_addr: String,
+    /// Discovery/configuration endpoint used to dial, absent for inbound peers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialed_endpoint: Option<String>,
+    pub direction: ConnectionDirection,
+    pub identity: PeerIdentity,
+}
+
 #[allow(dead_code)]
 /// Connection state of a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

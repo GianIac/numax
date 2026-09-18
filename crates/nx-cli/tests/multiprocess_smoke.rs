@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const COUNTER_KEY: &str = "counter:visits";
 
+#[cfg(unix)]
+#[path = "support/discovery_lan.rs"]
+mod discovery_lan;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -679,14 +683,14 @@ fn two_nx_run_processes_converge_distributed_counter() {
 }
 
 #[test]
-#[ignore = "requires v0.1.0 nx binary, built distributed_counter.wasm and local TCP sockets"]
+#[ignore = "requires v0.1.4 nx binary, built distributed_counter.wasm and local TCP sockets"]
 fn different_protocol_versions_reject_connection_without_exchanging_ops() {
     let wasm = assert_counter_wasm_exists();
 
     let current_addr = free_addr();
     let previous_addr = free_addr();
-    let current_data = temp_path("protocol-v3");
-    let previous_data = temp_path("protocol-v2");
+    let current_data = temp_path("protocol-v5");
+    let previous_data = temp_path("protocol-v4");
     let current_nx = nx_bin();
     let previous_nx = previous_nx_bin();
 
@@ -748,14 +752,14 @@ fn different_protocol_versions_reject_connection_without_exchanging_ops() {
     let previous_stdout = String::from_utf8_lossy(&previous_output.stdout);
     let previous_stderr = String::from_utf8_lossy(&previous_output.stderr);
     let protocol_mismatch_reported = current_stdout
-        .contains("protocol version mismatch: expected 4, got 2")
-        || current_stdout.contains("protocol version mismatch: expected 2, got 4")
-        || current_stderr.contains("protocol version mismatch: expected 2, got 4")
-        || current_stderr.contains("protocol version mismatch: expected 4, got 2")
-        || previous_stdout.contains("protocol version mismatch: expected 4, got 2")
-        || previous_stdout.contains("protocol version mismatch: expected 2, got 4")
-        || previous_stderr.contains("protocol version mismatch: expected 4, got 2")
-        || previous_stderr.contains("protocol version mismatch: expected 2, got 4");
+        .contains("protocol version mismatch: expected 5, got 4")
+        || current_stdout.contains("protocol version mismatch: expected 4, got 5")
+        || current_stderr.contains("protocol version mismatch: expected 4, got 5")
+        || current_stderr.contains("protocol version mismatch: expected 5, got 4")
+        || previous_stdout.contains("protocol version mismatch: expected 5, got 4")
+        || previous_stdout.contains("protocol version mismatch: expected 4, got 5")
+        || previous_stderr.contains("protocol version mismatch: expected 5, got 4")
+        || previous_stderr.contains("protocol version mismatch: expected 4, got 5");
     assert!(
         protocol_mismatch_reported,
         "neither node reported the protocol mismatch\ncurrent stdout:\n{current_stdout}\ncurrent stderr:\n{current_stderr}\nprevious stdout:\n{previous_stdout}\nprevious stderr:\n{previous_stderr}"

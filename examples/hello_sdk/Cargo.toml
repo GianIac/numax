@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-nx-sdk = { version = "0.1.4", path = "../../crates/nx-sdk" }
+nx-sdk = { version = "0.1.5", path = "../../crates/nx-sdk" }
 
 [profile.release]
 lto = true
