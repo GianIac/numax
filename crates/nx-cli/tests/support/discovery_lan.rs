@@ -67,11 +67,12 @@ impl Daemon {
                 command.env_remove(name);
             }
         }
+        let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         self.child = Some(
             command
                 .args(["serve", "--config"])
                 .arg(&self.config)
-                .env("RUST_LOG", "info")
+                .env("RUST_LOG", rust_log)
                 .stdin(Stdio::null())
                 .stderr(output.try_clone().unwrap())
                 .stdout(output)
