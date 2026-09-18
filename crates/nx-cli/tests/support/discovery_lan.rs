@@ -266,6 +266,11 @@ fn write_private(path: &Path, bytes: &[u8]) {
         .unwrap();
 }
 
+// This test requires a physical or dedicated multicast-capable network interface.
+// On virtualized single-host runners (e.g. cloud CI on macOS), running three separate
+// processes binding UDP 5353 with SO_REUSEPORT can experience kernel-level packet
+// load-balancing rather than full multicast fan-out to all sockets, causing intermittent
+// peer discovery timeouts. It is intended for manual LAN verification or physical hosts.
 #[test]
 #[ignore = "requires NUMAX_MDNS_E2E=1, NUMAX_MDNS_LAN_IP, real multicast and both discovery_lan WASM builds"]
 fn mdns_three_daemons_recover_missed_crdt_ops_after_restart() {
