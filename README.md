@@ -135,7 +135,7 @@ Same module, any node. State stays local. Sync happens through the runtime.
 
 ---
 
-## Learn more
+## Learn more and Try Numax !
 
 - [`Documentation`](https://gianiac.github.io/numax/) - guides, concepts and reference pages.
 - [`Whitepaper`](https://gianiac.github.io/numax/whitepaper/) - the vision, the architecture, the principles.
@@ -143,6 +143,7 @@ Same module, any node. State stays local. Sync happens through the runtime.
 - [`Host API`](https://gianiac.github.io/numax/reference/host-api/) - the host API available to WASM modules.
 - [`examples/distributed_magnets`](./examples/distributed_magnets) - adaptive Magnetic Optimization Algorithm swarm.
 - [`examples/distributed_ants`](./examples/distributed_ants) - distributed Ant Colony Optimization swarm.
+- [`examples/discovery_lan`](./examples/discovery_lan) - LAN discovery, CRDT replication and restart recovery
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.

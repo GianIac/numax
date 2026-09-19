@@ -5,7 +5,7 @@ description: Numax vision, architecture and principles.
 
 
 > **Note**
-> This whitepaper is aligned with **v0.1.4**, the current stable Numax release.
+> This whitepaper describes **v0.1.5**, the latest stable Numax version.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
@@ -13,7 +13,7 @@ description: Numax vision, architecture and principles.
 > - **(Prototype)**: partially present; internal wiring or critical paths already verified, but not yet production-ready.
 > - **(Planned)**: foreseen in the roadmap, not yet implemented.
 >
-> **Version reference**: `v0.1.4` - the Management API release for controlled, non-critical workloads. It retains the versioning, profiling and supply-chain foundations of earlier releases and adds authenticated node management, a persistent local module registry and bounded one-shot execution through HTTP.
+> **Version reference**: `v0.1.5` - the Peer Discovery: Foundations release for controlled, non-critical workloads. It adds static, bootstrap, mDNS, DNS-SRV and file discovery while retaining authenticated node management, persistent module registration, bounded one-shot execution through HTTP, and the versioning, profiling and supply-chain foundations of earlier releases.
 >
 > **Reference roadmap:** future work is tracked by release line and milestone in [Roadmap](/numax/roadmap/).
 
@@ -171,7 +171,7 @@ The separation keeps responsibilities clear and allows components to evolve inde
 
 ### 4.2 Supported environments
 
-Numax `v0.1.4` is designed to run as a native runtime on:
+Numax `v0.1.5` is designed to run as a native runtime on:
 
 - servers (x86_64, ARM64),
 - edge nodes,
@@ -464,8 +464,11 @@ data. Bincode is the default production format; JSON is selected with
 | `PullSince` | Client → Server | Requests operations after a given OpId |
 | `Ping` | Bidirectional | Keepalive |
 | `Pong` | Bidirectional | Response to Ping |
+| `Error` | Bidirectional | Structured rejection or failure |
+| `BootstrapHello` | Client → Seed | One-shot authenticated bootstrap request, cluster and optional endpoint advertisement |
+| `BootstrapAck` | Seed → Client | Seed identity, cluster, negotiated format and bounded endpoint suggestions with a lease |
 
-**Protocol versioning:** version number (`PROTOCOL_VERSION = 4`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity.
+**Protocol versioning:** version number (`PROTOCOL_VERSION = 5`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity. Version `4` belongs to Numax `v0.1.4` and is not wire-compatible with `v0.1.5`.
 
 **Current status:**
 
@@ -475,7 +478,8 @@ data. Bincode is the default production format; JSON is selected with
 - automatic reconnect with exponential backoff, peer health tracking and peer rotation *(Prototype)*;
 - periodic anti-entropy after missed pushes/reconnects *(Prototype)*;
 - bounded OpId deduplication and persisted dedup metadata *(Prototype)*;
-- peer-to-peer gossip with K-fanout: architecture defined, full dynamic discovery/fanout remains future work *(Prototype)*.
+- static, bootstrap, mDNS, DNS-SRV and file discovery through CLI, environment and TOML configuration *(Implemented)*;
+- peer-to-peer gossip with K-fanout: architecture defined, SWIM membership and K-fanout dissemination remain future work *(Prototype)*.
 
 ### 5.5 Channel security *(Implemented)*
 
@@ -876,7 +880,7 @@ flamegraphs with `pprof-rs` and load-phase heap profiles with `dhat`.
 
 ## 8. Use Cases
 
-The use cases below are **concretely achievable today** with the primitives of `v0.1.4`. They do not describe visions: they describe what the runtime already knows how to do with the current stable feature set.
+The use cases below are **concretely achievable today** with the primitives of `v0.1.5`. They do not describe visions: they describe what the runtime already knows how to do with the current stable feature set.
 
 ### 8.1 Distributed counters and metrics (example: `distributed_counter`)
 
@@ -906,7 +910,7 @@ The compute is portable across Numax nodes: the same `.wasm` module can run on a
 
 **Problem.** Applications that must work without a connection (collaborative notes, distributed configurations, field applications, maritime/aerial/rural devices) and reconcile when they come back online, without imposing manual conflict resolution.
 
-**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available since `v0.1.0` and retained in `v0.1.4`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
+**Why Numax.** This is exactly the sweet spot of CRDTs: each node operates locally on its own store, changes propagate opportunistically, convergence is mathematically guaranteed. With PNCounter, LWW-Register, ORSet, LWW-Map and RGA available since `v0.1.0` and retained in `v0.1.5`, the model covers counters, statuses, observed-remove sets, replicated settings and ordered collaborative sequences.
 
 The `distributed_chat` example (today in local-only mode) represents the skeleton of this use case.
 
@@ -942,19 +946,28 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 ## 10. Limitations
 
-`v0.1.4` is the current stable release, building on the first stable `v0.1.0` line. We recognize its limits explicitly:
+`v0.1.5` is the current stable release, building on the first stable `v0.1.0` line. We recognize its limits explicitly:
 
-- **Network resilience is still prototype-grade.** Automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup are implemented for configured peers, but full dynamic discovery and K-fanout gossip remain future work.
+- **Network resilience is still prototype-grade.** `v0.1.5` combines automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup with static, bootstrap, mDNS, DNS-SRV and file discovery. SWIM membership and K-fanout gossip remain future work. Local startup readiness is not peer or CRDT convergence. Recovery depends on retained operation and deduplication history, not merely on rediscovery; unrestricted lossless recovery is not guaranteed.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Observability is operational but intentionally small.** Structured logs, Prometheus-compatible metrics, health checks, a ready-made Prometheus/Grafana stack, a Grafana dashboard and PromQL examples are available. Deeper tracing and richer built-in dashboards remain future work.
-- **Wire format and Host API are versioned but still young.** The current wire protocol is versioned (`PROTOCOL_VERSION = 4`) and supports bincode by default with JSON debug mode. Future incompatible changes must be explicit and versioned.
+- **Wire format and Host API are versioned but still young.** `v0.1.5` uses wire protocol version `5` for bootstrap and rejects version `4` peers from `v0.1.4`. Both support Bincode (implemented with `wincode`) and JSON. This wire change does not change the persisted schema or guest ABI.
 - **Available CRDTs are still expanding.** GCounter, PNCounter, LWW-Register, ORSet, LWW-Map and RGA are implemented; additional CRDT families remain future work.
 - **It does not replace complex orchestrators.** It is not designed to manage extensive clusters or highly scalable deployments with advanced scheduling.
 - **Not optimized for CPU-bound workloads.** The focus is I/O and coordination, not intensive computation.
 - **Data models must be compatible with CRDTs.** Patterns based on locks or strong distributed transactions do not map directly.
 
-These limits are not hidden weaknesses: they are the **honest perimeter** of the 0.1.4 release, which is useful today and still explicit about what remains future work.
+These limits are not hidden weaknesses: they are the **honest perimeter** of the 0.1.5 release, which is useful today and still explicit about what remains future work.
+
+For `v0.1.5`, the [discovery contract](/numax/design/discovery-contract/)
+adds explicit freshness, lifecycle and resource boundaries: observations retain
+their timestamps across cached snapshots; anti-entropy uses active connections
+on a cadence independent of discovery churn; Numax bounds mDNS retained
+contributions globally, but `mdns-sd 0.21` exposes no configurable internal
+cache bound. Bounded unregister/shutdown acknowledgements do not guarantee LAN
+receipt of goodbye packets. NAT/WAN remains an open decision, not an adopted
+traversal design.
 
 ---
 
@@ -969,11 +982,11 @@ Numax proposes a unified runtime that combines:
 
 The goal is not to replicate the existing ecosystem, but **to reduce the self-imposed complexity** that today dominates distributed systems development, while preserving control over the necessary complexity of one's own domain.
 
-`v0.1.4` is the current stable Numax release. It retains the real, tested foundation established by `v0.1.0` and hardened in `v0.1.1` - WASM runtime, sled store, six CRDT families, async replication, TCP networking, TLS 1.3 + mTLS, extended host APIs, modular SyncManager, explicit wire/schema versioning, typed protocol errors and offline datastore migration - and retains opt-in task, CPU and heap profiling, WASM and sync metrics, a blocking performance-regression gate, signed release checksums, SBOMs and fuzzing. The 0.1.4 additions are `nx serve`, the authenticated Management API, persistent module registration, binary-safe datastore inspection and cancellable one-shot guest execution.
+`v0.1.5` is the current stable Numax release. It retains the real, tested foundation established by `v0.1.0` and hardened in `v0.1.1` WASM runtime, sled store, six CRDT families, async replication, TCP networking, TLS 1.3 + mTLS, extended host APIs, modular SyncManager, explicit wire/schema versioning, typed protocol errors and offline datastore migration - and retains opt-in task, CPU and heap profiling, WASM and sync metrics, a blocking performance-regression gate, signed release checksums, SBOMs and fuzzing. The 0.1.4 additions are `nx serve`, the authenticated Management API, persistent module registration, binary-safe datastore inspection and cancellable one-shot guest execution. Version 0.1.5 adds five peer discovery providers, bounded bootstrap address exchange and wire protocol version 5, with explicit lifecycle, resource and recovery boundaries.
 
 What is still missing is declared explicitly and tracked in the roadmap. Subsequent iterations will refine details, practical examples, comparisons and experimental results.
 
-**`v0.1.4` is the current stable release.** It is built on code, tests and documented limits rather than promises; `v0.1.0` remains the first stable line it evolved from.
+**`v0.1.5` is the current stable release.** It is built on code, tests and documented limits rather than promises; `v0.1.0` remains the first stable line it evolved from.
 
 In closing, I love software and I love numax.
 
