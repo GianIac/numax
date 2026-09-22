@@ -164,56 +164,14 @@ single further CLI command.
 
 ## v0.1.5 - Peer Discovery: Foundations 🌐
 
-**Release status**: current version. The NAT/WAN decision remains open and may
-be evaluated ASAP; this release does not introduce a traversal design or
-implementation. Verification coverage and its limits are recorded below.
+Introduces the foundations for dynamic peer discovery, allowing Numax nodes to discover potential 
+peers at runtime instead of relying exclusively on a statically configured cluster topology.
 
-**Goal**: stop requiring `--peer 1.2.3.4:9000` for every node. Introduce discovery providers and bootstrap address exchange; SWIM membership and K-fanout data gossip follow in `0.1.6`.
+The release adds a pluggable discovery system with support for static configuration, mDNS for local networks, 
+bootstrap gossip, DNS-SRV records, and file-based discovery with automatic change detection. Discovered peers are managed as bounded candidates and integrated into the node lifecycle, 
+while peer discovery remains deliberately separated from authentication and authorization: discovering a node does not automatically make it a trusted cluster member.
 
-**Abstraction**:
-- [x] `PeerDiscovery` trait with `discover()`, `announce()`, `watch()` methods
-- [x] Internal replacement of `--peer` with a `StaticDiscovery` implementing the trait
-- [x] Define snapshot/watch consistency, provider errors, announcement support, cancellation and bounded event delivery ([contract](/numax/design/discovery-contract/))
-
-**Peer coordination and identity**:
-- [x] Updateable peer candidates drive initial dialing and reconnection, including startup with an empty peer list; anti-entropy runs over active connections independently of discovery churn
-- [x] Distinguish discovery candidates, authenticated identities, advertised listening endpoints and active connections
-- [x] Define duplicate and self-peer handling, simultaneous connections, source expiry and removal semantics
-- [x] Bound candidates, concurrent connection attempts and connections; preserve backoff, TLS identity checks and authorization
-- [x] Define cluster isolation and advertised endpoint validation, including wildcard binds and dynamically assigned ports
-- [x] Own and stop all discovery tasks; roll back partial startup and withdraw announcements on shutdown ([contract](/numax/design/discovery-contract/))
-
-**Initial implementations**:
-- [x] `StaticDiscovery` - peer list from config (backward-compatible)
-- [x] `BootstrapGossipDiscovery` - contact a seed and learn bounded lists of advertised endpoints through the handshake/bootstrap exchange; suggestions remain candidates to authenticate, not membership assertions
-- [x] `MdnsDiscovery` - LAN discovery for demo and dev
-- [x] `DnsSrvDiscovery` - discovery via DNS-SRV record
-- [x] `FileWatchDiscovery` - peer file updated externally (useful for K8s headless services)
-
-**Configuration**:
-- [x] `[discovery]` section in `numax.toml` with `mode = "static" | "bootstrap" | "mdns" | "dns-srv" | "file"`
-- [x] Define provider-specific settings and interaction with explicit peers; preserve CLI > `NX_*` > TOML > defaults and effective-config output
-
-**Protocol compatibility**:
-- [x] Specify bootstrap messages and endpoint advertisement; increment the wire version for incompatible changes
-- [x] Verify JSON and Bincode encoding, handshake limits and safe rejection against `v0.1.4`; static configuration compatibility does not imply mixed-version wire compatibility
-
-**Explicit decision**:
-- [ ] Document `nat-traversal.md` - NAT/WAN traversal to be evaluated for `0.2.0`.
-
-**Acceptance tests**:
-- [x] Deterministic provider tests for late arrivals, overlapping sources, removals, transient errors, event overflow and shutdown
-- [x] Static configuration regression coverage; bootstrap recovery after seed loss; DNS refresh/expiry; file replacement and malformed updates
-- [x] Automate the environment-gated LAN mDNS check alongside the existing TLS rejection and reconnection-after-restart coverage; provider dependencies are justified in the discovery contract
-
-**Closing criterion**:
-> All five providers pass their acceptance tests. Three nodes on the same LAN discover each other via mDNS without any `--peer` flag, replicate a CRDT update and recover after reconnection within the declared retention window. Reproducible demo in `examples/discovery_lan/`.
-
-**Verification status (2026-09-14)**: the demo and environment-gated three-process
-E2E are present. The local macOS run passed discovery, CRDT replication and
-restart recovery within a 128-operation retention bound. This same-host test
-does not attest a three-device LAN run or the remote cross-platform CI matrix.
-The NAT/WAN decision above remains open.
+📄 Full details in the [v0.1.5 release notes](https://github.com/GianIac/numax/releases/tag/v0.1.5).
 
 ---
 
