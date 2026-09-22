@@ -1,0 +1,20 @@
+package numax:db@0.1.0;
+
+/// DRAFT - not connected to the runtime or nx-core.
+///
+/// This sketches the current hand-written ABI documented in
+/// `docs/nx-site/src/content/docs/reference/host-api.md`.
+///
+/// Open questions:
+/// - Should batch operations, prefix scans, and iteration be included?
+/// - Is `list<u8>` the right value type, or should values become a resource?
+/// - Should errors remain strings or become a shared typed error variant?
+interface db {
+    db-set: func(key: string, value: list<u8>) -> result<_, string>;
+    db-get: func(key: string) -> result<option<list<u8>>, string>;
+    db-del: func(key: string) -> result<_, string>;
+}
+
+world numax-db-guest {
+    import db;
+}
