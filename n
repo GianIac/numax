@@ -1,0 +1,13 @@
+# Numax
+
+## AssemblyScript Example
+
+Numax now supports AssemblyScript as a guest example.
+
+To build and run the example, follow these steps:
+
+1. Navigate to the `examples/assemblyscript` directory.
+2. Run `nx build` to build the example.
+3. Run `nx run` to run the example.
+
+## Example Output
