@@ -48,21 +48,9 @@ binding when configured, and allowlist authorization. When an operation is
 produced locally, the sync manager queues it and sends it to the currently
 connected peers.
 
-```
-local CRDT host call
-       |
-       v
-op queued in SyncManager
-       |
-       v
-broadcast loop batches ops
-       |
-       v
-PushOps sent to connected peers
-       |
-       v
-peer applies unseen ops and persists state
-```
+![Current direct broadcast to connected peers](/numax/diagrams/concepts/current-broadcast.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/current-broadcast.mmd)
 
 This is not SWIM and it is not K-fanout yet. It is a full broadcast to connected peers, bounded by `max_peers`, with batching and backpressure through the operation queue.
 
@@ -186,21 +174,9 @@ Today the request is conservative: it asks for the bounded op-log rather than re
 
 The receiving side deduplicates by `OpId`, applies only unseen operations, and persists the resulting CRDT state.
 
-```
-node A missed op-7 during a temporary disconnect
-       |
-       v
-node A reconnects
-       |
-       v
-anti-entropy sends PullSince(None)
-       |
-       v
-node B returns retained ops
-       |
-       v
-node A applies only unseen OpIds
-```
+![Current anti-entropy after a disconnect](/numax/diagrams/concepts/current-anti-entropy.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/current-anti-entropy.mmd)
 
 The op-log and deduplication history are bounded, so anti-entropy is a practical
 catch-up mechanism, not an infinite historical archive or state transfer.

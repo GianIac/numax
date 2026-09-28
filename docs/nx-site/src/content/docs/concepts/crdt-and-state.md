@@ -64,36 +64,16 @@ cargo test -p nx-sync
 
 When a guest module calls a CRDT host function, here is what happens:
 
-```
-guest calls crdt_gcounter_inc("visits", 1)
-       │
-       ▼
-host validates input, reads NodeId from HostState
-       │
-       ▼
-Host API applies op to in-memory CRDT state
-       │
-       ├── persists updated CRDT state / materialized value in sled (under __nx/)
-       │
-       └── queues op for broadcast
-              │
-              ▼
-         broadcast loop records seen-op + op-log metadata
-              │
-              ▼
-         nx-net sends PushOps to each peer
-              │
-              ▼
-         peer receives PushOps, checks OpId against seen-ops set
-              │
-              ├── if already seen: discard
-              │
-              └── if new: apply to peer's in-memory CRDT state
-                          persist updated state and op-log metadata
-                          mark OpId as seen
-```
+![Current local and remote CRDT operation flow](/numax/diagrams/concepts/crdt-operation-flow.svg)
 
-The module never waits for peers — the only thing it waits for is the push into the sync manager's channel. Propagation to peers happens asynchronously in the background.
+[Mermaid source for this diagram](/numax/diagrams/concepts/crdt-operation-flow.mmd)
+
+The host call persists the updated local CRDT state before publishing it in
+memory and queueing an operation; it does not wait for a peer. The broadcast
+loop persists that operation's seen ID and bounded op-log entry later, before
+sending `PushOps`. These are separate local write stages, not one atomic
+acceptance boundary. On the receiving node, an unseen batch is persisted
+before its new state is published in memory; a duplicate is skipped.
 
 ---
 

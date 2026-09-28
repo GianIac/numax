@@ -13,27 +13,9 @@ Every capability a module needs: compute, state, synchronization lives in the sa
 
 Numax integrates three things, and deliberately nothing more:
 
-```
- ┌──────────────────────────────────────────┐
- │           WASM module (guest)            │
- │        compiled with nx-sdk              │
- └─────────────────┬────────────────────────┘
-                   │  Host API (namespace "nx")
-                   ▼
- ┌──────────────────────────────────────────┐
- │              nx-core (host)              │
- │  ┌──────────┐  ┌──────────┐  ┌────────┐ │
- │  │ Wasmtime │  │ Host API │  │  WASI  │ │
- │  └──────────┘  └────┬─────┘  └────────┘ │
- └───────────────────┬─┼────────────────────┘
-                     │ │
-          ┌──────────┘ └──────────┐
-          ▼                       ▼
- ┌────────────────┐     ┌──────────────────────┐
- │   nx-store     │     │  nx-sync + nx-net     │
- │  sled (local)  │◄────┤  CRDT + gossip + TLS  │
- └────────────────┘     └──────────────────────┘
-```
+![Current Numax runtime components and their boundaries](/numax/diagrams/concepts/runtime-architecture.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/runtime-architecture.mmd)
 
 **1. Execution** - a WASM module runs in a sandbox. It has no access to the filesystem, network or system resources except what the host explicitly exposes via the `nx` namespace. Isolation is structural, not configured.
 
