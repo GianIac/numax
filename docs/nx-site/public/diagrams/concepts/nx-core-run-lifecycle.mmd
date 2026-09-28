@@ -1,0 +1,22 @@
+flowchart TD
+    init[Runtime::new_with_discovery]
+    observe[start_observability - no-op if disabled]
+    sync[start_sync - no-op if disabled]
+    wait{--wait-before-run set?}
+    waitCall[wait_before_run]
+    run[run_module]
+    settle{--settle-for set?}
+    settleCall[settle_for - no-op without sync]
+    enabled{Sync enabled?}
+    serve[serve - wait for shutdown signal]
+    results[Print requested CRDT values if any]
+    shutdown[shutdown_with_timeout]
+    init --> observe --> sync --> wait
+    wait -->|Yes| waitCall --> run
+    wait -->|No| run
+    run --> settle
+    settle -->|Yes| settleCall --> results
+    settle -->|No| enabled
+    enabled -->|Yes| serve --> results
+    enabled -->|No| results
+    results --> shutdown

@@ -83,6 +83,12 @@ the version `4` wire contract from Numax `v0.1.4`.
 
 When a node connects to a peer, the first exchange is:
 
+![Normal peer handshake from transport connection to peer admission](/numax/diagrams/concepts/peer-handshake.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/peer-handshake.mmd)
+
+The messages carry these fields:
+
 ```
 client -> server: Hello(node_id, protocol_version, supported_formats, preferred_format)
 server -> client: HelloAck(node_id, protocol_version, selected_format)
@@ -113,6 +119,12 @@ The rules for evolving this contract are defined in
 ### Bootstrap handshake
 
 Bootstrap uses the same listener but a separate, one-shot first message:
+
+![One-shot bootstrap handshake with seed validation and endpoint suggestions](/numax/diagrams/concepts/bootstrap-handshake.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/bootstrap-handshake.mmd)
+
+The one-shot messages carry these fields:
 
 ```text
 client -> seed: BootstrapHello(
