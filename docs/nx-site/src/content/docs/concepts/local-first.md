@@ -49,25 +49,13 @@ A node does not merely degrade gracefully when it is offline. For its own local 
 
 Every Numax node owns its data:
 
-```
-┌─────────────────────────────────────┐
-│           Numax node                │
-│                                     │
-│  ┌──────────────┐  ┌─────────────┐  │
-│  │ WASM module  │  │  nx-store   │  │
-│  │  (compute)   │◄─┤  (sled)     │  │
-│  └──────────────┘  └─────────────┘  │
-│                                     │
-│  ┌──────────────────────────────┐   │
-│  │  nx-sync + nx-net (optional) │   │
-│  │  CRDT sync with known peers  │   │
-│  └──────────────────────────────┘   │
-└─────────────────────────────────────┘
-```
+![A Numax node runs a WASM module beside its local store, with optional CRDT synchronization to peers](/numax/diagrams/concepts/local-first-node.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/local-first-node.mmd)
 
 The module reads and writes through an embedded store. There is no remote connection to open, no query to send across the network, and no acknowledgement to wait for from another system before local state can move forward.
 
-Sync is opt-in. A node started without `--listen` does not connect to peers. It simply runs. When sync is enabled, CRDTs handle convergence: local and remote state are merged using mathematical properties that guarantee eventual consistency without coordination.
+Sync is opt-in. A node started without `--listen` does not connect to peers. It simply runs. When sync is enabled, Numax exchanges CRDT operations with peers and applies them to local CRDT state. Ordinary key/value writes stay local.
 
 The key point is: **synchronization is decoupled from access**. You do not need to be connected to read or write local state. You need to be connected to propagate changes to other nodes. Those are different concerns, and treating them as the same thing is a major source of fragility in remote-first systems.
 

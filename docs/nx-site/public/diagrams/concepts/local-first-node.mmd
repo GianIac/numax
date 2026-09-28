@@ -1,0 +1,13 @@
+flowchart TB
+    subgraph node[Numax node]
+        guest[WASM module - local compute]
+        host[Host API - nx-core]
+        store[nx-store - embedded sled]
+        sync[Optional CRDT sync - nx-core using nx-sync and nx-net]
+        guest -->|Local API calls| host
+        host -->|Ordinary KV reads and writes| store
+        host -->|CRDT operations| sync
+        sync -->|Local CRDT persistence| store
+    end
+    peers[Other Numax nodes]
+    sync <-.->|When enabled: CRDT operations| peers

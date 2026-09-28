@@ -6,17 +6,8 @@ description: Overview of the Numax Rust crates.
 Numax is a Cargo workspace with seven crates. Each one owns a single layer of the stack.
 No crate reaches across its boundary.
 
-```
-nx-cli
-      ├── nx-core
-      │     ├── nx-store
-      │     ├── nx-sync
-      │     └── nx-net
-      │           └── nx-sync
-      └── nx-api
-
-nx-sdk          (standalone — targets wasm32, no internal deps)
-```
+The [dependency graph](#dependency-graph-in-full) shows the direct workspace
+dependencies; `nx-sdk` is standalone and targets the WASM guest.
 
 ---
 
@@ -168,25 +159,11 @@ reviewed OpenAPI contract.
 
 ## Dependency graph in full
 
-```
-nx-cli ──────────────────────────────────── bin: nx
-  │
-  ├── nx-api ─────────────────────────────  Management API adapter
-  │     │
-  │     └── nx-core
-  │
-  └── nx-core ──────────────────────────── runtime, host API, control, sync manager
-        │
-        ├── nx-store ─────────────────────  sled KV store
-        │
-        ├── nx-sync ──────────────────────  CRDT types, op types, pure logic
-        │
-        └── nx-net ───────────────────────  TCP, TLS, gossip, anti-entropy
-              │
-              └── nx-sync
+Arrows point from each crate to its direct workspace dependencies.
 
-nx-sdk ───────────────────────────────────  guest SDK (wasm32, no internal deps)
-```
+![Direct dependency graph of the seven Numax workspace crates](/numax/diagrams/concepts/crate-dependencies.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/crate-dependencies.mmd)
 
 ---
 

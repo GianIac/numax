@@ -111,28 +111,20 @@ counter:visits = 2
 ```
 
 Node A incremented once. Node B incremented once. They found each other,
-exchanged their state, and converged to the truth - **without you doing anything**.
+exchanged CRDT increment operations, and converged to the same value - **without you doing anything**.
 
 ---
 
 ## What just happened?
 
-```
-Node A                            Node B
-  |                                 |
-  +-- increment → local slot = 1    +-- increment → local slot = 1
-  |                                 |
-  +-- broadcast to B ────────────>  +-- receive A's slot
-  |                                 |
-  +<──────────── broadcast to A ────+
-  |                                 |
-  +-- merge: sum(1, 1) = 2          +-- merge: sum(1, 1) = 2
-  |                                 |
-"counter:visits = 2"            "counter:visits = 2"
-```
+![Two nodes exchange GCounter increment operations and converge on a value of two](/numax/diagrams/concepts/quickstart-gcounter-sync.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/quickstart-gcounter-sync.mmd)
 
 This is a **GCounter** - a grow-only CRDT. Each node owns its own slot.
-The total is the sum of all slots. Merging is just taking the max per slot.
+The total is the sum of all slots. When merging GCounter states, each slot takes
+the maximum value; in this example Numax sends increment operations and applies
+each unseen operation once.
 No coordinator. No conflict. Always converges.
 
 Your `.wasm` module called exactly one function:
