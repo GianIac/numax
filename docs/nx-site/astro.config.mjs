@@ -68,6 +68,7 @@ export default defineConfig({
           items: [
             { label: 'Schema versioning', slug: 'design/schema-versioning' },
             { label: 'Wire versioning', slug: 'design/wire-versioning' },
+            { label: 'Peer discovery (draft)', slug: 'design/peer-discovery' },
           ],
         },
         {

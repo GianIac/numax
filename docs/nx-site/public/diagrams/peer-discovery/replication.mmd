@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant W as Local CRDT call
+    participant A as Node A
+    participant B as Selected peer B
+    participant C as Peer C
+    W->>A: Update CRDT
+    A->>A: Accept state, operation ID, and replay metadata together
+    A-->>W: Success under the chosen durability contract
+    A->>B: Gossip accepted operation
+    B->>B: Persist unseen operation before publishing
+    B->>C: Forward with original operation ID
+    C->>C: Persist unseen operation or ignore duplicate
+    Note over A,C: Periodic anti-entropy repairs missed updates within the declared recovery contract
