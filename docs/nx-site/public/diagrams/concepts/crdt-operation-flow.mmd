@@ -1,0 +1,18 @@
+flowchart TD
+    subgraph origin[Origin node - current behavior]
+        call[Guest CRDT host call] --> validate[Validate input and reserve queue space]
+        validate --> update[Compute updated CRDT state]
+        update --> persist[Persist CRDT state and materialized value]
+        persist --> publish[Publish state in memory]
+        publish --> enqueue[Enqueue operation]
+        enqueue --> remember[Broadcast loop persists seen ID and bounded op log]
+    end
+    subgraph receiver[Receiving node - current behavior]
+        check{OpId already seen?}
+        check -->|Yes| ignore[Skip duplicate]
+        check -->|No| plan[Plan CRDT update]
+        plan --> persistRemote[Persist state, seen ID, and op-log batch]
+        persistRemote --> publishRemote[Publish state in memory]
+    end
+    remember --> push[PushOps to connected peers]
+    push --> check

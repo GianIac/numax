@@ -180,7 +180,7 @@ while peer discovery remains deliberately separated from authentication and auth
 **Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
 
 **Design doc as a public RFC**:
-- [ ] `peer-discovery.md`, documenting accepted contracts and recording unresolved alternatives
+- [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, planned behavior and open decisions
 - [ ] Documented failure scenarios
 - [ ] Detailed test plan
 

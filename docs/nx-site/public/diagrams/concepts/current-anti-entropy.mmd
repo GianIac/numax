@@ -1,0 +1,12 @@
+sequenceDiagram
+    participant A as Recovering node A
+    participant B as Connected peer B
+    Note over A,B: A missed an operation
+    A->>B: Reconnect and complete handshake
+    loop Each anti-entropy interval
+        A->>B: PullSince(None)
+        B->>B: Read retained op log
+        B-->>A: PushOps with retained operations
+        A->>A: Persist unseen ops
+    end
+    Note over A,B: Expired history needs another repair path

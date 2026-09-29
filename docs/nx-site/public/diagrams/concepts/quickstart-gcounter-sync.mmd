@@ -1,0 +1,10 @@
+sequenceDiagram
+    participant A as Node A
+    participant B as Node B
+    A->>A: Increment local slot (A = 1)
+    B->>B: Increment local slot (B = 1)
+    A-->>B: PushOps with A's increment operation
+    B->>B: Apply unseen operation from A
+    B-->>A: PushOps with B's increment operation
+    A->>A: Apply unseen operation from B
+    Note over A,B: Each node reads counter:visits = 2

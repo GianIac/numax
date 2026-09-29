@@ -83,16 +83,16 @@ pub struct HostState {
 
 Standard call order from `nx-cli`:
 
-```
-Runtime::new(config)
-  └── start_observability()   optional, starts HTTP endpoint
-  └── start_sync()            optional, starts SyncManager + networking
-  └── wait_before_run(dur)    optional, waits for peers before running
-  └── run_module(bytes)       loads, links, instantiates, calls run()
-  └── settle_for(dur)         optional, keeps sync alive for a bounded window
-      OR serve()              optional, keeps sync alive until SIGINT/SIGTERM/SIGHUP
-  └── shutdown_with_timeout(dur)
-```
+![Successful nx-cli run lifecycle, including optional settle and serve branches](/numax/diagrams/concepts/nx-core-run-lifecycle.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/nx-core-run-lifecycle.mmd)
+
+This shows the successful `nx run` path, which constructs the runtime with
+`new_with_discovery`. `start_observability()` and
+`start_sync()` are called even when their features are disabled and then have
+no effect. `settle_for(dur)` likewise returns immediately without sync. Without
+`--settle-for`, `serve()` waits for a shutdown signal only when sync is enabled.
+The CLI also shuts the runtime down if an earlier step fails.
 
 | Method | What it does |
 |---|---|

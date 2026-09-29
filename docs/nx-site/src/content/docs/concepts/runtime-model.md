@@ -13,27 +13,9 @@ Every capability a module needs: compute, state, synchronization lives in the sa
 
 Numax integrates three things, and deliberately nothing more:
 
-```
- ┌──────────────────────────────────────────┐
- │           WASM module (guest)            │
- │        compiled with nx-sdk              │
- └─────────────────┬────────────────────────┘
-                   │  Host API (namespace "nx")
-                   ▼
- ┌──────────────────────────────────────────┐
- │              nx-core (host)              │
- │  ┌──────────┐  ┌──────────┐  ┌────────┐ │
- │  │ Wasmtime │  │ Host API │  │  WASI  │ │
- │  └──────────┘  └────┬─────┘  └────────┘ │
- └───────────────────┬─┼────────────────────┘
-                     │ │
-          ┌──────────┘ └──────────┐
-          ▼                       ▼
- ┌────────────────┐     ┌──────────────────────┐
- │   nx-store     │     │  nx-sync + nx-net     │
- │  sled (local)  │◄────┤  CRDT + gossip + TLS  │
- └────────────────┘     └──────────────────────┘
-```
+![Current Numax runtime components and their boundaries](/numax/diagrams/concepts/runtime-architecture.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/runtime-architecture.mmd)
 
 **1. Execution** - a WASM module runs in a sandbox. It has no access to the filesystem, network or system resources except what the host explicitly exposes via the `nx` namespace. Isolation is structural, not configured.
 
@@ -47,27 +29,19 @@ Numax integrates three things, and deliberately nothing more:
 
 The module and the runtime live in different worlds. The module is a `.wasm` binary: a portable, sandboxed, architecture-independent unit of computation. The runtime is a native Rust process. They communicate through the Host API.
 
-Every Host API function follows the same convention:
+Byte-oriented Host API functions generally follow this convention:
 
 - pointers and lengths are passed as `u32` offsets into WASM linear memory
 - return codes are `i32`: non-negative values mean success, negative values carry error codes
 - the guest handles errors deterministically
 
-```
-Guest code (Rust, via nx-sdk)
-    │
-    │  safe wrapper (e.g. db::set("key", b"value"))
-    ▼
-FFI call  (unsafe extern "C" from ffi.rs)
-    │
-    │  WASM linear memory boundary
-    ▼
-Host function (Rust in nx-core)
-    │
-    │  writes to sled / pushes to SyncManager / reads from clock
-    ▼
-Return code (i32) back to guest
-```
+For functions that exchange bytes, the call crosses the boundary through an SDK
+wrapper and an FFI import. The host validates the guest's pointers and lengths
+before reading or writing its linear memory:
+
+![A guest calls a byte-oriented host function through nx-sdk, WASM linear memory, and the nx-core Host API](/numax/diagrams/concepts/host-guest-call.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/host-guest-call.mmd)
 
 | Code | Meaning |
 |---|---|

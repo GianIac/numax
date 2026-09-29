@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant Client as Dialing node
+    participant Server as Listening node
+    Client->>Server: TCP connection (TLS if configured)
+    Client->>Server: Hello
+    Server->>Server: Check protocol, formats, identity and admission
+    alt Rejected
+        Server-->>Client: Error when possible, then close
+    else Accepted
+        Server-->>Client: HelloAck with selected format
+        Server->>Server: Register admitted peer
+        Client->>Client: Validate ack and peer identity
+        Client->>Client: Register admitted peer
+        Note over Client,Server: Connection can carry CRDT traffic
+    end

@@ -1,0 +1,19 @@
+flowchart TD
+    guest[WASM guest module - nx-sdk]
+    subgraph core[nx-core runtime]
+        engine[Wasmtime engine and WASI preview1]
+        host[Host API - namespace nx]
+        sync[SyncManager - apply, replication, storage, migration]
+        engine --> host
+        host --> sync
+    end
+    store[nx-store - local sled datastore]
+    crdt[nx-sync - CRDT and operation types]
+    net[nx-net - TCP, TLS, peer protocol]
+    peers[Connected peer nodes]
+    guest -->|Host API calls| host
+    host -->|Local KV access| store
+    sync -->|CRDT persistence| store
+    sync -->|Uses CRDT logic| crdt
+    sync -->|Replication and repair| net
+    net <-->|Direct broadcast and bounded anti-entropy| peers
