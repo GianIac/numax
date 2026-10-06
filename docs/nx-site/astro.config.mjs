@@ -11,6 +11,7 @@ export default defineConfig({
     starlight({
       title: 'Numax',
       description: 'A portable runtime for local-first distributed WASM apps.',
+      favicon: '/favicon.png',
       defaultLocale: 'root',
       locales: {
         root: {
