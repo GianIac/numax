@@ -17,8 +17,8 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["sy
 mdns-sd = { version = "0.21", default-features = false, features = ["async"] }
 sha2 = "0.11.0"
 serde_json = "1"
-wasmtime = "48.0.3"
-wasmtime-wasi = "48.0.3"
+wasmtime = "49.0.2"
+wasmtime-wasi = "49.0.2"
 nx-store = { version = "0.1.5", path = "../nx-store" }
 nx-sync = { version = "0.1.5", path = "../nx-sync" }
 nx-net = { version = "0.1.5", path = "../nx-net" }
