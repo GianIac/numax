@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="800" alt="NUMAX" src="https://github.com/user-attachments/assets/c628c233-8523-4abd-a57c-a15e32c6947a" />
+  <img width="240" alt="Numax" src="./docs/nx-site/src/assets/brand/numax-mark.png" />
 </p>
 
 # numax
