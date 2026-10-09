@@ -710,23 +710,7 @@ pub(super) async fn apply_local_lww_map_remove(
 }
 
 pub(super) async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {
-    let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key, element);
-    let tag = match &op.kind {
-        OpKind::ORSetAdd { tag, .. } => tag.clone(),
-        other => panic!("unexpected op kind: {other:?}"),
-    };
-
-    {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
-        set.add(element, tag);
-
-        persist_orset_state(&handle.store(), key, &set).unwrap();
-        sets.insert(key.to_string(), set);
-    }
-
-    op
+    handle.add_orset(key, element).await.unwrap()
 }
 
 pub(super) async fn apply_local_orset_remove(
@@ -734,26 +718,7 @@ pub(super) async fn apply_local_orset_remove(
     key: &str,
     element: &str,
 ) -> Option<Op> {
-    let observed_tags = {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
-        let observed_tags = set.remove(element);
-        if observed_tags.is_empty() {
-            return None;
-        }
-
-        persist_orset_state(&handle.store(), key, &set).unwrap();
-        sets.insert(key.to_string(), set);
-        observed_tags
-    };
-
-    Some(Op::orset_remove(
-        handle.node_id().clone(),
-        key,
-        element,
-        observed_tags,
-    ))
+    handle.remove_orset(key, element).await.unwrap()
 }
 
 pub(super) async fn apply_local_rga_insert_after(

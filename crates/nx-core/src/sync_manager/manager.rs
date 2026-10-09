@@ -33,7 +33,7 @@ use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
     hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_map_op,
-    persist_local_lww_register_op, persist_local_pncounter_op,
+    persist_local_lww_register_op, persist_local_orset_op, persist_local_pncounter_op,
 };
 use super::types::*;
 
@@ -307,6 +307,84 @@ impl SyncHandle {
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
         Ok(op)
+    }
+
+    pub(crate) async fn add_orset(&self, key: &str, element: &str) -> anyhow::Result<Op> {
+        let op = Op::orset_add_with_op_id_tag(self.node_id.clone(), key, element);
+        let op_id = op.id.as_str().to_string();
+
+        // Match the remote apply lock order so observed tags and replay agree.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut sets = self.orsets.write().await;
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate ORSet operation id");
+        }
+
+        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+        set.add(element.to_string(), op_id.clone());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_orset_op(&self.store, key, &set, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        sets.insert(key.to_string(), set);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
+    }
+
+    pub(crate) async fn remove_orset(
+        &self,
+        key: &str,
+        element: &str,
+    ) -> anyhow::Result<Option<Op>> {
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut sets = self.orsets.write().await;
+        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+        let observed_tags = set.observed_tags(element);
+        if observed_tags.is_empty() {
+            return Ok(None);
+        }
+
+        let op = Op::orset_remove(self.node_id.clone(), key, element, observed_tags.clone());
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate ORSet operation id");
+        }
+        set.apply_remove(element.to_string(), observed_tags);
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_orset_op(&self.store, key, &set, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        sets.insert(key.to_string(), set);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(Some(op))
     }
 
     /// Read-side handle over the counter registry.

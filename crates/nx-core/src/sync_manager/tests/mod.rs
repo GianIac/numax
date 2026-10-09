@@ -2936,6 +2936,382 @@ async fn local_and_remote_lww_map_batches_preserve_field_winners_and_ignore_dupl
 }
 
 #[tokio::test]
+async fn local_orset_batch_restarts_with_tags_removals_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let blue = handle.add_orset("tags:item-1", "blue").await.unwrap();
+    let red = handle.add_orset("tags:item-1", "red").await.unwrap();
+    let remove = handle
+        .remove_orset("tags:item-1", "blue")
+        .await
+        .unwrap()
+        .unwrap();
+    let repeated_remove = handle
+        .remove_orset("tags:item-1", "blue")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_ops = [blue, red, remove, repeated_remove];
+
+    assert!(
+        matches!(&expected_ops[0].kind, OpKind::ORSetAdd { tag, .. } if tag == expected_ops[0].id.as_str())
+    );
+    for op in &expected_ops[2..] {
+        assert!(
+            matches!(&op.kind, OpKind::ORSetRemove { observed_tags, .. } if observed_tags == &[expected_ops[0].id.as_str().to_string()])
+        );
+    }
+    assert_eq!(manager.get_orset_elements("tags:item-1").await, vec!["red"]);
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    let state = read_durable_orset_state(&store, "tags:item-1");
+    assert_eq!(
+        state.observed_tags("blue"),
+        vec![expected_ops[0].id.as_str()]
+    );
+    assert!(!state.contains("blue"));
+    assert!(state.contains("red"));
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 4);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 4);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_orset_elements("tags:item-1").await, vec!["red"]);
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), state);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_orset_remove_without_observed_tags_writes_no_operation() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    assert!(
+        handle
+            .remove_orset("tags:item-1", "missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_orset_state_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_orset_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn local_orset_batch_failure_preserves_previous_state_and_metadata() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.add_orset("tags:item-1", "blue").await.is_err());
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_orset_state_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_orset_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let add = handle.add_orset("tags:item-1", "blue").await.unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.remove_orset("tags:item-1", "blue").await.is_err());
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["blue"]);
+    assert!(read_durable_orset_state(&store, "tags:item-1").contains("blue"));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&add)
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_orset_flush_failure_blocks_retry_and_recovers_remove() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let add = handle.add_orset("tags:item-1", "blue").await.unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(handle.remove_orset("tags:item-1", "blue").await.is_err());
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&add)
+    );
+    assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
+    let state = read_durable_orset_state(&store, "tags:item-1");
+    assert!(!state.contains("blue"));
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let remove = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != add.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .add_orset("tags:item-1", "red")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), state);
+    assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[add, remove]);
+}
+
+#[tokio::test]
+async fn local_and_remote_orset_batches_keep_tags_and_ignore_delayed_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle.add_orset("tags:item-1", "blue").await
+        };
+        let remote_op = Op::orset_add(
+            NodeId::new("remote-node"),
+            "tags:item-1",
+            "blue",
+            format!("remote-tag-{index}"),
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_orset_op_for_test(
+                &remote_op,
+                &manager.orsets,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote ORSet writes must not deadlock");
+        let local_op = local_result.unwrap();
+        assert!(
+            matches!(&local_op.kind, OpKind::ORSetAdd { tag, .. } if tag == local_op.id.as_str())
+        );
+        apply_remote_orset_op_for_test(
+            &remote_op,
+            &manager.orsets,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+        let remove = manager
+            .handle()
+            .remove_orset("tags:item-1", "blue")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&remove.kind, OpKind::ORSetRemove { observed_tags, .. } if observed_tags.contains(&local_op.id.as_str().to_string()) && observed_tags.contains(&format!("remote-tag-{index}")))
+        );
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 36);
+    let mut expected = ORSet::new();
+    for op in log.iter() {
+        match &op.kind {
+            OpKind::ORSetAdd { element, tag, .. } => {
+                expected.apply_add(element.clone(), tag.clone());
+            }
+            OpKind::ORSetRemove {
+                element,
+                observed_tags,
+                ..
+            } => {
+                expected.apply_remove(element.clone(), observed_tags.iter().cloned());
+            }
+            other => panic!("unexpected operation in ORSet log: {other:?}"),
+        }
+    }
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        expected.elements()
+    );
+    assert_eq!(
+        read_materialized_orset(&store, "tags:item-1"),
+        expected.elements()
+    );
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), expected);
+    assert_eq!(manager.seen_ops.read().await.len(), 36);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

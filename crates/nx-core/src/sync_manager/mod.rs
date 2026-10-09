@@ -15,4 +15,4 @@ pub use migration::{
     MigrationProgress, SyncSchemaMigration, migrate_sync_schema, migrate_sync_schema_at_path,
 };
 pub use peer::PeerHealthState;
-pub(crate) use storage::{persist_orset_state, persist_rga_state};
+pub(crate) use storage::persist_rga_state;

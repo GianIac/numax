@@ -1,10 +1,10 @@
 use anyhow::Result;
-use nx_sync::{ORSet, Op, OpKind, Rga};
+use nx_sync::{Op, OpKind, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::{persist_orset_state, persist_rga_state};
+use crate::sync_manager::persist_rga_state;
 
 // error codes
 const ERR_NOT_FOUND: i32 = -1;
@@ -884,27 +884,14 @@ async fn crdt_orset_add_impl(
         }
     };
 
-    let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key.clone(), element.clone());
-    let tag = match &op.kind {
-        OpKind::ORSetAdd { tag, .. } => tag.clone(),
-        _ => {
+    let op = match handle.add_orset(&key, &element).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_add: failed to persist operation");
             return ERR_INTERNAL;
         }
     };
-
-    {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
-        set.add(element, tag);
-        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
-            handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_orset_add: failed to persist set");
-            return ERR_INTERNAL;
-        }
-        sets.insert(key, set);
-    }
 
     tracing::debug!(op_id = %op.id, "queued local ORSet add");
     op_permit.send(op);
@@ -960,24 +947,15 @@ async fn crdt_orset_remove_impl(
         }
     };
 
-    let observed_tags = {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
-        let observed_tags = set.remove(&element);
-        if observed_tags.is_empty() {
-            return 0;
-        }
-        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
+    let op = match handle.remove_orset(&key, &element).await {
+        Ok(Some(op)) => op,
+        Ok(None) => return 0,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_orset_remove: failed to persist set");
+            tracing::warn!(error = %e, "crdt_orset_remove: failed to persist operation");
             return ERR_INTERNAL;
         }
-        sets.insert(key.clone(), set);
-        observed_tags
     };
-
-    let op = Op::orset_remove(handle.node_id().clone(), key, element, observed_tags);
     tracing::debug!(op_id = %op.id, "queued local ORSet remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);
