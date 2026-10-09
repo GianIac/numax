@@ -187,7 +187,8 @@ while peer discovery remains deliberately separated from authentication and auth
 The RFC records the agreed directions: local success after an atomic batch and confirmed (possibly grouped) flush; per-origin/generation sequencing; bounded replay with minimal versioned state transfer when needed; SWIM/Lifeguard membership over the existing connection transport; bounded K-fanout; persistent manual candidates; and explicit compatibility and data-readiness checks. These remain design decisions, not implemented or verified release capabilities.
 
 **Replication correctness prerequisites**:
-- [ ] Define and test atomic local persistence of CRDT state, operation identity and replay metadata before acknowledging a local write
+- [ ] First increment: create each local `OpId` before persistence and write CRDT state, materialized value, seen-operation metadata and the replayable op-log entry in one atomic batch for all six CRDT families; remove the later, separate local metadata write from broadcast and test storage failure and restart. This batch alone is not flush-confirmed durability.
+- [ ] Complete local acceptance: wait for a confirmed flush covering that batch before reporting success, and specify and test unknown-outcome retry behavior and the chosen crash model. Do not mark D1 complete after the batch-only increment.
 - [ ] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics
 - [ ] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
 - [ ] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures
