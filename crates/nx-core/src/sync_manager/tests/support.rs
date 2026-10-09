@@ -665,46 +665,11 @@ pub(super) async fn apply_local_increment(handle: &SyncHandle, key: &str, delta:
 }
 
 pub(super) async fn apply_local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Increment).await
+    handle.increment_pncounter(key, delta).await.unwrap()
 }
 
 pub(super) async fn apply_local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Decrement).await
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PNCounterChangeForTest {
-    Increment,
-    Decrement,
-}
-
-async fn apply_local_pncounter_change(
-    handle: &SyncHandle,
-    key: &str,
-    delta: u64,
-    change: PNCounterChangeForTest,
-) -> Op {
-    {
-        let counters_arc = handle.pncounters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(key).cloned().unwrap_or_else(PNCounter::new);
-        match change {
-            PNCounterChangeForTest::Increment => counter.increment(handle.node_id(), delta),
-            PNCounterChangeForTest::Decrement => counter.decrement(handle.node_id(), delta),
-        }
-
-        persist_pncounter_state(&handle.store(), key, &counter).unwrap();
-        counters.insert(key.to_string(), counter);
-    }
-
-    match change {
-        PNCounterChangeForTest::Increment => {
-            Op::pncounter_increment(handle.node_id().clone(), key, delta)
-        }
-        PNCounterChangeForTest::Decrement => {
-            Op::pncounter_decrement(handle.node_id().clone(), key, delta)
-        }
-    }
+    handle.decrement_pncounter(key, delta).await.unwrap()
 }
 
 pub(super) async fn apply_local_lww_register_set(

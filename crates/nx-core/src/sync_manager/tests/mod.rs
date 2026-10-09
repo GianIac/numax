@@ -1759,6 +1759,255 @@ async fn local_and_remote_gcounter_batches_keep_both_increments() {
 }
 
 #[tokio::test]
+async fn local_pncounter_batch_restarts_with_both_directions_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let increment = handle.increment_pncounter("stock:sku-1", 10).await.unwrap();
+    let decrement = handle.decrement_pncounter("stock:sku-1", 4).await.unwrap();
+    let expected_ops = [increment, decrement];
+
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 6);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 6);
+    let state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(state.positive_for(&NodeId::new("local-node")), 10);
+    assert_eq!(state.negative_for(&NodeId::new("local-node")), 4);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored_op = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored_op).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 2);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 2);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 6);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 6);
+    let restarted_state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(
+        restarted_state.positive_for(&NodeId::new("local-node")),
+        state.positive_for(&NodeId::new("local-node"))
+    );
+    assert_eq!(
+        restarted_state.negative_for(&NodeId::new("local-node")),
+        state.negative_for(&NodeId::new("local-node"))
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_pncounter_batch_failure_does_not_publish_partial_state() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.increment_pncounter("stock:sku-1", 10).await.is_err());
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_pncounter_state_key("stock:sku-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_pncounter_key("stock:sku-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle.decrement_pncounter("stock:sku-1", 3).await.unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -3);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_pncounter_flush_failure_blocks_retry_and_recovers_on_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(handle.decrement_pncounter("stock:sku-1", 3).await.is_err());
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .increment_pncounter("stock:sku-1", 2)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -3);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    assert_eq!(
+        read_durable_pncounter_state(&store, "stock:sku-1")
+            .negative_for(&NodeId::new("local-node")),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_pncounter_batches_preserve_directions_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for _ in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle.increment_pncounter("stock:sku-1", 2).await
+        };
+        let remote_op = Op::pncounter_decrement(NodeId::new("remote-node"), "stock:sku-1", 3);
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_pncounter_op_for_test(
+                &remote_op,
+                &manager.pncounters,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote PNCounter writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_pncounter_op_for_test(
+            &remote_op,
+            &manager.pncounters,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -16);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -16);
+    let state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(state.positive_for(&NodeId::new("local-node")), 32);
+    assert_eq!(state.negative_for(&NodeId::new("remote-node")), 48);
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+    assert_eq!(manager.op_log.read().await.len(), 32);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

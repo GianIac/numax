@@ -1,12 +1,11 @@
 use anyhow::Result;
-use nx_sync::{LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
+use nx_sync::{LwwMap, LwwRegister, ORSet, Op, OpKind, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 use crate::sync_manager::{
-    persist_lww_map_state, persist_lww_register_state, persist_orset_state,
-    persist_pncounter_state, persist_rga_state,
+    persist_lww_map_state, persist_lww_register_state, persist_orset_state, persist_rga_state,
 };
 
 // error codes
@@ -341,27 +340,17 @@ async fn crdt_pncounter_change_impl(
         }
     };
 
-    {
-        let counters_arc = handle.pncounters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(&key).cloned().unwrap_or_else(PNCounter::new);
-        match change {
-            PNCounterChange::Increment => counter.increment(handle.node_id(), delta),
-            PNCounterChange::Decrement => counter.decrement(handle.node_id(), delta),
-        }
-
-        if let Err(e) = persist_pncounter_state(&handle.store(), &key, &counter) {
+    let op = match change {
+        PNCounterChange::Increment => handle.increment_pncounter(&key, delta).await,
+        PNCounterChange::Decrement => handle.decrement_pncounter(&key, delta).await,
+    };
+    let op = match op {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "{api_name}: failed to persist counter");
+            tracing::warn!(error = %e, "{api_name}: failed to persist operation");
             return ERR_INTERNAL;
         }
-
-        counters.insert(key.clone(), counter);
-    }
-
-    let op = match change {
-        PNCounterChange::Increment => Op::pncounter_increment(handle.node_id().clone(), key, delta),
-        PNCounterChange::Decrement => Op::pncounter_decrement(handle.node_id().clone(), key, delta),
     };
     tracing::debug!(op_id = %op.id, api = api_name, "queued local PNCounter op");
     op_permit.send(op);

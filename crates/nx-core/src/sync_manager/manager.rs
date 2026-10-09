@@ -32,7 +32,7 @@ use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
-    hydrate_seen_ops, persist_local_gcounter_op,
+    hydrate_seen_ops, persist_local_gcounter_op, persist_local_pncounter_op,
 };
 use super::types::*;
 
@@ -55,6 +55,12 @@ pub struct SyncHandle {
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
+}
+
+#[derive(Clone, Copy)]
+enum PNCounterDirection {
+    Increment,
+    Decrement,
 }
 
 impl SyncHandle {
@@ -92,6 +98,68 @@ impl SyncHandle {
             op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
         };
         persist_local_gcounter_op(&self.store, key, &counter, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        counters.insert(key.to_string(), counter);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
+    }
+
+    pub(crate) async fn increment_pncounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+        self.change_pncounter(key, delta, PNCounterDirection::Increment)
+            .await
+    }
+
+    pub(crate) async fn decrement_pncounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+        self.change_pncounter(key, delta, PNCounterDirection::Decrement)
+            .await
+    }
+
+    async fn change_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+        direction: PNCounterDirection,
+    ) -> anyhow::Result<Op> {
+        let op = match direction {
+            PNCounterDirection::Increment => {
+                Op::pncounter_increment(self.node_id.clone(), key, delta)
+            }
+            PNCounterDirection::Decrement => {
+                Op::pncounter_decrement(self.node_id.clone(), key, delta)
+            }
+        };
+        let op_id = op.id.as_str().to_string();
+
+        // Match the remote apply lock order so local and remote updates cannot race.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut counters = self.pncounters.write().await;
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate PNCounter operation id");
+        }
+
+        let mut counter = counters.get(key).cloned().unwrap_or_else(PNCounter::new);
+        match direction {
+            PNCounterDirection::Increment => counter.increment(&self.node_id, delta),
+            PNCounterDirection::Decrement => counter.decrement(&self.node_id, delta),
+        }
+
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_pncounter_op(&self.store, key, &counter, &plan)?;
 
         apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
