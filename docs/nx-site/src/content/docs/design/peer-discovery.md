@@ -3,10 +3,11 @@ title: Peer Discovery, Membership, and Gossip (draft)
 description: How Numax finds peers, tracks membership, disseminates CRDT operations, and repairs missed updates.
 ---
 
-> **Status: in development.** Endpoint discovery, connection admission, direct
-> broadcast, and bounded anti-entropy exist today. Membership, failure detection,
-> K-fanout gossip, and the recovery contract below remain planned. The
-> [open decisions](#open-decisions) are not implemented or approved designs.
+> **Status: in development.** Endpoint discovery, connection admission, direct broadcast, and bounded anti-entropy exist today.
+
+> **Planning note.** I use this file mainly to plan the development of v0.1.6
+> as well as I can and to make each decision once and for all. This version is
+> already giving me a hard time, even before I have really started writing code.
 
 ## What this feature does
 
@@ -114,22 +115,23 @@ timeouts, or wire format. These choices require evidence under Numax workloads.
 
 [Mermaid source for this diagram](/numax/diagrams/peer-discovery/replication.mmd)
 
-> The sequence shows desired ordering !!
-A node may accept a local CRDT write before it has any peer connection; gossip begins only when eligible peers become available.
+> The sequence shows the intended ordering, not the current local write path.
+
+A node may accept a local CRDT write before it has any peer connection; gossip
+begins only when eligible peers become available.
 
 1. Establish an atomic local persistence boundary covering the CRDT state,
-   operation identity, and replay metadata before the selected local success
-   response. The identity must be available for the atomic write; its current
-   generation point differs by operation. State exactly whether success means
-   batch acceptance or confirmed flush durability, and whether the guarantee
-   covers process crashes, graceful restart, or a lost storage device. Do not
-   imply a remote acknowledgement unless one is added and specified. Preserve
-   the remote apply-before-publish ordering.
+   operation identity, and replay metadata, followed by a confirmed flush
+   before the local success response. The identity must be available for the
+   atomic write; its current generation point differs by operation. Specify
+   the covered crash model and unknown-outcome retry behavior before coding.
+   Local success does not imply remote acknowledgement or survival of a lost
+   storage device. Preserve the remote apply-before-publish ordering.
 2. After a newly accepted remote operation is persisted, make it eligible for
    onward dissemination with its original identity. A duplicate must not create
    a new operation or an unbounded forwarding loop. Storage failure must not
    publish or forward an operation as accepted.
-3. Choose a bounded, rotating set of eligible peers. My target target is
+3. Choose a bounded, rotating set of eligible peers. The target is
    `K = ceil(log2(N) + c)` with a local estimate `N`; calibrate `c`, define
    eligibility, clamp K to configured limits, and handle small clusters.
    Fanout is a dissemination policy, not a proof that every peer has the data.
@@ -143,43 +145,159 @@ A node may accept a local CRDT write before it has any peer connection; gossip b
    retention makes them unrecoverable. A new node with no history is a first-class
    case, not an implicit success of the old bounded-log pull.
 
-The recoverability statement is conditional: **no loss of accepted operations within the chosen recovery contract and its declared retention window**. The contract must name the failure model and require at least one surviving,durable source for every operation or equivalent state. Local success alone does not promise redundant copies; loss of the sole durable holder cannot be repaired by fanout or anti-entropy. It cannot be read as arbitrary-duration partition tolerance or complete state transfer. The implementation must expose a clear failure when the contract cannot be met.
+The recoverability statement is conditional: **no loss of accepted operations
+within the chosen recovery contract and its declared retention window**. The
+contract must name the failure model and require at least one surviving, durable
+source for every operation or equivalent state. Local success alone does not
+promise redundant copies; loss of the sole durable holder cannot be repaired by
+fanout or anti-entropy. The implementation must expose a clear failure when the
+contract cannot be met.
 
 ### Management and observation
 
 The planned `POST /api/v1/peers` submits a candidate through `RuntimeManagement`
-for ordinary validation and eventual admission. Its response must distinguish
-candidate acceptance from successful connection, authentication, and membership.
-To define its authorization, idempotency, bounds, error mapping, and restart
-persistence before fixing the HTTP schema. Once admitted, a manually added peer
-must participate in reconnection, detection, and anti-entropy under the same
-rules as other admitted peers.
+for ordinary validation and eventual admission. Its response confirms candidate
+acceptance only; it does not confirm connection, authentication, membership, or
+data readiness. Manual candidates will be persisted as a distinct discovery
+source and survive restart. Authorization, idempotency, bounds, removal, and
+error mapping must be specified before fixing the HTTP schema. Once admitted,
+a manually added peer follows the same reconnection, detection, and
+anti-entropy rules as other admitted peers.
 
 Introspection must distinguish candidates, current membership state, live
 connections, replication progress, and unrecoverable gaps. Publish bounded
 metrics for probes, suspicion/refutation, fanout, queues, retry, and recovery.
 Do not make per-operation or per-remote-address metric labels unbounded.
 
-## Open decisions
+## Decisions for v0.1.6
 
-I need time to think about it ...
+These are approved design directions. None changes the current behavior until
+implemented and tested. The [remaining specifications](#remaining-specifications)
+are deliberately open; choosing a direction does not select an unmeasured
+timeout, retention limit, wire layout, or performance guarantee.
 
-| ID | Decision to make | Viable alternatives and deciding evidence |
-| --- | --- | --- |
-| D1 | Local acceptance and durability | Is the success point after an atomic batch, or after a confirmed flush? Which failure model does it cover, and is remote durability required before success? How do host API error codes, retries after an unknown outcome, shutdown, and storage failure behave? Require crash injection at each boundary and a restart check of state, `OpId`, and replay metadata. |
-| D2 | Missing-history detection and deduplication | Compare a per-origin contiguous sequence (including identity/generation and hole tracking) with idempotent state/delta reconciliation. Current UUID `OpId` plus a seen-ID set detects duplicates only while history remains; a maximum ID is not a frontier. Test out-of-order delivery, delayed duplicates, seen-ID eviction, and replay after restart for each CRDT family. |
-| D3 | Recovery horizon | Select an explicit time/byte/operation retention contract and determine how both sides detect that required history expired. State the surviving-source and partition assumptions; decide whether bounded replay suffices or a versioned state-transfer subset is required now. Prove new-node admission, long partitions, and an explicit unrecoverable-gap outcome. |
-| D4 | Membership identity and ordering | Define node identity across restart, incarnation/generation storage, state transitions, refutation, tombstone lifetime, leave/rejoin, and stale-message precedence. Existing persisted `NodeId` alone does not settle incarnation ordering. Check restart loops, duplicated control messages, and split-brain merge. |
-| D5 | Control transport and trust | Choose how probes, indirect probes, and membership updates use authenticated connections or a separate transport. State behavior in secure TLS and unverified/insecure modes, authorization of relayed claims, payload/queue limits, and replay protection. Prove that endpoint discovery, cluster-name matching, or a third-party membership claim cannot bypass admission. |
-| D6 | Detector and timing | Specify probe cadence, suspicion duration, Lifeguard-style local-health adjustment, jitter, and escalation; compare against a separate phi-accrual detector only if the simpler scheme fails the false-positive and latency targets. Calibrate under slow storage, high CPU, 10% loss, and real transport faults. |
-| D7 | Fanout and repair scheduling | Define `N`, eligible peers, randomization/rotation, `c`, load/RTT adaptation, recovery contacts, pagination, cursor semantics, and separate control/data budgets. Measure sparse topologies and retained-history gaps; choose defaults from evidence rather than importing them from another protocol. |
-| D8 | Runtime peer API and persistence | Decide whether a manual candidate persists across restart, how it interacts with static/dynamic providers and removal, what a successful POST means, and how authorization and rate limits apply. Preserve GET semantics and existing config precedence. |
-| D9 | Compatibility and rollout | Choose wire version and schema migration plan only after message and storage shapes are known. Decide mixed-version rejection, in-flight messages, fixture handling, and behavior of v0.1.5 nodes and data. Keep package, wire, and storage versions distinct. Validate both wire formats and a real previous binary. |
-| D10 | Data readiness and convergence proof | Define a protocol-specific completion signal and an oracle that accounts for accepted operations as well as durable and materialized state in every CRDT family. Equal final values alone do not prove that a superseded operation was delivered. Keep local readiness, membership, live transport, caught-up state, and unrecoverable repair distinct. |
+### D1 — Local acceptance and durability
 
-D1–D3 gate claims of recovery correctness. D4–D6 gate a credible membership
-protocol. D7 depends on both; D8–D10 must be resolved before exposing a
-publicly usable release.
+A successful local CRDT write will mean that one atomic storage batch containing
+the CRDT state, operation identity, and replay metadata has completed a confirmed
+flush. Replication to another node is not part of this local success condition.
+The operation identity must be fixed before the batch, including for operations
+whose identity is currently generated after state persistence. Materialized and
+in-memory state must not be exposed as an accepted update before this boundary.
+
+Multiple waiting writes may share one flush to reduce I/O, but each success
+response must wait for a flush that covers its own batch. Grouping changes
+latency and throughput, not the meaning of success. Admission to a queue or a
+completed batch without flush is insufficient. A flush error or interrupted
+response can have an unknown outcome: the caller must not receive success, and
+restart/retry behavior must reconcile the durable operation identity rather
+than silently creating a second accepted operation. The precise guest error and
+retry contract is still to be specified and tested. A confirmed flush protects
+the selected local crash model; it is not a promise against destruction of the
+storage device or loss of the only durable copy.
+
+### D2 — Identity, missing history, and duplicates
+
+Keep a unique operation ID and add a logical position consisting of origin,
+restart generation, and a monotonically increasing per-origin sequence. A
+receiver tracks the highest **contiguous** sequence for each origin/generation
+and records later arrivals as holes. Receiving sequence 43 after 41 does not
+advance the contiguous frontier past 41: sequence 42 must be requested or
+reconciled. The maximum UUID or maximum received sequence is not proof of
+complete history.
+
+An operation already accepted with the same identity must not be applied or
+forwarded again. Sequence allocation and replay metadata belong to D1's atomic
+boundary so a crash cannot leave a successful state update without its place in
+history. Out-of-order delivery, delayed duplicates, retention expiry, and
+restart must be checked for each CRDT family. The exact wire/storage fields,
+generation allocation, hole limits, and migration of historical UUID-only
+operations remain to be designed before implementation.
+
+### D3 — Recovery and state transfer
+
+Replay missing operations while their required history is retained. When that
+history has expired, attempt a minimal, versioned CRDT state transfer whose
+completion can be verified for each CRDT family. If neither route can establish
+complete state, report an unrecoverable gap; connection or membership must not
+be reported as data convergence. This also applies to a new node that joins
+after old operations have expired. The retention window, surviving-source
+assumptions, transfer format, and completion proof require a separate detailed
+contract. State transfer is deliberately brought forward from the later
+snapshot work only to the extent required for v0.1.6 recovery.
+
+### D4–D6 — Membership, trust, and failure detection
+
+Membership is an eventually consistent view of admitted node identities, not
+the reconnect health of an endpoint. A candidate first passes the normal
+handshake and identity policy. A member may then be probed directly and, after
+a missed response, indirectly through other admitted members. Missed probes
+create suspicion, not immediate proof of failure. A valid newer incarnation
+can refute suspicion. Leave is distinct from a timeout; rejoin and restart
+must present newer evidence, and stale control messages must not replace it.
+Nodes may disagree temporarily during a partition.
+
+Use a SWIM-style membership protocol with Lifeguard-style adjustment for the
+local detector's scheduling health. A CPU-bound guest or slow storage can delay
+local probes; suspicion timing must account for this instead of treating
+every local delay as a remote fault. This may increase true-failure detection
+latency, so measure both false declarations and real-failure latency. Do not
+add an independent phi-accrual detector without evidence that the selected
+model misses the release targets.
+
+Use the existing connection transport and its configured identity policy for
+control messages, with bounded control queues and a scheduling budget separate
+from data gossip. In insecure or unverified modes, a claimed identity remains
+unverified; a relayed membership claim never grants authenticated admission.
+Probe cadence, suspicion duration, incarnation persistence, tombstone lifetime,
+indirect probe limits, and replay protection remain to be specified and tested.
+
+### D7 — Gossip and repair scheduling
+
+Introduce K-fanout only after D1–D3 establish accepted operations and recovery.
+Estimate `N` from eligible members, clamp `K = ceil(log2(N) + c)` to available
+peers and configured budgets, and handle empty and small clusters explicitly.
+Rotate a bounded neighbor set and retain useful recovery contacts so sparse
+topologies and healed partitions can reconnect. A newly accepted remote op
+becomes eligible for onward forwarding only after persistence, with its original
+identity; duplicate delivery must not create a forwarding cycle.
+
+Periodic anti-entropy must be paginated and byte-bounded. A failed or dropped
+send attempt does not delete the durable source needed for repair. Calibrate
+`c`, timing, jitter, load/RTT adaptation, queue sizes, and retry budgets from
+deterministic and real-transport measurements rather than fixing arbitrary
+defaults in this RFC.
+
+### D8–D10 — Management, compatibility, and readiness
+
+Persist manual candidates as their own discovery source across restart. A
+successful `POST /api/v1/peers` means candidate acceptance only. Validation,
+authentication, admission, reconnection, membership, and recovery retain their
+normal boundaries. Preserve GET behavior and configuration precedence; specify
+duplicate submission, removal, authorization, rate limits, and error mapping
+before implementing the API.
+
+Version incompatible wire and storage changes explicitly. Reject incompatible
+v0.1.5 peers before registration or CRDT exchange, and migrate historical data
+without rewriting fixtures. Verify JSON and the `wincode` implementation of
+public Bincode with a real previous binary. Package, wire, and schema versions
+remain independent.
+
+Expose data readiness separately from local service readiness, membership, and
+active connection. Convergence evidence must account for accepted operation
+identities and for durable and materialized CRDT state across all six families;
+equal final user-visible values alone are insufficient. An unrecoverable gap is
+an explicit failed recovery state, never a successful convergence result.
+
+### Remaining specifications
+
+Before coding the affected behavior, document and review: the local crash and
+unknown-outcome retry contract; per-origin generation allocation and bounded
+hole tracking; retention limits and state-transfer completeness; membership
+state ordering and control message authentication; fanout defaults and budgets;
+manual candidate removal; and the wire/schema migration procedure. These
+details are implementation gates, not permissions to silently choose a protocol
+or weaken the release criteria.
 
 ## Failure scenarios that define the contract
 
@@ -200,12 +318,53 @@ publicly usable release.
 | API candidate is invalid, duplicate, or untrusted | The request is bounded and authenticated; accepted candidacy never claims connection or membership. |
 | All nodes shut down at once | State recovery is tested separately from rolling restart. No guarantee inferred from the one-at-a-time scenario. |
 
-> These are test obligations and decision prompts !!
+Each scenario is a test obligation. Its expected result is conditional on the
+approved acceptance and recovery contracts above; a passing network send alone
+does not satisfy a durability or convergence check.
 
 ## Validation plan
 
 ### Deterministic model and component tests
-> TODO
+
+Use one membership and dissemination state machine in production and in the
+simulation, with an injected clock and transport, a seeded PRNG, and stable
+event/candidate ordering. Record seed, topology, workload, payload sizes,
+latency, retention, and loss model so a failing run is reproducible. Unit and
+component tests cover state transitions, incarnation precedence, suspected
+members who refute suspicion, leave/rejoin, duplicate and stale control
+messages, queue limits, and cancellation. Simulation message loss is labeled
+separately from real packet loss.
+
+For local persistence, inject a failure before the atomic batch, after batch
+acceptance but before flush, during flush, and after flush but before the caller
+receives a response. Restart from the resulting store and compare the
+materialized value, durable CRDT state, operation identity, per-origin
+sequence, seen metadata, and op log. A successful write must have all required
+records; a failed or unknown-outcome write must not be reported as successful.
+Test grouped flush under concurrent writes and shutdown so every successful
+response is covered by a confirmed flush. Measure its latency and throughput
+against an ungrouped baseline without relaxing the success condition.
+
+For recovery, deliver operations out of order, omit one sequence, replay it
+late, and replay duplicates after seen-ID eviction and restart. Verify the
+contiguous frontier, bounded hole tracking, and absence of duplicate effects
+or forwarding loops. Repeat with GCounter, PNCounter, LwwRegister, LwwMap,
+ORSet, and Rga: their operation semantics differ. Test replay inside retention,
+expiry beyond retention, a new node with no useful history, successful
+versioned state transfer, and explicit failure when no verified transfer is
+possible. Compare accepted identities and durable/materialized state, not
+only final values.
+
+Run the primary 50-node scenario with a declared 10% simulated loss model and
+a 60-second partition into two groups of 25. Stop new writes at rejoin and
+measure whether convergence completes within 30 seconds without loss of
+accepted operations under the stated recovery contract. Run a separate case
+with writes continuing during repair. Include sparse topologies, varying
+payloads and load, and a partition longer than retention; the latter must
+produce a clear recovery failure if state transfer cannot close the gap.
+Publish seeds, configuration, workload, observations, and resource use. A
+100% rolling restart means restarting nodes one at a time with recovery
+between restarts; test a simultaneous full shutdown separately.
 
 ### Compatibility and real transport
 
@@ -223,8 +382,37 @@ authentication, and the reserved `__nx/` namespace. Run the relevant ignored
 multi-process and mDNS checks rather than assuming `cargo test --workspace`
 covers them.
 
+Exercise direct and indirect probing, suspicion, refutation, stale messages,
+and reconnect under real transport loss. Include CPU-bound WASM execution and
+slow storage to measure local scheduling delay before interpreting probe
+timeouts. A defined one-hour nominal run reports false failure declarations,
+refuted suspicions, true-failure detection latency, queue pressure, and resource
+use. Zero false declarations in that run is an observation for that workload,
+not a universal guarantee. Test authenticated control under TLS and the
+documented limits of insecure/unverified mode. A relayed claim must never
+bypass normal admission.
+
+Exercise `POST /api/v1/peers` with invalid, duplicate, untrusted, and valid
+candidates. Verify that acceptance does not imply connection or data readiness,
+that manual candidates survive restart, and that an admitted manual peer joins
+reconnection, detection, and repair. Keep the current GET contract intact.
+
 ### Documented failure scenarios
-> TODO
+
+The table above is the failure matrix. Each row needs a reproducible test or
+simulation case with the injected fault, expected state transition, durable
+records, externally visible status, and whether recovery eventually succeeds
+or fails explicitly. In particular, a failed send after local acceptance must
+leave a recoverable durable source; an expired history window must not be
+reported as synchronized merely because the peers are connected.
 
 ### Detailed test plan
-> TODO
+
+Implement the tests in dependency order: D1 persistence and crash/restart;
+D2 out-of-order delivery and duplicate handling; D3 replay and state transfer;
+D4–D6 membership and transport under load; D7 fanout and repair; D8–D10 API,
+compatibility, and convergence evidence. Use component tests near the owning
+module, integration tests for storage/network boundaries, and end-to-end tests
+for each CRDT family. The [roadmap](/numax/roadmap/) closing criterion remains
+unchanged; report missing environmental dependencies and tests not run rather
+than treating planned tests as completed evidence.

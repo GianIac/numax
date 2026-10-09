@@ -180,18 +180,20 @@ while peer discovery remains deliberately separated from authentication and auth
 **Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
 
 **Design doc as a public RFC**:
-- [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, planned behavior and open decisions
-- [ ] Documented failure scenarios
+- [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, approved design directions and remaining specifications
+- [x] Documented failure scenarios in the RFC
 - [ ] Detailed test plan
+
+The RFC records the agreed directions: local success after an atomic batch and confirmed (possibly grouped) flush; per-origin/generation sequencing; bounded replay with minimal versioned state transfer when needed; SWIM/Lifeguard membership over the existing connection transport; bounded K-fanout; persistent manual candidates; and explicit compatibility and data-readiness checks. These remain design decisions, not implemented or verified release capabilities.
 
 **Replication correctness prerequisites**:
 - [ ] Define and test atomic local persistence of CRDT state, operation identity and replay metadata before acknowledging a local write
 - [ ] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics
-- [ ] Decide how to deduplicate delayed replay safely and identify missing operations; evaluate per-origin sequencing versus idempotent state/delta replication without treating an observed maximum OpId as a causal frontier
+- [ ] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
 - [ ] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures
 - [ ] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary
 - [ ] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
-- [ ] Decide whether bounded-window recovery is sufficient or a versioned CRDT state-transfer subset must move forward from `0.1.11`; do not promise unrestricted lossless recovery before this decision
+- [ ] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 
 **Separate control and data responsibilities**:
 - [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)
