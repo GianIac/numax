@@ -198,8 +198,8 @@ storage device or loss of the only durable copy.
 #### D1 implementation contract to review
 
 This section makes the accepted D1 direction testable without choosing the
-remaining wire and storage layouts. The local GCounter, PNCounter, and
-LwwRegister paths now create each `OpId` before one state-and-replay batch and
+remaining wire and storage layouts. The local GCounter, PNCounter, LwwRegister,
+and LwwMap paths now create each `OpId` before one state-and-replay batch and
 wait for a confirmed flush before publishing in memory or returning success.
 A failed flush leaves the outcome uncertain and blocks further writes through
 that store instance until it is reopened. The remaining local CRDT families
@@ -215,7 +215,7 @@ and the guest retry contract below remains unverified.
 | GCounter increment | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
 | PNCounter increment/decrement | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
 | LwwRegister set | Creates the `OpId`, batches the winning state and replay metadata, flushes, then publishes in memory and queues the operation. A losing candidate is still recorded as an accepted operation without replacing the winner. |
-| LwwMap set/remove | Persists state before creating the `OpId`; broadcast records replay metadata later. |
+| LwwMap set/remove | Creates the `OpId`, batches the map state and replay metadata, flushes, then publishes in memory and queues the operation. Tombstones and losing operations retain replay records even when the visible entries do not change. |
 | ORSet add/remove | Add creates its operation-derived tag before persisting state; remove creates the `OpId` after persisting state. Removing with no observed tags returns success without an operation. Replay metadata is recorded later. |
 | Rga insert/delete | Insert creates its operation-derived element ID before persisting state, but writes the ID to guest memory afterward; that output write can fail after state persistence. Delete creates the `OpId` after persisting state. Replay metadata is recorded later. |
 

@@ -1,10 +1,10 @@
 use anyhow::Result;
-use nx_sync::{LwwMap, ORSet, Op, OpKind, Rga};
+use nx_sync::{ORSet, Op, OpKind, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::{persist_lww_map_state, persist_orset_state, persist_rga_state};
+use crate::sync_manager::{persist_orset_state, persist_rga_state};
 
 // error codes
 const ERR_NOT_FOUND: i32 = -1;
@@ -578,29 +578,17 @@ async fn crdt_lww_map_set_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .set_lww_map(&key, &field, value, observed_timestamp_ms)
+        .await
     {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
-        if let Some(existing) = map.entry(&field) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
-        }
-        map.set(
-            field.clone(),
-            value.clone(),
-            timestamp_ms,
-            handle.node_id().clone(),
-        );
-        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_lww_map_set: failed to persist map");
+            tracing::warn!(error = %e, "crdt_lww_map_set: failed to persist operation");
             return ERR_INTERNAL;
         }
-        maps.insert(key.clone(), map);
-    }
-
-    let op = Op::lww_map_set(handle.node_id().clone(), key, field, value, timestamp_ms);
+    };
     tracing::debug!(op_id = %op.id, "queued local LWW-Map set");
     op_permit.send(op);
     handle.metrics().record_ops(1);
@@ -659,24 +647,17 @@ async fn crdt_lww_map_remove_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .remove_lww_map(&key, &field, observed_timestamp_ms)
+        .await
     {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
-        if let Some(existing) = map.entry(&field) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
-        }
-        map.remove(field.clone(), timestamp_ms, handle.node_id().clone());
-        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_lww_map_remove: failed to persist map");
+            tracing::warn!(error = %e, "crdt_lww_map_remove: failed to persist operation");
             return ERR_INTERNAL;
         }
-        maps.insert(key.clone(), map);
-    }
-
-    let op = Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms);
+    };
     tracing::debug!(op_id = %op.id, "queued local LWW-Map remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);

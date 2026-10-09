@@ -860,7 +860,8 @@ pub(super) fn persist_local_lww_register_op(
     Ok(())
 }
 
-pub(crate) fn persist_lww_map_state(
+#[cfg(test)]
+pub(super) fn persist_lww_map_state(
     store: &NxStore,
     key: &str,
     map: &LwwMap,
@@ -876,6 +877,42 @@ pub(crate) fn persist_lww_map_state(
         ],
         &[],
     )?;
+    Ok(())
+}
+
+pub(super) fn persist_local_lww_map_op(
+    store: &NxStore,
+    key: &str,
+    map: &LwwMap,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_lww_map_state_key(key);
+    let state_json = map.to_json()?;
+    let materialized_key = materialized_lww_map_key(key);
+    let materialized_value = serde_json::to_vec(&map.entries())?;
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    let lease = store.acquire_write_lease()?;
+    lease.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )?;
+    lease.flush()?;
     Ok(())
 }
 

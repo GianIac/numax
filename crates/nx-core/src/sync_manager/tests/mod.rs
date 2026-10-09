@@ -2435,6 +2435,507 @@ async fn local_and_remote_lww_register_batches_keep_winning_value_and_ignore_dup
 }
 
 #[tokio::test]
+async fn local_lww_map_batch_restarts_with_fields_tombstone_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let first = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+    let second = handle
+        .set_lww_map("settings:service-a", "theme", b"light".to_vec(), 100)
+        .await
+        .unwrap();
+    let remove = handle
+        .remove_lww_map("settings:service-a", "theme", 100)
+        .await
+        .unwrap();
+    let region = handle
+        .set_lww_map("settings:service-a", "region", b"eu".to_vec(), 50)
+        .await
+        .unwrap();
+    let expected_ops = [first, second, remove, region];
+
+    assert!(matches!(
+        &expected_ops[0].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 100,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[1].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 101,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[2].kind,
+        OpKind::LwwMapRemove {
+            timestamp_ms: 102,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[3].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 50,
+            ..
+        }
+    ));
+    let visible = vec![("region".to_string(), b"eu".to_vec())];
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        visible
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        visible
+    );
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert_eq!(state.entries(), visible);
+    assert_eq!(state.entry("theme").unwrap().timestamp_ms(), 102);
+    assert!(!state.entry("theme").unwrap().is_visible());
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 4);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 4);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        visible
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        visible
+    );
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        state
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_lww_map_batch_failure_preserves_previous_state_and_metadata() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .get_lww_map_entries("settings:service-a")
+            .await
+            .is_empty()
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_lww_map_state_key("settings:service-a"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_lww_map_key("settings:service-a"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let set = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .remove_lww_map("settings:service-a", "theme", 200)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert!(
+        read_durable_lww_map_state(&store, "settings:service-a")
+            .entry("theme")
+            .unwrap()
+            .is_visible()
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&set)
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_lww_map_flush_failure_blocks_retry_and_recovers_tombstone() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let set = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .remove_lww_map("settings:service-a", "theme", 200)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&set)
+    );
+    assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert!(!state.entry("theme").unwrap().is_visible());
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let remove = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != set.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .set_lww_map("settings:service-a", "theme", b"light".to_vec(), 300)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(
+        manager
+            .get_lww_map_entries("settings:service-a")
+            .await
+            .is_empty()
+    );
+    assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        state
+    );
+    assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[set, remove]);
+}
+
+#[tokio::test]
+async fn local_lww_map_losing_set_and_remove_retain_replay_identity() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let remote = Op::lww_map_set(
+        NodeId::new("remote-z"),
+        "settings:service-a",
+        "theme",
+        b"winner".to_vec(),
+        u64::MAX,
+    );
+    apply_remote_lww_map_op_for_test(
+        &remote,
+        &manager.lww_maps,
+        &manager.seen_ops,
+        &manager.seen_ops_next_sequence,
+        &manager.op_log,
+        &manager.op_log_next_sequence,
+        &store,
+    )
+    .await;
+    let handle = manager.handle();
+    let losing_set = handle
+        .set_lww_map("settings:service-a", "theme", b"loser".to_vec(), 100)
+        .await
+        .unwrap();
+    let losing_remove = handle
+        .remove_lww_map("settings:service-a", "theme", 100)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        &losing_set.kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &losing_remove.kind,
+        OpKind::LwwMapRemove {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"winner".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        vec![("theme".to_string(), b"winner".to_vec())]
+    );
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert_eq!(state.get("theme"), Some(b"winner".as_slice()));
+    assert_eq!(
+        state.entry("theme").unwrap().writer(),
+        &NodeId::new("remote-z")
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[remote, losing_set.clone(), losing_remove.clone()]
+    );
+    for op in [&losing_set, &losing_remove] {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+}
+
+#[tokio::test]
+async fn local_and_remote_lww_map_batches_preserve_field_winners_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            if index % 2 == 0 {
+                handle
+                    .set_lww_map("settings:service-a", "theme", b"local".to_vec(), 100)
+                    .await
+            } else {
+                handle
+                    .remove_lww_map("settings:service-a", "theme", 100)
+                    .await
+            }
+        };
+        let remote_op = if index % 2 == 0 {
+            Op::lww_map_remove(
+                NodeId::new("remote-node"),
+                "settings:service-a",
+                "theme",
+                200 + index,
+            )
+        } else {
+            Op::lww_map_set(
+                NodeId::new("remote-node"),
+                "settings:service-a",
+                "theme",
+                b"remote".to_vec(),
+                200 + index,
+            )
+        };
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_lww_map_op_for_test(
+                &remote_op,
+                &manager.lww_maps,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote LwwMap writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_lww_map_op_for_test(
+            &remote_op,
+            &manager.lww_maps,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 24);
+    let mut expected = LwwMap::new();
+    for op in log.iter() {
+        match &op.kind {
+            OpKind::LwwMapSet {
+                field,
+                value,
+                timestamp_ms,
+                ..
+            } => {
+                expected.set(
+                    field.clone(),
+                    value.clone(),
+                    *timestamp_ms,
+                    op.origin.clone(),
+                );
+            }
+            OpKind::LwwMapRemove {
+                field,
+                timestamp_ms,
+                ..
+            } => {
+                expected.remove(field.clone(), *timestamp_ms, op.origin.clone());
+            }
+            other => panic!("unexpected operation in LwwMap log: {other:?}"),
+        }
+    }
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        expected.entries()
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        expected.entries()
+    );
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        expected
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 24);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

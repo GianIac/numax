@@ -691,28 +691,10 @@ pub(super) async fn apply_local_lww_map_set(
     value: &[u8],
     timestamp_ms: u64,
 ) -> Op {
-    {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
-        map.set(
-            field.to_string(),
-            value.to_vec(),
-            timestamp_ms,
-            handle.node_id().clone(),
-        );
-
-        persist_lww_map_state(&handle.store(), key, &map).unwrap();
-        maps.insert(key.to_string(), map);
-    }
-
-    Op::lww_map_set(
-        handle.node_id().clone(),
-        key,
-        field,
-        value.to_vec(),
-        timestamp_ms,
-    )
+    handle
+        .set_lww_map(key, field, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap()
 }
 
 pub(super) async fn apply_local_lww_map_remove(
@@ -721,17 +703,10 @@ pub(super) async fn apply_local_lww_map_remove(
     field: &str,
     timestamp_ms: u64,
 ) -> Op {
-    {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
-        map.remove(field.to_string(), timestamp_ms, handle.node_id().clone());
-
-        persist_lww_map_state(&handle.store(), key, &map).unwrap();
-        maps.insert(key.to_string(), map);
-    }
-
-    Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms)
+    handle
+        .remove_lww_map(key, field, timestamp_ms)
+        .await
+        .unwrap()
 }
 
 pub(super) async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {

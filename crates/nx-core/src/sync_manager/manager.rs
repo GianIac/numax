@@ -32,8 +32,8 @@ use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
-    hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_register_op,
-    persist_local_pncounter_op,
+    hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_map_op,
+    persist_local_lww_register_op, persist_local_pncounter_op,
 };
 use super::types::*;
 
@@ -62,6 +62,11 @@ pub struct SyncHandle {
 enum PNCounterDirection {
     Increment,
     Decrement,
+}
+
+enum LwwMapChange {
+    Set(Vec<u8>),
+    Remove,
 }
 
 impl SyncHandle {
@@ -213,6 +218,89 @@ impl SyncHandle {
         log.push(op.clone());
         prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
         registers.insert(key.to_string(), register);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
+    }
+
+    pub(crate) async fn set_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<Op> {
+        self.change_lww_map(key, field, LwwMapChange::Set(value), observed_timestamp_ms)
+            .await
+    }
+
+    pub(crate) async fn remove_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<Op> {
+        self.change_lww_map(key, field, LwwMapChange::Remove, observed_timestamp_ms)
+            .await
+    }
+
+    async fn change_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        change: LwwMapChange,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<Op> {
+        // Match the remote apply lock order while selecting the field timestamp.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut maps = self.lww_maps.write().await;
+        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
+        let timestamp_ms = map.entry(field).map_or(observed_timestamp_ms, |current| {
+            observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
+        });
+        let op = match &change {
+            LwwMapChange::Set(value) => Op::lww_map_set(
+                self.node_id.clone(),
+                key,
+                field,
+                value.clone(),
+                timestamp_ms,
+            ),
+            LwwMapChange::Remove => {
+                Op::lww_map_remove(self.node_id.clone(), key, field, timestamp_ms)
+            }
+        };
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate LwwMap operation id");
+        }
+
+        match change {
+            LwwMapChange::Set(value) => {
+                map.set(field.to_string(), value, timestamp_ms, self.node_id.clone());
+            }
+            LwwMapChange::Remove => {
+                map.remove(field.to_string(), timestamp_ms, self.node_id.clone());
+            }
+        }
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_lww_map_op(&self.store, key, &map, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        maps.insert(key.to_string(), map);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
         self.op_log_next_sequence
