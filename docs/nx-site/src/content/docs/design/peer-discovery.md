@@ -51,7 +51,7 @@ must not be mistaken for synchronized state.
 | Anti-entropy | Periodic reconciliation independent of the fast gossip path. Today it pulls a bounded operation log; a future replacement requires its own contract. |
 
 ## Scope and existing contracts
-The following statements describe the inspected v0.1.5 source and its published
+The following statements describe the inspected checkout and its published
 contracts.
 
 | Existing contract | Evidence and consequence |
@@ -59,7 +59,7 @@ contracts.
 | Discovery publishes candidates, not authority | `crates/nx-core/src/discovery.rs` and [Discovery Contract](/numax/design/discovery-contract/). Static, bootstrap gossip, mDNS, DNS-SRV, and file sources feed a bounded coordinator. Provider snapshots, revisions, leases, overflow recovery, and shutdown ownership must remain coherent. |
 | Connection identity depends on transport policy | `crates/nx-net/src/node.rs::verify_peer_identity` rejects the local `NodeId`; secure TLS binds the claimed ID to a certificate and checks the peer allowlist. In insecure or non-TLS mode, the reported identity is unverified. A discovered address or cluster name is not proof of trust. |
 | Peer health is not SWIM membership | `crates/nx-core/src/sync_manager/peer.rs` tracks per-endpoint reconnection health. Its `Suspect` and `Dead` labels do not constitute a cluster-wide, incarnation-aware membership protocol. |
-| Local state and replay metadata have different write stages | `crates/nx-core/src/host_api/crdt.rs` persists local CRDT state and publishes it in memory before enqueueing an `Op`. Some operations generate their identity before state persistence (`ORSetAdd`, `RgaInsert`), others afterward. `sync_manager/replication.rs::broadcast_batch` later persists the seen ID and op-log entry. There is no single atomic local acceptance boundary. |
+| Local acceptance is only partially implemented | The GCounter host path creates its `OpId` before an atomic state-and-replay batch, waits for a flush, and then publishes in memory and enqueues the operation. Other local CRDT families still persist state separately from the seen ID and op-log entry written later by `sync_manager/replication.rs::broadcast_batch`. There is no common acceptance boundary across all six families. |
 | Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. Preserve this error ordering when adding forwarding; verify failure behavior and flush semantics separately. |
 | The present repair path is limited | `sync_manager/replication.rs` periodically pulls a bounded op log over active connections. The maximum observed `OpId` is not a causal frontier. Current `OpId` is UUID-based (`crates/nx-sync/src/op.rs`); its lexical order cannot prove that older operations were received. |
 | Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 5; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
@@ -67,8 +67,9 @@ contracts.
 
 `nx-store::Store::apply_batch` and `flush` are distinct operations. An atomic
 batch application, a completed flush, a local API response, and remote replication
-must not be described with the same durability promise. The exact acceptance
-semantics are an [open decision](#open-decisions).
+must not be described with the same durability promise. The target acceptance
+semantics are specified in [D1](#d1--local-acceptance-and-durability); their
+implementation remains partial.
 
 ## Planned behavior
 
@@ -122,7 +123,8 @@ begins only when eligible peers become available.
    operation identity, and replay metadata, followed by a confirmed flush
    before the local success response. The identity must be available for the
    atomic write; its current generation point differs by operation. Specify
-   the covered crash model and unknown-outcome retry behavior before coding.
+   the covered crash model and the D1 retry contract below when implementing
+   each remaining local write path.
    Local success does not imply remote acknowledgement or survival of a lost
    storage device. Preserve the remote apply-before-publish ordering.
 2. After a newly accepted remote operation is persisted, make it eligible for
@@ -169,8 +171,8 @@ Do not make per-operation or per-remote-address metric labels unbounded.
 
 ## Decisions for v0.1.6
 
-These are approved design directions. None changes the current behavior until
-implemented and tested. The [remaining specifications](#remaining-specifications)
+These are approved design directions. Only the implemented and tested portions
+change current behavior. The [remaining specifications](#remaining-specifications)
 are deliberately open; choosing a direction does not select an unmeasured
 timeout, retention limit, wire layout, or performance guarantee.
 
@@ -188,25 +190,33 @@ response must wait for a flush that covers its own batch. Grouping changes
 latency and throughput, not the meaning of success. Admission to a queue or a
 completed batch without flush is insufficient. A flush error or interrupted
 response can have an unknown outcome: the caller must not receive success, and
-restart/retry behavior must reconcile the durable operation identity rather
-than silently creating a second accepted operation. The precise guest error and
-retry contract is still to be specified and tested. A confirmed flush protects
+restart must retain any surviving operation identity for recovery. The guest
+retry contract below remains to be tested. A confirmed flush protects
 the selected local crash model; it is not a promise against destruction of the
 storage device or loss of the only durable copy.
 
 #### D1 implementation contract to review
 
 This section makes the accepted D1 direction testable without choosing the
-remaining wire and storage layouts. The local GCounter path now creates its
-`OpId` before one state-and-replay batch and waits for a confirmed flush before
-publishing in memory or returning success. A failed flush leaves the outcome
-uncertain and blocks further writes through that store instance until it is
-reopened. Other local CRDT families still write state before creating or
-recording replay metadata, and `sync_manager/replication.rs::broadcast_batch`
-writes their seen IDs and op-log entries later. The remote path in
+remaining wire and storage layouts. The local GCounter and PNCounter paths now
+create each `OpId` before one state-and-replay batch and wait for a confirmed
+flush before publishing in memory or returning success. A failed flush leaves
+the outcome uncertain and blocks further writes through that store instance
+until it is reopened. The remaining local CRDT families still write state
+before recording replay metadata, and
+`sync_manager/replication.rs::broadcast_batch` writes their seen IDs and op-log
+entries later. The remote path in
 `sync_manager/apply.rs` batches state and replay records before publishing in
 memory, but does not flush them. D1 remains incomplete across the six families,
-and the guest retry contract remains open.
+and the guest retry contract below remains unverified.
+
+| Local mutation | Inspected acceptance path |
+| --- | --- |
+| GCounter increment | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
+| PNCounter increment/decrement | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
+| LwwRegister set and LwwMap set/remove | Persist state before creating the `OpId`; broadcast records replay metadata later. A register set can still enqueue an operation when its candidate does not win the local merge. |
+| ORSet add/remove | Add creates its operation-derived tag before persisting state; remove creates the `OpId` after persisting state. Removing with no observed tags returns success without an operation. Replay metadata is recorded later. |
+| Rga insert/delete | Insert creates its operation-derived element ID before persisting state, but writes the ID to guest memory afterward; that output write can fail after state persistence. Delete creates the `OpId` after persisting state. Replay metadata is recorded later. |
 
 For a state-changing local operation, the planned atomic batch must contain its
 durable CRDT state, materialized value, unique operation identity, replayable
@@ -222,7 +232,7 @@ fails; the queue is only a delivery path.
 Any grouped flush must prove that each responding write's batch precedes the
 completed flush, including during shutdown and concurrent writes.
 
-The proposed local failure model for the first implementation tests is a
+The D1 local failure model for the first implementation tests is a
 process crash and restart with the same intact datastore. Extend testing to an
 OS restart or power interruption only after the filesystem and `sled::flush`
 assumptions for that environment are stated and exercised. Device destruction
@@ -233,24 +243,56 @@ response never certifies remote replication.
 | --- | --- |
 | Before the atomic batch | No success. No new accepted operation or partial CRDT/replay records. |
 | Batch application fails | No success. On restart, inspect the whole record set; never treat a partial set as an accepted operation. |
-| Batch completes, before or during flush | No success may be returned. The outcome can be unknown: the whole batch may or may not survive. Reconcile its identity before any retry. |
+| Batch completes, before or during flush | No success may be returned. The outcome can be unknown: the whole batch may or may not survive. Reopen and retain any surviving operation identity; the existing guest call cannot safely retry it. |
 | Flush fails or is interrupted | No success may be returned. A failure does not prove the batch was rolled back; restart must classify the outcome from persisted records. |
-| Flush completes, before the caller receives a response | The operation is durable under the selected crash model, but the caller can still see an unknown outcome. A retry must not silently accept the same logical request twice. |
+| Flush completes, before the caller receives a response | The operation is durable under the selected crash model, but the caller can still see an unknown outcome. A second call through the existing guest API is a new operation. |
 | After the success response | State, operation identity, and replay metadata must all be recoverable together from the intact datastore. Remote receipt remains unproven. |
 
-The current guest API supplies no caller-chosen idempotency token. In
-particular, repeating an increment after an interrupted response can create a
-second valid operation. Before implementing D1, specify whether the guest API
-will expose a stable retry token, offer an outcome lookup, or report an
-explicitly non-retryable unknown outcome. Keep the current error codes and ABI
-unchanged until that choice and its migration path are reviewed. Do not infer
-rollback from `ERR_INTERNAL` or generate a replacement `OpId` for an uncertain
-attempt.
+#### D1 retry contract for existing guest calls
+
+For v0.1.6, the existing mutating CRDT guest calls have no caller-chosen
+idempotency token or outcome lookup. The host and SDK must not automatically
+retry a mutation after an uncertain error or interrupted response. The Rga
+insert SDK does retry after `ERR_BUF_TOO_SMALL`: the host checks output capacity
+and returns that code before persisting, so this preflight retry is safe.
+`ERR_INTERNAL` on a mutation and a missing response are **unknown outcomes** to
+the caller: they do not establish that the batch rolled back, even when a
+particular failure occurred before the batch. A caller needing one logical
+mutation must not resubmit it through the same API as a retry. Repeating the
+call requests a new operation and may apply an increment twice. Preflight
+errors such as a reserved key, disabled sync, or Rga insert's
+`ERR_BUF_TOO_SMALL` do not accept an operation when they are returned before
+persistence. These rules define the planned guest-facing
+contract; they do not claim that every local CRDT path already implements D1.
+
+After a process crash, reopening the intact store must hydrate complete
+surviving operations from durable state, operation identity, seen metadata,
+and replay records. A complete surviving batch is retained for repair even if
+the guest received no success response. The current API cannot associate a
+specific lost guest request with a recovered operation; absence of a record
+cannot be reported as a confirmed outcome to that guest. Legacy records that
+lack an atomic operation identity require an explicit migration decision.
+Neither restart nor a fresh guest call may infer the identity of a lost
+request from its key and payload. An idempotent guest retry API would require a
+stable caller token committed with the operation and a defined token retention
+contract; it is outside this D1 contract and must be reviewed as a separate API
+and storage change.
+
+The current ABI still maps several failures to `ERR_INTERNAL`, which the SDK
+reports as `NxError::Internal`. Therefore it cannot tell the caller which
+attempts were definitely rejected before persistence. No new error code is
+selected here. Tests must cover failure before the batch, flush failure,
+restart after an uncertain outcome, interruption after flush before the
+response, and Rga insert's output buffer paths. They must show that the runtime
+does not silently issue a replacement `OpId` for the same attempt. The guest
+contract and crash tests remain unverified until implemented across all six
+families.
 
 All six families need the same acceptance boundary, with family-specific
 effects checked separately. GCounter and PNCounter increments must not be
-applied twice after an uncertain retry. LwwRegister and LwwMap must preserve the
-chosen timestamp and verify the same conflict resolution on replay. ORSet add
+replayed twice for one `OpId`; a fresh guest call is a new increment.
+LwwRegister and LwwMap must preserve the chosen timestamp and verify the same
+conflict resolution on replay. ORSet add
 must preserve its operation-derived tag, and a remove with no observed tags is
 currently a successful no-op with no operation to accept. Rga insert must
 preserve its operation-derived element ID; its guest output buffer must be
@@ -270,9 +312,11 @@ Regression tests must inject failures before the batch, between batch and
 flush, during flush, and after flush before response. Reopen the datastore and
 compare materialized and durable state, operation identity, seen metadata, op
 log, and the eventual origin/generation sequence for each family. Exercise
-concurrent writes, grouped flush and shutdown, queue or send failure after
-acceptance, and unknown-outcome retries. An injected failure is a component
-test; process termination and restart require a separate integration test.
+concurrent writes, grouped flush and shutdown, and queue or send failure after
+acceptance. Inject an unknown outcome before and after flush, verify that the
+SDK does not retry automatically, and verify that a second explicit guest call
+is a distinct operation. An injected failure is a component test; process
+termination and restart require a separate integration test.
 These tests must distinguish an accepted operation from a merely visible
 unflushed batch and from a remotely received operation.
 
@@ -371,8 +415,8 @@ an explicit failed recovery state, never a successful convergence result.
 
 ### Remaining specifications
 
-Before coding the affected behavior, document and review: the local crash and
-unknown-outcome retry contract; per-origin generation allocation and bounded
+Before coding the affected behavior, document and review: an expanded OS or
+power-interruption crash model; per-origin generation allocation and bounded
 hole tracking; retention limits and state-transfer completeness; membership
 state ordering and control message authentication; fanout defaults and budgets;
 manual candidate removal; and the wire/schema migration procedure. These
@@ -383,7 +427,7 @@ or weaken the release criteria.
 
 | Scenario | Required observation or unresolved choice |
 | --- | --- |
-| Crash after state write but before op-log metadata | Current local path can reach this interval. The selected D1 solution must remove the ambiguous accepted state or define a recovery procedure that restores its operation identity. |
+| Crash after state write but before op-log metadata | Local paths other than GCounter can reach this interval. The selected D1 solution must remove the ambiguous accepted state or define a recovery procedure that restores its operation identity. |
 | Crash after a batch but before flush or response | The documented D1 durability and retry semantics must match what survives a restart; unknown outcomes cannot be silently turned into acknowledged success. |
 | Remote op persisted but forwarding fails | The accepted op remains recoverable by the repair path; a send failure consumes bounded work and does not silently lose the sole source. |
 | Sole durable holder fails permanently | No recovery guarantee can be claimed without a surviving replica or equivalent state; D1 and D3 must state whether this case is outside the failure model or requires a remote durability acknowledgement. |
