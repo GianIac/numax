@@ -32,7 +32,8 @@ use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
-    hydrate_seen_ops, persist_local_gcounter_op, persist_local_pncounter_op,
+    hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_register_op,
+    persist_local_pncounter_op,
 };
 use super::types::*;
 
@@ -165,6 +166,53 @@ impl SyncHandle {
         log.push(op.clone());
         prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
         counters.insert(key.to_string(), counter);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
+    }
+
+    pub(crate) async fn set_lww_register(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<Op> {
+        // Match the remote apply lock order so the timestamp and winner use the
+        // same register state as the batch committed below.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut registers = self.lww_registers.write().await;
+        let timestamp_ms = registers.get(key).map_or(observed_timestamp_ms, |current| {
+            observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
+        });
+        let op = Op::lww_register_set(self.node_id.clone(), key, value.clone(), timestamp_ms);
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate LwwRegister operation id");
+        }
+
+        let candidate = LwwRegister::new(value, timestamp_ms, self.node_id.clone());
+        let register = registers
+            .get(key)
+            .map(|current| current.merged_with(&candidate))
+            .unwrap_or(candidate);
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_lww_register_op(&self.store, key, &register, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        registers.insert(key.to_string(), register);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
         self.op_log_next_sequence

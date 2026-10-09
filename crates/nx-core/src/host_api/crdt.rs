@@ -1,12 +1,10 @@
 use anyhow::Result;
-use nx_sync::{LwwMap, LwwRegister, ORSet, Op, OpKind, Rga};
+use nx_sync::{LwwMap, ORSet, Op, OpKind, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::{
-    persist_lww_map_state, persist_lww_register_state, persist_orset_state, persist_rga_state,
-};
+use crate::sync_manager::{persist_lww_map_state, persist_orset_state, persist_rga_state};
 
 // error codes
 const ERR_NOT_FOUND: i32 = -1;
@@ -446,37 +444,17 @@ async fn crdt_lww_set_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .set_lww_register(&key, value, observed_timestamp_ms)
+        .await
     {
-        let registers_arc = handle.lww_registers();
-        let mut registers = registers_arc.write().await;
-        if let Some(existing) = registers.get(&key) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
+        Ok(op) => op,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_set: failed to persist operation");
+            return ERR_INTERNAL;
         }
-        let candidate = LwwRegister::new(value.clone(), timestamp_ms, handle.node_id().clone());
-        let next_register = match registers.get(&key) {
-            Some(register) => {
-                let mut next = register.clone();
-                if next.merge(&candidate) {
-                    Some(next)
-                } else {
-                    None
-                }
-            }
-            None => Some(candidate.clone()),
-        };
-
-        if let Some(register) = next_register {
-            if let Err(e) = persist_lww_register_state(&handle.store(), &key, &register) {
-                handle.metrics().record_sync_error();
-                tracing::warn!(error = %e, "crdt_lww_set: failed to persist register");
-                return ERR_INTERNAL;
-            }
-            registers.insert(key.clone(), register);
-        }
-    }
-
-    let op = Op::lww_register_set(handle.node_id().clone(), key, value, timestamp_ms);
+    };
     tracing::debug!(op_id = %op.id, "queued local LWW-Register set");
     op_permit.send(op);
     handle.metrics().record_ops(1);

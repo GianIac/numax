@@ -2008,6 +2008,433 @@ async fn local_and_remote_pncounter_batches_preserve_directions_and_ignore_dupli
 }
 
 #[tokio::test]
+async fn local_lww_register_batch_preserves_timestamp_and_replay_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let first = handle
+        .set_lww_register("status:user-1", b"online".to_vec(), 100)
+        .await
+        .unwrap();
+    let second = handle
+        .set_lww_register("status:user-1", b"away".to_vec(), 100)
+        .await
+        .unwrap();
+    let expected_ops = [first, second];
+
+    assert!(matches!(
+        &expected_ops[0].kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: 100,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[1].kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: 101,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"away".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"away"
+    );
+    let state = read_durable_lww_register_state(&store, "status:user-1");
+    assert_eq!(state.value(), b"away");
+    assert_eq!(state.timestamp_ms(), 101);
+    assert_eq!(state.writer(), handle.node_id());
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 2);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 2);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"away".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"away"
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        state
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_lww_register_batch_failure_keeps_state_and_metadata_absent() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"online".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_lww_register_state_key("status:user-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_lww_register_key("status:user-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle
+        .set_lww_register("status:user-1", b"online".to_vec(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_lww_register_flush_failure_blocks_retry_and_recovers_on_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"online".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1").value(),
+        b"online"
+    );
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"away".to_vec(), 101)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"online".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_lww_register_losing_candidate_still_has_durable_replay_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let initial_manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    drop(initial_manager);
+    let winner = LwwRegister::new(b"winner".to_vec(), u64::MAX, NodeId::new("remote-z"));
+    persist_lww_register_state(&store, "status:user-1", &winner).unwrap();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let op = handle
+        .set_lww_register("status:user-1", b"loser".to_vec(), 100)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        &op.kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"winner".as_slice())
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        winner
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"winner"
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&op)
+    );
+    let stored = store
+        .get(&op_log_store_key(op.id.as_str()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, op);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"winner".as_slice())
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_lww_register_batches_keep_winning_value_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle
+                .set_lww_register("status:user-1", b"local".to_vec(), 100)
+                .await
+        };
+        let remote_op = Op::lww_register_set(
+            NodeId::new("remote-node"),
+            "status:user-1",
+            b"remote".to_vec(),
+            200 + index,
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_lww_register_op_for_test(
+                &remote_op,
+                &manager.lww_registers,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote LwwRegister writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_lww_register_op_for_test(
+            &remote_op,
+            &manager.lww_registers,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 32);
+    let mut expected: Option<LwwRegister> = None;
+    for op in log.iter() {
+        let OpKind::LwwRegisterSet {
+            value,
+            timestamp_ms,
+            ..
+        } = &op.kind
+        else {
+            panic!("unexpected operation in LwwRegister log");
+        };
+        let candidate = LwwRegister::new(value.clone(), *timestamp_ms, op.origin.clone());
+        if let Some(register) = expected.as_mut() {
+            register.merge(&candidate);
+        } else {
+            expected = Some(candidate);
+        }
+    }
+    let expected = expected.unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(expected.value())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        expected.value()
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        expected
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

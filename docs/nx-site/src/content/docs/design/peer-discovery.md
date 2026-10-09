@@ -198,15 +198,15 @@ storage device or loss of the only durable copy.
 #### D1 implementation contract to review
 
 This section makes the accepted D1 direction testable without choosing the
-remaining wire and storage layouts. The local GCounter and PNCounter paths now
-create each `OpId` before one state-and-replay batch and wait for a confirmed
-flush before publishing in memory or returning success. A failed flush leaves
-the outcome uncertain and blocks further writes through that store instance
-until it is reopened. The remaining local CRDT families still write state
-before recording replay metadata, and
+remaining wire and storage layouts. The local GCounter, PNCounter, and
+LwwRegister paths now create each `OpId` before one state-and-replay batch and
+wait for a confirmed flush before publishing in memory or returning success.
+A failed flush leaves the outcome uncertain and blocks further writes through
+that store instance until it is reopened. The remaining local CRDT families
+still write state before recording replay metadata, and
 `sync_manager/replication.rs::broadcast_batch` writes their seen IDs and op-log
-entries later. The remote path in
-`sync_manager/apply.rs` batches state and replay records before publishing in
+entries later. The remote path in `sync_manager/apply.rs` batches state and
+replay records before publishing in
 memory, but does not flush them. D1 remains incomplete across the six families,
 and the guest retry contract below remains unverified.
 
@@ -214,7 +214,8 @@ and the guest retry contract below remains unverified.
 | --- | --- |
 | GCounter increment | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
 | PNCounter increment/decrement | Creates the `OpId`, batches state and replay metadata, flushes, then publishes in memory and queues the operation. |
-| LwwRegister set and LwwMap set/remove | Persist state before creating the `OpId`; broadcast records replay metadata later. A register set can still enqueue an operation when its candidate does not win the local merge. |
+| LwwRegister set | Creates the `OpId`, batches the winning state and replay metadata, flushes, then publishes in memory and queues the operation. A losing candidate is still recorded as an accepted operation without replacing the winner. |
+| LwwMap set/remove | Persists state before creating the `OpId`; broadcast records replay metadata later. |
 | ORSet add/remove | Add creates its operation-derived tag before persisting state; remove creates the `OpId` after persisting state. Removing with no observed tags returns success without an operation. Replay metadata is recorded later. |
 | Rga insert/delete | Insert creates its operation-derived element ID before persisting state, but writes the ID to guest memory afterward; that output write can fail after state persistence. Delete creates the `OpId` after persisting state. Replay metadata is recorded later. |
 

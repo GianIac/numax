@@ -678,19 +678,10 @@ pub(super) async fn apply_local_lww_register_set(
     value: &[u8],
     timestamp_ms: u64,
 ) -> Op {
-    {
-        let registers_arc = handle.lww_registers();
-        let mut registers = registers_arc.write().await;
-        let candidate = LwwRegister::new(value.to_vec(), timestamp_ms, handle.node_id().clone());
-        let register = registers
-            .entry(key.to_string())
-            .or_insert_with(|| candidate.clone());
-        register.merge(&candidate);
-
-        persist_lww_register_state(&handle.store(), key, register).unwrap();
-    }
-
-    Op::lww_register_set(handle.node_id().clone(), key, value.to_vec(), timestamp_ms)
+    handle
+        .set_lww_register(key, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap()
 }
 
 pub(super) async fn apply_local_lww_map_set(
