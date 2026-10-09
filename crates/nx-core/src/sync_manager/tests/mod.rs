@@ -1498,8 +1498,6 @@ async fn local_gcounter_batch_restarts_with_state_and_replay_metadata() {
     assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 1);
     assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 1);
 
-    // This test flushes explicitly; local API durability is a later D1 step.
-    store.flush().unwrap();
     drop(handle);
     drop(manager);
     drop(store);
@@ -1575,6 +1573,112 @@ async fn local_gcounter_batch_failure_does_not_publish_partial_state() {
         .await
         .unwrap();
     assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_gcounter_flush_failure_does_not_publish_or_allow_retry() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_counter_value("counter:visits").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_gcounter_flush_failure_restarts_with_consistent_replay_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
     assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
     assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
 }

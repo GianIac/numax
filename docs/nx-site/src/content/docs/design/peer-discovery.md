@@ -196,16 +196,17 @@ storage device or loss of the only durable copy.
 
 #### D1 implementation contract to review
 
-This section makes the accepted D1 direction testable; it does not describe
-implemented behavior or choose the remaining wire and storage layouts. Today
-`host_api/crdt.rs` writes local CRDT state before sending an operation to the
-broadcast queue. For most families it also creates the `OpId` after that state
-write. `sync_manager/replication.rs::broadcast_batch` later writes the seen ID
-and op-log entry in a separate batch. Its persistence failure drops the queued
-send after the local call may have succeeded. The remote path in
-`sync_manager/apply.rs` already batches state and replay records before
-publishing in memory, but does not flush them. Neither path currently meets the
-proposed local acceptance boundary.
+This section makes the accepted D1 direction testable without choosing the
+remaining wire and storage layouts. The local GCounter path now creates its
+`OpId` before one state-and-replay batch and waits for a confirmed flush before
+publishing in memory or returning success. A failed flush leaves the outcome
+uncertain and blocks further writes through that store instance until it is
+reopened. Other local CRDT families still write state before creating or
+recording replay metadata, and `sync_manager/replication.rs::broadcast_batch`
+writes their seen IDs and op-log entries later. The remote path in
+`sync_manager/apply.rs` batches state and replay records before publishing in
+memory, but does not flush them. D1 remains incomplete across the six families,
+and the guest retry contract remains open.
 
 For a state-changing local operation, the planned atomic batch must contain its
 durable CRDT state, materialized value, unique operation identity, replayable

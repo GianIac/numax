@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "test-utils")]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{
+    Arc, RwLock, RwLockWriteGuard,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::StoreError;
 
@@ -10,8 +11,11 @@ use crate::StoreError;
 pub struct Store {
     db: sled::Db,
     write_lock: Arc<RwLock<()>>,
+    durability_uncertain: Arc<AtomicBool>,
     #[cfg(feature = "test-utils")]
     fail_writes_with_disk_full: Arc<AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    fail_flushes_with_disk_full: Arc<AtomicBool>,
 }
 
 pub struct StoreWriteLease<'a> {
@@ -44,8 +48,11 @@ impl Store {
         Ok(Self {
             db,
             write_lock: Arc::new(RwLock::new(())),
+            durability_uncertain: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-utils")]
             fail_writes_with_disk_full: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            fail_flushes_with_disk_full: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -97,9 +104,11 @@ impl Store {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.check_injected_write_failure()?;
-        self.db.flush()?;
-        Ok(())
+        let _guard = self
+            .write_lock
+            .read()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        self.flush_unlocked()
     }
 
     /// Inject or clear a deterministic disk-full failure on every write.
@@ -109,6 +118,13 @@ impl Store {
     #[doc(hidden)]
     pub fn inject_disk_full_on_writes(&self, enabled: bool) {
         self.fail_writes_with_disk_full
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn inject_disk_full_on_flush(&self, enabled: bool) {
+        self.fail_flushes_with_disk_full
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -124,6 +140,7 @@ impl Store {
     }
 
     fn set_unlocked(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
         self.db.insert(key, value)?;
         Ok(())
@@ -134,6 +151,7 @@ impl Store {
         sets: &[(&[u8], &[u8])],
         deletes: &[&[u8]],
     ) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
         let mut batch = sled::Batch::default();
         for (key, value) in sets {
@@ -147,8 +165,42 @@ impl Store {
     }
 
     fn delete_unlocked(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
         self.db.remove(key)?;
+        Ok(())
+    }
+
+    fn flush_unlocked(&self) -> Result<(), StoreError> {
+        self.check_durability()?;
+        let result = self.check_injected_write_failure().and_then(|_| {
+            self.check_injected_flush_failure()?;
+            self.db.flush()?;
+            Ok(())
+        });
+        if result.is_err() {
+            self.durability_uncertain.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn check_durability(&self) -> Result<(), StoreError> {
+        if self.durability_uncertain.load(Ordering::Acquire) {
+            return Err(StoreError::DurabilityUncertain);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_injected_flush_failure(&self) -> Result<(), StoreError> {
+        if self.fail_flushes_with_disk_full.load(Ordering::Relaxed) {
+            return Err(StoreError::InjectedFlushFailure);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn check_injected_flush_failure(&self) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -418,5 +470,9 @@ impl StoreWriteLease<'_> {
 
     pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
         self.store.delete_unlocked(key)
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.store.flush_unlocked()
     }
 }

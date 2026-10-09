@@ -736,7 +736,8 @@ pub(super) fn persist_local_gcounter_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    store.apply_batch(
+    let lease = store.acquire_write_lease()?;
+    lease.apply_batch(
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -745,6 +746,7 @@ pub(super) fn persist_local_gcounter_op(
         ],
         &deletes,
     )?;
+    lease.flush()?;
     Ok(())
 }
 

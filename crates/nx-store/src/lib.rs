@@ -146,6 +146,44 @@ mod tests {
         assert_eq!(store.get(b"old").unwrap(), None);
     }
 
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn failed_flush_blocks_writes_through_store_and_lease_until_reopen() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let clone = store.clone();
+        store.set(b"pending", b"value").unwrap();
+        store.inject_disk_full_on_flush(true);
+
+        assert!(matches!(
+            store.flush(),
+            Err(StoreError::InjectedFlushFailure)
+        ));
+        assert_eq!(store.get(b"pending").unwrap(), Some(b"value".to_vec()));
+        store.inject_disk_full_on_flush(false);
+        assert!(matches!(
+            store.flush(),
+            Err(StoreError::DurabilityUncertain)
+        ));
+        assert!(matches!(
+            clone.set(b"next", b"value"),
+            Err(StoreError::DurabilityUncertain)
+        ));
+        let lease = store.acquire_write_lease().unwrap();
+        assert!(matches!(
+            lease.apply_batch(&[(b"next", b"value")], &[]),
+            Err(StoreError::DurabilityUncertain)
+        ));
+        drop(lease);
+        drop(clone);
+        drop(store);
+
+        let reopened = Store::open(dir.path()).unwrap();
+        reopened.set(b"next", b"value").unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"next").unwrap(), Some(b"value".to_vec()));
+    }
+
     #[test]
     fn test_scan_prefix_page_paginates_visible_keys() {
         let dir = tempdir().unwrap();
