@@ -194,6 +194,87 @@ retry contract is still to be specified and tested. A confirmed flush protects
 the selected local crash model; it is not a promise against destruction of the
 storage device or loss of the only durable copy.
 
+#### D1 implementation contract to review
+
+This section makes the accepted D1 direction testable; it does not describe
+implemented behavior or choose the remaining wire and storage layouts. Today
+`host_api/crdt.rs` writes local CRDT state before sending an operation to the
+broadcast queue. For most families it also creates the `OpId` after that state
+write. `sync_manager/replication.rs::broadcast_batch` later writes the seen ID
+and op-log entry in a separate batch. Its persistence failure drops the queued
+send after the local call may have succeeded. The remote path in
+`sync_manager/apply.rs` already batches state and replay records before
+publishing in memory, but does not flush them. Neither path currently meets the
+proposed local acceptance boundary.
+
+For a state-changing local operation, the planned atomic batch must contain its
+durable CRDT state, materialized value, unique operation identity, replayable
+operation record, and the metadata needed to identify and deduplicate its
+logical position. D2's origin, restart generation, and sequence allocation must
+eventually be committed at this same boundary; their encoding and allocation
+rules are still open. A successful response requires a confirmed flush covering
+that batch. A reserved queue slot, a completed batch, or a network send alone
+does not satisfy this condition. The in-memory registry and any success result
+must follow the flush. The durable replay record remains the recovery source
+within the eventual retention contract if the subsequent queue or network send
+fails; the queue is only a delivery path.
+Any grouped flush must prove that each responding write's batch precedes the
+completed flush, including during shutdown and concurrent writes.
+
+The proposed local failure model for the first implementation tests is a
+process crash and restart with the same intact datastore. Extend testing to an
+OS restart or power interruption only after the filesystem and `sled::flush`
+assumptions for that environment are stated and exercised. Device destruction
+or loss of the sole durable holder is outside local flush durability. A local
+response never certifies remote replication.
+
+| Interruption point | Required response and restart observation |
+| --- | --- |
+| Before the atomic batch | No success. No new accepted operation or partial CRDT/replay records. |
+| Batch application fails | No success. On restart, inspect the whole record set; never treat a partial set as an accepted operation. |
+| Batch completes, before or during flush | No success may be returned. The outcome can be unknown: the whole batch may or may not survive. Reconcile its identity before any retry. |
+| Flush fails or is interrupted | No success may be returned. A failure does not prove the batch was rolled back; restart must classify the outcome from persisted records. |
+| Flush completes, before the caller receives a response | The operation is durable under the selected crash model, but the caller can still see an unknown outcome. A retry must not silently accept the same logical request twice. |
+| After the success response | State, operation identity, and replay metadata must all be recoverable together from the intact datastore. Remote receipt remains unproven. |
+
+The current guest API supplies no caller-chosen idempotency token. In
+particular, repeating an increment after an interrupted response can create a
+second valid operation. Before implementing D1, specify whether the guest API
+will expose a stable retry token, offer an outcome lookup, or report an
+explicitly non-retryable unknown outcome. Keep the current error codes and ABI
+unchanged until that choice and its migration path are reviewed. Do not infer
+rollback from `ERR_INTERNAL` or generate a replacement `OpId` for an uncertain
+attempt.
+
+All six families need the same acceptance boundary, with family-specific
+effects checked separately. GCounter and PNCounter increments must not be
+applied twice after an uncertain retry. LwwRegister and LwwMap must preserve the
+chosen timestamp and verify the same conflict resolution on replay. ORSet add
+must preserve its operation-derived tag, and a remove with no observed tags is
+currently a successful no-op with no operation to accept. Rga insert must
+preserve its operation-derived element ID; its guest output buffer must be
+validated before persistence so a failed output write cannot strand a durable
+insert without enqueueing it. Rga delete needs its own replay check. An
+operation that leaves a materialized value unchanged may still require a
+durable identity and replay record if it is accepted as an operation.
+
+The implementation plan must also resolve two visibility and concurrency
+issues. A sled batch can become readable before its flush; delaying only the
+in-memory registry update does not by itself prevent direct reads of an
+unconfirmed materialized value. Local and remote writers must share a defined
+lock order and sequence-allocation owner so concurrent batches cannot reuse a
+position, lose an update, or hold a blocking lock across `.await`.
+
+Regression tests must inject failures before the batch, between batch and
+flush, during flush, and after flush before response. Reopen the datastore and
+compare materialized and durable state, operation identity, seen metadata, op
+log, and the eventual origin/generation sequence for each family. Exercise
+concurrent writes, grouped flush and shutdown, queue or send failure after
+acceptance, and unknown-outcome retries. An injected failure is a component
+test; process termination and restart require a separate integration test.
+These tests must distinguish an accepted operation from a merely visible
+unflushed batch and from a remotely received operation.
+
 ### D2 — Identity, missing history, and duplicates
 
 Keep a unique operation ID and add a logical position consisting of origin,
