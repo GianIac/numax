@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
@@ -20,15 +23,16 @@ use super::peer::{
     normalize_peer_dead_after_failures,
 };
 use super::replication::{
-    drain_node_events, handle_node_event, normalize_op_log_limit, normalize_seen_ops_limit,
-    spawn_anti_entropy_loop, spawn_broadcast_loop, spawn_reconnect_loop,
-    try_connect_configured_peer,
+    apply_seen_insertions, drain_node_events, handle_node_event, normalize_op_log_limit,
+    normalize_seen_ops_limit, plan_op_log_evictions, plan_seen_evictions,
+    prune_op_log_and_return_evicted, spawn_anti_entropy_loop, spawn_broadcast_loop,
+    spawn_reconnect_loop, try_connect_configured_peer,
 };
 use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
-    hydrate_seen_ops,
+    hydrate_seen_ops, persist_local_gcounter_op,
 };
 use super::types::*;
 
@@ -43,6 +47,11 @@ pub struct SyncHandle {
     lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     rgas: Arc<RwLock<HashMap<String, Rga>>>,
+    seen_ops: Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: Arc<AtomicU64>,
+    op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: Arc<AtomicU64>,
+    op_log_limit: usize,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
@@ -57,6 +66,43 @@ impl SyncHandle {
     /// Sender to enqueue Ops for broadcast. Backpressure is bounded by the underlying channel capacity.
     pub fn op_sender(&self) -> mpsc::Sender<Op> {
         self.op_tx.clone()
+    }
+
+    pub(crate) async fn increment_gcounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+        let op = Op::gcounter_increment(self.node_id.clone(), key, delta);
+        let op_id = op.id.as_str().to_string();
+
+        // Match the remote apply lock order so local and remote updates cannot race.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut counters = self.counters.write().await;
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate GCounter operation id");
+        }
+
+        let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
+        counter.increment(&self.node_id, delta);
+
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_gcounter_op(&self.store, key, &counter, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        counters.insert(key.to_string(), counter);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
     }
 
     /// Read-side handle over the counter registry.
@@ -349,6 +395,11 @@ impl SyncManager {
             lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
             rgas: Arc::clone(&self.rgas),
+            seen_ops: Arc::clone(&self.seen_ops),
+            seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
+            op_log: Arc::clone(&self.op_log),
+            op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
+            op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             active_connections: Arc::clone(&self.active_connections),

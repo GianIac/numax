@@ -1448,6 +1448,213 @@ async fn disk_full_does_not_expose_partial_remote_state() {
 }
 
 #[tokio::test]
+async fn local_gcounter_batch_restarts_with_state_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    let op = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&op)
+    );
+    assert!(
+        store
+            .get(&seen_op_store_key(op.id.as_str()))
+            .unwrap()
+            .is_some()
+    );
+    let op_log_key = op_log_store_key(op.id.as_str());
+    let op_log_value = store.get(&op_log_key).unwrap().unwrap();
+    remember_ops(
+        &manager.seen_ops,
+        &manager.seen_ops_next_sequence,
+        &manager.op_log,
+        &manager.op_log_next_sequence,
+        manager.config.op_log_limit,
+        &store,
+        std::slice::from_ref(&op),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.get(&op_log_key).unwrap().unwrap(), op_log_value);
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 1);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 1);
+
+    // This test flushes explicitly; local API durability is a later D1 step.
+    store.flush().unwrap();
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_gcounter_batch_failure_does_not_publish_partial_state() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_counter_value("counter:visits").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_gcounter_state_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_gcounter_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_gcounter_batches_keep_both_increments() {
+    let store = temp_store();
+    let metrics = metrics();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+    )
+    .unwrap();
+
+    for _ in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let local_handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = tokio::spawn(async move {
+            local_barrier.wait().await;
+            local_handle.increment_gcounter("counter:visits", 2).await
+        });
+
+        let remote_op = Op::gcounter_increment(NodeId::new("remote-node"), "counter:visits", 3);
+        let remote_barrier = Arc::clone(&barrier);
+        let counters = Arc::clone(&manager.counters);
+        let pncounters = Arc::clone(&manager.pncounters);
+        let lww_registers = Arc::clone(&manager.lww_registers);
+        let lww_maps = Arc::clone(&manager.lww_maps);
+        let orsets = Arc::clone(&manager.orsets);
+        let rgas = Arc::clone(&manager.rgas);
+        let seen_ops = Arc::clone(&manager.seen_ops);
+        let seen_ops_next_sequence = Arc::clone(&manager.seen_ops_next_sequence);
+        let op_log = Arc::clone(&manager.op_log);
+        let op_log_next_sequence = Arc::clone(&manager.op_log_next_sequence);
+        let remote_store = Arc::clone(&store);
+        let remote_metrics = Arc::clone(&metrics);
+        let remote = tokio::spawn(async move {
+            let context = RemoteOpApplyContext {
+                counters: &counters,
+                pncounters: &pncounters,
+                lww_registers: &lww_registers,
+                lww_maps: &lww_maps,
+                orsets: &orsets,
+                rgas: &rgas,
+                seen_ops: &seen_ops,
+                seen_ops_next_sequence: &seen_ops_next_sequence,
+                op_log: &op_log,
+                op_log_next_sequence: &op_log_next_sequence,
+                op_log_limit: 1024,
+                store: &remote_store,
+                metrics: &remote_metrics,
+            };
+            remote_barrier.wait().await;
+            apply_remote_ops(std::slice::from_ref(&remote_op), &context).await
+        });
+
+        let (local_result, remote_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            barrier.wait().await;
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote GCounter writes must not deadlock");
+        local_result.unwrap().unwrap();
+        remote_result.unwrap().unwrap();
+    }
+
+    assert_eq!(manager.get_counter_value("counter:visits").await, 80);
+    assert_eq!(read_materialized(&store, "counter:visits"), 80);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        80
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+    assert_eq!(manager.op_log.read().await.len(), 32);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

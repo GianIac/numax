@@ -694,7 +694,8 @@ pub(super) fn parse_durable_rga_state(bytes: &[u8]) -> anyhow::Result<Rga> {
     Rga::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable RGA JSON: {e}"))
 }
 
-pub(crate) fn persist_gcounter_state(
+#[cfg(test)]
+pub(super) fn persist_gcounter_state(
     store: &NxStore,
     key: &str,
     counter: &GCounter,
@@ -709,6 +710,40 @@ pub(crate) fn persist_gcounter_state(
             (materialized_key.as_slice(), materialized_value.as_slice()),
         ],
         &[],
+    )?;
+    Ok(())
+}
+
+pub(super) fn persist_local_gcounter_op(
+    store: &NxStore,
+    key: &str,
+    counter: &GCounter,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_gcounter_state_key(key);
+    let state_json = counter.to_json()?;
+    let materialized_key = materialized_gcounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    store.apply_batch(
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
     )?;
     Ok(())
 }

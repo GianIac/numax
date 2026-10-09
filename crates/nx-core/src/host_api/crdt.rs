@@ -1,11 +1,11 @@
 use anyhow::Result;
-use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
+use nx_sync::{LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
 use crate::sync_manager::{
-    persist_gcounter_state, persist_lww_map_state, persist_lww_register_state, persist_orset_state,
+    persist_lww_map_state, persist_lww_register_state, persist_orset_state,
     persist_pncounter_state, persist_rga_state,
 };
 
@@ -204,22 +204,14 @@ async fn crdt_gcounter_inc_impl(
         }
     };
 
-    // Apply locally and persist the CRDT state before exposing the new value.
-    {
-        let counters_arc = handle.counters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(&key).cloned().unwrap_or_else(GCounter::new);
-        counter.increment(handle.node_id(), delta);
-        if let Err(e) = persist_gcounter_state(&handle.store(), &key, &counter) {
+    let op = match handle.increment_gcounter(&key, delta).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to persist counter");
+            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to persist operation");
             return ERR_INTERNAL;
         }
-
-        counters.insert(key.clone(), counter);
-    }
-
-    let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
+    };
     tracing::debug!(op_id = %op.id, "queued local GCounter increment");
     op_permit.send(op);
     handle.metrics().record_ops(1);
