@@ -3312,6 +3312,380 @@ async fn local_and_remote_orset_batches_keep_tags_and_ignore_delayed_duplicates(
 }
 
 #[tokio::test]
+async fn local_rga_batch_restarts_with_parents_tombstones_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let parent = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"parent".to_vec(),
+    );
+    let parent_id = parent.id.as_str().to_string();
+    let child = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        Some(parent_id.clone()),
+        b"child".to_vec(),
+    );
+    let delete = handle
+        .delete_rga("comments:doc-1", &parent_id)
+        .await
+        .unwrap();
+    handle.insert_rga(child.clone()).await.unwrap();
+    handle.insert_rga(parent.clone()).await.unwrap();
+    let expected_ops = [delete, child, parent];
+
+    let state = read_durable_rga_state(&store, "comments:doc-1");
+    assert_eq!(
+        state.ordered_ids(),
+        vec![parent_id, expected_ops[1].id.as_str().to_string()]
+    );
+    assert!(!state.contains(expected_ops[2].id.as_str()));
+    assert_eq!(state.values(), vec![b"child".to_vec()]);
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        state.values()
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        state.values()
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 3);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 3);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        state.values()
+    );
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), state);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_rga_batch_failure_does_not_publish_insert_or_delete() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"first".to_vec(),
+    );
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.insert_rga(insert.clone()).await.is_err());
+    assert!(manager.get_rga_values("comments:doc-1").await.is_empty());
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(
+        store
+            .get(&durable_rga_state_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_rga_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    handle.insert_rga(insert.clone()).await.unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        vec![b"first".to_vec()]
+    );
+    assert!(read_durable_rga_state(&store, "comments:doc-1").contains(insert.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[insert]);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_rga_flush_failure_blocks_retry_and_recovers_delete() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"first".to_vec(),
+    );
+    handle.insert_rga(insert.clone()).await.unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&insert)
+    );
+    assert!(read_materialized_rga(&store, "comments:doc-1").is_empty());
+    let state = read_durable_rga_state(&store, "comments:doc-1");
+    assert!(!state.contains(insert.id.as_str()));
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let delete = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != insert.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(manager.get_rga_values("comments:doc-1").await.is_empty());
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), state);
+    assert!(manager.seen_ops.read().await.contains(delete.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[insert, delete]);
+}
+
+#[tokio::test]
+async fn local_rga_insert_rejects_mismatched_identity_without_writing() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let invalid = Op::rga_insert(
+        NodeId::new("local-node"),
+        "comments:doc-1",
+        "different-element-id",
+        None::<String>,
+        b"value".to_vec(),
+    );
+    assert!(manager.handle().insert_rga(invalid).await.is_err());
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get(&durable_rga_state_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn local_and_remote_rga_batches_preserve_elements_and_ignore_delayed_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_op = Op::rga_insert_with_op_id(
+            handle.node_id().clone(),
+            "comments:doc-1",
+            None::<String>,
+            format!("local-{index}").into_bytes(),
+        );
+        let local_barrier = Arc::clone(&barrier);
+        let local = async {
+            local_barrier.wait().await;
+            handle.insert_rga(local_op.clone()).await
+        };
+        let remote_op = Op::rga_insert(
+            NodeId::new("remote-node"),
+            "comments:doc-1",
+            format!("remote-element-{index}"),
+            None::<String>,
+            format!("remote-{index}").into_bytes(),
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_rga_op_for_test(
+                &remote_op,
+                &manager.rgas,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote RGA writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_rga_op_for_test(
+            &remote_op,
+            &manager.rgas,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+        assert!(manager.seen_ops.read().await.contains(local_op.id.as_str()));
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 24);
+    let mut expected = Rga::new();
+    for op in log.iter() {
+        let OpKind::RgaInsert {
+            id, parent, value, ..
+        } = &op.kind
+        else {
+            panic!("unexpected operation in RGA log: {:?}", op.kind);
+        };
+        expected.apply_insert(id.clone(), parent.clone(), value.clone());
+    }
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        expected.values()
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        expected.values()
+    );
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), expected);
+    assert_eq!(manager.seen_ops.read().await.len(), 24);
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

@@ -738,31 +738,13 @@ pub(super) async fn apply_local_rga_insert_after(
         other => panic!("unexpected op kind: {other:?}"),
     };
 
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
-        rga.insert(id.clone(), parent.map(ToOwned::to_owned), value.to_vec());
-
-        persist_rga_state(&handle.store(), key, &rga).unwrap();
-        rgas.insert(key.to_string(), rga);
-    }
+    handle.insert_rga(op.clone()).await.unwrap();
 
     (id, op)
 }
 
 pub(super) async fn apply_local_rga_delete(handle: &SyncHandle, key: &str, id: &str) -> Op {
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
-        rga.delete(id.to_string());
-
-        persist_rga_state(&handle.store(), key, &rga).unwrap();
-        rgas.insert(key.to_string(), rga);
-    }
-
-    Op::rga_delete(handle.node_id().clone(), key, id)
+    handle.delete_rga(key, id).await.unwrap()
 }
 
 pub(super) async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {

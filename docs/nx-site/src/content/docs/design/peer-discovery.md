@@ -199,16 +199,15 @@ storage device or loss of the only durable copy.
 
 This section makes the accepted D1 direction testable without choosing the
 remaining wire and storage layouts. The local GCounter, PNCounter, LwwRegister,
-LwwMap, and ORSet paths now create each accepted `OpId` before one state-and-replay batch and
-wait for a confirmed flush before publishing in memory or returning success.
-A failed flush leaves the outcome uncertain and blocks further writes through
-that store instance until it is reopened. The remaining local CRDT families
-still write state before recording replay metadata, and
-`sync_manager/replication.rs::broadcast_batch` writes their seen IDs and op-log
-entries later. The remote path in `sync_manager/apply.rs` batches state and
-replay records before publishing in
-memory, but does not flush them. D1 remains incomplete across the six families,
-and the guest retry contract below remains unverified.
+LwwMap, ORSet, and Rga paths now create each accepted `OpId` before one
+state-and-replay batch and wait for a confirmed flush before publishing in
+memory or returning success. A failed flush leaves the outcome uncertain and
+blocks further writes through that store instance until it is reopened.
+`sync_manager/replication.rs::broadcast_batch` can still receive these
+operations after their local batch has been persisted.
+The remote path in `sync_manager/apply.rs` batches state and replay records
+before publishing in memory, but does not flush them. The guest retry contract
+and the full D1 crash model remain unverified.
 
 | Local mutation | Inspected acceptance path |
 | --- | --- |
@@ -217,7 +216,7 @@ and the guest retry contract below remains unverified.
 | LwwRegister set | Creates the `OpId`, batches the winning state and replay metadata, flushes, then publishes in memory and queues the operation. A losing candidate is still recorded as an accepted operation without replacing the winner. |
 | LwwMap set/remove | Creates the `OpId`, batches the map state and replay metadata, flushes, then publishes in memory and queues the operation. Tombstones and losing operations retain replay records even when the visible entries do not change. |
 | ORSet add/remove | Creates the `OpId` before a state-and-replay batch, flushes, then publishes in memory and queues the operation. Add uses its `OpId` as the tag; remove records exactly the observed tags. Removing with no observed tags remains a successful no-op without an operation. |
-| Rga insert/delete | Insert creates its operation-derived element ID before persisting state, but writes the ID to guest memory afterward; that output write can fail after state persistence. Delete creates the `OpId` after persisting state. Replay metadata is recorded later. |
+| Rga insert/delete | Insert uses its `OpId` as the element ID and checks output capacity and bounds before the state-and-replay batch. Delete creates its own `OpId` before the batch and records a tombstone even for an unknown element. Both flush before publishing in memory and queueing. The insert ID is written to guest memory after persistence, so an unexpected output write failure still gives an uncertain response; the operation has already been queued for broadcast. |
 
 For a state-changing local operation, the planned atomic batch must contain its
 durable CRDT state, materialized value, unique operation identity, replayable

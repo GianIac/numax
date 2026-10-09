@@ -1,10 +1,9 @@
 use anyhow::Result;
-use nx_sync::{Op, OpKind, Rga};
+use nx_sync::{Op, OpKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::persist_rga_state;
 
 // error codes
 const ERR_NOT_FOUND: i32 = -1;
@@ -1157,28 +1156,27 @@ async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsert
     if id_bytes.len() > args.out_id_cap as usize {
         return ERR_BUF_TOO_SMALL;
     }
-
+    if (args.out_id_ptr as usize)
+        .checked_add(id_bytes.len())
+        .is_none_or(|end| end > memory.data_size(&caller))
     {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
-        rga.insert(element_id.clone(), parent, value);
-        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
-            handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
-            return ERR_INTERNAL;
-        }
-        rgas.insert(key, rga);
+        return ERR_INTERNAL;
     }
 
-    if let Err(e) = memory.write(&mut caller, args.out_id_ptr as usize, id_bytes) {
-        eprintln!("[nx-core] crdt_rga_insert: failed to write output id: {e}");
+    if let Err(e) = handle.insert_rga(op.clone()).await {
+        handle.metrics().record_sync_error();
+        tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
         return ERR_INTERNAL;
     }
 
     tracing::debug!(op_id = %op.id, "queued local RGA insert");
     op_permit.send(op);
     handle.metrics().record_ops(1);
+
+    if let Err(e) = memory.write(&mut caller, args.out_id_ptr as usize, id_bytes) {
+        eprintln!("[nx-core] crdt_rga_insert: failed to write output id: {e}");
+        return ERR_INTERNAL;
+    }
 
     id_bytes.len() as i32
 }
@@ -1230,20 +1228,14 @@ async fn crdt_rga_delete_impl(
         }
     };
 
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
-        rga.delete(id.clone());
-        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
+    let op = match handle.delete_rga(&key, &id).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_rga_delete: failed to persist sequence");
             return ERR_INTERNAL;
         }
-        rgas.insert(key.clone(), rga);
-    }
-
-    let op = Op::rga_delete(handle.node_id().clone(), key, id);
+    };
     tracing::debug!(op_id = %op.id, "queued local RGA delete");
     op_permit.send(op);
     handle.metrics().record_ops(1);

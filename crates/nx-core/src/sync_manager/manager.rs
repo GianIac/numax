@@ -6,7 +6,7 @@ use std::sync::{
 
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
+use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -34,6 +34,7 @@ use super::storage::{
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
     hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_map_op,
     persist_local_lww_register_op, persist_local_orset_op, persist_local_pncounter_op,
+    persist_local_rga_op,
 };
 use super::types::*;
 
@@ -385,6 +386,88 @@ impl SyncHandle {
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
         Ok(Some(op))
+    }
+
+    pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<()> {
+        let OpKind::RgaInsert {
+            key,
+            id,
+            parent,
+            value,
+        } = &op.kind
+        else {
+            anyhow::bail!("expected RGA insert operation");
+        };
+        if op.origin != self.node_id || id != op.id.as_str() {
+            anyhow::bail!("invalid local RGA insert identity");
+        }
+        let op_id = op.id.as_str().to_string();
+
+        // Match the remote apply lock order so sequence positions and state agree.
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut rgas = self.rgas.write().await;
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate RGA operation id");
+        }
+
+        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+        rga.insert(id.clone(), parent.clone(), value.clone());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_rga_op(&self.store, key, &rga, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        rgas.insert(key.clone(), rga);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<Op> {
+        let op = Op::rga_delete(self.node_id.clone(), key, id);
+        let op_id = op.id.as_str().to_string();
+
+        let mut seen = self.seen_ops.write().await;
+        let mut log = self.op_log.write().await;
+        let mut rgas = self.rgas.write().await;
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate RGA operation id");
+        }
+
+        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+        rga.delete(id.to_string());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+        };
+        persist_local_rga_op(&self.store, key, &rga, &plan)?;
+
+        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        rgas.insert(key.to_string(), rga);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(op)
     }
 
     /// Read-side handle over the counter registry.
