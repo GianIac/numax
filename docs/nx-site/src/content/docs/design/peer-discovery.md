@@ -5,9 +5,7 @@ description: How Numax finds peers, tracks membership, disseminates CRDT operati
 
 > **Status: in development.** Endpoint discovery, connection admission, direct broadcast, and bounded anti-entropy exist today.
 
-> **Planning note.** I use this file mainly to plan the development of v0.1.6
-> as well as I can and to make each decision once and for all. This version is
-> already giving me a hard time, even before I have really started writing code.
+> **Planning note.** I use this file mainly to plan the development of v0.1.6 as well as I can and to make each decision once and for all. This version is already giving me a hard time, even before I have really started writing code.
 
 ## What this feature does
 
@@ -239,7 +237,7 @@ Nodes may disagree temporarily during a partition.
 
 Use a SWIM-style membership protocol with Lifeguard-style adjustment for the
 local detector's scheduling health. A CPU-bound guest or slow storage can delay
-local probes; suspicion timing must account for this instead of treating
+our own probes; suspicion timing must account for this instead of treating
 every local delay as a remote fault. This may increase true-failure detection
 latency, so measure both false declarations and real-failure latency. Do not
 add an independent phi-accrual detector without evidence that the selected
