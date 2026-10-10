@@ -2,6 +2,7 @@ use super::*;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::sync_manager::{apply::*, peer::*, replication::*, storage::*};
 use nx_net::{ConnectionDirection, NodeEvent, PeerIdentityVerification};
+use nx_store::CrashCheckpoint;
 use nx_sync::OpKind;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant as StdInstant;
@@ -3773,6 +3774,247 @@ async fn local_batches_recover_all_families_without_volatile_enqueue() {
                 .unwrap()
                 .is_some()
         );
+    }
+}
+
+const CRASH_TEST_FAMILIES: [&str; 6] = [
+    "gcounter",
+    "pncounter",
+    "lww_register",
+    "lww_map",
+    "orset",
+    "rga",
+];
+
+fn crash_test_keys(family: &str) -> (Vec<u8>, Vec<u8>) {
+    let key = "crash:local";
+    match family {
+        "gcounter" => (
+            durable_gcounter_state_key(key),
+            materialized_gcounter_key(key),
+        ),
+        "pncounter" => (
+            durable_pncounter_state_key(key),
+            materialized_pncounter_key(key),
+        ),
+        "lww_register" => (
+            durable_lww_register_state_key(key),
+            materialized_lww_register_key(key),
+        ),
+        "lww_map" => (
+            durable_lww_map_state_key(key),
+            materialized_lww_map_key(key),
+        ),
+        "orset" => (durable_orset_state_key(key), materialized_orset_key(key)),
+        "rga" => (durable_rga_state_key(key), materialized_rga_key(key)),
+        _ => panic!("unknown crash test family: {family}"),
+    }
+}
+
+#[tokio::test]
+async fn local_crdt_crash_child() {
+    let Ok(family) = std::env::var("NUMAX_CRASH_TEST_FAMILY") else {
+        return;
+    };
+    let directory = std::env::var("NUMAX_CRASH_TEST_STORE").unwrap();
+    let marker = std::env::var("NUMAX_CRASH_TEST_MARKER").unwrap();
+    let checkpoint = match std::env::var("NUMAX_CRASH_TEST_CHECKPOINT")
+        .unwrap()
+        .as_str()
+    {
+        "before_batch" => CrashCheckpoint::BeforeBatch,
+        "before_flush" => CrashCheckpoint::BeforeFlush,
+        "after_flush" => CrashCheckpoint::AfterFlush,
+        other => panic!("unknown crash checkpoint: {other}"),
+    };
+    let store = Arc::new(NxStore::open(directory).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    store.inject_crash_checkpoint(checkpoint, marker.into());
+    let key = "crash:local";
+    match family.as_str() {
+        "gcounter" => {
+            handle.increment_gcounter(key, 3).await.unwrap();
+        }
+        "pncounter" => {
+            handle.decrement_pncounter(key, 3).await.unwrap();
+        }
+        "lww_register" => {
+            handle
+                .set_lww_register(key, b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+        }
+        "lww_map" => {
+            handle
+                .set_lww_map(key, "mode", b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+        }
+        "orset" => {
+            handle.add_orset(key, "blue").await.unwrap();
+        }
+        "rga" => {
+            let op = Op::rga_insert_with_op_id(
+                handle.node_id().clone(),
+                key,
+                None::<String>,
+                b"first".to_vec(),
+            );
+            handle.insert_rga(op).await.unwrap();
+        }
+        _ => panic!("unknown crash test family: {family}"),
+    }
+    panic!("mutation passed an armed crash checkpoint");
+}
+
+#[test]
+fn local_crdt_process_crash_preserves_complete_batches() {
+    use std::process::Command;
+
+    for family in CRASH_TEST_FAMILIES {
+        for checkpoint in ["before_batch", "before_flush", "after_flush"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store_path = directory.path().join("store");
+            let marker = directory.path().join("checkpoint");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync_manager::manager::tests::local_crdt_crash_child",
+                    "--nocapture",
+                ])
+                .env("NUMAX_CRASH_TEST_FAMILY", family)
+                .env("NUMAX_CRASH_TEST_CHECKPOINT", checkpoint)
+                .env("NUMAX_CRASH_TEST_STORE", &store_path)
+                .env("NUMAX_CRASH_TEST_MARKER", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = StdInstant::now() + std::time::Duration::from_secs(10);
+            while !marker.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("crash child exited before {family}/{checkpoint}: {status}");
+                }
+                if StdInstant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("crash child did not reach {family}/{checkpoint}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let store = Arc::new(NxStore::open(&store_path).unwrap());
+            let (state_key, materialized_key) = crash_test_keys(family);
+            let state = store.get(&state_key).unwrap();
+            let materialized = store.get(&materialized_key).unwrap();
+            let seen = store.scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes()).unwrap();
+            let replay = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+            let survived = state.is_some();
+            assert_eq!(
+                materialized.is_some(),
+                survived,
+                "{family}/{checkpoint}: materialized"
+            );
+            assert_eq!(
+                seen.len(),
+                usize::from(survived),
+                "{family}/{checkpoint}: seen"
+            );
+            assert_eq!(
+                replay.len(),
+                usize::from(survived),
+                "{family}/{checkpoint}: replay"
+            );
+            if checkpoint == "before_batch" {
+                assert!(!survived, "{family}: operation appeared before batch");
+            } else if checkpoint == "after_flush" {
+                assert!(survived, "{family}: confirmed flush lost operation");
+            }
+
+            let manager = SyncManager::try_new(
+                NodeId::new("local-node"),
+                SyncConfig::new(),
+                Arc::clone(&store),
+                metrics(),
+            )
+            .unwrap();
+            let log = manager.op_log.blocking_read();
+            assert_eq!(
+                log.len(),
+                usize::from(survived),
+                "{family}/{checkpoint}: hydrated log"
+            );
+            if let Some(op) = log.first() {
+                assert!(manager.seen_ops.blocking_read().contains(op.id.as_str()));
+                assert!(
+                    store
+                        .get(&seen_op_store_key(op.id.as_str()))
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .get(&op_log_store_key(op.id.as_str()))
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            drop(log);
+            if survived {
+                let key = "crash:local";
+                match family {
+                    "gcounter" => {
+                        assert_eq!(read_materialized(&store, key), 3);
+                        assert_eq!(read_durable_gcounter_state(&store, key).value(), 3);
+                    }
+                    "pncounter" => {
+                        assert_eq!(read_materialized_pncounter(&store, key), -3);
+                        assert_eq!(read_durable_pncounter_state(&store, key).value(), -3);
+                    }
+                    "lww_register" => {
+                        assert_eq!(read_materialized_lww_register(&store, key), b"ready");
+                        assert_eq!(
+                            read_durable_lww_register_state(&store, key).timestamp_ms(),
+                            7
+                        );
+                    }
+                    "lww_map" => {
+                        assert_eq!(
+                            read_materialized_lww_map(&store, key),
+                            vec![("mode".into(), b"ready".to_vec())]
+                        );
+                        assert_eq!(
+                            read_durable_lww_map_state(&store, key).entries(),
+                            vec![("mode".into(), b"ready".to_vec())]
+                        );
+                    }
+                    "orset" => {
+                        assert_eq!(read_materialized_orset(&store, key), vec!["blue"]);
+                        let op = &manager.op_log.blocking_read()[0];
+                        assert_eq!(
+                            read_durable_orset_state(&store, key).observed_tags("blue"),
+                            vec![op.id.as_str().to_string()]
+                        );
+                    }
+                    "rga" => {
+                        assert_eq!(read_materialized_rga(&store, key), vec![b"first".to_vec()]);
+                        assert_eq!(
+                            read_durable_rga_state(&store, key).values(),
+                            vec![b"first".to_vec()]
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 }
 

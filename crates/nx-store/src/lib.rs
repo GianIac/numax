@@ -2,6 +2,8 @@ mod error;
 mod store;
 
 pub use error::StoreError;
+#[cfg(feature = "test-utils")]
+pub use store::CrashCheckpoint;
 pub use store::{Store, StoreStats, StoreWriteLease};
 
 #[cfg(test)]

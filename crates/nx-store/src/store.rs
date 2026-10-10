@@ -1,5 +1,9 @@
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "test-utils")]
+use std::path::PathBuf;
+#[cfg(feature = "test-utils")]
+use std::sync::Mutex;
 use std::sync::{
     Arc, RwLock, RwLockWriteGuard,
     atomic::{AtomicBool, Ordering},
@@ -16,6 +20,16 @@ pub struct Store {
     fail_writes_with_disk_full: Arc<AtomicBool>,
     #[cfg(feature = "test-utils")]
     fail_flushes_with_disk_full: Arc<AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    crash_checkpoint: Arc<Mutex<Option<(CrashCheckpoint, PathBuf)>>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashCheckpoint {
+    BeforeBatch,
+    BeforeFlush,
+    AfterFlush,
 }
 
 pub struct StoreWriteLease<'a> {
@@ -53,6 +67,8 @@ impl Store {
             fail_writes_with_disk_full: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-utils")]
             fail_flushes_with_disk_full: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            crash_checkpoint: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -128,6 +144,13 @@ impl Store {
             .store(enabled, Ordering::Relaxed);
     }
 
+    /// Arm a one-shot checkpoint for a child process that the test parent terminates.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn inject_crash_checkpoint(&self, checkpoint: CrashCheckpoint, marker: PathBuf) {
+        *self.crash_checkpoint.lock().expect("test checkpoint lock") = Some((checkpoint, marker));
+    }
+
     pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
         let guard = self
             .write_lock
@@ -153,6 +176,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.check_durability()?;
         self.check_injected_write_failure()?;
+        #[cfg(feature = "test-utils")]
+        self.wait_at_crash_checkpoint(CrashCheckpoint::BeforeBatch);
         let mut batch = sled::Batch::default();
         for (key, value) in sets {
             batch.insert(*key, *value);
@@ -175,13 +200,38 @@ impl Store {
         self.check_durability()?;
         let result = self.check_injected_write_failure().and_then(|_| {
             self.check_injected_flush_failure()?;
+            #[cfg(feature = "test-utils")]
+            self.wait_at_crash_checkpoint(CrashCheckpoint::BeforeFlush);
             self.db.flush()?;
+            #[cfg(feature = "test-utils")]
+            self.wait_at_crash_checkpoint(CrashCheckpoint::AfterFlush);
             Ok(())
         });
         if result.is_err() {
             self.durability_uncertain.store(true, Ordering::Release);
         }
         result
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn wait_at_crash_checkpoint(&self, current: CrashCheckpoint) {
+        let marker = {
+            let mut armed = self.crash_checkpoint.lock().expect("test checkpoint lock");
+            if armed
+                .as_ref()
+                .is_some_and(|(checkpoint, _)| *checkpoint == current)
+            {
+                armed.take().map(|(_, marker)| marker)
+            } else {
+                None
+            }
+        };
+        if let Some(marker) = marker {
+            std::fs::write(marker, b"ready").expect("write test checkpoint marker");
+            loop {
+                std::thread::park();
+            }
+        }
     }
 
     fn check_durability(&self) -> Result<(), StoreError> {
