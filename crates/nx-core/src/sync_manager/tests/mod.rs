@@ -3686,6 +3686,97 @@ async fn local_and_remote_rga_batches_preserve_elements_and_ignore_delayed_dupli
 }
 
 #[tokio::test]
+async fn local_batches_recover_all_families_without_volatile_enqueue() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    let mut accepted = vec![
+        handle
+            .increment_gcounter("counter:visits", 2)
+            .await
+            .unwrap(),
+        handle
+            .increment_pncounter("balance:credits", 3)
+            .await
+            .unwrap(),
+        handle
+            .set_lww_register("status:service", b"ready".to_vec(), 10)
+            .await
+            .unwrap(),
+        handle
+            .set_lww_map("settings:service", "mode", b"active".to_vec(), 10)
+            .await
+            .unwrap(),
+        handle.add_orset("tags:item", "blue").await.unwrap(),
+    ];
+    let rga_insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc",
+        None::<String>,
+        b"first".to_vec(),
+    );
+    handle.insert_rga(rga_insert.clone()).await.unwrap();
+    accepted.push(rga_insert);
+
+    // Simulate losing the volatile delivery path after each confirmed flush.
+    let sender = handle.op_sender();
+    assert_eq!(sender.capacity(), sender.max_capacity());
+    assert_eq!(manager.op_log.read().await.as_slice(), &accepted);
+    drop(sender);
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 2);
+    assert_eq!(manager.get_pncounter_value("balance:credits").await, 3);
+    assert_eq!(
+        manager.get_lww_register_value("status:service").await,
+        Some(b"ready".to_vec())
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service").await,
+        vec![("mode".to_string(), b"active".to_vec())]
+    );
+    assert_eq!(manager.get_orset_elements("tags:item").await, vec!["blue"]);
+    assert_eq!(
+        manager.get_rga_values("comments:doc").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &accepted);
+    for op in &accepted {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();
     materialize_gcounter_value(&store, "counter:visits", 42).unwrap();

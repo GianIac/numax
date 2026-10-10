@@ -284,9 +284,19 @@ attempts were definitely rejected before persistence. No new error code is
 selected here. Tests must cover failure before the batch, flush failure,
 restart after an uncertain outcome, interruption after flush before the
 response, and Rga insert's output buffer paths. They must show that the runtime
-does not silently issue a replacement `OpId` for the same attempt. The guest
-contract and crash tests remain unverified until implemented across all six
-families.
+does not silently issue a replacement `OpId` for the same attempt. The full
+guest retry contract and process crash model remain unverified.
+
+Guest-level Rga tests now exercise the output boundary: an insufficient
+capacity or out-of-bounds output range rejects the call without state or
+replay records, while an exact-capacity buffer receives the accepted `OpId`.
+A guest trap after a successful host call leaves one durable, queued operation
+despite the failed invocation; reopening the store recovers the same replay
+record. A separate test confirms that each of the six local CRDT families can
+recover its state and replay record after a confirmed flush without placing
+the operation in the volatile broadcast queue. These tests do not simulate a
+process crash in the instruction window between flush and enqueue, and they
+do not establish the complete guest retry contract or crash model.
 
 All six families need the same acceptance boundary, with family-specific
 effects checked separately. GCounter and PNCounter increments must not be

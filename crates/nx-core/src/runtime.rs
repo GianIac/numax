@@ -737,6 +737,197 @@ mod tests {
         br#"(module (func (export "run") unreachable))"#
     }
 
+    fn rga_insert_guest(
+        out_id_ptr: u32,
+        out_id_cap: u32,
+        expected_code: i32,
+        save_id: bool,
+        trap_after_call: bool,
+    ) -> Vec<u8> {
+        let save_id = if save_id {
+            format!(
+                "(drop (call $db_set (i32.const 64) (i32.const 6) (i32.const {out_id_ptr}) (local.get $result)))"
+            )
+        } else {
+            String::new()
+        };
+        let trap = if trap_after_call { "unreachable" } else { "" };
+        format!(
+            r#"(module
+                (import "nx" "crdt_rga_insert"
+                    (func $insert (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "nx" "db_set"
+                    (func $db_set (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "comments:doc-1")
+                (data (i32.const 32) "first")
+                (data (i32.const 64) "rga-id")
+                (func (export "run") (local $result i32)
+                    (local.set $result
+                        (call $insert
+                            (i32.const 0) (i32.const 14)
+                            (i32.const 0) (i32.const 0)
+                            (i32.const 32) (i32.const 5)
+                            (i32.const {out_id_ptr}) (i32.const {out_id_cap})))
+                    (if (i32.ne (local.get $result) (i32.const {expected_code}))
+                        (then unreachable))
+                    {save_id}
+                    {trap}))"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn rga_insert_guest_rejects_output_buffers_before_acceptance() {
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-rga-output-preflight-test"),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        runtime
+            .run_module(&rga_insert_guest(128, 35, -2, false, false))
+            .await
+            .unwrap();
+        runtime
+            .run_module(&rga_insert_guest(65_520, 36, -3, false, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(Vec::new())
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/state/rga/")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .is_empty()
+        );
+
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, true, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let output_id = String::from_utf8(runtime.store.get(b"rga-id").unwrap().unwrap()).unwrap();
+        let op_log = runtime.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(op_log.len(), 1);
+        assert_eq!(
+            op_log[0].0.strip_prefix(b"__nx/crdt/op-log/").unwrap(),
+            output_id.as_bytes()
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rga_insert_survives_guest_trap_after_flush_and_enqueue() {
+        let datastore_path = temp_datastore_path("numax-rga-uncertain-response-test");
+        let config = RuntimeConfig {
+            datastore_path: datastore_path.clone(),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+
+        assert!(
+            runtime
+                .run_module(&rga_insert_guest(128, 36, 36, false, true))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let op_log = runtime.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(op_log.len(), 1);
+        let accepted_id = op_log[0]
+            .0
+            .strip_prefix(b"__nx/crdt/op-log/")
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The unstarted manager keeps the first op in its one-slot broadcast queue.
+        runtime
+            .run_module(&rga_insert_guest(128, 36, -3, false, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(runtime);
+
+        let reopened = Runtime::new(RuntimeConfig {
+            datastore_path,
+            enable_wasi: false,
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            reopened.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let recovered_ops = reopened.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(recovered_ops.len(), 1);
+        assert_eq!(
+            recovered_ops[0]
+                .0
+                .strip_prefix(b"__nx/crdt/op-log/")
+                .unwrap(),
+            accepted_id
+        );
+    }
+
     #[tokio::test]
     async fn serve_returns_immediately_when_sync_is_disabled() {
         let config = RuntimeConfig {
