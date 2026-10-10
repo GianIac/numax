@@ -208,7 +208,7 @@ async fn crdt_gcounter_inc_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local GCounter increment");
+    tracing::debug!(op_id = %op.op().id, "queued local GCounter increment");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -349,7 +349,7 @@ async fn crdt_pncounter_change_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, api = api_name, "queued local PNCounter op");
+    tracing::debug!(op_id = %op.op().id, api = api_name, "queued local PNCounter op");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -454,7 +454,7 @@ async fn crdt_lww_set_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local LWW-Register set");
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Register set");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -588,7 +588,7 @@ async fn crdt_lww_map_set_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local LWW-Map set");
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Map set");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -657,7 +657,7 @@ async fn crdt_lww_map_remove_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local LWW-Map remove");
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Map remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -892,7 +892,7 @@ async fn crdt_orset_add_impl(
         }
     };
 
-    tracing::debug!(op_id = %op.id, "queued local ORSet add");
+    tracing::debug!(op_id = %op.op().id, "queued local ORSet add");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -936,6 +936,10 @@ async fn crdt_orset_remove_impl(
         None => return ERR_SYNC_DISABLED,
     };
 
+    if handle.orset_remove_is_noop(&key, &element).await {
+        return 0;
+    }
+
     let op_tx = handle.op_sender();
     let op_permit = match op_tx.try_reserve() {
         Ok(permit) => permit,
@@ -955,7 +959,7 @@ async fn crdt_orset_remove_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local ORSet remove");
+    tracing::debug!(op_id = %op.op().id, "queued local ORSet remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -1163,14 +1167,17 @@ async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsert
         return ERR_INTERNAL;
     }
 
-    if let Err(e) = handle.insert_rga(op.clone()).await {
-        handle.metrics().record_sync_error();
-        tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
-        return ERR_INTERNAL;
-    }
+    let accepted_op = match handle.insert_rga(op).await {
+        Ok(accepted_op) => accepted_op,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
+            return ERR_INTERNAL;
+        }
+    };
 
-    tracing::debug!(op_id = %op.id, "queued local RGA insert");
-    op_permit.send(op);
+    tracing::debug!(op_id = %accepted_op.op().id, "queued local RGA insert");
+    op_permit.send(accepted_op);
     handle.metrics().record_ops(1);
 
     if let Err(e) = memory.write(&mut caller, args.out_id_ptr as usize, id_bytes) {
@@ -1236,7 +1243,7 @@ async fn crdt_rga_delete_impl(
             return ERR_INTERNAL;
         }
     };
-    tracing::debug!(op_id = %op.id, "queued local RGA delete");
+    tracing::debug!(op_id = %op.op().id, "queued local RGA delete");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 

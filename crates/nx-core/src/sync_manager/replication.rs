@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, NodeEvent, WireRetryPolicy};
+#[cfg(test)]
 use nx_store::Store as NxStore;
 use nx_sync::Op;
 use tokio::sync::{RwLock, mpsc, watch};
@@ -13,17 +13,17 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::apply::apply_remote_ops;
+use super::manager::AcceptedLocalOp;
 use super::peer::{
     ConfiguredPeerConnectContext, ConfiguredPeerConnectOutcome, PeerReconnectState,
     mark_known_peer_failure, mark_known_peer_success, mark_peer_failure, mark_peer_success,
     normalize_peer_dead_after_failures, normalize_reconnect_delay,
 };
-use super::storage::persist_local_ops_batch;
 use super::types::*;
 
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
-    mut op_rx: mpsc::Receiver<Op>,
+    mut op_rx: mpsc::Receiver<AcceptedLocalOp>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -400,8 +400,8 @@ pub(super) fn normalize_seen_ops_limit(limit: usize) -> usize {
 
 pub(super) async fn broadcast_batch(
     context: &BroadcastLoopContext,
-    op_rx: &mut mpsc::Receiver<Op>,
-    first: Op,
+    op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
+    first: AcceptedLocalOp,
 ) {
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
@@ -417,22 +417,11 @@ pub(super) async fn broadcast_batch(
         }
     }
 
+    let batch = batch
+        .into_iter()
+        .map(AcceptedLocalOp::into_op)
+        .collect::<Vec<_>>();
     let count = batch.len();
-    if let Err(e) = remember_ops(
-        &context.seen_ops,
-        &context.seen_ops_next_sequence,
-        &context.op_log,
-        &context.op_log_next_sequence,
-        context.op_log_limit,
-        &context.store,
-        &batch,
-    )
-    .await
-    {
-        context.metrics.record_sync_error();
-        warn!(error = %e, "failed to persist local op dedup metadata");
-        return;
-    }
     let started = std::time::Instant::now();
     if let Err(e) = context.node.broadcast_ops(batch).await {
         context.metrics.record_sync_error();
@@ -446,68 +435,11 @@ pub(super) async fn broadcast_batch(
 
 pub(super) async fn drain_broadcast_queue(
     context: &BroadcastLoopContext,
-    op_rx: &mut mpsc::Receiver<Op>,
+    op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
 ) {
     while let Ok(first) = op_rx.try_recv() {
         broadcast_batch(context, op_rx, first).await;
     }
-}
-
-pub(super) async fn remember_ops(
-    seen_ops: &Arc<RwLock<SeenOps>>,
-    seen_ops_next_sequence: &Arc<AtomicU64>,
-    op_log: &Arc<RwLock<Vec<Op>>>,
-    op_log_next_sequence: &Arc<AtomicU64>,
-    op_log_limit: usize,
-    store: &Arc<NxStore>,
-    ops: &[Op],
-) -> anyhow::Result<()> {
-    let mut seen = seen_ops.write().await;
-    let mut log = op_log.write().await;
-    let mut next_seen_sequence = seen_ops_next_sequence.load(Ordering::Relaxed);
-    let mut next_op_log_sequence = op_log_next_sequence.load(Ordering::Relaxed);
-    let mut inserted_ops = Vec::new();
-    let mut inserted_ids = Vec::new();
-    let mut inserts = Vec::new();
-    for op in ops {
-        let op_id = op.id.as_str();
-        if !seen.ids.contains(op_id) && !inserted_ids.iter().any(|id| id == op_id) {
-            inserted_ids.push(op_id.to_string());
-            inserted_ops.push(op.clone());
-        }
-    }
-
-    let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
-    let op_log_evicted = plan_op_log_evictions(&log, inserted_ops.len(), op_log_limit);
-    let last_insert_index = inserted_ops.len().saturating_sub(1);
-
-    for (index, op) in inserted_ops.iter().enumerate() {
-        inserts.push(OpPersistencePlan {
-            op: op.clone(),
-            seen_sequence: next_seen_sequence,
-            op_log_sequence: next_op_log_sequence,
-            seen_evicted: if index == last_insert_index {
-                seen_evicted.clone()
-            } else {
-                Vec::new()
-            },
-            op_log_evicted: if index == last_insert_index {
-                op_log_evicted.clone()
-            } else {
-                Vec::new()
-            },
-        });
-        next_seen_sequence = next_seen_sequence.saturating_add(1);
-        next_op_log_sequence = next_op_log_sequence.saturating_add(1);
-    }
-
-    persist_local_ops_batch(store, &inserts)?;
-    apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
-    log.extend(inserted_ops);
-    prune_op_log_and_return_evicted(&mut log, op_log_limit);
-    seen_ops_next_sequence.store(next_seen_sequence, Ordering::Relaxed);
-    op_log_next_sequence.store(next_op_log_sequence, Ordering::Relaxed);
-    Ok(())
 }
 
 pub(super) fn plan_seen_evictions(seen: &SeenOps, inserted_ids: &[String]) -> Vec<String> {
@@ -870,33 +802,6 @@ mod tests {
             op_log_since(&op_log, Some(op_b.id.as_str())).await,
             vec![op_c]
         );
-    }
-
-    #[tokio::test]
-    async fn remember_ops_prunes_op_log_to_configured_limit() {
-        let store = temp_store();
-        let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
-        let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
-        let op_log_next_sequence = Arc::new(AtomicU64::new(0));
-        let op_log = Arc::new(RwLock::new(Vec::new()));
-        let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
-        let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
-        let op_c = Op::gcounter_increment(NodeId::new("node-c"), "counter:visits", 3);
-
-        remember_ops(
-            &seen_ops,
-            &seen_ops_next_sequence,
-            &op_log,
-            &op_log_next_sequence,
-            2,
-            &store,
-            &[op_a.clone(), op_b.clone(), op_c.clone()],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(op_log.read().await.as_slice(), &[op_b, op_c]);
-        assert!(seen_ops.read().await.contains(op_a.id.as_str()));
     }
 
     #[test]

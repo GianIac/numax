@@ -1090,41 +1090,6 @@ pub(super) fn persist_op_log_evictions(store: &NxStore, evicted: &[Op]) -> anyho
     Ok(())
 }
 
-pub(super) fn persist_local_ops_batch(
-    store: &NxStore,
-    plans: &[OpPersistencePlan],
-) -> anyhow::Result<()> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-
-    let mut set_keys = Vec::new();
-    let mut set_values = Vec::new();
-    let mut delete_keys = Vec::new();
-
-    for plan in plans {
-        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
-        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
-        set_keys.push(op_log_store_key(plan.op.id.as_str()));
-        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
-        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
-        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
-    }
-
-    let sets = set_keys
-        .iter()
-        .zip(set_values.iter())
-        .map(|(key, value)| (key.as_slice(), value.as_slice()))
-        .collect::<Vec<_>>();
-    let deletes = delete_keys
-        .iter()
-        .map(|key| key.as_slice())
-        .collect::<Vec<_>>();
-
-    store.apply_batch(&sets, &deletes)?;
-    Ok(())
-}
-
 pub(super) fn persist_remote_ops_batch(
     store: &NxStore,
     plans: &[OpPersistencePlan],

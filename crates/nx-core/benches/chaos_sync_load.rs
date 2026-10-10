@@ -10,7 +10,7 @@ use nx_core::SyncConfig;
 use nx_core::observability::RuntimeMetrics;
 use nx_core::sync_manager::{SyncHandle, SyncManager};
 use nx_store::Store;
-use nx_sync::{GCounter, NodeId, Op};
+use nx_sync::NodeId;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
 const DEFAULT_NODE_COUNT: usize = 3;
@@ -362,16 +362,9 @@ async fn restart_node(node: &mut BenchNode) -> Result<(), String> {
 }
 
 async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), ()> {
-    let op = Op::gcounter_increment(handle.node_id().clone(), key, 1);
-    handle.op_sender().send(op).await.map_err(|_| ())?;
-
-    {
-        let counters = handle.counters();
-        let mut counters = counters.write().await;
-        let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
-        counter.increment(handle.node_id(), 1);
-        counters.insert(key.to_string(), counter);
-    }
+    let permit = handle.op_sender().reserve_owned().await.map_err(|_| ())?;
+    let op = handle.increment_gcounter(key, 1).await.map_err(|_| ())?;
+    permit.send(op);
 
     Ok(())
 }

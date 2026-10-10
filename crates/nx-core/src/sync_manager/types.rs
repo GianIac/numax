@@ -148,12 +148,6 @@ pub(super) struct AntiEntropyLoopContext {
 
 pub(super) struct BroadcastLoopContext {
     pub(super) node: Arc<Node>,
-    pub(super) seen_ops: Arc<RwLock<SeenOps>>,
-    pub(super) seen_ops_next_sequence: Arc<AtomicU64>,
-    pub(super) op_log: Arc<RwLock<Vec<Op>>>,
-    pub(super) op_log_next_sequence: Arc<AtomicU64>,
-    pub(super) op_log_limit: usize,
-    pub(super) store: Arc<NxStore>,
     pub(super) metrics: Arc<RuntimeMetrics>,
 }
 

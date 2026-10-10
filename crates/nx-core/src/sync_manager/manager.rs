@@ -42,7 +42,7 @@ use super::types::*;
 #[derive(Clone)]
 pub struct SyncHandle {
     node_id: NodeId,
-    op_tx: mpsc::Sender<Op>,
+    op_tx: mpsc::Sender<AcceptedLocalOp>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
@@ -70,18 +70,67 @@ enum LwwMapChange {
     Remove,
 }
 
+/// Opaque proof that a local operation completed its state-and-replay persistence path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedLocalOp(Op);
+
+impl AcceptedLocalOp {
+    fn new(op: Op) -> Self {
+        Self(op)
+    }
+
+    pub(crate) fn op(&self) -> &Op {
+        &self.0
+    }
+
+    pub(crate) fn into_op(self) -> Op {
+        self.0
+    }
+}
+
+impl std::ops::Deref for AcceptedLocalOp {
+    type Target = Op;
+
+    fn deref(&self) -> &Self::Target {
+        self.op()
+    }
+}
+
+impl PartialEq<Op> for AcceptedLocalOp {
+    fn eq(&self, other: &Op) -> bool {
+        self.op() == other
+    }
+}
+
+impl PartialEq<AcceptedLocalOp> for Op {
+    fn eq(&self, other: &AcceptedLocalOp) -> bool {
+        self == other.op()
+    }
+}
+
 impl SyncHandle {
     /// NodeId of the local node (used to stamp locally-produced Ops).
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
 
-    /// Sender to enqueue Ops for broadcast. Backpressure is bounded by the underlying channel capacity.
-    pub fn op_sender(&self) -> mpsc::Sender<Op> {
+    /// Sender for locally accepted operations awaiting broadcast.
+    ///
+    /// Reserve capacity before starting a mutation so a full queue rejects the
+    /// attempt before persistence. Only `SyncHandle` can create the accepted
+    /// value consumed by this channel.
+    pub fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
     }
 
-    pub(crate) async fn increment_gcounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+    /// Persist and publish a local GCounter increment without enqueueing it.
+    ///
+    /// The returned value can be submitted through [`Self::op_sender`].
+    pub async fn increment_gcounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = Op::gcounter_increment(self.node_id.clone(), key, delta);
         let op_id = op.id.as_str().to_string();
 
@@ -115,15 +164,23 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
     }
 
-    pub(crate) async fn increment_pncounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+    pub(crate) async fn increment_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         self.change_pncounter(key, delta, PNCounterDirection::Increment)
             .await
     }
 
-    pub(crate) async fn decrement_pncounter(&self, key: &str, delta: u64) -> anyhow::Result<Op> {
+    pub(crate) async fn decrement_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         self.change_pncounter(key, delta, PNCounterDirection::Decrement)
             .await
     }
@@ -133,7 +190,7 @@ impl SyncHandle {
         key: &str,
         delta: u64,
         direction: PNCounterDirection,
-    ) -> anyhow::Result<Op> {
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = match direction {
             PNCounterDirection::Increment => {
                 Op::pncounter_increment(self.node_id.clone(), key, delta)
@@ -177,7 +234,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
     }
 
     pub(crate) async fn set_lww_register(
@@ -185,7 +242,7 @@ impl SyncHandle {
         key: &str,
         value: Vec<u8>,
         observed_timestamp_ms: u64,
-    ) -> anyhow::Result<Op> {
+    ) -> anyhow::Result<AcceptedLocalOp> {
         // Match the remote apply lock order so the timestamp and winner use the
         // same register state as the batch committed below.
         let mut seen = self.seen_ops.write().await;
@@ -224,7 +281,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
     }
 
     pub(crate) async fn set_lww_map(
@@ -233,7 +290,7 @@ impl SyncHandle {
         field: &str,
         value: Vec<u8>,
         observed_timestamp_ms: u64,
-    ) -> anyhow::Result<Op> {
+    ) -> anyhow::Result<AcceptedLocalOp> {
         self.change_lww_map(key, field, LwwMapChange::Set(value), observed_timestamp_ms)
             .await
     }
@@ -243,7 +300,7 @@ impl SyncHandle {
         key: &str,
         field: &str,
         observed_timestamp_ms: u64,
-    ) -> anyhow::Result<Op> {
+    ) -> anyhow::Result<AcceptedLocalOp> {
         self.change_lww_map(key, field, LwwMapChange::Remove, observed_timestamp_ms)
             .await
     }
@@ -254,7 +311,7 @@ impl SyncHandle {
         field: &str,
         change: LwwMapChange,
         observed_timestamp_ms: u64,
-    ) -> anyhow::Result<Op> {
+    ) -> anyhow::Result<AcceptedLocalOp> {
         // Match the remote apply lock order while selecting the field timestamp.
         let mut seen = self.seen_ops.write().await;
         let mut log = self.op_log.write().await;
@@ -307,10 +364,14 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
     }
 
-    pub(crate) async fn add_orset(&self, key: &str, element: &str) -> anyhow::Result<Op> {
+    pub(crate) async fn add_orset(
+        &self,
+        key: &str,
+        element: &str,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = Op::orset_add_with_op_id_tag(self.node_id.clone(), key, element);
         let op_id = op.id.as_str().to_string();
 
@@ -343,14 +404,22 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
+    }
+
+    pub(crate) async fn orset_remove_is_noop(&self, key: &str, element: &str) -> bool {
+        self.orsets
+            .read()
+            .await
+            .get(key)
+            .is_none_or(|set| set.observed_tags(element).is_empty())
     }
 
     pub(crate) async fn remove_orset(
         &self,
         key: &str,
         element: &str,
-    ) -> anyhow::Result<Option<Op>> {
+    ) -> anyhow::Result<Option<AcceptedLocalOp>> {
         let mut seen = self.seen_ops.write().await;
         let mut log = self.op_log.write().await;
         let mut sets = self.orsets.write().await;
@@ -385,10 +454,10 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(Some(op))
+        Ok(Some(AcceptedLocalOp::new(op)))
     }
 
-    pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<()> {
+    pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<AcceptedLocalOp> {
         let OpKind::RgaInsert {
             key,
             id,
@@ -432,10 +501,10 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(())
+        Ok(AcceptedLocalOp::new(op))
     }
 
-    pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<Op> {
+    pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<AcceptedLocalOp> {
         let op = Op::rga_delete(self.node_id.clone(), key, id);
         let op_id = op.id.as_str().to_string();
 
@@ -467,7 +536,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(op)
+        Ok(AcceptedLocalOp::new(op))
     }
 
     /// Read-side handle over the counter registry.
@@ -600,10 +669,10 @@ pub struct SyncManager {
     anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 
     /// Channel to send Ops to broadcast.
-    op_tx: mpsc::Sender<Op>,
+    op_tx: mpsc::Sender<AcceptedLocalOp>,
 
     /// Receiver drained by `start` into the broadcast task.
-    op_rx: Option<mpsc::Receiver<Op>>,
+    op_rx: Option<mpsc::Receiver<AcceptedLocalOp>>,
 
     /// Shutdown signal shared with background tasks.
     shutdown_tx: watch::Sender<bool>,
@@ -740,13 +809,9 @@ impl SyncManager {
     }
 
     /// Return sender
-    pub fn op_sender(&self) -> mpsc::Sender<Op> {
+    #[cfg(test)]
+    pub(crate) fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
-    }
-
-    /// Take the receiver of operations
-    pub fn take_op_receiver(&mut self) -> Option<mpsc::Receiver<Op>> {
-        self.op_rx.take()
     }
 
     /// Build a clonable handle exposing the op channel and the counter registry.
@@ -921,12 +986,6 @@ impl SyncManager {
         self.broadcast_task = Some(spawn_broadcast_loop(
             BroadcastLoopContext {
                 node: Arc::clone(&node),
-                seen_ops: Arc::clone(&self.seen_ops),
-                seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
-                op_log: Arc::clone(&self.op_log),
-                op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
-                op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
-                store: Arc::clone(&self.store),
                 metrics: Arc::clone(&self.metrics),
             },
             op_rx,

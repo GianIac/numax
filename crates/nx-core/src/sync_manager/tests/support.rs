@@ -557,19 +557,26 @@ pub(super) async fn wait_for_peer_health(
     }
 }
 
+async fn reserve_local_op(handle: &SyncHandle) -> tokio::sync::mpsc::OwnedPermit<AcceptedLocalOp> {
+    handle.op_sender().reserve_owned().await.unwrap()
+}
+
 pub(super) async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_increment(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.increment_gcounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_pncounter_inc(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.increment_pncounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_pncounter_dec(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.decrement_pncounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_register_set(
@@ -578,13 +585,18 @@ pub(super) async fn local_lww_register_set(
     value: &[u8],
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_register_set(handle, key, value, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .set_lww_register(key, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_orset_add(handle: &SyncHandle, key: &str, element: &str) {
-    let op = apply_local_orset_add(handle, key, element).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.add_orset(key, element).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_map_set(
@@ -594,8 +606,12 @@ pub(super) async fn local_lww_map_set(
     value: &[u8],
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_map_set(handle, key, field, value, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .set_lww_map(key, field, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_map_remove(
@@ -604,13 +620,21 @@ pub(super) async fn local_lww_map_remove(
     field: &str,
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_map_remove(handle, key, field, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .remove_lww_map(key, field, timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_orset_remove(handle: &SyncHandle, key: &str, element: &str) {
-    if let Some(op) = apply_local_orset_remove(handle, key, element).await {
-        handle.op_sender().send(op).await.unwrap();
+    if handle.orset_remove_is_noop(key, element).await {
+        return;
+    }
+    let permit = reserve_local_op(handle).await;
+    if let Some(op) = handle.remove_orset(key, element).await.unwrap() {
+        permit.send(op);
     }
 }
 
@@ -620,131 +644,32 @@ pub(super) async fn local_rga_insert_after(
     parent: Option<&str>,
     value: &[u8],
 ) -> String {
-    let (id, op) = apply_local_rga_insert_after(handle, key, parent, value).await;
-    handle.op_sender().send(op).await.unwrap();
-    id
-}
-
-pub(super) async fn local_rga_delete(handle: &SyncHandle, key: &str, id: &str) {
-    let op = apply_local_rga_delete(handle, key, id).await;
-    handle.op_sender().send(op).await.unwrap();
-}
-
-pub(super) async fn dropped_local_increment(
-    manager: &SyncManager,
-    handle: &SyncHandle,
-    key: &str,
-    delta: u64,
-) {
-    let op = apply_local_increment(handle, key, delta).await;
-    remember_ops(
-        &manager.seen_ops,
-        &manager.seen_ops_next_sequence,
-        &manager.op_log,
-        &manager.op_log_next_sequence,
-        manager.config.op_log_limit,
-        &manager.store,
-        &[op],
-    )
-    .await
-    .unwrap();
-}
-
-pub(super) async fn apply_local_increment(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    {
-        let counters_arc = handle.counters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
-        counter.increment(handle.node_id(), delta);
-
-        persist_gcounter_state(&handle.store(), key, &counter).unwrap();
-        counters.insert(key.to_string(), counter);
-    }
-
-    Op::gcounter_increment(handle.node_id().clone(), key, delta)
-}
-
-pub(super) async fn apply_local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    handle.increment_pncounter(key, delta).await.unwrap()
-}
-
-pub(super) async fn apply_local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    handle.decrement_pncounter(key, delta).await.unwrap()
-}
-
-pub(super) async fn apply_local_lww_register_set(
-    handle: &SyncHandle,
-    key: &str,
-    value: &[u8],
-    timestamp_ms: u64,
-) -> Op {
-    handle
-        .set_lww_register(key, value.to_vec(), timestamp_ms)
-        .await
-        .unwrap()
-}
-
-pub(super) async fn apply_local_lww_map_set(
-    handle: &SyncHandle,
-    key: &str,
-    field: &str,
-    value: &[u8],
-    timestamp_ms: u64,
-) -> Op {
-    handle
-        .set_lww_map(key, field, value.to_vec(), timestamp_ms)
-        .await
-        .unwrap()
-}
-
-pub(super) async fn apply_local_lww_map_remove(
-    handle: &SyncHandle,
-    key: &str,
-    field: &str,
-    timestamp_ms: u64,
-) -> Op {
-    handle
-        .remove_lww_map(key, field, timestamp_ms)
-        .await
-        .unwrap()
-}
-
-pub(super) async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {
-    handle.add_orset(key, element).await.unwrap()
-}
-
-pub(super) async fn apply_local_orset_remove(
-    handle: &SyncHandle,
-    key: &str,
-    element: &str,
-) -> Option<Op> {
-    handle.remove_orset(key, element).await.unwrap()
-}
-
-pub(super) async fn apply_local_rga_insert_after(
-    handle: &SyncHandle,
-    key: &str,
-    parent: Option<&str>,
-    value: &[u8],
-) -> (String, Op) {
+    let permit = reserve_local_op(handle).await;
     let op = Op::rga_insert_with_op_id(
         handle.node_id().clone(),
         key,
         parent.map(ToOwned::to_owned),
         value.to_vec(),
     );
-    let id = match &op.kind {
-        OpKind::RgaInsert { id, .. } => id.clone(),
-        other => panic!("unexpected op kind: {other:?}"),
-    };
-
-    handle.insert_rga(op.clone()).await.unwrap();
-
-    (id, op)
+    let id = op.id.as_str().to_string();
+    let op = handle.insert_rga(op).await.unwrap();
+    permit.send(op);
+    id
 }
 
-pub(super) async fn apply_local_rga_delete(handle: &SyncHandle, key: &str, id: &str) -> Op {
-    handle.delete_rga(key, id).await.unwrap()
+pub(super) async fn local_rga_delete(handle: &SyncHandle, key: &str, id: &str) {
+    let permit = reserve_local_op(handle).await;
+    let op = handle.delete_rga(key, id).await.unwrap();
+    permit.send(op);
+}
+
+pub(super) async fn dropped_local_increment(
+    _manager: &SyncManager,
+    handle: &SyncHandle,
+    key: &str,
+    delta: u64,
+) {
+    let _accepted = handle.increment_gcounter(key, delta).await.unwrap();
 }
 
 pub(super) async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {

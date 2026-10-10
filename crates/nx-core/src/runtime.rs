@@ -777,6 +777,149 @@ mod tests {
         .into_bytes()
     }
 
+    fn orset_remove_guest(element: &str, expected_code: i32) -> Vec<u8> {
+        format!(
+            r#"(module
+                (import "nx" "crdt_orset_remove"
+                    (func $remove (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "tags:item-1")
+                (data (i32.const 32) "{element}")
+                (func (export "run")
+                    (if (i32.ne
+                            (call $remove
+                                (i32.const 0) (i32.const 11)
+                                (i32.const 32) (i32.const {element_len}))
+                            (i32.const {expected_code}))
+                        (then unreachable))))"#,
+            element_len = element.len()
+        )
+        .into_bytes()
+    }
+
+    fn orset_add_guest(expected_code: i32) -> Vec<u8> {
+        format!(
+            r#"(module
+                (import "nx" "crdt_orset_add"
+                    (func $add (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "tags:item-1")
+                (data (i32.const 32) "blue")
+                (func (export "run")
+                    (if (i32.ne
+                            (call $add
+                                (i32.const 0) (i32.const 11)
+                                (i32.const 32) (i32.const 4))
+                            (i32.const {expected_code}))
+                        (then unreachable))))"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn orset_remove_noop_succeeds_when_broadcast_queue_is_full() {
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-orset-noop-full-queue-test"),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, false, false))
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .sync_handle
+                .as_ref()
+                .unwrap()
+                .op_sender()
+                .try_reserve()
+                .is_err()
+        );
+        runtime
+            .run_module(&orset_remove_guest("missing", 0))
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/state/orset/")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn orset_remove_with_observed_tags_does_not_persist_when_queue_is_full() {
+        let datastore_path = temp_datastore_path("numax-orset-remove-full-queue-test");
+        let config = RuntimeConfig {
+            datastore_path: datastore_path.clone(),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config.clone()).unwrap();
+        runtime.run_module(&orset_add_guest(0)).await.unwrap();
+        drop(runtime);
+
+        let runtime = Runtime::new(config).unwrap();
+        assert_eq!(
+            runtime.get_orset_elements("tags:item-1").await,
+            Some(vec!["blue".to_string()])
+        );
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, false, false))
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .sync_handle
+                .as_ref()
+                .unwrap()
+                .op_sender()
+                .try_reserve()
+                .is_err()
+        );
+
+        runtime
+            .run_module(&orset_remove_guest("blue", -3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.get_orset_elements("tags:item-1").await,
+            Some(vec!["blue".to_string()])
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn rga_insert_guest_rejects_output_buffers_before_acceptance() {
         let runtime = Runtime::new(RuntimeConfig {

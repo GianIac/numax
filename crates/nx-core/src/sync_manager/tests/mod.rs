@@ -348,30 +348,31 @@ async fn op_log_since_returns_ops_after_known_id() {
 }
 
 #[tokio::test]
-async fn remember_ops_prunes_op_log_to_configured_limit() {
+async fn local_acceptance_prunes_op_log_to_configured_limit() {
     let store = temp_store();
-    let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
-    let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
-    let op_log_next_sequence = Arc::new(AtomicU64::new(0));
-    let op_log = Arc::new(RwLock::new(Vec::new()));
-    let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
-    let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
-    let op_c = Op::gcounter_increment(NodeId::new("node-c"), "counter:visits", 3);
-
-    remember_ops(
-        &seen_ops,
-        &seen_ops_next_sequence,
-        &op_log,
-        &op_log_next_sequence,
-        2,
-        &store,
-        &[op_a.clone(), op_b.clone(), op_c.clone()],
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new().with_op_log_limit(2),
+        Arc::clone(&store),
+        metrics(),
     )
-    .await
     .unwrap();
+    let handle = manager.handle();
+    let op_a = handle
+        .increment_gcounter("counter:visits", 1)
+        .await
+        .unwrap();
+    let op_b = handle
+        .increment_gcounter("counter:visits", 2)
+        .await
+        .unwrap();
+    let op_c = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
 
-    assert_eq!(op_log.read().await.as_slice(), &[op_b, op_c]);
-    assert!(seen_ops.read().await.contains(op_a.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op_b, op_c]);
+    assert!(manager.seen_ops.read().await.contains(op_a.id.as_str()));
 }
 
 #[test]
@@ -1482,20 +1483,6 @@ async fn local_gcounter_batch_restarts_with_state_and_replay_metadata() {
             .unwrap()
             .is_some()
     );
-    let op_log_key = op_log_store_key(op.id.as_str());
-    let op_log_value = store.get(&op_log_key).unwrap().unwrap();
-    remember_ops(
-        &manager.seen_ops,
-        &manager.seen_ops_next_sequence,
-        &manager.op_log,
-        &manager.op_log_next_sequence,
-        manager.config.op_log_limit,
-        &store,
-        std::slice::from_ref(&op),
-    )
-    .await
-    .unwrap();
-    assert_eq!(store.get(&op_log_key).unwrap().unwrap(), op_log_value);
     assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 1);
     assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 1);
 
@@ -2736,7 +2723,10 @@ async fn local_lww_map_flush_failure_blocks_retry_and_recovers_tombstone() {
         state
     );
     assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
-    assert_eq!(manager.op_log.read().await.as_slice(), &[set, remove]);
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[set.into_op(), remove]
+    );
 }
 
 #[tokio::test]
@@ -2806,7 +2796,7 @@ async fn local_lww_map_losing_set_and_remove_retain_replay_identity() {
     );
     assert_eq!(
         manager.op_log.read().await.as_slice(),
-        &[remote, losing_set.clone(), losing_remove.clone()]
+        &[remote, losing_set.op().clone(), losing_remove.op().clone(),]
     );
     for op in [&losing_set, &losing_remove] {
         assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
@@ -2814,7 +2804,7 @@ async fn local_lww_map_losing_set_and_remove_retain_replay_identity() {
             .get(&op_log_store_key(op.id.as_str()))
             .unwrap()
             .unwrap();
-        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op.op());
     }
 }
 
@@ -3210,7 +3200,10 @@ async fn local_orset_flush_failure_blocks_retry_and_recovers_remove() {
     assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
     assert_eq!(read_durable_orset_state(&store, "tags:item-1"), state);
     assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
-    assert_eq!(manager.op_log.read().await.as_slice(), &[add, remove]);
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[add.into_op(), remove]
+    );
 }
 
 #[tokio::test]
@@ -3343,7 +3336,7 @@ async fn local_rga_batch_restarts_with_parents_tombstones_and_replay_metadata() 
         .unwrap();
     handle.insert_rga(child.clone()).await.unwrap();
     handle.insert_rga(parent.clone()).await.unwrap();
-    let expected_ops = [delete, child, parent];
+    let expected_ops = [delete.into_op(), child, parent];
 
     let state = read_durable_rga_state(&store, "comments:doc-1");
     assert_eq!(
@@ -3703,20 +3696,28 @@ async fn local_batches_recover_all_families_without_volatile_enqueue() {
         handle
             .increment_gcounter("counter:visits", 2)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_op(),
         handle
             .increment_pncounter("balance:credits", 3)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_op(),
         handle
             .set_lww_register("status:service", b"ready".to_vec(), 10)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_op(),
         handle
             .set_lww_map("settings:service", "mode", b"active".to_vec(), 10)
             .await
-            .unwrap(),
-        handle.add_orset("tags:item", "blue").await.unwrap(),
+            .unwrap()
+            .into_op(),
+        handle
+            .add_orset("tags:item", "blue")
+            .await
+            .unwrap()
+            .into_op(),
     ];
     let rga_insert = Op::rga_insert_with_op_id(
         handle.node_id().clone(),
@@ -5248,7 +5249,7 @@ async fn shutdown_drains_queued_ops_before_closing_connections() {
 
     manager_a.connect_to_peer(&addr_b).await.unwrap();
 
-    let op = Op::gcounter_increment(handle_a.node_id().clone(), key, 1);
+    let op = handle_a.increment_gcounter(key, 1).await.unwrap();
     handle_a.op_sender().send(op).await.unwrap();
     manager_a.shutdown().await.unwrap();
 
