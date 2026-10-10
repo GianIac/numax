@@ -5249,8 +5249,7 @@ async fn shutdown_drains_queued_ops_before_closing_connections() {
 
     manager_a.connect_to_peer(&addr_b).await.unwrap();
 
-    let op = handle_a.increment_gcounter(key, 1).await.unwrap();
-    handle_a.op_sender().send(op).await.unwrap();
+    handle_a.submit_gcounter_increment(key, 1).await.unwrap();
     manager_a.shutdown().await.unwrap();
 
     wait_for_counter(&manager_b, key, 1).await;
@@ -5273,6 +5272,50 @@ async fn manager_normalizes_empty_queued_ops_limit() {
     let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
 
     assert_eq!(manager.op_sender().max_capacity(), 1);
+}
+
+#[tokio::test]
+async fn public_gcounter_submission_rejects_closed_queue_before_persistence() {
+    let store = temp_store();
+    let manager = SyncManager::new(
+        NodeId::generate(),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    );
+    let handle = manager.handle();
+    drop(manager);
+
+    assert!(
+        handle
+            .submit_gcounter_increment("counter:visits", 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .get(&durable_gcounter_state_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_gcounter_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

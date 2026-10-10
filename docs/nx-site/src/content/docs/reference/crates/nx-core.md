@@ -307,17 +307,22 @@ schema evolution in `schema.rs` and `migration.rs`.
 
 ### SyncHandle
 
-`SyncHandle` is a cheap clone of a channel endpoint into the `SyncManager`.
-It is what the host API functions hold - they push ops into the manager via the handle
-without blocking the guest.
+`SyncHandle` is a cheap clone of the local acceptance state and bounded
+broadcast endpoint owned by `SyncManager`. Its public submission method owns the
+reserve, persistence and enqueue sequence; direct Rust callers cannot access the
+queue or a persist-only mutation primitive. Host API functions use the same
+ordering internally so a full or closed queue rejects the call before storage.
 
 ```rust
-// Inside a host API function (e.g. crdt.rs):
-state.sync_handle.as_ref()
-    .ok_or(ERR_SYNC_DISABLED)?
-    .push_op(op)
-    .await?;
+let handle = state.sync_handle.as_ref().ok_or(ERR_SYNC_DISABLED)?;
+handle.submit_gcounter_increment("visits", 1).await?;
 ```
+
+Internally, successful persistence returns a crate-private `AcceptedLocalOp`;
+only that type can enter the bounded broadcast queue. The broadcast loop only
+batches and disseminates accepted operations. It has no datastore,
+deduplication registry or op-log access; a failed send leaves the flushed replay
+record available for recovery.
 
 ### CRDT read-back methods
 

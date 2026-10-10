@@ -72,7 +72,7 @@ enum LwwMapChange {
 
 /// Opaque proof that a local operation completed its state-and-replay persistence path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptedLocalOp(Op);
+pub(crate) struct AcceptedLocalOp(Op);
 
 impl AcceptedLocalOp {
     fn new(op: Op) -> Self {
@@ -114,19 +114,35 @@ impl SyncHandle {
         &self.node_id
     }
 
-    /// Sender for locally accepted operations awaiting broadcast.
-    ///
-    /// Reserve capacity before starting a mutation so a full queue rejects the
-    /// attempt before persistence. Only `SyncHandle` can create the accepted
-    /// value consumed by this channel.
-    pub fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
+    pub(crate) fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
     }
 
-    /// Persist and publish a local GCounter increment without enqueueing it.
+    /// Reserve delivery capacity, accept a local increment, and enqueue it for broadcast.
     ///
-    /// The returned value can be submitted through [`Self::op_sender`].
-    pub async fn increment_gcounter(
+    /// Persist-only mutation and direct queue access are intentionally unavailable
+    /// outside `nx-core`:
+    ///
+    /// ```compile_fail
+    /// fn bypass(handle: &nx_core::SyncHandle) {
+    ///     let _ = handle.op_sender();
+    ///     let _ = handle.increment_gcounter("visits", 1);
+    /// }
+    /// ```
+    pub async fn submit_gcounter_increment(&self, key: &str, delta: u64) -> anyhow::Result<()> {
+        let permit = self
+            .op_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("local operation queue is closed"))?;
+        let accepted = self.increment_gcounter(key, delta).await?;
+        permit.send(accepted);
+        self.metrics.record_ops(1);
+        Ok(())
+    }
+
+    pub(crate) async fn increment_gcounter(
         &self,
         key: &str,
         delta: u64,

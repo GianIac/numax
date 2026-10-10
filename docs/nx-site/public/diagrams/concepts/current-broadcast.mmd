@@ -5,9 +5,12 @@ sequenceDiagram
     participant Broadcast as Broadcast loop
     participant Peers as Connected peers
     Guest->>Host: CRDT update
-    Host->>Store: Persist updated CRDT state
-    Host->>Broadcast: Enqueue operation in bounded queue
-    Broadcast->>Broadcast: Drain and batch operations
-    Broadcast->>Store: Persist seen IDs and bounded op log
+    Host->>Host: Validate and reserve bounded queue space
+    Host->>Host: Create OpId and compute updated state
+    Host->>Store: Atomic state, value, seen ID, and replay op-log batch
+    Store-->>Host: Flush confirmed
+    Host->>Host: Publish state in memory
+    Host->>Broadcast: Enqueue accepted operation
+    Broadcast->>Broadcast: Drain and batch accepted operations
     Broadcast->>Peers: PushOps via nx-net to each connected peer
     Note over Broadcast,Peers: Direct broadcast now. K-fanout is planned

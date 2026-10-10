@@ -362,11 +362,10 @@ async fn restart_node(node: &mut BenchNode) -> Result<(), String> {
 }
 
 async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), ()> {
-    let permit = handle.op_sender().reserve_owned().await.map_err(|_| ())?;
-    let op = handle.increment_gcounter(key, 1).await.map_err(|_| ())?;
-    permit.send(op);
-
-    Ok(())
+    handle
+        .submit_gcounter_increment(key, 1)
+        .await
+        .map_err(|_| ())
 }
 
 async fn wait_for_full_mesh(nodes: &[BenchNode]) -> Result<(), String> {

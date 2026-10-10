@@ -217,6 +217,39 @@ and the full D1 crash model remain unverified.
 | ORSet add/remove | Creates the `OpId` before a state-and-replay batch, flushes, then publishes in memory and queues the operation. Add uses its `OpId` as the tag; remove records exactly the observed tags. Removing with no observed tags remains a successful no-op without an operation. |
 | Rga insert/delete | Insert uses its `OpId` as the element ID and checks output capacity and bounds before the state-and-replay batch. Delete creates its own `OpId` before the batch and records a tombstone even for an unknown element. Both flush before publishing in memory and queueing. The insert ID is written to guest memory after persistence, so an unexpected output write failure still gives an uncertain response; the operation has already been queued for broadcast. |
 
+#### D1 local acceptance ownership and delivery invariant
+
+`SyncHandle` is the only owner of local CRDT acceptance. Its mutation methods
+create the operation identity, commit state and replay metadata, wait for the
+covering flush, update the in-memory registries, and only then return an opaque
+`AcceptedLocalOp`. The wrapper, persist-only mutation methods and queue sender
+are crate-private: external Rust callers cannot manufacture, inspect or enqueue
+an accepted operation independently.
+
+The bounded broadcast channel carries `AcceptedLocalOp`, never a raw `Op`.
+Guest host calls reserve channel capacity before asking `SyncHandle` to persist
+the mutation. Public direct producers use a submission method that owns the
+complete reserve → persist/flush → enqueue sequence. A full or closed queue
+therefore rejects the attempt before it can create a durable operation with no
+reserved delivery slot. After acceptance, consuming the permit only transfers
+the opaque wrapper to the volatile delivery path.
+
+`broadcast_batch` owns batching and network dissemination only. Its context has
+no datastore, seen-operation registry, sequence allocator, or op-log access, and
+it performs no local persistence. A queue or network failure after acceptance
+cannot roll back the flushed replay record; recovery and later anti-entropy use
+that durable record. Tests and benchmarks must enter the queue through the same
+accepted-operation boundary and must not restore a metadata-only production
+persistence path. Test-only metadata seeders may construct historical hydration
+fixtures but are not local acceptance paths.
+
+A test-only fault injector may deliberately invoke crate-private persist-only
+acceptance and drop the resulting `AcceptedLocalOp` after the confirmed flush,
+without reserving or enqueueing it. This models loss of the volatile delivery
+path and verifies recovery from the durable replay record; it is not a supported
+production path or a relaxation of the reserve → persist/flush → enqueue
+invariant.
+
 For a state-changing local operation, the planned atomic batch must contain its
 durable CRDT state, materialized value, unique operation identity, replayable
 operation record, and the metadata needed to identify and deduplicate its

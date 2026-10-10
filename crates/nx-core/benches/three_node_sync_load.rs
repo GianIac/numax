@@ -428,14 +428,10 @@ struct ProducerResult {
 }
 
 async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), ()> {
-    let permit = timeout(SEND_TIMEOUT, handle.op_sender().reserve_owned())
+    timeout(SEND_TIMEOUT, handle.submit_gcounter_increment(key, 1))
         .await
         .map_err(|_| ())?
-        .map_err(|_| ())?;
-    let op = handle.increment_gcounter(key, 1).await.map_err(|_| ())?;
-    permit.send(op);
-
-    Ok(())
+        .map_err(|_| ())
 }
 
 async fn wait_for_full_mesh(nodes: &[BenchNode]) -> Result<(), String> {
