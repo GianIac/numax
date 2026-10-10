@@ -281,6 +281,13 @@ let keys = db::keys("user:")?;
 
 ## CRDT API
 
+A successful mutating CRDT call confirms the local state-and-replay flush, not
+receipt by another node. `ERR_INTERNAL` or an interrupted call has an unknown
+outcome; repeating it creates a new operation. The RGA insert
+`ERR_BUFFER_TOO_SMALL` path is checked before persistence and may be retried
+with a larger output buffer. See the [SDK outcome table](/numax/reference/crates/nx-sdk/#mutating-crdt-calls-and-uncertain-outcomes)
+for the guest-facing contract.
+
 CRDT functions operate on replicated state managed by the runtime sync manager.
 They require sync to be enabled; otherwise they return `ERR_SYNC_DISABLED`.
 

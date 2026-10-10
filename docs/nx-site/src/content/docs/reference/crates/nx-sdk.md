@@ -90,10 +90,28 @@ pub enum NxError {
 }
 ```
 
-The buffer-too-small retry loop is handled inside the SDK. You never see it.
-When the host writes more bytes than the current buffer holds, the SDK doubles the
-buffer and retries automatically up to a cap (`MAX_SCAN_BUFFER = 1 MiB` for scan/keys,
-`MAX_NET_BUFFER = 1 MiB` for net).
+For read calls with variable-length output, the SDK grows the output buffer and
+retries `ERR_BUFFER_TOO_SMALL` up to the wrapper's cap. The RGA insert wrapper
+also retries this code because the host rejects an undersized ID output buffer
+before accepting the insertion. Other mutating CRDT wrappers call the host once;
+they do not retry after an error.
+
+### Mutating CRDT calls and uncertain outcomes
+
+| Result seen by the module | What it establishes | What to do |
+| --- | --- | --- |
+| `Ok(())` or `Ok(id)` for RGA insert | State, operation identity, and replay metadata were flushed locally. It does not confirm receipt by another node. An ORSet remove without observed tags is a successful no-op. | Continue; check remote recovery separately if needed. |
+| `Err(NxError::ReservedKey)` or `Err(NxError::SyncDisabled)` | The host rejected the call before accepting an operation. | Correct the input or enable sync before another call. |
+| RGA insert `ERR_BUFFER_TOO_SMALL` | The host rejected the output buffer before persistence. | `rga::insert_after` grows the buffer and retries safely; if its cap is reached, it returns `NxError::BufferTooSmall`. |
+| `Err(NxError::Internal)`, another unexpected error, or an interrupted invocation | The outcome is unknown to the module. The operation may already be durable. | Do not automatically repeat the mutation as a retry. Another call has a new operation identity and can change state again. |
+
+![Local CRDT write outcomes and guest retry boundary](/numax/diagrams/peer-discovery/local-crdt-outcomes.svg)
+
+The [D1 retry contract](/numax/design/peer-discovery/#d1-retry-contract-for-existing-guest-calls)
+explains the crash and recovery boundary. The existing API has no caller-provided
+idempotency token or lookup for a lost request. Reading the current CRDT value
+may help an application reconcile its state, but it cannot prove whether one
+particular attempt was accepted.
 
 ---
 

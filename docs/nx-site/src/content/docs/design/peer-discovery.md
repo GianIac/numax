@@ -45,7 +45,7 @@ must not be mistaken for synchronized state.
 | Admitted peer | Remote node whose connection passed the configured handshake and identity policy. Admission is distinct from discovery and from a membership vote. |
 | Member | Node represented in the new, weakly consistent membership view. The exact admission and removal transitions remain open. |
 | Suspect | Member believed unreachable pending confirmation or refutation; not proof of failure. |
-| Accepted operation | A local or remote CRDT operation that has reached the chosen, documented acceptance point. (The current local host API does not yet supply the proposed atomic replay contract) |
+| Accepted operation | A CRDT operation that has reached its documented persistence boundary. Local writes now batch state and replay metadata and wait for flush; remote apply still has a separate durability contract to review. |
 | Recoverable gap | Missing accepted history for which the chosen repair source and retention contract can still supply the needed information. |
 | Unrecoverable gap | Missing required history beyond that contract. It must become visible as a recovery error. |
 | Anti-entropy | Periodic reconciliation independent of the fast gossip path. Today it pulls a bounded operation log; a future replacement requires its own contract. |
@@ -59,7 +59,7 @@ contracts.
 | Discovery publishes candidates, not authority | `crates/nx-core/src/discovery.rs` and [Discovery Contract](/numax/design/discovery-contract/). Static, bootstrap gossip, mDNS, DNS-SRV, and file sources feed a bounded coordinator. Provider snapshots, revisions, leases, overflow recovery, and shutdown ownership must remain coherent. |
 | Connection identity depends on transport policy | `crates/nx-net/src/node.rs::verify_peer_identity` rejects the local `NodeId`; secure TLS binds the claimed ID to a certificate and checks the peer allowlist. In insecure or non-TLS mode, the reported identity is unverified. A discovered address or cluster name is not proof of trust. |
 | Peer health is not SWIM membership | `crates/nx-core/src/sync_manager/peer.rs` tracks per-endpoint reconnection health. Its `Suspect` and `Dead` labels do not constitute a cluster-wide, incarnation-aware membership protocol. |
-| Local acceptance is only partially implemented | The GCounter host path creates its `OpId` before an atomic state-and-replay batch, waits for a flush, and then publishes in memory and enqueues the operation. Other local CRDT families still persist state separately from the seen ID and op-log entry written later by `sync_manager/replication.rs::broadcast_batch`. There is no common acceptance boundary across all six families. |
+| Local acceptance needs crash and retry verification | All six local CRDT families persist state, `OpId`, seen metadata, and replay in one batch and wait for flush before publishing in memory. Guest retry behavior and the process-crash model still need complete verification. |
 | Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. Preserve this error ordering when adding forwarding; verify failure behavior and flush semantics separately. |
 | The present repair path is limited | `sync_manager/replication.rs` periodically pulls a bounded op log over active connections. The maximum observed `OpId` is not a causal frontier. Current `OpId` is UUID-based (`crates/nx-sync/src/op.rs`); its lexical order cannot prove that older operations were received. |
 | Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 5; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
@@ -121,10 +121,9 @@ begins only when eligible peers become available.
 
 1. Establish an atomic local persistence boundary covering the CRDT state,
    operation identity, and replay metadata, followed by a confirmed flush
-   before the local success response. The identity must be available for the
-   atomic write; its current generation point differs by operation. Specify
-   the covered crash model and the D1 retry contract below when implementing
-   each remaining local write path.
+   before the local success response. Operation identity is now fixed before
+   this batch for all six families. Complete verification of the covered crash
+   model and the D1 retry contract below.
    Local success does not imply remote acknowledgement or survival of a lost
    storage device. Preserve the remote apply-before-publish ordering.
 2. After a newly accepted remote operation is persisted, make it eligible for
@@ -262,8 +261,24 @@ mutation must not resubmit it through the same API as a retry. Repeating the
 call requests a new operation and may apply an increment twice. Preflight
 errors such as a reserved key, disabled sync, or Rga insert's
 `ERR_BUF_TOO_SMALL` do not accept an operation when they are returned before
-persistence. These rules define the planned guest-facing
-contract; they do not claim that every local CRDT path already implements D1.
+persistence. These rules define the guest-facing contract for the current ABI;
+the process-crash and retry tests are still incomplete.
+
+| Observed result of a mutating guest call | What the caller may conclude | Next action for one logical mutation |
+| --- | --- | --- |
+| Success (`0`, or an Rga insert ID) | The local batch and its flush completed. Remote receipt is unconfirmed. An ORSet remove with no observed tags succeeds as a no-op without creating an operation. | Treat the local call as complete; use separate recovery or replication evidence for remote state. |
+| `ERR_RESERVED_KEY` / `NxError::ReservedKey` or `ERR_SYNC_DISABLED` / `NxError::SyncDisabled` | Host validation rejected the call before the batch. No operation was accepted. | Correct the key or enable sync before making a new call. |
+| Rga insert `ERR_BUF_TOO_SMALL` | The ID output capacity was rejected before the batch. No operation was accepted. The SDK may resize the buffer and repeat this call. | Let `rga::insert_after` perform its bounded buffer retry. |
+| `ERR_INTERNAL` / `NxError::Internal`, another unexpected error, or no response | The caller cannot determine whether the batch survived, even if this particular error occurred before persistence. | Do not automatically repeat the mutation as the same logical attempt. Inspect application state or recovery records where available; a new call creates a new operation. |
+
+![Local CRDT write outcomes and guest retry boundary](/numax/diagrams/peer-discovery/local-crdt-outcomes.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/peer-discovery/local-crdt-outcomes.mmd)
+
+The diagram follows what the guest can observe. `ERR_INTERNAL` covers failures
+on both sides of the batch boundary, so it cannot prove rollback. The broadcast
+queue is volatile; the flushed replay record remains the recovery source when
+the process stops before enqueueing or before the guest receives a response.
 
 After a process crash, reopening the intact store must hydrate complete
 surviving operations from durable state, operation identity, seen metadata,
