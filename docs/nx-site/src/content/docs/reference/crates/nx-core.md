@@ -324,6 +324,10 @@ batches and disseminates accepted operations. It has no datastore,
 deduplication registry or op-log access; a failed send leaves the flushed replay
 record available for recovery.
 
+The [D1 local acceptance contract](/numax/design/peer-discovery/#d1--local-acceptance-and-durability)
+defines the persistence, result, retry and failure semantics of local CRDT
+mutations.
+
 ### CRDT read-back methods
 
 After `settle_for` or `serve`, `nx-cli` can read CRDT state via `Runtime`:

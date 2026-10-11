@@ -4142,6 +4142,285 @@ fn local_crdt_process_crash_preserves_complete_batches() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_local_successes_wait_for_their_own_flush_and_recover() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let flushes_before = store.completed_flushes();
+    let mut accepted = vec![
+        handle
+            .set_lww_map("concurrent:map", "obsolete", b"remove-me".to_vec(), 1)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .add_orset("concurrent:set", "red")
+            .await
+            .unwrap()
+            .into_op(),
+    ];
+    let removable_rga = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "concurrent:rga",
+        None::<String>,
+        b"obsolete".to_vec(),
+    );
+    let removable_rga_id = removable_rga.id.as_str().to_string();
+    handle.insert_rga(removable_rga.clone()).await.unwrap();
+    accepted.push(removable_rga);
+    let flushes_before_pause = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .increment_gcounter("concurrent:counter", 1)
+            .await
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_finished(), "local success preceded its flush");
+    assert_eq!(store.completed_flushes(), flushes_before_pause);
+
+    let mut pending = Vec::new();
+    for _ in 0..7 {
+        let handle = handle.clone();
+        pending.push(tokio::spawn(async move {
+            handle.increment_gcounter("concurrent:counter", 1).await
+        }));
+    }
+    let pn_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        pn_handle.increment_pncounter("concurrent:balance", 3).await
+    }));
+    let pn_decrement_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        pn_decrement_handle
+            .decrement_pncounter("concurrent:balance", 1)
+            .await
+    }));
+    let register_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        register_handle
+            .set_lww_register("concurrent:register", b"ready".to_vec(), 7)
+            .await
+    }));
+    let map_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        map_handle
+            .set_lww_map("concurrent:map", "mode", b"ready".to_vec(), 7)
+            .await
+    }));
+    let map_remove_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        map_remove_handle
+            .remove_lww_map("concurrent:map", "obsolete", 8)
+            .await
+    }));
+    let set_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        set_handle.add_orset("concurrent:set", "blue").await
+    }));
+    let set_remove_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        set_remove_handle
+            .remove_orset("concurrent:set", "red")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected observed ORSet tags"))
+    }));
+    let rga_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        let op = Op::rga_insert_with_op_id(
+            rga_handle.node_id().clone(),
+            "concurrent:rga",
+            None::<String>,
+            b"first".to_vec(),
+        );
+        rga_handle.insert_rga(op).await
+    }));
+    let rga_delete_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        rga_delete_handle
+            .delete_rga("concurrent:rga", &removable_rga_id)
+            .await
+    }));
+
+    assert!(pending.iter().all(|task| !task.is_finished()));
+    resume_tx.send(()).unwrap();
+    accepted.push(first.await.unwrap().unwrap().into_op());
+    for task in pending {
+        accepted.push(task.await.unwrap().unwrap().into_op());
+    }
+    assert_eq!(accepted.len(), 20);
+    assert_eq!(
+        store.completed_flushes() - flushes_before,
+        accepted.len() as u64,
+        "each accepted local batch must complete a flush"
+    );
+    let ids = accepted
+        .iter()
+        .map(|op| op.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), accepted.len());
+    assert_eq!(manager.get_counter_value("concurrent:counter").await, 8);
+    assert_eq!(manager.op_log.read().await.len(), accepted.len());
+    for op in &accepted {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+    let reopened = Arc::new(NxStore::open(directory.path()).unwrap());
+    let hydrated = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&reopened),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(read_materialized(&reopened, "concurrent:counter"), 8);
+    assert_eq!(
+        read_durable_gcounter_state(&reopened, "concurrent:counter").value(),
+        8
+    );
+    assert_eq!(
+        read_materialized_pncounter(&reopened, "concurrent:balance"),
+        2
+    );
+    assert_eq!(
+        read_materialized_lww_register(&reopened, "concurrent:register"),
+        b"ready"
+    );
+    assert_eq!(
+        read_materialized_lww_map(&reopened, "concurrent:map"),
+        vec![("mode".to_string(), b"ready".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_orset(&reopened, "concurrent:set"),
+        vec!["blue"]
+    );
+    assert_eq!(
+        read_materialized_rga(&reopened, "concurrent:rga"),
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(hydrated.op_log.read().await.len(), accepted.len());
+    for op in &accepted {
+        assert!(hydrated.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            reopened
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_success_during_shutdown_still_waits_for_its_flush() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let config = SyncConfig::new().with_listen_addr(free_addr());
+    let (mut manager, handle) =
+        started_manager_with_store(NodeId::new("local-node"), config, Arc::clone(&store)).await;
+    let flushes_before = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+
+    let submit_handle = handle.clone();
+    let submission = tokio::spawn(async move {
+        submit_handle
+            .submit_gcounter_increment("shutdown:counter", 1)
+            .await
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !submission.is_finished(),
+        "local success preceded its flush"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+
+    let mut shutdown_rx = manager.shutdown_tx.subscribe();
+    let shutdown = tokio::spawn(async move { manager.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*shutdown_rx.borrow());
+    assert!(
+        !submission.is_finished(),
+        "shutdown bypassed the local flush"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), submission)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    drop(handle);
+    drop(store);
+    let reopened = Arc::new(NxStore::open(directory.path()).unwrap());
+    let hydrated = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&reopened),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(read_materialized(&reopened, "shutdown:counter"), 1);
+    assert_eq!(
+        read_durable_gcounter_state(&reopened, "shutdown:counter").value(),
+        1
+    );
+    let log = hydrated.op_log.read().await;
+    assert_eq!(log.len(), 1);
+    let op_id = log[0].id.as_str();
+    assert!(hydrated.seen_ops.read().await.contains(op_id));
+    assert!(reopened.get(&seen_op_store_key(op_id)).unwrap().is_some());
+    assert!(reopened.get(&op_log_store_key(op_id)).unwrap().is_some());
+}
+
 #[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();

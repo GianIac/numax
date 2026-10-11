@@ -3,11 +3,13 @@ use std::path::Path;
 #[cfg(feature = "test-utils")]
 use std::path::PathBuf;
 #[cfg(feature = "test-utils")]
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, RwLock, RwLockWriteGuard,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(feature = "test-utils")]
+use std::sync::{Mutex, mpsc};
 
 use crate::StoreError;
 
@@ -22,6 +24,16 @@ pub struct Store {
     fail_flushes_with_disk_full: Arc<AtomicBool>,
     #[cfg(feature = "test-utils")]
     crash_checkpoint: Arc<Mutex<Option<(CrashCheckpoint, PathBuf)>>>,
+    #[cfg(feature = "test-utils")]
+    flush_pause: Arc<Mutex<Option<FlushPause>>>,
+    #[cfg(feature = "test-utils")]
+    completed_flushes: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "test-utils")]
+struct FlushPause {
+    reached: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
 }
 
 #[cfg(feature = "test-utils")]
@@ -69,6 +81,10 @@ impl Store {
             fail_flushes_with_disk_full: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-utils")]
             crash_checkpoint: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            flush_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            completed_flushes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -151,6 +167,20 @@ impl Store {
         *self.crash_checkpoint.lock().expect("test checkpoint lock") = Some((checkpoint, marker));
     }
 
+    /// Pause one flush immediately before calling sled.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn pause_next_flush(&self, reached: mpsc::Sender<()>, resume: mpsc::Receiver<()>) {
+        *self.flush_pause.lock().expect("test flush pause lock") =
+            Some(FlushPause { reached, resume });
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_flushes(&self) -> u64 {
+        self.completed_flushes.load(Ordering::Acquire)
+    }
+
     pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
         let guard = self
             .write_lock
@@ -202,7 +232,11 @@ impl Store {
             self.check_injected_flush_failure()?;
             #[cfg(feature = "test-utils")]
             self.wait_at_crash_checkpoint(CrashCheckpoint::BeforeFlush);
+            #[cfg(feature = "test-utils")]
+            self.wait_at_flush_pause();
             self.db.flush()?;
+            #[cfg(feature = "test-utils")]
+            self.completed_flushes.fetch_add(1, Ordering::Release);
             #[cfg(feature = "test-utils")]
             self.wait_at_crash_checkpoint(CrashCheckpoint::AfterFlush);
             Ok(())
@@ -231,6 +265,19 @@ impl Store {
             loop {
                 std::thread::park();
             }
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn wait_at_flush_pause(&self) {
+        let pause = self
+            .flush_pause
+            .lock()
+            .expect("test flush pause lock")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.recv();
         }
     }
 
