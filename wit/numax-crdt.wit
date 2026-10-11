@@ -1,0 +1,16 @@
+package numax:crdt@0.1.0;
+
+/// DRAFT - GCounter only, mirroring the smallest replicated-state API in the
+/// current host reference.
+///
+/// PNCounter, LWW types, ORSet, and RGA are intentionally outside this initial
+/// skeleton. A shared typed error may be preferable to `string` as the shape
+/// grows.
+interface crdt {
+    gcounter-increment: func(name: string, delta: u64) -> result<_, string>;
+    gcounter-get: func(name: string) -> result<u64, string>;
+}
+
+world numax-crdt-guest {
+    import crdt;
+}

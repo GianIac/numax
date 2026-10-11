@@ -1,0 +1,20 @@
+package numax:log@0.1.0;
+
+/// DRAFT - not connected to the runtime.
+///
+/// The current `host_log_v2` raw ABI has no log level. This draft adds one so
+/// the trade-off can be discussed against the existing host API.
+interface log {
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    log-msg: func(level: log-level, msg: string);
+}
+
+world numax-log-guest {
+    import log;
+}
