@@ -295,7 +295,7 @@ call requests a new operation and may apply an increment twice. Preflight
 errors such as a reserved key, disabled sync, or Rga insert's
 `ERR_BUF_TOO_SMALL` do not accept an operation when they are returned before
 persistence. These rules define the guest-facing contract for the current ABI;
-the process-crash and retry tests are still incomplete.
+caller-level reconciliation after a lost response remains unspecified.
 
 | Observed result of a mutating guest call | What the caller may conclude | Next action for one logical mutation |
 | --- | --- | --- |
@@ -303,6 +303,17 @@ the process-crash and retry tests are still incomplete.
 | `ERR_RESERVED_KEY` / `NxError::ReservedKey` or `ERR_SYNC_DISABLED` / `NxError::SyncDisabled` | Host validation rejected the call before the batch. No operation was accepted. | Correct the key or enable sync before making a new call. |
 | Rga insert `ERR_BUF_TOO_SMALL` | The ID output capacity was rejected before the batch. No operation was accepted. The SDK may resize the buffer and repeat this call. | Let `rga::insert_after` perform its bounded buffer retry. |
 | `ERR_INTERNAL` / `NxError::Internal`, another unexpected error, or no response | The caller cannot determine whether the batch survived, even if this particular error occurred before persistence. | Do not automatically repeat the mutation as the same logical attempt. Inspect application state or recovery records where available; a new call creates a new operation. |
+
+SDK tests use controlled FFI responses for all ten mutating wrappers: each
+returns `ERR_INTERNAL` or an unexpected negative code after exactly one host
+call. Rga insert alone repeats after `ERR_BUF_TOO_SMALL`, growing its output
+buffer before stopping on a subsequent uncertain error. The host's separate
+buffer-preflight test verifies that `ERR_BUF_TOO_SMALL` creates no operation.
+Runtime tests use a Wasm guest that traps after an accepted host call for each
+mutation. Exactly one new replay identity remains; a second, explicit guest
+invocation creates a distinct identity. The trap models a lost guest response
+after acceptance, not a process crash. The SDK FFI tests do not exercise a
+real Wasm guest, and the runtime trap test calls the host ABI directly.
 
 ![Local CRDT write outcomes and guest retry boundary](/numax/diagrams/peer-discovery/local-crdt-outcomes.svg)
 
@@ -331,9 +342,10 @@ reports as `NxError::Internal`. Therefore it cannot tell the caller which
 attempts were definitely rejected before persistence. No new error code is
 selected here. Tests must cover failure before the batch, flush failure,
 restart after an uncertain outcome, interruption after flush before the
-response, and Rga insert's output buffer paths. They must show that the runtime
-does not silently issue a replacement `OpId` for the same attempt. The full
-guest retry contract and process crash model remain unverified.
+response, and Rga insert's output buffer paths. The covered wrapper and guest
+tests show no automatic replacement `OpId` for these attempts. Caller-level
+reconciliation of a lost request and the broader process crash model remain
+unverified.
 
 Guest-level Rga tests now exercise the output boundary: an insufficient
 capacity or out-of-bounds output range rejects the call without state or

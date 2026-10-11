@@ -816,6 +816,166 @@ mod tests {
         .into_bytes()
     }
 
+    fn crdt_mutation_guest(case: &str, trap_after_call: bool) -> Vec<u8> {
+        let (import, parameters, arguments) = match case {
+            "gcounter_inc" => (
+                "crdt_gcounter_inc",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "pncounter_inc" => (
+                "crdt_pncounter_inc",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "pncounter_dec" => (
+                "crdt_pncounter_dec",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "lww_set" => (
+                "crdt_lww_set",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 64) (i32.const 5)",
+            ),
+            "lww_map_set" => (
+                "crdt_lww_map_set",
+                "i32 i32 i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4) (i32.const 64) (i32.const 5)",
+            ),
+            "lww_map_remove" => (
+                "crdt_lww_map_remove",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "orset_add" => (
+                "crdt_orset_add",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "orset_remove" => (
+                "crdt_orset_remove",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "rga_insert" => (
+                "crdt_rga_insert",
+                "i32 i32 i32 i32 i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 0) (i32.const 0) (i32.const 64) (i32.const 5) (i32.const 128) (i32.const 64)",
+            ),
+            "rga_delete" => (
+                "crdt_rga_delete",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 96) (i32.const 7)",
+            ),
+            _ => panic!("unknown CRDT mutation case: {case}"),
+        };
+        let trap = if trap_after_call { "unreachable" } else { "" };
+        format!(
+            r#"(module
+                (import "nx" "{import}" (func $mutate (param {parameters}) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "guest:crdt")
+                (data (i32.const 32) "blue")
+                (data (i32.const 64) "first")
+                (data (i32.const 96) "missing")
+                (func (export "run") (local $result i32)
+                    (local.set $result (call $mutate {arguments}))
+                    (if (i32.lt_s (local.get $result) (i32.const 0))
+                        (then unreachable))
+                    {trap}))"#
+        )
+        .into_bytes()
+    }
+
+    fn replay_ids(runtime: &Runtime) -> std::collections::HashSet<Vec<u8>> {
+        runtime
+            .store
+            .scan_prefix(b"__nx/crdt/op-log/")
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.strip_prefix(b"__nx/crdt/op-log/").unwrap().to_vec())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn guest_trap_does_not_retry_crdt_mutations_and_explicit_calls_get_new_ids() {
+        for case in [
+            "gcounter_inc",
+            "pncounter_inc",
+            "pncounter_dec",
+            "lww_set",
+            "lww_map_set",
+            "lww_map_remove",
+            "orset_add",
+            "orset_remove",
+            "rga_insert",
+            "rga_delete",
+        ] {
+            let runtime = Runtime::new(RuntimeConfig {
+                datastore_path: temp_datastore_path("numax-crdt-guest-interrupted-response"),
+                enable_wasi: false,
+                sync: Some(
+                    SyncConfig::new()
+                        .with_listen_addr("127.0.0.1:0")
+                        .with_queued_ops_limit(4),
+                ),
+                ..RuntimeConfig::default()
+            })
+            .unwrap();
+
+            if case == "orset_remove" {
+                runtime
+                    .run_module(&crdt_mutation_guest("orset_add", false))
+                    .await
+                    .unwrap();
+            }
+            let before = replay_ids(&runtime);
+            assert!(
+                runtime
+                    .run_module(&crdt_mutation_guest(case, true))
+                    .await
+                    .is_err(),
+                "{case}: guest response should be interrupted"
+            );
+            let after_trap = replay_ids(&runtime);
+            assert_eq!(after_trap.len(), before.len() + 1, "{case}: first call");
+            let first_id = after_trap.difference(&before).next().unwrap().clone();
+
+            if case == "orset_remove" {
+                runtime
+                    .run_module(&crdt_mutation_guest("orset_add", false))
+                    .await
+                    .unwrap();
+            }
+            let before_second_call = replay_ids(&runtime);
+            runtime
+                .run_module(&crdt_mutation_guest(case, false))
+                .await
+                .unwrap();
+            let after_second_call = replay_ids(&runtime);
+            assert_eq!(
+                after_second_call.len(),
+                before_second_call.len() + 1,
+                "{case}: explicit second call"
+            );
+            let second_id = after_second_call
+                .difference(&before_second_call)
+                .next()
+                .unwrap();
+            assert_ne!(second_id, &first_id, "{case}: operation identity");
+            assert_eq!(
+                runtime
+                    .store
+                    .scan_prefix(b"__nx/crdt/seen-op/")
+                    .unwrap()
+                    .len(),
+                after_second_call.len(),
+                "{case}: seen metadata"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn orset_remove_noop_succeeds_when_broadcast_queue_is_full() {
         let runtime = Runtime::new(RuntimeConfig {
