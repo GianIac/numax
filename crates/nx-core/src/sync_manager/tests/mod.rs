@@ -3778,23 +3778,27 @@ async fn local_batches_recover_all_families_without_volatile_enqueue() {
     }
 }
 
-const CRASH_TEST_FAMILIES: [&str; 6] = [
+const CRASH_TEST_CASES: [&str; 10] = [
     "gcounter",
     "pncounter",
+    "pncounter_increment",
     "lww_register",
     "lww_map",
+    "lww_map_remove",
     "orset",
+    "orset_remove",
     "rga",
+    "rga_delete",
 ];
 
-fn crash_test_keys(family: &str) -> (Vec<u8>, Vec<u8>) {
+fn crash_test_keys(case: &str) -> (Vec<u8>, Vec<u8>) {
     let key = "crash:local";
-    match family {
+    match case {
         "gcounter" => (
             durable_gcounter_state_key(key),
             materialized_gcounter_key(key),
         ),
-        "pncounter" => (
+        "pncounter" | "pncounter_increment" => (
             durable_pncounter_state_key(key),
             materialized_pncounter_key(key),
         ),
@@ -3802,13 +3806,13 @@ fn crash_test_keys(family: &str) -> (Vec<u8>, Vec<u8>) {
             durable_lww_register_state_key(key),
             materialized_lww_register_key(key),
         ),
-        "lww_map" => (
+        "lww_map" | "lww_map_remove" => (
             durable_lww_map_state_key(key),
             materialized_lww_map_key(key),
         ),
-        "orset" => (durable_orset_state_key(key), materialized_orset_key(key)),
-        "rga" => (durable_rga_state_key(key), materialized_rga_key(key)),
-        _ => panic!("unknown crash test family: {family}"),
+        "orset" | "orset_remove" => (durable_orset_state_key(key), materialized_orset_key(key)),
+        "rga" | "rga_delete" => (durable_rga_state_key(key), materialized_rga_key(key)),
+        _ => panic!("unknown crash test case: {case}"),
     }
 }
 
@@ -3837,14 +3841,42 @@ async fn local_crdt_crash_child() {
     )
     .unwrap();
     let handle = manager.handle();
-    store.inject_crash_checkpoint(checkpoint, marker.into());
     let key = "crash:local";
+    let inserted_id = match family.as_str() {
+        "lww_map_remove" => {
+            handle
+                .set_lww_map(key, "mode", b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+            None
+        }
+        "orset_remove" => {
+            handle.add_orset(key, "blue").await.unwrap();
+            None
+        }
+        "rga_delete" => {
+            let op = Op::rga_insert_with_op_id(
+                handle.node_id().clone(),
+                key,
+                None::<String>,
+                b"first".to_vec(),
+            );
+            let id = op.id.as_str().to_string();
+            handle.insert_rga(op).await.unwrap();
+            Some(id)
+        }
+        _ => None,
+    };
+    store.inject_crash_checkpoint(checkpoint, marker.into());
     match family.as_str() {
         "gcounter" => {
             handle.increment_gcounter(key, 3).await.unwrap();
         }
         "pncounter" => {
             handle.decrement_pncounter(key, 3).await.unwrap();
+        }
+        "pncounter_increment" => {
+            handle.increment_pncounter(key, 3).await.unwrap();
         }
         "lww_register" => {
             handle
@@ -3858,8 +3890,14 @@ async fn local_crdt_crash_child() {
                 .await
                 .unwrap();
         }
+        "lww_map_remove" => {
+            handle.remove_lww_map(key, "mode", 8).await.unwrap();
+        }
         "orset" => {
             handle.add_orset(key, "blue").await.unwrap();
+        }
+        "orset_remove" => {
+            handle.remove_orset(key, "blue").await.unwrap().unwrap();
         }
         "rga" => {
             let op = Op::rga_insert_with_op_id(
@@ -3870,6 +3908,12 @@ async fn local_crdt_crash_child() {
             );
             handle.insert_rga(op).await.unwrap();
         }
+        "rga_delete" => {
+            handle
+                .delete_rga(key, inserted_id.as_deref().unwrap())
+                .await
+                .unwrap();
+        }
         _ => panic!("unknown crash test family: {family}"),
     }
     panic!("mutation passed an armed crash checkpoint");
@@ -3879,7 +3923,7 @@ async fn local_crdt_crash_child() {
 fn local_crdt_process_crash_preserves_complete_batches() {
     use std::process::Command;
 
-    for family in CRASH_TEST_FAMILIES {
+    for family in CRASH_TEST_CASES {
         for checkpoint in ["before_batch", "before_flush", "after_flush"] {
             let directory = tempfile::tempdir().unwrap();
             let store_path = directory.path().join("store");
@@ -3918,21 +3962,29 @@ fn local_crdt_process_crash_preserves_complete_batches() {
             let materialized = store.get(&materialized_key).unwrap();
             let seen = store.scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes()).unwrap();
             let replay = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
-            let survived = state.is_some();
+            let baseline_count = usize::from(matches!(
+                family,
+                "lww_map_remove" | "orset_remove" | "rga_delete"
+            ));
+            assert!(
+                replay.len() == baseline_count || replay.len() == baseline_count + 1,
+                "{family}/{checkpoint}: replay count"
+            );
+            let survived = replay.len() == baseline_count + 1;
             assert_eq!(
                 materialized.is_some(),
-                survived,
+                baseline_count != 0 || survived,
                 "{family}/{checkpoint}: materialized"
             );
             assert_eq!(
-                seen.len(),
-                usize::from(survived),
-                "{family}/{checkpoint}: seen"
+                state.is_some(),
+                baseline_count != 0 || survived,
+                "{family}/{checkpoint}: state"
             );
             assert_eq!(
-                replay.len(),
-                usize::from(survived),
-                "{family}/{checkpoint}: replay"
+                seen.len(),
+                baseline_count + usize::from(survived),
+                "{family}/{checkpoint}: seen"
             );
             if checkpoint == "before_batch" {
                 assert!(!survived, "{family}: operation appeared before batch");
@@ -3950,10 +4002,10 @@ fn local_crdt_process_crash_preserves_complete_batches() {
             let log = manager.op_log.blocking_read();
             assert_eq!(
                 log.len(),
-                usize::from(survived),
+                baseline_count + usize::from(survived),
                 "{family}/{checkpoint}: hydrated log"
             );
-            if let Some(op) = log.first() {
+            for op in log.iter() {
                 assert!(manager.seen_ops.blocking_read().contains(op.id.as_str()));
                 assert!(
                     store
@@ -3968,6 +4020,32 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                         .is_some()
                 );
             }
+            if survived {
+                let mutation = &log[baseline_count];
+                match family {
+                    "pncounter_increment" => assert!(matches!(
+                        mutation.kind,
+                        OpKind::PNCounterIncrement { increment: 3, .. }
+                    )),
+                    "lww_map_remove" => assert!(matches!(
+                        mutation.kind,
+                        OpKind::LwwMapRemove {
+                            timestamp_ms: 8,
+                            ..
+                        }
+                    )),
+                    "orset_remove" => assert!(matches!(
+                        &mutation.kind,
+                        OpKind::ORSetRemove { observed_tags, .. }
+                            if observed_tags == &[log[0].id.as_str().to_string()]
+                    )),
+                    "rga_delete" => assert!(matches!(
+                        &mutation.kind,
+                        OpKind::RgaDelete { id, .. } if id == log[0].id.as_str()
+                    )),
+                    _ => {}
+                }
+            }
             drop(log);
             if survived {
                 let key = "crash:local";
@@ -3979,6 +4057,10 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                     "pncounter" => {
                         assert_eq!(read_materialized_pncounter(&store, key), -3);
                         assert_eq!(read_durable_pncounter_state(&store, key).value(), -3);
+                    }
+                    "pncounter_increment" => {
+                        assert_eq!(read_materialized_pncounter(&store, key), 3);
+                        assert_eq!(read_durable_pncounter_state(&store, key).value(), 3);
                     }
                     "lww_register" => {
                         assert_eq!(read_materialized_lww_register(&store, key), b"ready");
@@ -3997,6 +4079,13 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                             vec![("mode".into(), b"ready".to_vec())]
                         );
                     }
+                    "lww_map_remove" => {
+                        assert!(read_materialized_lww_map(&store, key).is_empty());
+                        let state = read_durable_lww_map_state(&store, key);
+                        let entry = state.entry("mode").unwrap();
+                        assert!(!entry.is_visible());
+                        assert_eq!(entry.timestamp_ms(), 8);
+                    }
                     "orset" => {
                         assert_eq!(read_materialized_orset(&store, key), vec!["blue"]);
                         let op = &manager.op_log.blocking_read()[0];
@@ -4005,12 +4094,46 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                             vec![op.id.as_str().to_string()]
                         );
                     }
+                    "orset_remove" => {
+                        assert!(read_materialized_orset(&store, key).is_empty());
+                        assert!(!read_durable_orset_state(&store, key).contains("blue"));
+                    }
                     "rga" => {
                         assert_eq!(read_materialized_rga(&store, key), vec![b"first".to_vec()]);
                         assert_eq!(
                             read_durable_rga_state(&store, key).values(),
                             vec![b"first".to_vec()]
                         );
+                    }
+                    "rga_delete" => {
+                        assert!(read_materialized_rga(&store, key).is_empty());
+                        let inserted_id = manager.op_log.blocking_read()[0].id.as_str().to_string();
+                        let state = read_durable_rga_state(&store, key);
+                        assert_eq!(state.ordered_ids(), vec![inserted_id.clone()]);
+                        assert!(!state.contains(&inserted_id));
+                    }
+                    _ => unreachable!(),
+                }
+            } else if baseline_count != 0 {
+                let key = "crash:local";
+                match family {
+                    "lww_map_remove" => {
+                        let visible = vec![("mode".into(), b"ready".to_vec())];
+                        assert_eq!(read_materialized_lww_map(&store, key), visible);
+                        assert_eq!(read_durable_lww_map_state(&store, key).entries(), visible);
+                    }
+                    "orset_remove" => {
+                        assert_eq!(read_materialized_orset(&store, key), vec!["blue"]);
+                        let inserted_id = manager.op_log.blocking_read()[0].id.as_str().to_string();
+                        assert_eq!(
+                            read_durable_orset_state(&store, key).observed_tags("blue"),
+                            vec![inserted_id]
+                        );
+                    }
+                    "rga_delete" => {
+                        let visible = vec![b"first".to_vec()];
+                        assert_eq!(read_materialized_rga(&store, key), visible);
+                        assert_eq!(read_durable_rga_state(&store, key).values(), visible);
                     }
                     _ => unreachable!(),
                 }
