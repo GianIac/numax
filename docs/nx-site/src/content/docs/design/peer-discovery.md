@@ -338,21 +338,177 @@ isolation for direct internal reads of reserved storage keys.
 
 ### D2 — Identity, missing history, and duplicates
 
-Keep a unique operation ID and add a logical position consisting of origin,
-restart generation, and a monotonically increasing per-origin sequence. A
-receiver tracks the highest **contiguous** sequence for each origin/generation
-and records later arrivals as holes. Receiving sequence 43 after 41 does not
-advance the contiguous frontier past 41: sequence 42 must be requested or
-reconciled. The maximum UUID or maximum received sequence is not proof of
-complete history.
+**Proposed contract; not yet implemented.** Keep the UUID `OpId` as the unique
+operation identity and add a
+logical position `(origin, generation, sequence)`. The sequence should be
+monotonic per origin across process restarts; generation identifies the
+origin's process incarnation and increases durably at each start. Do not reset
+the sequence at a restart. This keeps one contiguous history per origin and
+avoids needing a separate end-of-generation marker to prove where an earlier
+generation stopped.
 
-An operation already accepted with the same identity must not be applied or
-forwarded again. Sequence allocation and replay metadata belong to D1's atomic
-boundary so a crash cannot leave a successful state update without its place in
-history. Out-of-order delivery, delayed duplicates, retention expiry, and
-restart must be checked for each CRDT family. The exact wire/storage fields,
-generation allocation, hole limits, and migration of historical UUID-only
-operations remain to be designed before implementation.
+#### Recommended allocation and persistence
+
+- Persist the origin identity with its local generation metadata. On startup,
+  increment the generation and confirm its flush before accepting writes. If
+  the store is already bound to a different `NodeId`, fail closed rather than
+  silently restarting the sequence under another identity.
+- Allocate the next per-origin sequence while holding the existing local
+  mutation locks. Persist the sequence high-water mark, operation identity,
+  CRDT state, materialized value, seen metadata, and replay record in D1's
+  atomic batch. A failed or uncertain write must never cause the same sequence
+  to be assigned to a different surviving operation after restart.
+- For a newly received sequenced operation, persist its position and receiver
+  tracking state in the same atomic batch as the CRDT update, seen metadata,
+  and replay record, before publishing in memory. Do not describe this remote
+  batch as flush-confirmed unless its path also waits for a flush.
+- Keep `OpId` separate from the logical position: UUID identity remains useful
+  for legacy identification and diagnostics, while the position establishes ordering
+  and duplicate safety after the bounded `seen-op` cache evicts an ID.
+
+The proposed store binding, generation, local sequence, received frontier, and
+sparse positions need versioned schema records. Any sequence metadata carried
+over the network changes wire semantics and requires a protocol version change
+under [Wire Versioning](/numax/design/wire-versioning/).
+
+#### Recommended receiver behavior
+
+For each origin, track the highest **contiguous** sequence and a bounded set of
+received positions beyond it. Starting from sequence 0, if sequence 2 arrives
+first, retain it as sparse and leave the contiguous frontier at 0. Receiving
+sequence 1 then advances the frontier through 2. Never infer completeness from
+the largest received sequence or UUID.
+
+For a position still retained in the sparse set, the same generation and
+`OpId` identify a duplicate. A different generation or `OpId` at that retained
+`(origin, sequence)` is an identity conflict: reject it without changing state.
+At or below the contiguous frontier, suppress the operation without applying
+or forwarding it. **A compacted frontier proves that a position is covered,
+not which UUID or generation occupied every historical position.** Do not
+promise exact conflict detection after those identities have been discarded.
+
+Bound both the number of sparse positions per origin and their distance from
+the contiguous frontier. **If either limit is exceeded, reject the new
+operation before changing CRDT state and expose the unresolved gap**; silently
+evicting sparse positions would make later duplicate handling unsafe.
+
+Also bound the total number of tracked origins, aggregate sparse entries, and
+resident and persisted tracking bytes. Keep durable contiguous frontiers when
+replay entries expire or members leave; removing a cache entry must not erase
+the protection against old operations. If an origin or metadata update cannot
+fit the global budget, reject it before applying its operations and expose the
+resource limit. Never evict a durable frontier merely to admit another origin.
+Paging durable metadata into memory is allowed only if duplicate checks still
+consult its authoritative record before application.
+
+Calibrate numerical limits from the configured resource budget and tests before
+integration. Sequence and generation exhaustion and corrupt tracking metadata
+must fail closed. Sequence 0 is a frontier sentinel, not a valid operation.
+
+#### Missing-operation detection and bounded progress
+
+A gap between received operations does not reveal a lost final operation. For
+example, after receiving sequence 1, a node cannot know that accepted sequence
+2 was lost if the producer stops writing. **Periodically exchange bounded,
+paginated per-origin history summaries independently of new writes.** A summary
+advertises the highest sequence the sender knows to exist, distinguishing the
+origin's flush-confirmed local acceptance from a relay's observed history. A
+relay's observed maximum does not certify a durable copy on that relay.
+
+Compare the advertised high-water mark with the receiver's contiguous frontier
+and sparse positions to identify missing ranges, including a missing suffix.
+Never advance the receiver's frontier from an advertisement. It advances only
+when the corresponding operations and tracking metadata have been persisted
+together, or when a future D3 state-transfer contract establishes an equivalent
+baseline. A matching frontier certifies coverage only through that advertised
+sequence, not global or instantaneous cluster convergence. Without contact
+with a source or relay that knows about a lost operation, its existence cannot
+be detected by this exchange.
+
+Budget summary entries and bytes, range requests, replay bytes, and retries
+per cycle; retain pagination progress so each tracked origin is eventually
+visited while communication continues. Numeric maxima do not demonstrate
+that every requested replay record remains available. A source must check the
+actual requested interval and report unavailable history instead of treating
+an empty or partial response as complete recovery.
+
+When a far-ahead operation exceeds the gap-distance or sparse-entry budget,
+leave it unapplied, record the bounded recovery target, and request the earliest
+missing range first. Bounded replay pages must allow that frontier to advance
+without requiring acceptance of the rejected far-ahead operation first. If
+retained history cannot close the gap, expose a recovery failure or the need
+for D3 state transfer. Global origin-budget exhaustion likewise remains an
+explicit resource failure; it must not be presented as synchronized state.
+
+Continue to apply valid out-of-order CRDT operations after their identity and
+bounded tracking metadata can be persisted. This matches the current
+operation-based apply path, but it is conditional on tests proving convergence
+for all six families, especially ORSet observed removals and RGA parent/delete
+reordering. If a family does not preserve its specified merge behavior under
+these orders, buffer the causally dependent operation for that family or revise
+the operation contract before enabling sequenced replication.
+
+#### Legacy history and recovery boundary
+
+Existing operations contain only UUID identity, and the old replay log is
+bounded. Do not manufacture historical origin sequences from UUID order or
+local op-log order. Preserve those records as explicitly unsequenced legacy
+operations for migration and inspection, together with the existing CRDT state.
+**Do not automatically apply or forward legacy operation replay over the new
+replication path.** An old ID missing from the bounded seen cache does not
+prove that its operation was never applied; replaying a counter increment can
+otherwise apply its effect twice. Reject unsupported legacy replay before
+changing state and expose the need for baseline recovery.
+
+Remote recovery of legacy state requires D3's verified state-transfer and
+baseline contract, or an explicit unsupported/unrecoverable result while that
+path is unavailable. A new sequenced frontier never certifies coverage of
+legacy history. The implementation must preserve pre-migration local values
+and prevent automatic legacy op-log replay; merely tagging an operation as
+legacy is insufficient. Keep historical fixtures unchanged and test migration
+using copied fixtures.
+
+The current protocol requires exact version equality. A wire version that
+requires sequence metadata therefore rejects v0.1.5 peers before CRDT exchange;
+deployment and tests must account for the resulting mixed-version disconnects.
+Do not claim lossless recovery of legacy history or across expired retention.
+
+#### D2 acceptance tests
+
+Use the same deterministic tracker in production and tests. Cover, in order:
+
+1. In-order delivery and sparse arrivals, such as `2, 1`, with frontier and
+   sparse set asserted after each event.
+2. Delayed duplicates before and after the contiguous frontier advances,
+   including after restart and after bounded `seen-op` eviction; verify no
+   second CRDT effect or duplicate forwarding.
+3. Conflicting operation IDs or generations at a retained sparse position;
+   verify rejection and unchanged durable and materialized state. After prefix
+   compaction and identity eviction, verify suppression without promising exact
+   historical conflict classification.
+4. Per-origin sparse-count and gap-distance limits, total origin and aggregate
+   metadata budgets; verify bounded resources, rejected application, durable
+   frontier preservation, and a visible unresolved-gap or resource failure.
+5. Crashes before and after the atomic local and remote persistence batches;
+   after restart, state, position, frontier, sparse entries, seen metadata, and
+   replay records must agree.
+6. Every CRDT family under reordered dependencies, followed by convergence to
+   the same state as a valid in-order delivery.
+7. UUID-only historical fixture migration; preserve existing values, suppress
+   automatic legacy replay, reject unsupported incoming legacy operations even
+   after old seen-ID eviction, and never advance a frontier from legacy history.
+8. Lose the last accepted operation, stop new writes, and verify detection
+   through periodic summaries followed by recovery when history is available.
+   Cover a relayed summary and temporary disconnection without claiming unseen
+   operations are detectable before a knowledgeable source becomes reachable.
+9. Reject a far-ahead operation at the gap limit, then close the gap through
+   bounded replay pages from the earliest missing sequence. Test unavailable
+   intervals and partial responses without false completion.
+10. Paginate summaries over more origins than fit one cycle; verify eventual
+    visitation and that maxima never advance the receiver's contiguous frontier.
+
+The on-wire representation, exact schema versions, gap-limit values, migration
+command, and status/API surface remain open for review before implementation.
 
 ### D3 — Recovery and state transfer
 
