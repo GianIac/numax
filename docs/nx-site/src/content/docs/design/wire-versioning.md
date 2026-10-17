@@ -165,12 +165,34 @@ version `4`/`5` clusters wire-compatible.
 
 JSON and Bincode round trips cover the complete private version `5` message set.
 Bincode golden hashes and direct public/private byte comparisons protect every
-legacy public variant, while exact-version and multiprocess compatibility coverage
-uses the previous `v0.1.4` binary to verify safe rejection at the normal
-handshake boundary.
+legacy public variant. They preserve encoding references; they do not grant
+mixed-version admission.
 
-CI resolves the previous binary's source from the explicit
-`refs/tags/v0.1.4` reference and verifies its peeled commit is
-`419d840e2afe780e7ad1f4135e39e9b38a4f30b1` before building it. A branch with the
-same short name is not an acceptable substitute. This test checks rejection,
-not mixed-version replication or unrestricted recovery after history expiry.
+## Development protocol 7 validation and deployment
+
+Unit handshake tests cover incoming `Hello` and outgoing `HelloAck` rejection
+for versions 5, 6 and 8 in both JSON and Bincode. They assert the version error,
+closed socket, zero admitted peers and absence of connection/CRDT events.
+History codec tests cover every protocol-7 message variant in both formats,
+with frozen SHA-256 references for complete frames as well as round trips.
+
+The real-process compatibility test is
+`different_protocol_versions_reject_connection_without_exchanging_ops` in
+`crates/nx-cli/tests/multiprocess_smoke.rs`. It runs both JSON and Bincode,
+checks the protocol-5/protocol-7 mismatch and separate local counter values,
+then checks explicit store migration, preserved values plus a new write, and
+old-runtime downgrade rejection followed by a successful reopen and new write
+on the protected store. Unit admission assertions complement the
+real-process data-isolation assertions; no single counter check alone proves
+absence of peer registration.
+
+CI builds the previous binary from `refs/tags/v0.1.5` and verifies its peeled
+commit is `471a2281d0ffc8b7a3c20550320854812b8af726`. A similarly named branch
+is not a substitute. The older v0.1.4 codec fixtures remain frozen references.
+
+Exact matching interrupts replication between old and upgraded nodes during
+deployment. Persisted-data migration does not translate wire traffic or provide
+mixed-version rolling replication. See [Schema Versioning](/numax/design/schema-versioning/)
+for offline upgrade, downgrade protection and the historical baseline boundary.
+Future state-transfer or membership wire additions must follow the same version
+procedure; protocol 7 does not implicitly reserve a compatible transfer format.

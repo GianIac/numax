@@ -28,7 +28,10 @@ pub struct Op {
 }
 ```
 
-Each operation has a globally unique `OpId`, the node that produced it, and the CRDT change itself. Peers use `OpId` to deduplicate messages they have already seen.
+Each operation has a globally unique `OpId`, its origin and the CRDT change.
+The v0.1.6 development replication envelope also carries a durable generation
+and per-origin sequence. Receipt tracking suppresses delayed duplicates after
+the bounded UUID cache expires; the largest UUID is not a completeness frontier.
 
 ---
 
@@ -52,6 +55,9 @@ connected peers.
 
 [Mermaid source for this diagram](/numax/diagrams/concepts/current-broadcast.mmd)
 
+The direct-broadcast topology remains current; the diagram's `PushOps` label
+predates the development protocol-7 `History::Push` envelope.
+
 This is not SWIM and it is not K-fanout yet. It is a full broadcast to connected peers, bounded by `max_peers`, with batching and backpressure through the operation queue.
 
 ---
@@ -64,18 +70,20 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 |---|---|
 | `Hello` | Start the handshake, declare node id, protocol version and supported serialization formats. |
 | `HelloAck` | Accept the handshake and choose the serialization format. |
-| `PushOps` | Send one or more CRDT operations to a peer. |
+| `PushOps` | Legacy public codec; unsequenced replay is rejected by the development sync path. |
 | `PushOpsAck` | Acknowledgement message for received operations. The current sync path does not rely on it as a causal frontier. |
-| `PullSince` | Ask a peer for retained operations. Today this is usually sent with `None`. |
+| `PullSince` | Legacy public codec; development replication uses sequenced history requests instead. |
 | `Ping` / `Pong` | Keepalive message types. A received `Ping` is answered with `Pong`. |
 | `Error` | Structured wire error sent before rejecting a request or closing a connection. |
 | `BootstrapHello` | Start a one-shot authenticated bootstrap request with cluster, advertisement and result limit. |
 | `BootstrapAck` | Return the seed identity, matching cluster, negotiated format, bounded endpoint suggestions and their lease. |
+| `History` | Private protocol-7 envelope for sequenced pushes, paginated summaries, correlated range requests/replay and unavailable-history responses. |
 
-The protocol version is currently `5`. Peers negotiate either `Bincode` or
-`Json`, with `Bincode` as the production default and `Json` available for
-debug-style interoperability. Version `5` is deliberately incompatible with
-the version `4` wire contract from Numax `v0.1.4`.
+The v0.1.6 development protocol is `7`; the released v0.1.5 protocol is `5`.
+Peers require equal versions before negotiating `Bincode` (implemented with
+`wincode`) or `Json`. Preserving legacy codec bytes does not make protocol-5
+peers compatible with protocol 7. See [Wire Versioning](/numax/design/wire-versioning/)
+for rejection tests and deployment implications.
 
 ---
 
@@ -155,9 +163,12 @@ socket time and concurrent client queries are all bounded.
 
 ## Broadcast path
 
-Local CRDT writes are applied locally first. Then the corresponding operation is queued for network propagation.
-
-The broadcast loop drains that queue, groups operations into batches, records them in the seen-op and op-log metadata, and sends a `PushOps` message through `nx-net`.
+In the v0.1.6 development checkout, local success follows an atomic batch of
+CRDT state, materialized value, UUID, seen/replay metadata and sequence position,
+then a covering flush. Only then does the operation become eligible for network
+propagation. The broadcast loop drains the bounded queue and sends sequenced
+`History::Push` batches through `nx-net`; local success is not a remote ACK.
+See the [acceptance contract](/numax/design/peer-discovery/#d1--local-acceptance-and-durability).
 
 The important boundaries are:
 
@@ -177,22 +188,32 @@ If a peer is disconnected, it does not receive the immediate push. That is why a
 
 Anti-entropy is the repair loop.
 
-Every `anti_entropy_interval`, a node asks each active connection for retained
-operations using `PullSince`. This cadence is independent of discovery churn;
-missed ticks are skipped rather than replayed in a burst. Candidate removal
-stops future reconnect attempts, not repair over an already admitted connection.
+The development protocol periodically exchanges bounded, paginated per-origin
+summaries with active connections. It compares known maxima against durable
+contiguous receipt prefixes and sparse positions, then requests missing ranges.
+Each request has an attempt ID and deadline; replies must match the source,
+origin and requested interval. A summary advertises known existence, not durable
+receipt or global convergence. Candidate removal stops future reconnects, not
+repair over an already admitted connection.
 
-Today the request is conservative: it asks for the bounded op-log rather than relying on a single "last seen op id" as a causal frontier. That matters because one newer operation does not prove that every older operation arrived.
+Replay is paginated and bounded in bytes. Applying an operation persists its
+state and receipt tracking together before publication. If a source lacks the
+requested history it reports that interval unavailable; this does not prove
+that every other source also lacks it.
 
-The receiving side deduplicates by `OpId`, applies only unseen operations, and persists the resulting CRDT state.
+The following diagram shows the older v0.1.5 bounded-log pull, not a trace of
+protocol-7 messages:
 
-![Current anti-entropy after a disconnect](/numax/diagrams/concepts/current-anti-entropy.svg)
+![Historical v0.1.5 anti-entropy after a disconnect](/numax/diagrams/concepts/current-anti-entropy.svg)
 
 [Mermaid source for this diagram](/numax/diagrams/concepts/current-anti-entropy.mmd)
 
-The op-log and deduplication history are bounded, so anti-entropy is a practical
-catch-up mechanism, not an infinite historical archive or state transfer.
-Rediscovery alone cannot guarantee recovery when the required history is gone.
+Migrated UUID-only history is preserved locally and excluded from automatic
+replay. Its `baseline_required` condition survives new sequenced writes and
+restart; a fresh peer cannot infer historical convergence from new frontiers.
+The [schema migration contract](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract)
+specifies this boundary. D3 state transfer and the recoverable retention window
+remain separate work; the bounded log is not an unlimited recovery archive.
 
 ---
 
@@ -230,7 +251,7 @@ The current release line does **not** yet provide:
 - K-fanout dissemination,
 - adaptive gossip rate,
 - NAT traversal,
-- causal frontier metadata for precise incremental pulls.
+- verified versioned state transfer for legacy baselines and expired history.
 
 If you see "gossip" in the current docs, distinguish bootstrap gossip — a
 bounded exchange of endpoint suggestions — from data gossip. Current CRDT

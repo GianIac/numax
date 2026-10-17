@@ -182,15 +182,14 @@ while peer discovery remains deliberately separated from authentication and auth
 **Design doc as a public RFC**:
 - [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, approved design directions and remaining specifications
 - [x] Documented failure scenarios in the RFC
-- [ ] Detailed test plan
 
 **Replication correctness prerequisites**:
 - [x] Atomic local operation persistence: create `OpId` before persistence and commit CRDT state, materialized value, seen-operation metadata and replay record in one batch.
 - [x] Flush-confirmed local acceptance: return success only after a flush covering the batch; define uncertain outcomes, retry semantics and the bounded process-crash model.
 - [x] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics ([current contract](/numax/design/peer-discovery/#acknowledgement-semantics))
 - [x] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
-- [ ] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures
-- [ ] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary
+- [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([contract and evidence](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
+- [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
 - [ ] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
 - [ ] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 

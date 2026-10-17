@@ -2671,45 +2671,62 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_peer_rejects_protocol_version_mismatch() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let accept_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = NetStream::Plain(stream);
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await.unwrap();
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await.unwrap();
-
-            let ack = Message {
-                kind: MessageKind::HelloAck {
-                    node_id: NodeId::new("old-peer"),
-                    protocol_version: PROTOCOL_VERSION - 1,
-                    selected_format: SerializationFormat::Bincode,
-                },
-            };
-            let bytes = ack.to_bytes().unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            stream.flush().await.unwrap();
-        });
-
-        let node = Node::new(
-            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
-                .with_socket_timeout(Duration::from_secs(1)),
-        );
-
-        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
-
-        assert!(matches!(
-            err,
-            NetError::Wire(WireError::ProtocolMismatch {
-                expected: PROTOCOL_VERSION,
-                got
-            }) if got == PROTOCOL_VERSION - 1
-        ));
-        accept_task.await.unwrap();
+        for version in [5, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let accept_task = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = NetStream::Plain(stream);
+                    let hello = read_message(
+                        &mut stream,
+                        DEFAULT_MAX_MESSAGE_SIZE,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(hello.kind, MessageKind::Hello { .. }));
+                    let ack = Message {
+                        kind: MessageKind::HelloAck {
+                            node_id: NodeId::new("incompatible-peer"),
+                            protocol_version: version,
+                            selected_format: format,
+                        },
+                    };
+                    stream
+                        .write_all(&ack.to_bytes_with_format(format).unwrap())
+                        .await
+                        .unwrap();
+                    stream.flush().await.unwrap();
+                    // Rejection must close the socket before any CRDT frame is sent.
+                    let mut byte = [0u8; 1];
+                    assert_eq!(
+                        timeout(Duration::from_secs(1), stream.read(&mut byte))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
+                });
+                let mut node = Node::new(
+                    NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                        .with_socket_timeout(Duration::from_secs(1)),
+                );
+                let mut events = node.take_event_receiver().unwrap();
+                let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+                assert!(matches!(
+                    err,
+                    NetError::Wire(WireError::ProtocolMismatch { expected: PROTOCOL_VERSION, got }) if got == version
+                ));
+                accept_task.await.unwrap();
+                assert_eq!(node.connected_peer_count().await, 0);
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                node.shutdown().await;
+            }
+        }
     }
 
     #[test]
@@ -2721,47 +2738,55 @@ mod tests {
 
     #[tokio::test]
     async fn incoming_rejects_protocol_version_mismatch() {
-        let mut node = Node::new(
-            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
-                .with_socket_timeout(Duration::from_secs(1)),
-        );
-        let mut events = node.take_event_receiver().unwrap();
-        let addr = node.start_listener().await.unwrap();
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let hello = Message {
-            kind: MessageKind::Hello {
-                node_id: NodeId::new("old-peer"),
-                protocol_version: PROTOCOL_VERSION - 1,
-                supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
-                preferred_format: SerializationFormat::Bincode,
-            },
-        };
-        let bytes = hello.to_bytes().unwrap();
-        stream.write_all(&bytes).await.unwrap();
-        stream.flush().await.unwrap();
-
-        let reply = read_message(
-            &mut stream,
-            DEFAULT_MAX_MESSAGE_SIZE,
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            reply.kind,
-            MessageKind::Error {
-                error: WireError::ProtocolMismatch {
-                    expected: PROTOCOL_VERSION,
-                    got
-                }
-            } if got == PROTOCOL_VERSION - 1
-        ));
-
-        let event = timeout(Duration::from_millis(200), events.recv()).await;
-        assert!(event.is_err(), "old protocol peer must not connect");
-
-        node.shutdown().await;
+        for version in [5, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let mut node = Node::new(
+                    NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                        .with_socket_timeout(Duration::from_secs(1)),
+                );
+                let mut events = node.take_event_receiver().unwrap();
+                let addr = node.start_listener().await.unwrap();
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                let hello = Message {
+                    kind: MessageKind::Hello {
+                        node_id: NodeId::new("incompatible-peer"),
+                        protocol_version: version,
+                        supported_formats: vec![format],
+                        preferred_format: format,
+                    },
+                };
+                stream
+                    .write_all(&hello.to_bytes_with_format(format).unwrap())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                let reply = read_message(
+                    &mut stream,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    reply.kind,
+                    MessageKind::Error { error: WireError::ProtocolMismatch { expected: PROTOCOL_VERSION, got } } if got == version
+                ));
+                let mut byte = [0u8; 1];
+                assert_eq!(
+                    timeout(Duration::from_secs(1), stream.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(node.connected_peer_count().await, 0);
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                node.shutdown().await;
+            }
+        }
     }
 
     #[tokio::test]

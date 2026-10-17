@@ -789,6 +789,25 @@ fn reject_previous_protocol(format: &str) {
         "unexpected downgrade result: {downgraded:?}"
     );
 
+    // Reopen with the new runtime after the rejected old writer. The guest
+    // adds exactly one increment: any old-runtime mutation would be visible
+    // as a value above two or inconsistent sequence metadata on startup.
+    let after_downgrade = Command::new(&current_nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(free_addr())
+        .arg("--datastore-path")
+        .arg(&current_data)
+        .arg("--settle-for")
+        .arg("200ms")
+        .arg("--print-gcounter")
+        .arg(COUNTER_KEY)
+        .output()
+        .expect("reopen current store after rejected downgrade");
+    assert_success(&after_downgrade, "store after rejected downgrade");
+    assert_printed_counter(&after_downgrade, "store after rejected downgrade", 2);
+
     let unmigrated = Command::new(&current_nx)
         .arg("run")
         .arg(&wasm)

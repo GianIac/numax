@@ -332,6 +332,249 @@ async fn sequenced_legacy_baseline_is_visible_and_unsequenced_replay_is_rejected
 }
 
 #[tokio::test]
+async fn migrated_v015_all_families_preserve_state_and_reject_legacy_after_eviction_and_reopen() {
+    use crate::sync_manager::{MigrationOptions, fixtures::parse_fixture, migrate_sync_schema};
+
+    let records = parse_fixture(include_str!("../fixtures/v0_1_5/records.hex"));
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    for (key, value) in &records {
+        store.set(key, value).unwrap();
+    }
+    migrate_sync_schema(&store, MigrationOptions::default()).unwrap();
+    let legacy: Vec<_> = records
+        .iter()
+        .filter(|(key, _)| key.starts_with(b"__nx/crdt/op-log/"))
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .collect();
+    assert_eq!(legacy.len(), 6);
+    for op in &legacy {
+        assert!(sequenced_op(&store, op).unwrap().is_none());
+    }
+    let config = SyncConfig::new()
+        .with_seen_ops_limit(1)
+        .with_op_log_limit(1);
+    let origin = NodeId::new("fixture-node-a");
+    let target = SyncManager::try_new(
+        origin.clone(),
+        config.clone(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let progress = target.handle().replication_progress().unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].contiguous_sequence, 0);
+    assert_eq!(progress[0].known_high_sequence, 0);
+    assert!(progress[0].baseline_required);
+    // Make real new writes so old seen IDs and replay entries are evicted.
+    // New coverage must never certify the pre-sequence baseline as recovered.
+    for _ in 0..2 {
+        target
+            .handle()
+            .increment_gcounter("new-writes", 1)
+            .await
+            .unwrap();
+    }
+    for op in &legacy {
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_none()
+        );
+    }
+    store.flush().unwrap();
+    drop(target);
+    drop(store);
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let target = SyncManager::try_new(origin, config, Arc::clone(&store), metrics()).unwrap();
+    let mut context = test_event_context(
+        Arc::clone(&target.counters),
+        Arc::clone(&target.seen_ops),
+        Arc::clone(&target.op_log),
+        Arc::clone(&store),
+        metrics(),
+        Arc::new(RwLock::new(HashMap::new())),
+    );
+    context.pncounters = Arc::clone(&target.pncounters);
+    context.lww_registers = Arc::clone(&target.lww_registers);
+    context.lww_maps = Arc::clone(&target.lww_maps);
+    context.orsets = Arc::clone(&target.orsets);
+    context.rgas = Arc::clone(&target.rgas);
+    let before = store.scan_prefix(b"").unwrap();
+    handle_node_event(
+        NodeEvent::OpsReceived {
+            from: NodeId::new("legacy-peer"),
+            ops: legacy,
+        },
+        &context,
+    )
+    .await;
+    assert_eq!(store.scan_prefix(b"").unwrap(), before);
+    assert!(
+        context
+            .metrics
+            .render_for_test(&store)
+            .contains("numax_sync_errors_total 1\n")
+    );
+    assert_eq!(target.get_counter_value("visits").await, 12);
+    assert_eq!(target.get_pncounter_value("stock").await, 6);
+    assert_eq!(
+        target.get_lww_register_value("status").await,
+        Some(b"online".to_vec())
+    );
+    assert_eq!(
+        target.get_lww_map_entries("settings").await,
+        vec![("region".to_owned(), b"eu".to_vec())]
+    );
+    assert_eq!(target.get_orset_elements("tags").await, vec!["blue"]);
+    assert_eq!(
+        target.get_rga_values("document").await,
+        vec![b"hello".to_vec()]
+    );
+    // Compare original durable AND materialized bytes, including map/set/RGA tombstones.
+    for (key, value) in &records {
+        if key.starts_with(b"__nx/crdt/")
+            && !key.starts_with(b"__nx/crdt/seen-op/")
+            && !key.starts_with(b"__nx/crdt/op-log/")
+        {
+            assert_eq!(
+                store.get(key).unwrap().as_ref(),
+                Some(value),
+                "historical key: {key:?}"
+            );
+        }
+    }
+    let progress = target.handle().replication_progress().unwrap();
+    assert_eq!(progress[0].contiguous_sequence, 2);
+    assert!(progress[0].baseline_required);
+    let (summaries, _) = summary_page(&store, None).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].baseline_required);
+    let receiver = temp_store();
+    record_summary(&receiver, &summaries[0]).unwrap();
+    let progress = replication_progress(&receiver).unwrap();
+    assert_eq!(progress[0].contiguous_sequence, 0);
+    assert_eq!(progress[0].known_high_sequence, 2);
+    assert!(progress[0].baseline_required);
+}
+
+#[tokio::test]
+async fn migrated_v015_tcp_history_advertises_baseline_and_never_replays_legacy_in_both_formats() {
+    use crate::sync_manager::{MigrationOptions, fixtures::parse_fixture, migrate_sync_schema};
+    use nx_sync::{HistoryMessage, OpId};
+
+    for format in [
+        crate::SerializationFormat::Json,
+        crate::SerializationFormat::Bincode,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(NxStore::open(directory.path()).unwrap());
+        for (key, value) in parse_fixture(include_str!("../fixtures/v0_1_5/records.hex")) {
+            store.set(&key, &value).unwrap();
+        }
+        migrate_sync_schema(&store, MigrationOptions::default()).unwrap();
+        let addr = free_addr();
+        let origin = NodeId::new("fixture-node-a");
+        let mut source = SyncManager::try_new(
+            origin.clone(),
+            SyncConfig::new()
+                .with_listen_addr(addr.clone())
+                .with_serialization_format(format),
+            Arc::clone(&store),
+            metrics(),
+        )
+        .unwrap();
+        source.start().await.unwrap();
+        assert_eq!(source.op_log.read().await.len(), 6);
+        let mut peer = Node::new(
+            NodeConfig::new(NodeId::new("fresh-peer"), "127.0.0.1:0")
+                .with_serialization_format(format),
+        );
+        let mut events = peer.take_event_receiver().unwrap();
+        peer.connect_to_peer(&addr).await.unwrap();
+        peer.send_history_to_addr(&addr, HistoryMessage::SummaryRequest { after_origin: None })
+            .await
+            .unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    NodeEvent::HistoryReceived {
+                        message: HistoryMessage::Summary { entries },
+                        ..
+                    } => break entries,
+                    NodeEvent::OpsReceived { .. }
+                    | NodeEvent::HistoryReceived {
+                        message: HistoryMessage::Push { .. } | HistoryMessage::Replay { .. },
+                        ..
+                    } => panic!("legacy operation was sent to a fresh peer"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            summary,
+            vec![HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 0,
+                baseline_required: true
+            }]
+        );
+        let request_id = OpId::new("legacy-must-not-be-renumbered");
+        peer.send_history_to_addr(
+            &addr,
+            HistoryMessage::Request {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                start: 1,
+                end: 6,
+            },
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    NodeEvent::HistoryReceived {
+                        message: message @ HistoryMessage::Unavailable { .. },
+                        ..
+                    } => break message,
+                    NodeEvent::OpsReceived { .. }
+                    | NodeEvent::HistoryReceived {
+                        message: HistoryMessage::Push { .. } | HistoryMessage::Replay { .. },
+                        ..
+                    } => panic!("legacy operation was replayed as sequenced history"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            HistoryMessage::Unavailable {
+                request_id,
+                origin,
+                start: 1,
+                end: 6
+            }
+        );
+        assert!(!store.prefix_exists(b"__nx/crdt/sequence/replay/").unwrap());
+        peer.shutdown().await;
+        source.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn sequenced_all_families_ignore_delayed_replay_after_eviction_and_restart() {
     let source_store = temp_store();
     let source = SyncManager::try_new(

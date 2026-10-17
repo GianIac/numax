@@ -338,7 +338,7 @@ isolation for direct internal reads of reserved storage keys.
 
 ### D2 — Identity, missing history, and duplicates
 
-**Implementation present; D2 acceptance validation remains incomplete.**
+**Implementation present; the D2 validation results and limits are recorded below.**
 Recovery beyond retained history remains D3.
 The UUID `OpId` remains the unique operation identity, with a logical position
 `(origin, generation, sequence)` carried by the replication envelope.
@@ -636,6 +636,51 @@ These results close D2's previously recorded validation blocker; they do not
 establish D3 recovery beyond retained history or the later 50-node membership
 and dissemination criteria.
 
+#### Wire/schema evolution and historical-data verification
+
+The compatibility matrix and offline upgrade procedure are specified in
+[Schema Versioning](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract).
+The exact-version admission and deployment contract is in
+[Wire Versioning](/numax/design/wire-versioning/#development-protocol-7-validation-and-deployment).
+
+The immutable v0.1.0 fixture remains unchanged. An additional logical fixture
+comes from the pinned v0.1.5 release crates and is reproducible independently
+of current encoders. It includes all six CRDT families, tombstones, schema
+headers, UUID-only replay and an unrelated application key. Migration tests
+check preserved bytes, record-checkpoint resumption after reopening, storage
+failures at every op-log write boundary, corrupted source records, and process
+termination around the atomic final header/checkpoint update. The sequence
+schema-1 migration also resumes after reopening with partially converted data.
+
+Manager regression tests combine migration, real seen/replay eviction and
+restart before rejecting legacy replay for all families. New sequence coverage
+must leave the baseline requirement intact. Real TCP tests verify that both
+JSON and Bincode advertise that requirement and respond with unavailable history
+instead of renumbering historical records. Frozen protocol-7 frame hashes guard
+new message layouts alongside the unchanged historical codec references.
+These tests establish preservation and safe refusal, not D3 baseline recovery.
+
+Validation on 2026-10-18, on macOS x86_64 with Rust 1.98.0:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo check --workspace --all-targets` | Pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
+| `cargo test --workspace --verbose` | 784 passed, 0 failed, 8 ignored; core: 380 passed, 2 ignored |
+| Focused `cargo test -p nx-core v015` | 6 passed, including migration process-crash and JSON/Bincode TCP tests |
+| Real-process `different_protocol_versions_reject_connection_without_exchanging_ops`, explicitly `--ignored` | Pass in 12.34 s; JSON and Bincode, migration, downgrade rejection, reopen and new write |
+| Independent v0.1.5 fixture regeneration using the release lockfile | Byte-identical; SHA-256 recorded beside the fixture |
+
+The previous CLI binary was rebuilt from sources verified against
+`refs/tags/v0.1.5` at `471a2281d0ffc8b7a3c20550320854812b8af726`.
+The v0.1.0 fixture and older codec references were not modified.
+
+The workspace's other ignored tests were not enabled by these checks. Neither
+these results nor the successful finite reopen establish mixed-version
+replication, D3 state transfer, power-loss durability, or the later 50-node and
+one-hour membership criteria.
+
 ### D3 — Recovery and state transfer
 
 Replay missing operations while their required history is retained. When that
@@ -714,11 +759,10 @@ an explicit failed recovery state, never a successful convergence result.
 ### Remaining specifications
 
 Before coding the affected behavior, document and review: an expanded OS or
-power-interruption crash model; per-origin generation allocation and bounded
-hole tracking; retention limits and state-transfer completeness; membership
+power-interruption crash model; retention limits and state-transfer completeness; membership
 state ordering and control message authentication; fanout defaults and budgets;
-manual candidate removal; and the wire/schema migration procedure. These
-details are implementation gates, not permissions to silently choose a protocol
+manual candidate removal; and wire/schema evolution for the future state-transfer
+and membership messages. These details are implementation gates, not permissions to silently choose a protocol
 or weaken the release criteria.
 
 ## Failure scenarios that define the contract

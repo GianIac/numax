@@ -1048,7 +1048,14 @@ mod tests {
         use nx_sync::{HistoryMessage, HistorySummary, OpPosition, SequencedOp};
         let origin = NodeId::new("origin");
         let operation = SequencedOp {
-            op: Op::gcounter_increment(origin.clone(), "visits", 1),
+            op: Op {
+                id: OpId::new("protocol-7-fixture-op"),
+                origin: origin.clone(),
+                kind: OpKind::GCounterIncrement {
+                    key: "visits".into(),
+                    increment: 1,
+                },
+            },
             position: OpPosition {
                 generation: 3,
                 sequence: 42,
@@ -1089,12 +1096,53 @@ mod tests {
                 end: 41,
             },
         ];
-        for message in messages {
+        // Frozen protocol-7 frame hashes (JSON, Bincode). A layout change must
+        // choose a new protocol version, not rewrite these references in place.
+        let expected_hashes = [
+            [
+                "1c7c353ae1912598d36249d976325601c485ddd10214741e686bd87cbffded93",
+                "f64fde74ad91c3530c0397928e3310b96f1a9209214e1164eaad1065e2e822f3",
+            ],
+            [
+                "bdd3175b887915adadf94e86a22bb4a80ff137a1a479857255a9af068759faed",
+                "ea6865d1fb4ddb84e6bfb1e8d73063ffbcaa49223ac485b259bf545fbab3af90",
+            ],
+            [
+                "d1886991e28c2976b8de28685764e500763560faef36c1c2b7baba3acf96367e",
+                "f4eb40c13e605c09de3d9b1eaacdb207fd3017a8d9efade7c7ccfd7e54cd8d16",
+            ],
+            [
+                "c7b0c6e6ea3f41764430e7d1b847ecc5326d08812fbc36378360e9717da179c1",
+                "df6f9b83751e4a7477b38f2d9161ccf81b5b94e581b62b7da9bde27867807150",
+            ],
+            [
+                "82851acf9746868a578fca1e08fedcb1133619a84f94b8fa7ba4404647e8eb1c",
+                "a3cfd5719d83e5cd28eba55f08c49ece3bef1899d892531a95781391e2256ced",
+            ],
+            [
+                "9278d22cdaf92604e76f5cfa2629a89caa41cbb7a70cb9a848e3e7d513080a43",
+                "79ba0a4afc4c1784a261ea992b7e34381df9ee47c45638f15d1abdb1b9cf28f0",
+            ],
+            [
+                "933c8acec05e4b8d96c2959241733e8619706cc7805e53461d62ccb3a6156341",
+                "5fd0bf090af52c544ffc7d6f5db124781757dafaafe5c69cf0575b4ea4f77d0a",
+            ],
+        ];
+        assert_eq!(messages.len(), expected_hashes.len());
+        for (message, expected) in messages.into_iter().zip(expected_hashes) {
             let wire = WireMessage {
                 kind: WireMessageKind::History { message },
             };
-            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for (format, expected_hash) in [SerializationFormat::Json, SerializationFormat::Bincode]
+                .into_iter()
+                .zip(expected)
+            {
                 let bytes = wire.to_bytes_with_format(format).unwrap();
+                assert_eq!(
+                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                    expected_hash,
+                    "{format:?}: {wire:?}"
+                );
                 let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
                 assert_eq!(decoded, wire);
                 assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());

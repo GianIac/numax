@@ -1,6 +1,8 @@
 mod apply;
 mod candidates;
 pub(crate) use candidates::canonicalize_endpoint;
+#[cfg(test)]
+mod fixtures;
 mod manager;
 mod migration;
 mod peer;
