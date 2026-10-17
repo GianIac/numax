@@ -175,12 +175,30 @@ Every message is framed as:
 | `Hello` | dialer -> listener | Open handshake: node identity, protocol version, supported formats |
 | `HelloAck` | listener -> dialer | Accept handshake: protocol version and selected format |
 | `PushOps` | both | Carry a batch of CRDT ops |
-| `PushOpsAck` | both | Acknowledge reception count |
+| `PushOpsAck` | unused by current exchange | Encodable reception-count variant; not emitted or handled as an acknowledgement |
 | `PullSince` | both | Request ops since a known op id (anti-entropy) |
 | `Ping` / `Pong` | both | Keepalive |
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
 | `BootstrapHello` *(private wire variant)* | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
 | `BootstrapAck` *(private wire variant)* | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
+
+### Delivery and acknowledgement boundary
+
+`broadcast_ops` and `send_ops_to_addr` wait for local transport writes and
+stream flushes, not for remote CRDT application or storage flushes.
+`broadcast_ops` can succeed with zero connected peers; a failed broadcast may
+already have delivered to some peers. Neither result identifies durable remote
+copies.
+
+Receiving `PushOps` emits an internal `NodeEvent::OpsReceived` for `nx-core` to
+process. It does not send `PushOpsAck`. Incoming `PushOpsAck` messages fall
+through the read loop's unhandled-message branch; no receipt count is used to
+confirm replication. `HelloAck` and `Pong` concern handshake and ping handling,
+respectively, and do not acknowledge CRDT operations.
+
+The [acknowledgement contract](/numax/design/peer-discovery/#acknowledgement-semantics)
+distinguishes batch application, flush-confirmed local acceptance, and remote
+replication. The current API provides no remote durability acknowledgement.
 
 ### WireError semantics
 

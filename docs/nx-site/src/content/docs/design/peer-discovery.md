@@ -67,9 +67,11 @@ contracts.
 
 `nx-store::Store::apply_batch` and `flush` are distinct operations. An atomic
 batch application, a completed flush, a local API response, and remote replication
-must not be described with the same durability promise. The target acceptance
-semantics are specified in [D1](#d1--local-acceptance-and-durability); their
-implementation remains partial.
+must not be described with the same durability promise. Local acceptance is
+implemented as specified in [D1](#d1--local-acceptance-and-durability), within
+its documented verification limits. The current remote persistence boundary and
+absence of replication acknowledgements are specified in
+[Acknowledgement semantics](#acknowledgement-semantics).
 
 ## Planned behavior
 
@@ -114,16 +116,18 @@ timeouts, or wire format. These choices require evidence under Numax workloads.
 
 [Mermaid source for this diagram](/numax/diagrams/peer-discovery/replication.mmd)
 
-> The sequence shows the intended ordering, not the current local write path.
+> The sequence combines the implemented local acceptance boundary with planned
+> gossip, remote forwarding, and recovery behavior. It is not a trace of the
+> complete current replication path.
 
 A node may accept a local CRDT write before it has any peer connection; gossip
 begins only when eligible peers become available.
 
-1. Establish an atomic local persistence boundary covering the CRDT state,
-   operation identity, and replay metadata, followed by a confirmed flush
-   before the local success response. Operation identity is now fixed before
-   this batch for all six families. Complete verification of the covered crash
-   model and the D1 retry contract below.
+1. Preserve the implemented atomic local persistence boundary covering the
+   CRDT state, materialized value, operation identity, seen metadata, and replay
+   record, followed by a confirmed flush before the local success response.
+   This boundary covers all six families; [D1](#d1--local-acceptance-and-durability)
+   specifies the retry contract, verified process-crash model, and evidence limits.
    Local success does not imply remote acknowledgement or survival of a lost
    storage device. Preserve the remote apply-before-publish ordering.
 2. After a newly accepted remote operation is persisted, make it eligible for
@@ -179,9 +183,9 @@ timeout, retention limit, wire layout, or performance guarantee.
 
 **Status:** implemented and verified for the current local CRDT mutation APIs.
 
-D1 defines when Numax may report a local CRDT mutation as successful. It does
-not define remote acknowledgement, cluster convergence, retention, or state
-transfer.
+D1 defines when Numax may report a local CRDT mutation as successful and what
+the current delivery path confirms. It does not guarantee remote durability or
+cluster convergence, or define retention or state transfer.
 
 #### Acceptance contract
 
@@ -263,6 +267,54 @@ contract defined by D2 and D3.
 
 Remote application has a separate persistence boundary and is not covered by
 this local acceptance contract.
+
+#### Acknowledgement semantics
+
+The current API confirms local acceptance only. It does not wait for an
+application-level acknowledgement from another node, require a replica count
+or quorum, or expose a per-operation remote durability result.
+
+| Event | What it establishes | What it does not establish |
+| --- | --- | --- |
+| Storage `apply_batch()` returns successfully | The batch was applied atomically in the local store. | A flush covering the batch has completed. This alone is not local CRDT acceptance. |
+| Storage `flush()` covering the local batch returns successfully | The local durability boundary required by D1 has been reached, within the failure model below. | Any remote receipt, application, or durable copy. |
+| Local mutation returns success | The D1 acceptance sequence completed for the new operation. ORSet remove without observed tags is a successful no-op. | Remote replication or cluster convergence. |
+| Network send returns successfully | The local transport write and stream flush completed without a reported error. | The peer application received, applied, or flushed the operation. A stream flush is not a storage flush. |
+| Receiver emits `NodeEvent::OpsReceived` | The decoded batch reached the network event path. | Successful CRDT application or persistence; this event is internal, not an acknowledgement to the sender. |
+| Remote apply returns successfully for new operations | The receiver applied the state, seen metadata, and replay records in an atomic storage batch before publishing the updates in memory. | A covering storage flush has completed; the remote apply path does not explicitly wait for one before publication. |
+
+`Node::broadcast_ops()` can return success with no connected peers. With peers,
+its success concerns local transport writes to the selected connections, not
+remote application. A failed broadcast can also have delivered operations to
+some peers; it does not undo local acceptance or prove that nobody received
+the batch. The caller must not repeat a logical mutation merely to retry its
+delivery. The existing replay record retains its original operation identity
+and remains subject to the bounded retention and recovery contract.
+
+`PushOpsAck { received_count }` exists in the public message and wire formats,
+but the current receiver does not send it and the sender does not wait for it.
+An incoming `PushOpsAck` falls through the read loop's unhandled-message branch;
+its count is not used to establish receipt, application, durability, or a
+contiguous recovery frontier. `HelloAck` confirms the handshake, and `Pong`
+answers a ping; neither confirms CRDT replication.
+
+These statements describe the existing implementation, not a new ACK exchange.
+Any future remote durability acknowledgement requires a separate contract for
+the operations covered, the receiver's persistence boundary, duplicates,
+failures, timeouts, and wire compatibility. A count alone must not be treated
+as proof of which operations are durable.
+
+For example, node A can return local success while node B is disconnected. A
+then holds the flushed operation, but B has no confirmed copy. Permanent loss
+of A's storage before another durable copy exists is outside the local
+acceptance guarantee.
+
+Implementation evidence: `nx-store/src/store.rs` separates batch and flush;
+`nx-core/src/sync_manager/storage.rs` flushes local batches but not remote
+batches before returning; `nx-core/src/sync_manager/apply.rs` publishes after
+the remote batch; `nx-net/src/node.rs` implements transport sends and dispatches
+received messages; `nx-net/src/message.rs` retains the unused ACK variant.
+These paths are relative to `crates/`.
 
 #### Verified failure model
 
@@ -391,7 +443,7 @@ or weaken the release criteria.
 
 | Scenario | Required observation or unresolved choice |
 | --- | --- |
-| Crash after state write but before op-log metadata | Local paths other than GCounter can reach this interval. The selected D1 solution must remove the ambiguous accepted state or define a recovery procedure that restores its operation identity. |
+| Crash between local state and replay persistence | D1 now writes both in one atomic batch for all six families; recovery must not expose a surviving new state without its operation identity and replay metadata. The batch may survive before flush without having been accepted. |
 | Crash after a batch but before flush or response | The documented D1 durability and retry semantics must match what survives a restart; unknown outcomes cannot be silently turned into acknowledged success. |
 | Remote op persisted but forwarding fails | The accepted op remains recoverable by the repair path; a send failure consumes bounded work and does not silently lose the sole source. |
 | Sole durable holder fails permanently | No recovery guarantee can be claimed without a surviving replica or equivalent state; D1 and D3 must state whether this case is outside the failure model or requires a remote durability acknowledgement. |
@@ -429,9 +481,10 @@ receives a response. Restart from the resulting store and compare the
 materialized value, durable CRDT state, operation identity, per-origin
 sequence, seen metadata, and op log. A successful write must have all required
 records; a failed or unknown-outcome write must not be reported as successful.
-Test grouped flush under concurrent writes and shutdown so every successful
-response is covered by a confirmed flush. Measure its latency and throughput
-against an ungrouped baseline without relaxing the success condition.
+The current per-batch flush has concurrent-write and shutdown tests. If grouped
+flush is introduced, verify that every successful response is covered by a
+confirmed flush and measure latency and throughput against the current
+per-batch baseline without relaxing the success condition.
 
 For recovery, deliver operations out of order, omit one sequence, replay it
 late, and replay duplicates after seen-ID eviction and restart. Verify the
