@@ -296,7 +296,8 @@ schema evolution in `schema.rs` and `migration.rs`.
 **What it owns:**
 - In-memory CRDT registry (one state per CRDT key, all types)
 - Op-log (bounded by `op_log_limit`) for anti-entropy replay
-- Seen-ops set (bounded by `seen_ops_limit`) for deduplication
+- Seen-ops cache (bounded by `seen_ops_limit`) and durable per-origin receipt
+  frontiers for delayed-replay deduplication beyond cache eviction
 - Anti-entropy scheduling loop
 - Peer broadcast queue (bounded by `queued_ops_limit`)
 
@@ -327,6 +328,18 @@ record available for recovery.
 The [D1 local acceptance contract](/numax/design/peer-discovery/#d1--local-acceptance-and-durability)
 defines the persistence, result, retry and failure semantics of local CRDT
 mutations.
+
+### Replication coverage
+
+`SyncHandle::replication_progress()` returns bounded per-origin durable receipt
+metadata: contiguous sequence, known-high sequence, sparse count,
+`source_unavailable`, optional `unavailable_evidence` (source, interval and
+request ID), and `baseline_required`. A known maximum can reveal a gap;
+it does not advance the contiguous prefix. A missing replay source does not
+exclude recovery from another source. Legacy baseline requirements persist
+independently of new sequenced receipts. See [D2](/numax/design/peer-discovery/#d2--identity-missing-history-and-duplicates).
+Unavailable evidence survives restart and is removed once its specific interval
+is covered, even if a different gap remains.
 
 ### CRDT read-back methods
 

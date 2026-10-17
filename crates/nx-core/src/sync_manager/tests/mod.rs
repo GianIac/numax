@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 mod e2e;
+mod sequencing;
 mod support;
 
 use support::*;
@@ -622,9 +623,22 @@ async fn ops_received_updates_anti_entropy_watermark() {
     let expected = op_b.id.as_str().to_string();
 
     handle_node_event(
-        NodeEvent::OpsReceived {
+        NodeEvent::HistoryReceived {
             from: peer.clone(),
-            ops: vec![op_a, op_b],
+            addr: "unused".into(),
+            message: nx_sync::HistoryMessage::Push {
+                ops: vec![op_a, op_b]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, op)| nx_sync::SequencedOp {
+                        op,
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: index as u64 + 1,
+                        },
+                    })
+                    .collect(),
+            },
         },
         &context,
     )
@@ -3971,6 +3985,29 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                 "{family}/{checkpoint}: replay count"
             );
             let survived = replay.len() == baseline_count + 1;
+            let progress = replication_progress(&store).unwrap();
+            if replay.is_empty() {
+                assert!(
+                    progress.is_empty(),
+                    "{family}/{checkpoint}: unexpected receipt"
+                );
+            } else {
+                assert_eq!(progress.len(), 1);
+                assert_eq!(
+                    progress[0].contiguous_sequence,
+                    replay.len() as u64,
+                    "{family}/{checkpoint}: receipt frontier"
+                );
+                assert_eq!(progress[0].sparse_positions, 0);
+            }
+            assert_eq!(
+                store
+                    .scan_prefix(b"__nx/crdt/sequence/replay/")
+                    .unwrap()
+                    .len(),
+                replay.len(),
+                "{family}/{checkpoint}: replay positions"
+            );
             assert_eq!(
                 materialized.is_some(),
                 baseline_count != 0 || survived,
@@ -4006,6 +4043,12 @@ fn local_crdt_process_crash_preserves_complete_batches() {
                 "{family}/{checkpoint}: hydrated log"
             );
             for op in log.iter() {
+                let sequenced = sequenced_op(&store, op).unwrap().unwrap();
+                assert!(sequenced.position.generation > 0);
+                assert!(
+                    sequenced.position.sequence > 0
+                        && sequenced.position.sequence <= log.len() as u64
+                );
                 assert!(manager.seen_ops.blocking_read().contains(op.id.as_str()));
                 assert!(
                     store
@@ -5153,7 +5196,13 @@ async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
     let recovery = async {
         let mut ops = Vec::new();
         for expected in 1..=3 {
-            ops.push(Op::gcounter_increment(source_id.clone(), "churn", 1));
+            ops.push(nx_sync::SequencedOp {
+                op: Op::gcounter_increment(source_id.clone(), "churn", 1),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: expected,
+                },
+            });
             updates_rx.changed().await.unwrap();
             let first_change = *updates_rx.borrow_and_update();
             // Observe distinct published changes spanning a full anti-entropy
@@ -5169,40 +5218,47 @@ async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
             while let Ok(event) = source_events.try_recv() {
                 assert!(matches!(
                     event,
-                    NodeEvent::PeerConnected { .. } | NodeEvent::PullRequested { .. }
+                    NodeEvent::PeerConnected { .. } | NodeEvent::HistoryReceived { .. }
                 ));
             }
-            let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-            assert_eq!(since, None);
+            let (reply_addr, _) = source.connected_peers().await.into_iter().next().unwrap();
+            source
+                .send_history_to_addr(
+                    &reply_addr,
+                    nx_sync::HistoryMessage::Summary {
+                        entries: vec![nx_sync::HistorySummary {
+                            baseline_required: false,
+                            origin: source_id.clone(),
+                            high_sequence: expected,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            let (reply_addr, request_id, origin, start, end) =
+                wait_for_history_request(&mut source_events).await;
+            assert_eq!(origin, source_id);
+            assert_eq!((start, end), (expected, expected));
             let change_at_pull = *updates_rx.borrow_and_update();
             updates_rx.changed().await.unwrap();
             assert!(*updates_rx.borrow_and_update() > change_at_pull);
             assert_eq!(target.get_counter_value("churn").await, expected - 1);
             source
-                .send_ops_to_addr(&reply_addr, ops.clone())
+                .send_history_to_addr(
+                    &reply_addr,
+                    nx_sync::HistoryMessage::Replay {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                        ops: vec![ops.last().unwrap().clone()],
+                    },
+                )
                 .await
                 .unwrap();
-
-            // FIFO on this connection makes the reply to our pull an apply
-            // barrier: the target must have processed the preceding ops first.
-            source
-                .send_pull_since_to_addr(&reply_addr, None)
-                .await
-                .unwrap();
-            loop {
-                match source_events
-                    .recv()
-                    .await
-                    .expect("peer event channel closed")
-                {
-                    NodeEvent::OpsReceived { ops: received, .. } => {
-                        assert_eq!(received, ops);
-                        break;
-                    }
-                    NodeEvent::PullRequested { .. } => {}
-                    event => panic!("unexpected event during recovery: {event:?}"),
-                }
-            }
+            wait_for_counter(&target, "churn", expected).await;
+            let progress = target.handle().replication_progress().unwrap();
+            assert_eq!(progress[0].contiguous_sequence, expected);
             assert_eq!(target.get_counter_value("churn").await, expected);
         }
     };
@@ -5242,8 +5298,27 @@ async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
 
     let older = Op::gcounter_increment(source_id.clone(), "missing", 3);
     let newer = Op::gcounter_increment(source_id.clone(), "received", 7);
+    let old_entry = nx_sync::SequencedOp {
+        op: older.clone(),
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence: 1,
+        },
+    };
+    let new_entry = nx_sync::SequencedOp {
+        op: newer.clone(),
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence: 2,
+        },
+    };
     source
-        .send_ops_to_addr(&addr, vec![newer.clone()])
+        .send_history_to_addr(
+            &addr,
+            nx_sync::HistoryMessage::Push {
+                ops: vec![new_entry.clone()],
+            },
+        )
         .await
         .unwrap();
     wait_for_counter(&target, "received", 7).await;
@@ -5259,20 +5334,44 @@ async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
 
     // A newer received op must not become a causal frontier. The inbound
     // transport address (not an advertised candidate) is the only valid target.
-    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-    assert_eq!(since, None);
+    let (reply_addr, request_id, origin, start, end) =
+        wait_for_history_request(&mut source_events).await;
+    assert_eq!(origin, source_id);
+    assert_eq!((start, end), (1, 2));
     source
-        .send_ops_to_addr(&reply_addr, vec![older.clone(), newer.clone()])
+        .send_history_to_addr(
+            &reply_addr,
+            nx_sync::HistoryMessage::Replay {
+                request_id,
+                origin,
+                start,
+                end: start,
+                ops: vec![old_entry.clone()],
+            },
+        )
         .await
         .unwrap();
     wait_for_counter(&target, "missing", 3).await;
 
-    // Repeated full bounded-log pulls must still deduplicate previously seen ops.
-    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-    assert_eq!(since, None);
+    // Replayed positions are suppressed even after the gap has closed.
     let barrier = Op::gcounter_increment(source_id, "barrier", 1);
     source
-        .send_ops_to_addr(&reply_addr, vec![older, newer, barrier])
+        .send_history_to_addr(
+            &reply_addr,
+            nx_sync::HistoryMessage::Push {
+                ops: vec![
+                    old_entry,
+                    new_entry,
+                    nx_sync::SequencedOp {
+                        op: barrier,
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: 3,
+                        },
+                    },
+                ],
+            },
+        )
         .await
         .unwrap();
     wait_for_counter(&target, "barrier", 1).await;
@@ -5400,6 +5499,12 @@ async fn anti_entropy_pull_converges_peer_that_missed_broadcast() {
 
 #[tokio::test]
 async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
+    // sled's process-global batch lock also blocks reads in unrelated test stores.
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::intermittent_network_with_ten_percent_lost_pushes_converges",
+    ) {
+        return;
+    }
     let key = "visits";
     let addr_a = free_addr();
     let addr_b = free_addr();
@@ -5408,13 +5513,13 @@ async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
         .with_listen_addr(addr_a.clone())
         .with_peer(addr_b.clone())
         .with_anti_entropy_interval(Duration::from_millis(10));
-    let (manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
+    let (mut manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
 
     let config_b = SyncConfig::new()
         .with_listen_addr(addr_b)
         .with_peer(addr_a)
         .with_anti_entropy_interval(Duration::from_millis(10));
-    let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+    let (mut manager_b, handle_b, store_b) = started_manager_with_config(config_b).await;
 
     wait_for_connected_peer(&manager_a).await;
     wait_for_connected_peer(&manager_b).await;
@@ -5427,10 +5532,26 @@ async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
         }
     }
 
+    let recovery_started = StdInstant::now();
     wait_for_counter(&manager_b, key, 100).await;
+    assert!(
+        recovery_started.elapsed() < Duration::from_secs(5),
+        "lost-push recovery exceeded five seconds: {:?}",
+        recovery_started.elapsed()
+    );
     assert_eq!(manager_a.get_counter_value(key).await, 100);
     assert_eq!(read_materialized(&store_a, key), 100);
     assert_eq!(read_materialized(&store_b, key), 100);
+    let progress = handle_b.replication_progress().unwrap();
+    let source_progress = progress
+        .iter()
+        .find(|p| p.origin == *handle_a.node_id())
+        .unwrap();
+    assert_eq!(source_progress.contiguous_sequence, 100);
+    assert_eq!(source_progress.known_high_sequence, 100);
+    assert_eq!(source_progress.sparse_positions, 0);
+    manager_a.shutdown().await.unwrap();
+    manager_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]

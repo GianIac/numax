@@ -10,16 +10,18 @@ use nx_store::Store as NxStore;
 use nx_sync::Op;
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use super::apply::apply_remote_ops;
+use super::apply::apply_sequenced_ops;
 use super::manager::AcceptedLocalOp;
 use super::peer::{
     ConfiguredPeerConnectContext, ConfiguredPeerConnectOutcome, PeerReconnectState,
     mark_known_peer_failure, mark_known_peer_success, mark_peer_failure, mark_peer_success,
     normalize_peer_dead_after_failures, normalize_reconnect_delay,
 };
+use super::sequence::{REPLAY_BYTES, REPLAY_PAGE, SUMMARY_PAGE};
 use super::types::*;
+use nx_sync::HistoryMessage;
 
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
@@ -292,6 +294,8 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
     let AntiEntropyLoopContext {
+        history_cursors,
+        request_timeout,
         node,
         interval,
         mut shutdown_rx,
@@ -321,18 +325,29 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
                 }
                 _ = async {
                     tokio::time::sleep_until(deadline).await;
-                    // These are Node's send-address keys, including inbound
-                    // connections and peers no longer present in discovery.
-                    for (peer, _) in node.connected_peers().await {
-                        // A single "last seen OpId" is not a safe causal frontier: a peer can
-                        // receive a newer op while an older broadcast was dropped. Until the
-                        // protocol has contiguous/causal metadata, anti-entropy pulls the bounded
-                        // op-log and relies on OpId deduplication on the receiver.
-                        if let Err(e) = node.send_pull_since_to_addr(&peer, None).await {
+                    let peers = node.connected_peers().await;
+                    for (peer, _) in peers {
+                        let after_origin = {
+                            let mut cursors = history_cursors.write().await;
+                            let cursor = cursors.entry(peer.clone()).or_default();
+                            let now = StdInstant::now();
+                            if cursor.request_deadline.is_some_and(|deadline| deadline > now) {
+                                continue;
+                            }
+                            let Some(deadline) = now.checked_add(request_timeout) else {
+                                metrics.record_sync_error();
+                                warn!("stopping anti-entropy loop: request deadline overflow");
+                                return;
+                            };
+                            cursor.request_deadline = Some(deadline);
+                            cursor.after_origin.clone()
+                        };
+                        if let Err(error) = node.send_history_to_addr(&peer, HistoryMessage::SummaryRequest { after_origin }).await {
+                            if let Some(cursor) = history_cursors.write().await.get_mut(&peer) {
+                                cursor.request_deadline = None;
+                            }
                             metrics.record_sync_error();
-                            debug!(peer = %peer, error = %e, "anti-entropy pull failed");
-                        } else {
-                            debug!(peer = %peer, "anti-entropy pull requested");
+                            debug!(%peer, %error, "history summary request failed");
                         }
                     }
                 } => {}
@@ -419,11 +434,15 @@ pub(super) async fn broadcast_batch(
 
     let batch = batch
         .into_iter()
-        .map(AcceptedLocalOp::into_op)
+        .map(AcceptedLocalOp::into_sequenced)
         .collect::<Vec<_>>();
     let count = batch.len();
     let started = std::time::Instant::now();
-    if let Err(e) = context.node.broadcast_ops(batch).await {
+    if let Err(e) = context
+        .node
+        .broadcast_history(HistoryMessage::Push { ops: batch })
+        .await
+    {
         context.metrics.record_sync_error();
         warn!(error = %e, count, "broadcast partially failed; ops dropped for failed peers");
     } else {
@@ -481,11 +500,15 @@ pub(super) fn apply_seen_insertions(
     }
 }
 
-pub(super) fn plan_op_log_evictions(log: &[Op], inserted_count: usize, limit: usize) -> Vec<Op> {
+pub(super) fn plan_op_log_evictions(log: &[Op], inserted_ops: &[Op], limit: usize) -> Vec<Op> {
     let limit = normalize_op_log_limit(limit);
-    let total_len = log.len().saturating_add(inserted_count);
+    let total_len = log.len().saturating_add(inserted_ops.len());
     let remove_count = total_len.saturating_sub(limit);
-    log.iter().take(remove_count).cloned().collect()
+    log.iter()
+        .chain(inserted_ops)
+        .take(remove_count)
+        .cloned()
+        .collect()
 }
 
 pub(super) fn prune_op_log_and_return_evicted(log: &mut Vec<Op>, limit: usize) -> Vec<Op> {
@@ -498,6 +521,7 @@ pub(super) fn prune_op_log_and_return_evicted(log: &mut Vec<Op>, limit: usize) -
     }
 }
 
+#[cfg(test)]
 pub(super) async fn op_log_since(
     op_log: &Arc<RwLock<Vec<Op>>>,
     since_op_id: Option<&str>,
@@ -523,50 +547,35 @@ pub(super) async fn drain_node_events(
 
 pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
     match event {
-        NodeEvent::OpsReceived { from, ops } => {
-            debug!(from = %from, count = ops.len(), "received ops from peer");
-            let last_received_op_id = ops.last().map(|op| op.id.as_str().to_string());
-            let apply_context = RemoteOpApplyContext {
-                counters: &context.counters,
-                pncounters: &context.pncounters,
-                lww_registers: &context.lww_registers,
-                lww_maps: &context.lww_maps,
-                orsets: &context.orsets,
-                rgas: &context.rgas,
-                seen_ops: &context.seen_ops,
-                seen_ops_next_sequence: &context.seen_ops_next_sequence,
-                op_log: &context.op_log,
-                op_log_next_sequence: &context.op_log_next_sequence,
-                op_log_limit: context.op_log_limit,
-                store: &context.store,
-                metrics: &context.metrics,
+        NodeEvent::HistoryReceived {
+            from,
+            addr,
+            message,
+        } => {
+            let observed_id = match &message {
+                HistoryMessage::Push { ops } | HistoryMessage::Replay { ops, .. } => {
+                    ops.last().map(|entry| entry.op.id.as_str().to_owned())
+                }
+                _ => None,
             };
-            if let Err(e) = apply_remote_ops(&ops, &apply_context).await {
+            if let Err(error) = handle_history_message(&addr, message, context).await {
                 context.metrics.record_sync_error();
-                error!(error = %e, "failed to apply remote ops batch");
-                return;
-            }
-            if let Some(op_id) = last_received_op_id {
+                warn!(%from, %error, "replication history exchange failed");
+            } else if let Some(id) = observed_id {
                 context
                     .anti_entropy_watermarks
                     .write()
                     .await
-                    .insert(from, op_id);
+                    .insert(from, id);
             }
         }
-        NodeEvent::PullRequested {
-            from,
-            addr,
-            since_op_id,
-        } => {
-            let ops = op_log_since(&context.op_log, since_op_id.as_deref()).await;
-            let count = ops.len();
-            if let Err(e) = context.node.send_ops_to_addr(&addr, ops).await {
-                context.metrics.record_sync_error();
-                warn!(peer = %from, addr = %addr, error = %e, "failed to answer pull request");
-            } else {
-                debug!(peer = %from, addr = %addr, count, "answered pull request");
-            }
+        NodeEvent::OpsReceived { from, .. } => {
+            context.metrics.record_sync_error();
+            warn!(%from, "unsequenced legacy replay rejected; state baseline recovery required");
+        }
+        NodeEvent::PullRequested { from, .. } => {
+            context.metrics.record_sync_error();
+            warn!(%from, "legacy replay request rejected; sequenced history request required");
         }
         NodeEvent::PeerConnected {
             node_id,
@@ -594,6 +603,8 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
             addr,
             peers_connected,
         } => {
+            context.history_cursors.write().await.remove(&addr);
+            context.history_requests.write().await.remove(&addr);
             mark_known_peer_failure(
                 &context.peer_health,
                 &addr,
@@ -606,6 +617,299 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
             info!(peer = %node_id, addr = %addr, "peer disconnected");
         }
     }
+}
+
+fn history_apply_context(context: &NodeEventContext) -> RemoteOpApplyContext<'_> {
+    RemoteOpApplyContext {
+        counters: &context.counters,
+        pncounters: &context.pncounters,
+        lww_registers: &context.lww_registers,
+        lww_maps: &context.lww_maps,
+        orsets: &context.orsets,
+        rgas: &context.rgas,
+        seen_ops: &context.seen_ops,
+        seen_ops_next_sequence: &context.seen_ops_next_sequence,
+        op_log: &context.op_log,
+        op_log_next_sequence: &context.op_log_next_sequence,
+        op_log_limit: context.op_log_limit,
+        store: &context.store,
+        metrics: &context.metrics,
+    }
+}
+
+fn validate_range(start: u64, end: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        start > 0 && end >= start && end - start < REPLAY_PAGE,
+        "invalid history request interval"
+    );
+    Ok(())
+}
+
+async fn request_history_range(
+    addr: &str,
+    origin: nx_sync::NodeId,
+    start: u64,
+    end: u64,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    let request_id = nx_sync::OpId::generate();
+    {
+        let mut requests = context.history_requests.write().await;
+        let pending = requests.entry(addr.to_owned()).or_default();
+        let now = StdInstant::now();
+        pending.retain(|_, request| request.deadline > now);
+        if pending.contains_key(origin.as_str()) || pending.len() >= SUMMARY_PAGE {
+            debug!(%addr, %origin, "deferring history range: request pending or peer budget full");
+            return Ok(());
+        }
+        let deadline = now
+            .checked_add(context.history_request_timeout)
+            .ok_or_else(|| anyhow::anyhow!("history request deadline overflow"))?;
+        pending.insert(
+            origin.as_str().to_owned(),
+            PendingHistoryRequest {
+                request_id: request_id.clone(),
+                start,
+                end,
+                deadline,
+            },
+        );
+    }
+    if let Err(error) = context
+        .node
+        .send_history_to_addr(
+            addr,
+            HistoryMessage::Request {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                start,
+                end,
+            },
+        )
+        .await
+    {
+        complete_history_request(addr, &origin, &request_id, start, end, context).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+async fn complete_history_request(
+    addr: &str,
+    origin: &nx_sync::NodeId,
+    request_id: &nx_sync::OpId,
+    start: u64,
+    end: u64,
+    context: &NodeEventContext,
+) -> bool {
+    let mut requests = context.history_requests.write().await;
+    if let Some(pending) = requests.get_mut(addr)
+        && let Some(request) = pending.get(origin.as_str())
+        && request.request_id == *request_id
+        && request.deadline > StdInstant::now()
+        && request.start == start
+        && end >= start
+        && end <= request.end
+    {
+        pending.remove(origin.as_str());
+        return true;
+    }
+    false
+}
+
+async fn handle_history_message(
+    addr: &str,
+    message: HistoryMessage,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    match message {
+        HistoryMessage::Push { ops } => {
+            anyhow::ensure!(
+                ops.len() <= 1024,
+                "sequenced batch exceeds operation budget"
+            );
+            let result = apply_sequenced_ops(&ops, &history_apply_context(context)).await;
+            if let Err(error) = &result
+                && error
+                    .downcast_ref::<super::sequence::TrackingLimit>()
+                    .is_none()
+            {
+                return result;
+            }
+            let mut origins = std::collections::BTreeMap::<String, u64>::new();
+            for entry in &ops {
+                anyhow::ensure!(
+                    entry.position.generation > 0 && entry.position.sequence > 0,
+                    "invalid pushed position"
+                );
+                origins
+                    .entry(entry.op.origin.as_str().to_owned())
+                    .and_modify(|high| *high = (*high).max(entry.position.sequence))
+                    .or_insert(entry.position.sequence);
+            }
+            // A far-ahead rejection must still permit earliest-range recovery.
+            for (origin, high_sequence) in origins.into_iter().take(SUMMARY_PAGE) {
+                let summary = nx_sync::HistorySummary {
+                    baseline_required: false,
+                    origin: nx_sync::NodeId::new(origin),
+                    high_sequence,
+                };
+                if let Some((start, end)) =
+                    super::storage::record_summary(&context.store, &summary)?
+                {
+                    request_history_range(addr, summary.origin, start, end, context).await?;
+                }
+            }
+            result?;
+        }
+        HistoryMessage::SummaryRequest { after_origin } => {
+            let cursor = super::storage::summary_cursor(after_origin.as_deref())?;
+            let (entries, _) = super::storage::summary_page(&context.store, cursor.as_deref())?;
+            context
+                .node
+                .send_history_to_addr(addr, HistoryMessage::Summary { entries })
+                .await?;
+        }
+        HistoryMessage::Summary { entries } => {
+            anyhow::ensure!(
+                entries.len() <= SUMMARY_PAGE,
+                "history summary page exceeds budget"
+            );
+            anyhow::ensure!(
+                entries
+                    .windows(2)
+                    .all(|pair| pair[0].origin.as_str() < pair[1].origin.as_str()),
+                "unordered history summary page"
+            );
+            let next = if entries.len() == SUMMARY_PAGE {
+                entries.last().map(|entry| entry.origin.as_str().to_owned())
+            } else {
+                None
+            };
+            {
+                let mut cursors = context.history_cursors.write().await;
+                let cursor = cursors.entry(addr.to_owned()).or_default();
+                cursor.after_origin = next;
+                cursor.request_deadline = None;
+            }
+            for entry in entries {
+                if let Some((start, end)) = super::storage::record_summary(&context.store, &entry)?
+                {
+                    request_history_range(addr, entry.origin, start, end, context).await?;
+                }
+            }
+        }
+        HistoryMessage::Request {
+            request_id,
+            origin,
+            start,
+            end,
+        } => {
+            validate_range(start, end)?;
+            anyhow::ensure!(
+                !request_id.as_str().is_empty() && request_id.as_str().len() <= 128,
+                "invalid history request identity"
+            );
+            let response = {
+                let log = context.op_log.read().await;
+                let mut retained = Vec::new();
+                for op in log.iter().filter(|op| op.origin == origin) {
+                    if let Some(entry) = super::storage::sequenced_op(&context.store, op)?
+                        && entry.position.sequence >= start
+                        && entry.position.sequence <= end
+                    {
+                        retained.push(entry);
+                    }
+                }
+                retained.sort_by_key(|entry| entry.position.sequence);
+                let mut page = Vec::new();
+                let mut bytes = 2;
+                for (expected, entry) in (start..=end).zip(retained) {
+                    let size = serde_json::to_vec(&entry)?.len() + 1;
+                    if entry.position.sequence != expected || bytes + size > REPLAY_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    page.push(entry);
+                    if expected == end {
+                        break;
+                    }
+                }
+                if let Some(last) = page.last() {
+                    HistoryMessage::Replay {
+                        request_id,
+                        origin,
+                        start,
+                        end: last.position.sequence,
+                        ops: page,
+                    }
+                } else {
+                    HistoryMessage::Unavailable {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                    }
+                }
+            };
+            context.node.send_history_to_addr(addr, response).await?;
+        }
+        HistoryMessage::Replay {
+            request_id,
+            origin,
+            start,
+            end,
+            ops,
+        } => {
+            validate_range(start, end)?;
+            anyhow::ensure!(
+                ops.len() as u64 == end - start + 1,
+                "partial replay interval"
+            );
+            anyhow::ensure!(
+                serde_json::to_vec(&ops)?.len() <= REPLAY_BYTES,
+                "replay exceeds byte budget"
+            );
+            for (index, entry) in ops.iter().enumerate() {
+                anyhow::ensure!(
+                    entry.op.origin == origin && entry.position.sequence == start + index as u64,
+                    "replay position mismatch"
+                );
+            }
+            if !complete_history_request(addr, &origin, &request_id, start, end, context).await {
+                debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited history replay");
+                return Ok(());
+            }
+            apply_sequenced_ops(&ops, &history_apply_context(context)).await?;
+            if let Some((start, end)) = super::storage::missing_range(&context.store, &origin)? {
+                request_history_range(addr, origin, start, end, context).await?;
+            }
+        }
+        HistoryMessage::Unavailable {
+            request_id,
+            origin,
+            start,
+            end,
+        } => {
+            validate_range(start, end)?;
+            if !complete_history_request(addr, &origin, &request_id, start, end, context).await {
+                debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited unavailable history");
+                return Ok(());
+            }
+            super::storage::record_unavailable(
+                &context.store,
+                &origin,
+                super::sequence::UnavailableHistory {
+                    source: addr.to_owned(),
+                    start,
+                    end,
+                    request_id,
+                },
+            )?;
+            warn!(%origin, start, end, "source cannot supply missing history; another source or state baseline is required");
+        }
+    }
+    Ok(())
 }
 
 // End of main code. Test below:
@@ -661,6 +965,8 @@ mod tests {
     async fn anti_entropy_task_exits_without_panicking_on_deadline_overflow() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            history_cursors: Arc::new(RwLock::new(HashMap::new())),
+            request_timeout: Duration::from_secs(30),
             node: Arc::new(
                 Node::try_new(NodeConfig::new(NodeId::generate(), "127.0.0.1:0")).unwrap(),
             ),
@@ -763,6 +1069,9 @@ mod tests {
         peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
     ) -> NodeEventContext {
         NodeEventContext {
+            history_cursors: Arc::new(RwLock::new(HashMap::new())),
+            history_requests: Arc::new(RwLock::new(HashMap::new())),
+            history_request_timeout: Duration::from_secs(30),
             counters,
             pncounters: Arc::new(RwLock::new(HashMap::new())),
             lww_registers: Arc::new(RwLock::new(HashMap::new())),
@@ -931,9 +1240,22 @@ mod tests {
         let expected = op_b.id.as_str().to_string();
 
         handle_node_event(
-            NodeEvent::OpsReceived {
+            NodeEvent::HistoryReceived {
                 from: peer.clone(),
-                ops: vec![op_a, op_b],
+                addr: "unused".into(),
+                message: nx_sync::HistoryMessage::Push {
+                    ops: vec![op_a, op_b]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, op)| nx_sync::SequencedOp {
+                            op,
+                            position: nx_sync::OpPosition {
+                                generation: 1,
+                                sequence: index as u64 + 1,
+                            },
+                        })
+                        .collect(),
+                },
             },
             &context,
         )
@@ -950,5 +1272,493 @@ mod tests {
         );
         let key = materialized_gcounter_key("counter:visits");
         assert!(store.get(&key).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn sequenced_invalid_pushes_do_not_persist_recovery_targets() {
+        use nx_sync::{OpId, OpPosition, SequencedOp};
+        let store = temp_store();
+        let context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&store),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let valid = SequencedOp {
+            op: Op::gcounter_increment(NodeId::new("origin"), "visits", 1),
+            position: OpPosition {
+                generation: 1,
+                sequence: 100,
+            },
+        };
+        let mut long_id = valid.clone();
+        long_id.op.id = OpId::new("x".repeat(129));
+        let mut zero_generation = valid.clone();
+        zero_generation.position.generation = 0;
+        let mut conflict = valid.clone();
+        conflict.op.id = OpId::new("different");
+        let mut far = valid.clone();
+        far.position.sequence = super::super::sequence::MAX_GAP + 1;
+        let before = store.scan_prefix(b"__nx/").unwrap();
+        for ops in [
+            vec![long_id.clone()],
+            vec![zero_generation],
+            vec![valid.clone(), conflict],
+            vec![far.clone(), long_id],
+        ] {
+            assert!(
+                handle_history_message("unused", HistoryMessage::Push { ops }, &context)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.scan_prefix(b"__nx/").unwrap(), before);
+            assert!(context.counters.read().await.is_empty());
+            assert!(context.history_requests.read().await.is_empty());
+        }
+        // A validated far-ahead rejection still records the target even if transport is absent.
+        assert!(
+            handle_history_message("unused", HistoryMessage::Push { ops: vec![far] }, &context)
+                .await
+                .is_err()
+        );
+        let progress = super::super::storage::replication_progress(&store).unwrap();
+        assert_eq!(progress[0].contiguous_sequence, 0);
+        assert_eq!(
+            progress[0].known_high_sequence,
+            super::super::sequence::MAX_GAP + 1
+        );
+        assert!(context.counters.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequenced_stale_unavailable_cannot_describe_a_new_gap_or_retry() {
+        use nx_sync::{HistorySummary, OpId, OpPosition, SequencedOp};
+        let store = temp_store();
+        let context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&store),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let origin = NodeId::new("origin");
+        let addr = "source-a:1234";
+        let old_id = OpId::generate();
+        let new_id = OpId::generate();
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 2,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        apply_sequenced_ops(
+            &[SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "visits", 1),
+                position: OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            }],
+            &history_apply_context(&context),
+        )
+        .await
+        .unwrap();
+        context.history_requests.write().await.insert(
+            addr.to_owned(),
+            HashMap::from([(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: old_id.clone(),
+                    start: 2,
+                    end: 2,
+                    deadline: StdInstant::now(),
+                },
+            )]),
+        );
+        let before_expired = store.scan_prefix(b"__nx/").unwrap();
+        handle_history_message(
+            addr,
+            HistoryMessage::Unavailable {
+                request_id: old_id.clone(),
+                origin: origin.clone(),
+                start: 2,
+                end: 2,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.scan_prefix(b"__nx/").unwrap(), before_expired);
+        context.history_requests.write().await.insert(
+            addr.to_owned(),
+            HashMap::from([(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: new_id.clone(),
+                    start: 2,
+                    end: 2,
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            )]),
+        );
+        let before = store.scan_prefix(b"__nx/").unwrap();
+        for (source, id, start, end) in [
+            (addr, old_id.clone(), 1, 1),
+            (addr, old_id, 2, 2),
+            ("source-b:1234", new_id.clone(), 2, 2),
+        ] {
+            handle_history_message(
+                source,
+                HistoryMessage::Unavailable {
+                    request_id: id,
+                    origin: origin.clone(),
+                    start,
+                    end,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(store.scan_prefix(b"__nx/").unwrap(), before);
+            assert_eq!(context.history_requests.read().await[addr].len(), 1);
+        }
+        handle_history_message(
+            addr,
+            HistoryMessage::Unavailable {
+                request_id: new_id.clone(),
+                origin: origin.clone(),
+                start: 2,
+                end: 2,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        let progress = super::super::storage::replication_progress(&store).unwrap();
+        assert!(progress[0].source_unavailable);
+        let evidence = progress[0].unavailable_evidence.as_ref().unwrap();
+        assert_eq!(evidence.source, addr);
+        assert_eq!(evidence.request_id, new_id);
+        assert_eq!((evidence.start, evidence.end), (2, 2));
+        store.flush().unwrap();
+        assert!(super::super::storage::replication_progress(&store).unwrap()[0].source_unavailable);
+        // Another source closes that interval; a later suffix must not inherit the evidence.
+        apply_sequenced_ops(
+            &[SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "visits", 1),
+                position: OpPosition {
+                    generation: 1,
+                    sequence: 2,
+                },
+            }],
+            &history_apply_context(&context),
+        )
+        .await
+        .unwrap();
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 3,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        handle_history_message(
+            addr,
+            HistoryMessage::Unavailable {
+                request_id: new_id,
+                origin,
+                start: 2,
+                end: 2,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        let progress = super::super::storage::replication_progress(&store).unwrap();
+        assert_eq!(progress[0].contiguous_sequence, 2);
+        assert_eq!(progress[0].known_high_sequence, 3);
+        assert!(!progress[0].source_unavailable);
+        assert!(progress[0].unavailable_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn sequenced_partial_and_mismatched_replays_do_not_advance_receipts() {
+        use nx_sync::{HistorySummary, NodeId, OpPosition, SequencedOp};
+
+        let store = temp_store();
+        let origin = NodeId::new("origin");
+        let context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&store),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 2,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let operation = SequencedOp {
+            op: Op::gcounter_increment(origin.clone(), "visits", 1),
+            position: OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let before = store.scan_prefix(b"__nx/").unwrap();
+        for (start, end, ops) in [
+            (1, 2, vec![operation.clone()]),
+            (2, 2, vec![operation.clone()]),
+            (1, 1, Vec::new()),
+            (0, 0, vec![operation.clone()]),
+            (1, REPLAY_PAGE + 1, vec![operation.clone()]),
+        ] {
+            assert!(
+                handle_history_message(
+                    "unused",
+                    HistoryMessage::Replay {
+                        request_id: nx_sync::OpId::new("test-request"),
+                        origin: origin.clone(),
+                        start,
+                        end,
+                        ops,
+                    },
+                    &context,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(store.scan_prefix(b"__nx/").unwrap(), before);
+            assert!(context.counters.read().await.is_empty());
+        }
+        context.history_requests.write().await.insert(
+            "unused".to_owned(),
+            HashMap::from([(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: nx_sync::OpId::new("test-request"),
+                    start: 1,
+                    end: 2,
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            )]),
+        );
+        handle_history_message(
+            "unused",
+            HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("test-request"),
+                origin: origin.clone(),
+                start: 1,
+                end: 2,
+                ops: vec![
+                    operation,
+                    SequencedOp {
+                        op: Op::gcounter_increment(origin, "visits", 1),
+                        position: OpPosition {
+                            generation: 1,
+                            sequence: 2,
+                        },
+                    },
+                ],
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        let progress = super::super::storage::replication_progress(&store).unwrap();
+        assert_eq!(progress[0].contiguous_sequence, 2);
+        assert_eq!(progress[0].known_high_sequence, 2);
+        assert_eq!(context.counters.read().await["visits"].value(), 2);
+    }
+
+    #[tokio::test]
+    async fn sequenced_repeated_summaries_bound_inflight_range_requests() {
+        let mut source = Node::new(NodeConfig::new(NodeId::new("source"), "127.0.0.1:0"));
+        let mut events = source.take_event_receiver().unwrap();
+        let addr = source.start_listener().await.unwrap().to_string();
+        let context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            temp_store(),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        context.node.connect_to_peer(&addr).await.unwrap();
+        for _ in 0..3 {
+            handle_history_message(
+                &addr,
+                HistoryMessage::Summary {
+                    entries: vec![nx_sync::HistorySummary {
+                        origin: NodeId::new("offline-origin"),
+                        high_sequence: 3,
+                        baseline_required: false,
+                    }],
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    NodeEvent::HistoryReceived {
+                        message: HistoryMessage::Request {
+                            start: 1,
+                            end: 3,
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "repeated summaries duplicated an outstanding range request"
+        );
+        let origin = NodeId::new("offline-origin");
+        let old_id = context.history_requests.read().await[&addr][origin.as_str()]
+            .request_id
+            .clone();
+        complete_history_request(&addr, &origin, &old_id, 2, 3, &context).await;
+        assert_eq!(context.history_requests.read().await[&addr].len(), 1);
+        context
+            .history_requests
+            .write()
+            .await
+            .get_mut(&addr)
+            .unwrap()
+            .get_mut(origin.as_str())
+            .unwrap()
+            .deadline = StdInstant::now();
+        request_history_range(&addr, origin.clone(), 1, 3, &context)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            NodeEvent::HistoryReceived {
+                message: HistoryMessage::Request {
+                    start: 1,
+                    end: 3,
+                    ..
+                },
+                ..
+            }
+        ));
+        let request_id = context.history_requests.read().await[&addr][origin.as_str()]
+            .request_id
+            .clone();
+        handle_history_message(
+            &addr,
+            HistoryMessage::Unavailable {
+                request_id,
+                origin,
+                start: 1,
+                end: 3,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(context.history_requests.read().await[&addr].is_empty());
+        assert!(
+            super::super::storage::replication_progress(&context.store).unwrap()[0]
+                .source_unavailable
+        );
+        context.node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sequenced_summary_polling_waits_for_response_or_retry_deadline() {
+        let mut source = Node::new(NodeConfig::new(NodeId::new("source"), "127.0.0.1:0"));
+        let mut events = source.take_event_receiver().unwrap();
+        let addr = source.start_listener().await.unwrap().to_string();
+        let node = Arc::new(Node::new(NodeConfig::new(
+            NodeId::new("target"),
+            "127.0.0.1:0",
+        )));
+        node.connect_to_peer(&addr).await.unwrap();
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            history_cursors: Arc::clone(&cursors),
+            request_timeout: Duration::from_secs(30),
+            node: Arc::clone(&node),
+            interval: Duration::from_millis(1),
+            shutdown_rx,
+            metrics: metrics(),
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    NodeEvent::HistoryReceived {
+                        message: HistoryMessage::SummaryRequest { .. },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .is_err(),
+            "polling duplicated an outstanding summary request"
+        );
+        cursors
+            .write()
+            .await
+            .get_mut(&addr)
+            .unwrap()
+            .request_deadline = Some(StdInstant::now());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            NodeEvent::HistoryReceived {
+                message: HistoryMessage::SummaryRequest { .. },
+                ..
+            }
+        ));
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        node.shutdown().await;
+        source.shutdown().await;
     }
 }

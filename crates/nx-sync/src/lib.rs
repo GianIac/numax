@@ -13,3 +13,6 @@ pub use crdt::lww_register::LwwRegister;
 pub use crdt::orset::ORSet;
 pub use crdt::pncounter::PNCounter;
 pub use crdt::rga::{Rga, RgaElement, RgaElementId};
+
+mod history;
+pub use history::{HistoryMessage, HistorySummary, OpPosition, SequencedOp};

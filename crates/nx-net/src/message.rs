@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -240,6 +240,9 @@ pub(crate) enum WireMessageKind {
         cluster_id: String,
         candidates: Vec<String>,
         candidate_ttl_ms: u64,
+    },
+    History {
+        message: nx_sync::HistoryMessage,
     },
 }
 
@@ -543,7 +546,9 @@ impl TryFrom<WireMessage> for Message {
             WireMessageKind::Error { error } => MessageKind::Error {
                 error: error.try_into()?,
             },
-            WireMessageKind::BootstrapHello { .. } | WireMessageKind::BootstrapAck { .. } => {
+            WireMessageKind::BootstrapHello { .. }
+            | WireMessageKind::BootstrapAck { .. }
+            | WireMessageKind::History { .. } => {
                 return Err(NetError::InvalidMessage(
                     "bootstrap wire messages are not public protocol messages".into(),
                 ));
@@ -782,7 +787,7 @@ mod tests {
             },
         ];
 
-        vec![
+        let mut messages = vec![
             Message::hello(origin.clone()),
             Message::hello_ack(origin),
             Message::push_ops(ops),
@@ -807,7 +812,25 @@ mod tests {
             Message::wire_error(WireError::Internal {
                 reason: "internal".into(),
             }),
-        ]
+        ];
+        for message in &mut messages {
+            match &mut message.kind {
+                MessageKind::Hello {
+                    protocol_version, ..
+                }
+                | MessageKind::HelloAck {
+                    protocol_version, ..
+                } => *protocol_version = 5,
+                MessageKind::Error {
+                    error: WireError::ProtocolMismatch { expected, got },
+                } => {
+                    *expected = 5;
+                    *got = 4;
+                }
+                _ => {}
+            }
+        }
+        messages
     }
 
     fn bootstrap_wire_messages() -> Vec<WireMessage> {
@@ -1015,6 +1038,65 @@ mod tests {
                 let bytes = message.to_bytes_with_format(format).unwrap();
                 let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
                 assert_eq!(decoded, message);
+                assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_v7_history_roundtrips_in_both_formats_without_changing_legacy_codec() {
+        use nx_sync::{HistoryMessage, HistorySummary, OpPosition, SequencedOp};
+        let origin = NodeId::new("origin");
+        let operation = SequencedOp {
+            op: Op::gcounter_increment(origin.clone(), "visits", 1),
+            position: OpPosition {
+                generation: 3,
+                sequence: 42,
+            },
+        };
+        let messages = [
+            HistoryMessage::SummaryRequest { after_origin: None },
+            HistoryMessage::SummaryRequest {
+                after_origin: Some(origin.as_str().to_owned()),
+            },
+            HistoryMessage::Push {
+                ops: vec![operation.clone()],
+            },
+            HistoryMessage::Summary {
+                entries: vec![HistorySummary {
+                    baseline_required: false,
+                    origin: origin.clone(),
+                    high_sequence: 42,
+                }],
+            },
+            HistoryMessage::Request {
+                request_id: nx_sync::OpId::new("request-1"),
+                origin: origin.clone(),
+                start: 42,
+                end: 42,
+            },
+            HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("request-1"),
+                origin: origin.clone(),
+                start: 42,
+                end: 42,
+                ops: vec![operation],
+            },
+            HistoryMessage::Unavailable {
+                request_id: nx_sync::OpId::new("request-2"),
+                origin,
+                start: 1,
+                end: 41,
+            },
+        ];
+        for message in messages {
+            let wire = WireMessage {
+                kind: WireMessageKind::History { message },
+            };
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let bytes = wire.to_bytes_with_format(format).unwrap();
+                let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
+                assert_eq!(decoded, wire);
                 assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
             }
         }

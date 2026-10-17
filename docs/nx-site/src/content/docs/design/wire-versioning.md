@@ -10,9 +10,22 @@ independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
 
-In `v0.1.5`, the current Numax version, the value is `5`. Version `5` adds the
-one-shot bootstrap handshake described below; it is not wire-compatible with
-the version `4` protocol shipped by `v0.1.4`.
+The v0.1.6 development checkout uses `7`. Version `5`, shipped by v0.1.5,
+introduced the one-shot bootstrap handshake described below. The development
+protocol `6` introduced sequenced replication and bounded history exchange;
+version `7` adds required attempt identifiers to range requests, replay pages,
+and unavailable-range responses. Exact version matching rejects both protocol
+`6` and v0.1.5 before peer registration or CRDT exchange.
+
+Protocol 7 uses a private `History` variant after the existing private
+bootstrap variants. Its messages carry sequenced operations, paginated
+per-origin summaries, replay interval requests and pages, and unavailable-range
+responses. The UUID `Op`, existing public `MessageKind` discriminants, and frozen
+v0.1.4/v0.1.5 codec fixtures are preserved. A history summary advertises known
+existence; it is neither a contiguous receipt frontier nor a durability ACK.
+Range responses must match the pending source connection, origin, request ID,
+unexpired deadline and requested interval. Retried requests receive fresh IDs;
+late responses cannot complete or mark unavailable a later attempt.
 
 ## Compatibility policy
 

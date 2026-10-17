@@ -41,6 +41,7 @@ use super::types::*;
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    generation: u64,
     node_id: NodeId,
     op_tx: mpsc::Sender<AcceptedLocalOp>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
@@ -72,19 +73,35 @@ enum LwwMapChange {
 
 /// Opaque proof that a local operation completed its state-and-replay persistence path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AcceptedLocalOp(Op);
+pub(crate) struct AcceptedLocalOp {
+    op: Op,
+    position: nx_sync::OpPosition,
+}
 
 impl AcceptedLocalOp {
-    fn new(op: Op) -> Self {
-        Self(op)
+    fn new(store: &NxStore, op: Op) -> anyhow::Result<Self> {
+        let entry = super::storage::sequenced_op(store, &op)?
+            .ok_or_else(|| anyhow::anyhow!("missing accepted operation position"))?;
+        Ok(Self {
+            op,
+            position: entry.position,
+        })
+    }
+
+    pub(crate) fn into_sequenced(self) -> nx_sync::SequencedOp {
+        nx_sync::SequencedOp {
+            op: self.op,
+            position: self.position,
+        }
     }
 
     pub(crate) fn op(&self) -> &Op {
-        &self.0
+        &self.op
     }
 
+    #[cfg(test)]
     pub(crate) fn into_op(self) -> Op {
-        self.0
+        self.op
     }
 }
 
@@ -109,6 +126,11 @@ impl PartialEq<AcceptedLocalOp> for Op {
 }
 
 impl SyncHandle {
+    /// Bounded, durable per-origin coverage; known maxima do not imply contiguous receipt.
+    pub fn replication_progress(&self) -> anyhow::Result<Vec<super::ReplicationProgress>> {
+        super::storage::replication_progress(&self.store)
+    }
+
     /// NodeId of the local node (used to stamp locally-produced Ops).
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
@@ -163,11 +185,16 @@ impl SyncHandle {
 
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_gcounter_op(&self.store, key, &counter, &plan)?;
 
@@ -180,7 +207,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn increment_pncounter(
@@ -233,11 +260,16 @@ impl SyncHandle {
 
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_pncounter_op(&self.store, key, &counter, &plan)?;
 
@@ -250,7 +282,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn set_lww_register(
@@ -280,11 +312,16 @@ impl SyncHandle {
             .unwrap_or(candidate);
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_lww_register_op(&self.store, key, &register, &plan)?;
 
@@ -297,7 +334,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn set_lww_map(
@@ -363,11 +400,16 @@ impl SyncHandle {
         }
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_lww_map_op(&self.store, key, &map, &plan)?;
 
@@ -380,7 +422,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn add_orset(
@@ -403,11 +445,16 @@ impl SyncHandle {
         set.add(element.to_string(), op_id.clone());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_orset_op(&self.store, key, &set, &plan)?;
 
@@ -420,7 +467,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn orset_remove_is_noop(&self, key: &str, element: &str) -> bool {
@@ -453,11 +500,16 @@ impl SyncHandle {
         set.apply_remove(element.to_string(), observed_tags);
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_orset_op(&self.store, key, &set, &plan)?;
 
@@ -470,7 +522,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(Some(AcceptedLocalOp::new(op)))
+        Ok(Some(AcceptedLocalOp::new(&self.store, op)?))
     }
 
     pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<AcceptedLocalOp> {
@@ -500,11 +552,16 @@ impl SyncHandle {
         rga.insert(id.clone(), parent.clone(), value.clone());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_rga_op(&self.store, key, &rga, &plan)?;
 
@@ -517,7 +574,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<AcceptedLocalOp> {
@@ -535,11 +592,16 @@ impl SyncHandle {
         rga.delete(id.to_string());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
+            local_generation: Some(self.generation),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
             seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
-            op_log_evicted: plan_op_log_evictions(&log, 1, self.op_log_limit),
+            op_log_evicted: plan_op_log_evictions(
+                &log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
         };
         persist_local_rga_op(&self.store, key, &rga, &plan)?;
 
@@ -552,7 +614,7 @@ impl SyncHandle {
         self.op_log_next_sequence
             .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
 
-        Ok(AcceptedLocalOp::new(op))
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     /// Read-side handle over the counter registry.
@@ -620,6 +682,8 @@ impl SyncHandle {
 }
 
 pub struct SyncManager {
+    history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    generation: u64,
     /// NodeId.
     node_id: NodeId,
 
@@ -754,6 +818,7 @@ impl SyncManager {
     ) -> anyhow::Result<Self> {
         config.validate()?;
         ensure_sync_schema(&store)?;
+        let generation = super::storage::initialize_sequence_origin(&store, &node_id)?;
 
         let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
         let op_log_limit = normalize_op_log_limit(config.op_log_limit);
@@ -788,6 +853,8 @@ impl SyncManager {
         let rgas = Arc::new(RwLock::new(rgas));
 
         Ok(Self {
+            history_cursors: Arc::new(RwLock::new(HashMap::new())),
+            generation,
             node_id,
             config,
             discovery_providers,
@@ -833,6 +900,7 @@ impl SyncManager {
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            generation: self.generation,
             node_id: self.node_id.clone(),
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
@@ -955,6 +1023,9 @@ impl SyncManager {
 
         // Inbound loop: apply remote ops into the counter registry.
         let event_context = NodeEventContext {
+            history_cursors: Arc::clone(&self.history_cursors),
+            history_requests: Arc::new(RwLock::new(HashMap::new())),
+            history_request_timeout: self.config.socket_timeout,
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
@@ -1021,6 +1092,8 @@ impl SyncManager {
         });
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            history_cursors: Arc::clone(&self.history_cursors),
+            request_timeout: self.config.socket_timeout,
             node: Arc::clone(&node),
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),

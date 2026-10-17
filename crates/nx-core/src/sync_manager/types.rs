@@ -139,7 +139,15 @@ pub(super) struct ReconnectLoopContext {
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct HistoryCursor {
+    pub(super) after_origin: Option<String>,
+    pub(super) request_deadline: Option<std::time::Instant>,
+}
+
 pub(super) struct AntiEntropyLoopContext {
+    pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    pub(super) request_timeout: Duration,
     pub(super) node: Arc<Node>,
     pub(super) interval: Duration,
     pub(super) shutdown_rx: watch::Receiver<bool>,
@@ -195,6 +203,7 @@ pub(super) struct RemoteCrdtUpdateBatch<'a> {
 }
 
 pub(super) struct OpPersistencePlan {
+    pub(super) local_generation: Option<u64>,
     pub(super) op: Op,
     pub(super) seen_sequence: u64,
     pub(super) op_log_sequence: u64,
@@ -202,8 +211,20 @@ pub(super) struct OpPersistencePlan {
     pub(super) op_log_evicted: Vec<Op>,
 }
 
+pub(super) struct PendingHistoryRequest {
+    pub(super) request_id: nx_sync::OpId,
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) deadline: std::time::Instant,
+}
+
+pub(super) type HistoryRequests = HashMap<String, HashMap<String, PendingHistoryRequest>>;
+
 #[derive(Clone)]
 pub(super) struct NodeEventContext {
+    pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    pub(super) history_requests: Arc<RwLock<HistoryRequests>>,
+    pub(super) history_request_timeout: Duration,
     pub(super) counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pub(super) pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     pub(super) lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,

@@ -87,7 +87,9 @@ Node::try_new_with_bootstrap_server(config, bootstrap)?
   └── announce_bootstrap_endpoint(addr)  publish the local bootstrap suggestion
   └── withdraw_bootstrap_endpoint()      remove that suggestion
       ...running...
-  └── broadcast_ops(ops)        push ops to all connected peers
+  └── broadcast_history(message)        send sequenced history to all connected peers
+  └── send_history_to_addr(addr, message)
+  └── broadcast_ops(ops)        legacy unsequenced codec; not accepted by the sync manager
   └── send_ops_to_addr(addr, ops)
   └── send_pull_since_to_addr(addr, since_op_id)
   └── shutdown()                sends true on shutdown_tx, waits for tasks (3s grace), drops peers
@@ -99,6 +101,7 @@ Events emitted to the sync manager via `mpsc::Sender<NodeEvent>`:
 
 ```rust
 pub enum NodeEvent {
+    HistoryReceived { from: NodeId, addr: String, message: HistoryMessage },
     OpsReceived     { from: NodeId, ops: Vec<Op> },
     PullRequested   { from: NodeId, addr: String, since_op_id: Option<String> },
     PeerConnected   { node_id: NodeId, addr: String, peers_connected: usize },
@@ -124,7 +127,7 @@ connect_to_peer(addr)
   5. capture peer_cert DER bytes
   6. send Hello { node_id, protocol_version, supported_formats, preferred_format }
   7. receive HelloAck { node_id, protocol_version, selected_format }
-  8. validate protocol version == PROTOCOL_VERSION (5) and reject the local NodeId
+  8. validate protocol version == PROTOCOL_VERSION (7) and reject the local NodeId
   9. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
   10. if allowlist configured: verify peer_node_id in allowed_peers
   11. insert PeerConnection and its `PeerConnectionInfo` into the peers map
@@ -165,7 +168,7 @@ Every message is framed as:
   bootstrap-only variants remain private so the exhaustive public enums retain
   their 0.1.4 source-compatible shape.
 
-`PROTOCOL_VERSION = 5`. Version mismatch during a recognized handshake causes a structured
+`PROTOCOL_VERSION = 7`. Version mismatch during a recognized handshake causes a structured
 `WireError::ProtocolMismatch` and immediate disconnect.
 
 ### Protocol message variants
@@ -174,24 +177,37 @@ Every message is framed as:
 |---|---|---|
 | `Hello` | dialer -> listener | Open handshake: node identity, protocol version, supported formats |
 | `HelloAck` | listener -> dialer | Accept handshake: protocol version and selected format |
-| `PushOps` | both | Carry a batch of CRDT ops |
+| `PushOps` | both | Legacy unsequenced operations; rejected by the sync manager |
 | `PushOpsAck` | unused by current exchange | Encodable reception-count variant; not emitted or handled as an acknowledgement |
-| `PullSince` | both | Request ops since a known op id (anti-entropy) |
+| `PullSince` | both | Legacy UUID-based replay request; rejected by the sync manager |
 | `Ping` / `Pong` | both | Keepalive |
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
 | `BootstrapHello` *(private wire variant)* | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
 | `BootstrapAck` *(private wire variant)* | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
+| `History` *(private wire variant)* | both | Sequenced pushes, summary requests/replies and bounded range recovery |
+
+The protocol-7 private `History` variant carries `HistoryMessage` exchanges.
+Range requests and responses carry a required `request_id`; replies from an
+expired or superseded attempt cannot complete a current request.
+Use `Node::broadcast_history` / `send_history_to_addr`; received messages become
+`NodeEvent::HistoryReceived`. The sync manager accepts sequenced envelopes and
+rejects legacy `PushOps` / `PullSince` replay. The old public codecs remain
+available for compatibility and inspection, without granting legacy replay a
+new deduplication guarantee.
 
 ### Delivery and acknowledgement boundary
 
-`broadcast_ops` and `send_ops_to_addr` wait for local transport writes and
+`broadcast_history` and `send_history_to_addr`, like the legacy
+`broadcast_ops` and `send_ops_to_addr`, wait for local transport writes and
 stream flushes, not for remote CRDT application or storage flushes.
 `broadcast_ops` can succeed with zero connected peers; a failed broadcast may
 already have delivered to some peers. Neither result identifies durable remote
 copies.
 
-Receiving `PushOps` emits an internal `NodeEvent::OpsReceived` for `nx-core` to
-process. It does not send `PushOpsAck`. Incoming `PushOpsAck` messages fall
+Receiving `History` emits an internal `NodeEvent::HistoryReceived` for `nx-core`
+to validate and apply. Legacy `PushOps` emits `NodeEvent::OpsReceived`, which
+the sync manager rejects before applying state. Neither sends `PushOpsAck`.
+Incoming `PushOpsAck` messages fall
 through the read loop's unhandled-message branch; no receipt count is used to
 confirm replication. `HelloAck` and `Pong` concern handshake and ping handling,
 respectively, and do not acknowledge CRDT operations.

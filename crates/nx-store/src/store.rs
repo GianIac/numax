@@ -40,6 +40,7 @@ struct FlushPause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashCheckpoint {
     BeforeBatch,
+    AfterBatch,
     BeforeFlush,
     AfterFlush,
 }
@@ -216,6 +217,8 @@ impl Store {
             batch.remove(*key);
         }
         self.db.apply_batch(batch)?;
+        #[cfg(feature = "test-utils")]
+        self.wait_at_crash_checkpoint(CrashCheckpoint::AfterBatch);
         Ok(())
     }
 

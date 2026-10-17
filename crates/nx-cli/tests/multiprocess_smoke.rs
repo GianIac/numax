@@ -683,19 +683,26 @@ fn two_nx_run_processes_converge_distributed_counter() {
 }
 
 #[test]
-#[ignore = "requires v0.1.4 nx binary, built distributed_counter.wasm and local TCP sockets"]
+#[ignore = "requires v0.1.5 nx binary, built distributed_counter.wasm and local TCP sockets"]
 fn different_protocol_versions_reject_connection_without_exchanging_ops() {
+    for format in ["json", "bincode"] {
+        reject_previous_protocol(format);
+    }
+}
+
+fn reject_previous_protocol(format: &str) {
     let wasm = assert_counter_wasm_exists();
 
     let current_addr = free_addr();
     let previous_addr = free_addr();
-    let current_data = temp_path("protocol-v5");
-    let previous_data = temp_path("protocol-v4");
+    let current_data = temp_path("protocol-v7");
+    let previous_data = temp_path("protocol-v5");
     let current_nx = nx_bin();
     let previous_nx = previous_nx_bin();
 
     let current_node = Command::new(&current_nx)
         .env("RUST_LOG", "nx_net=error")
+        .env("NX_SERIALIZATION_FORMAT", format)
         .arg("run")
         .arg(&wasm)
         .arg("--listen")
@@ -719,6 +726,7 @@ fn different_protocol_versions_reject_connection_without_exchanging_ops() {
 
     let previous_output = Command::new(&previous_nx)
         .env("RUST_LOG", "nx_net=error")
+        .env("NX_SERIALIZATION_FORMAT", format)
         .arg("run")
         .arg(&wasm)
         .arg("--listen")
@@ -752,18 +760,72 @@ fn different_protocol_versions_reject_connection_without_exchanging_ops() {
     let previous_stdout = String::from_utf8_lossy(&previous_output.stdout);
     let previous_stderr = String::from_utf8_lossy(&previous_output.stderr);
     let protocol_mismatch_reported = current_stdout
-        .contains("protocol version mismatch: expected 5, got 4")
-        || current_stdout.contains("protocol version mismatch: expected 4, got 5")
-        || current_stderr.contains("protocol version mismatch: expected 4, got 5")
-        || current_stderr.contains("protocol version mismatch: expected 5, got 4")
-        || previous_stdout.contains("protocol version mismatch: expected 5, got 4")
-        || previous_stdout.contains("protocol version mismatch: expected 4, got 5")
-        || previous_stderr.contains("protocol version mismatch: expected 5, got 4")
-        || previous_stderr.contains("protocol version mismatch: expected 4, got 5");
+        .contains("protocol version mismatch: expected 7, got 5")
+        || current_stdout.contains("protocol version mismatch: expected 5, got 7")
+        || current_stderr.contains("protocol version mismatch: expected 5, got 7")
+        || current_stderr.contains("protocol version mismatch: expected 7, got 5")
+        || previous_stdout.contains("protocol version mismatch: expected 7, got 5")
+        || previous_stdout.contains("protocol version mismatch: expected 5, got 7")
+        || previous_stderr.contains("protocol version mismatch: expected 7, got 5")
+        || previous_stderr.contains("protocol version mismatch: expected 5, got 7");
     assert!(
         protocol_mismatch_reported,
         "neither node reported the protocol mismatch\ncurrent stdout:\n{current_stdout}\ncurrent stderr:\n{current_stderr}\nprevious stdout:\n{previous_stdout}\nprevious stderr:\n{previous_stderr}"
     );
+    // Schema 2 prevents the old runtime from bypassing sequence tracking on downgrade.
+    let downgraded = Command::new(&previous_nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(free_addr())
+        .arg("--datastore-path")
+        .arg(&current_data)
+        .output()
+        .expect("run old binary on upgraded store");
+    assert!(!downgraded.status.success());
+    assert!(
+        String::from_utf8_lossy(&downgraded.stderr)
+            .contains("unsupported future schema for op-log"),
+        "unexpected downgrade result: {downgraded:?}"
+    );
+
+    let unmigrated = Command::new(&current_nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(free_addr())
+        .arg("--datastore-path")
+        .arg(&previous_data)
+        .output()
+        .expect("open v0.1.5 store before migration");
+    assert!(!unmigrated.status.success());
+    assert!(
+        String::from_utf8_lossy(&unmigrated.stderr)
+            .contains("schema migration required for op-log"),
+        "unexpected upgrade result: {unmigrated:?}"
+    );
+    let migrated = Command::new(&current_nx)
+        .arg("migrate")
+        .arg("--datastore-path")
+        .arg(&previous_data)
+        .output()
+        .expect("migrate v0.1.5 store");
+    assert_success(&migrated, "v0.1.5 store migration");
+    let upgraded = Command::new(&current_nx)
+        .arg("run")
+        .arg(&wasm)
+        .arg("--listen")
+        .arg(free_addr())
+        .arg("--datastore-path")
+        .arg(&previous_data)
+        .arg("--settle-for")
+        .arg("200ms")
+        .arg("--print-gcounter")
+        .arg(COUNTER_KEY)
+        .output()
+        .expect("run current binary on migrated v0.1.5 store");
+    assert_success(&upgraded, "migrated v0.1.5 node");
+    assert_printed_counter(&upgraded, "migrated v0.1.5 node", 2);
 }
 
 #[cfg(unix)]

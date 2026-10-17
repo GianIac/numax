@@ -6,7 +6,9 @@ mod migration;
 mod peer;
 mod replication;
 mod schema;
+mod sequence;
 mod storage;
+pub use sequence::{ReplicationProgress, UnavailableHistory};
 mod types;
 
 pub use manager::{SyncHandle, SyncManager};

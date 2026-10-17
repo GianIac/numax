@@ -12,7 +12,8 @@ The managed tables are:
 
 - materialized and durable state for each CRDT family;
 - seen-operation metadata;
-- the durable operation log.
+- the durable operation log;
+- sequence allocation, receipt tracking, and retained replay positions.
 
 These are logical tables implemented with key prefixes in one sled database.
 
@@ -35,6 +36,39 @@ encoding.
 
 The table identifier prevents valid metadata for one namespace from being
 accepted for another. Each table owns its schema version independently.
+
+## Sequenced replication in v0.1.6
+
+The op-log table (id 14) now uses schema 2. Its `1 -> 2` migration validates
+existing operation payloads without assigning historical sequences or rewriting
+those payloads. The version change also makes v0.1.5 reject an upgraded store
+before it can mutate CRDT state without updating sequence metadata.
+
+The additive `sequences` table (id 15, schema 2) uses `__nx/crdt/sequence/`:
+
+- `local`: the bound origin, current generation, and allocated sequence;
+- `origin/<origin>`: contiguous prefix, known high sequence, sparse identities,
+  optional unavailable-history evidence (source, interval and request ID), and
+  legacy baseline requirement;
+- `usage`: origin count, serialized receipt bytes, and sparse-position count;
+- `replay/<OpId>`: original origin/generation/sequence, retained alongside the
+  corresponding replay record and deleted when that record expires.
+
+The sequence-table `1 -> 2` migration preserves contiguous coverage, sparse
+identities, known maxima and baseline requirements. It discards the old
+uncorrelated unavailable boolean instead of inventing a source or interval.
+Migration is resumable; receipt-byte accounting is recomputed and committed
+atomically with the schema-2 header and checkpoint removal at completion.
+
+Local state and sequence allocation commit in one batch before the covering
+flush. Remote state, positions, and receipt metadata likewise commit atomically
+before publication. Compacted receipt prefixes survive replay and seen-ID
+retention. Missing or corrupt authoritative sequence records fail closed.
+
+Existing stores require explicit offline migration with
+`nx migrate --datastore-path /path/to/data`. UUID-only records remain legacy;
+their automatic remote replay is rejected, and the need for a legacy state
+baseline is advertised separately. Historical fixture payloads remain intact.
 
 ## Startup validation
 
@@ -83,7 +117,8 @@ gaps and double-processing.
 
 ## Legacy migration
 
-The migration engine currently supports `v0 -> v1`. Version `0` means either
+The migration engine supports `v0 -> v1` for the original tables and
+`v1 -> v2` for the op log. Version `0` means either
 legacy data without metadata or an explicit version-zero header.
 
 This migration certifies existing payloads without rewriting them:

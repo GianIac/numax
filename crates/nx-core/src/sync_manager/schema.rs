@@ -32,10 +32,11 @@ pub(super) enum StoreTable {
     RgaState = 12,
     SeenOps = 13,
     OpLog = 14,
+    Sequences = 15,
 }
 
 impl StoreTable {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 15] = [
         Self::GCounterMaterialized,
         Self::GCounterState,
         Self::PNCounterMaterialized,
@@ -50,6 +51,7 @@ impl StoreTable {
         Self::RgaState,
         Self::SeenOps,
         Self::OpLog,
+        Self::Sequences,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -68,6 +70,7 @@ impl StoreTable {
             Self::RgaState => "rga-state",
             Self::SeenOps => "seen-ops",
             Self::OpLog => "op-log",
+            Self::Sequences => "sequences",
         }
     }
 
@@ -87,11 +90,17 @@ impl StoreTable {
             Self::RgaState => RGA_STATE_STORE_PREFIX,
             Self::SeenOps => SEEN_OP_STORE_PREFIX,
             Self::OpLog => OP_LOG_STORE_PREFIX,
+            Self::Sequences => super::storage::SEQUENCE_PREFIX,
         }
     }
 
     pub(super) fn current_version(self) -> u16 {
-        INITIAL_SCHEMA_VERSION
+        // Version 2 also fences old runtimes that would bypass receipt tracking.
+        if matches!(self, Self::OpLog | Self::Sequences) {
+            2
+        } else {
+            INITIAL_SCHEMA_VERSION
+        }
     }
 
     pub(super) fn schema_key(self) -> Vec<u8> {

@@ -61,8 +61,8 @@ contracts.
 | Peer health is not SWIM membership | `crates/nx-core/src/sync_manager/peer.rs` tracks per-endpoint reconnection health. Its `Suspect` and `Dead` labels do not constitute a cluster-wide, incarnation-aware membership protocol. |
 | Local acceptance is flush-confirmed | Local CRDT mutations persist state, `OpId`, seen metadata, and replay in one atomic batch. Success follows the covering flush and does not imply remote receipt. |
 | Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. Preserve this error ordering when adding forwarding; verify failure behavior and flush semantics separately. |
-| The present repair path is limited | `sync_manager/replication.rs` periodically pulls a bounded op log over active connections. The maximum observed `OpId` is not a causal frontier. Current `OpId` is UUID-based (`crates/nx-sync/src/op.rs`); its lexical order cannot prove that older operations were received. |
-| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 5; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
+| The present repair path is limited | `sync_manager/replication.rs` exchanges paginated per-origin summaries and bounded replay ranges over active connections. Durable contiguous prefixes and sparse receipt metadata suppress delayed duplicates independently of replay retention. Unavailable history is reported; UUID order and advertised maxima are not receipt frontiers. |
+| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 7; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
 | Management lists peers today | `GET /api/v1/peers` exists in `crates/nx-api/src/routes.rs`. The proposed POST is not yet a runtime admission API. Control cases belong behind `nx-core/src/control.rs`. |
 
 `nx-store::Store::apply_batch` and `flush` are distinct operations. An atomic
@@ -338,16 +338,17 @@ isolation for direct internal reads of reserved storage keys.
 
 ### D2 — Identity, missing history, and duplicates
 
-**Proposed contract; not yet implemented.** Keep the UUID `OpId` as the unique
-operation identity and add a
-logical position `(origin, generation, sequence)`. The sequence should be
-monotonic per origin across process restarts; generation identifies the
-origin's process incarnation and increases durably at each start. Do not reset
-the sequence at a restart. This keeps one contiguous history per origin and
-avoids needing a separate end-of-generation marker to prove where an earlier
-generation stopped.
+**Implementation present; D2 acceptance validation remains incomplete.**
+Recovery beyond retained history remains D3.
+The UUID `OpId` remains the unique operation identity, with a logical position
+`(origin, generation, sequence)` carried by the replication envelope.
+The sequence is monotonic per origin across process restarts; generation
+identifies the origin's process incarnation and increases durably at each start.
+The sequence does not reset at a restart. This keeps one contiguous history per
+origin and avoids needing a separate end-of-generation marker to prove where an
+earlier generation stopped.
 
-#### Recommended allocation and persistence
+#### Allocation and persistence
 
 - Persist the origin identity with its local generation metadata. On startup,
   increment the generation and confirm its flush before accepting writes. If
@@ -366,12 +367,13 @@ generation stopped.
   for legacy identification and diagnostics, while the position establishes ordering
   and duplicate safety after the bounded `seen-op` cache evicts an ID.
 
-The proposed store binding, generation, local sequence, received frontier, and
-sparse positions need versioned schema records. Any sequence metadata carried
-over the network changes wire semantics and requires a protocol version change
-under [Wire Versioning](/numax/design/wire-versioning/).
+The store binding, generation, local sequence, received frontier, and sparse
+positions use versioned schema records. Protocol 7 carries the replication
+envelopes; the legacy public `Op` and message encodings remain unchanged.
+See [Wire Versioning](/numax/design/wire-versioning/) and
+[Schema Versioning](/numax/design/schema-versioning/).
 
-#### Recommended receiver behavior
+#### Receiver behavior
 
 For each origin, track the highest **contiguous** sequence and a bounded set of
 received positions beyond it. Starting from sequence 0, if sequence 2 arrives
@@ -401,9 +403,27 @@ resource limit. Never evict a durable frontier merely to admit another origin.
 Paging durable metadata into memory is allowed only if duplicate checks still
 consult its authoritative record before application.
 
-Calibrate numerical limits from the configured resource budget and tests before
-integration. Sequence and generation exhaustion and corrupt tracking metadata
-must fail closed. Sequence 0 is a frontier sentinel, not a valid operation.
+The implementation uses the following hard budgets; these are correctness and
+resource bounds, not performance targets:
+
+| Resource | Limit |
+| --- | --- |
+| Tracked origins | 1,024 |
+| Origin / operation-ID UTF-8 bytes | 256 / 128 |
+| Sparse positions per origin / total | 256 / 8,192 |
+| Serialized receipt keys and values | 4 MiB total |
+| Sequence distance from contiguous prefix | 65,536 |
+| Summary origins per page | 16 |
+| Requested sequences per replay page | 128 |
+| Replay operation-array JSON size | 8 MiB |
+
+The replay budget accommodates a maximum 1 MiB guest value in JSON byte-array
+form. Before accepting a new operation, reserve 1 KiB of that budget for
+framing/metadata; an operation that cannot fit is rejected before its state
+batch. Replay-position sidecars are bounded by the configured op-log retention
+count and identity-length limits, independently of the receipt-record budget.
+Sequence and generation exhaustion and corrupt tracking metadata fail closed.
+Sequence 0 is a frontier sentinel, not a valid operation.
 
 #### Missing-operation detection and bounded progress
 
@@ -411,9 +431,10 @@ A gap between received operations does not reveal a lost final operation. For
 example, after receiving sequence 1, a node cannot know that accepted sequence
 2 was lost if the producer stops writing. **Periodically exchange bounded,
 paginated per-origin history summaries independently of new writes.** A summary
-advertises the highest sequence the sender knows to exist, distinguishing the
-origin's flush-confirmed local acceptance from a relay's observed history. A
-relay's observed maximum does not certify a durable copy on that relay.
+advertises the highest sequence the sender knows to exist. These summaries
+report observed history, including when sent by the origin; they do not certify
+flush-confirmed acceptance or a durable remote copy. D1 remains the contract
+for the local success response.
 
 Compare the advertised high-water mark with the receiver's contiguous frontier
 and sparse positions to identify missing ranges, including a missing suffix.
@@ -426,11 +447,35 @@ with a source or relay that knows about a lost operation, its existence cannot
 be detected by this exchange.
 
 Budget summary entries and bytes, range requests, replay bytes, and retries
-per cycle; retain pagination progress so each tracked origin is eventually
-visited while communication continues. Numeric maxima do not demonstrate
+per cycle; the receiver retains a per-connection origin cursor and periodically
+requests the next summary page, so each tracked origin is eventually visited
+while communication continues. Recovery therefore does not depend on the
+producer choosing the same anti-entropy interval. Numeric maxima do not demonstrate
 that every requested replay record remains available. A source must check the
 actual requested interval and report unavailable history instead of treating
 an empty or partial response as complete recovery.
+
+After persisting a valid replay page, request at most one next missing range
+from that source immediately. Do not wait for another periodic summary to
+continue an already known gap. Every request and response still obeys the
+range and byte budgets; unavailable history is retried through the periodic
+exchange rather than an immediate retry loop.
+Request a bounded interval starting at the first missing sequence, including
+already received sparse positions within that interval. Receiver deduplication
+suppresses those duplicates. This closes multiple scattered gaps per page
+instead of requiring a separate network round trip for each missing position.
+Keep at most one outstanding range per origin and 16 per connection. Repeated
+pushes or summaries must not duplicate an in-flight request. A valid replay
+prefix or unavailable response releases its matching request; failed sends
+release it immediately. Missing responses become eligible for retry after the
+configured socket timeout. Disconnect removes the connection's pending requests.
+Each range attempt has a fresh request ID. Accept replies only from the pending
+source and origin, with that ID, an unexpired deadline, and a matching interval.
+Persist unavailable evidence with its source, interval and request ID; remove
+it when that interval is covered, not only when all later gaps are closed.
+Likewise, allow only one outstanding summary request per connection until its
+reply or socket-timeout deadline; short polling intervals must not build a
+backlog of identical summaries while a peer is busy.
 
 When a far-ahead operation exceeds the gap-distance or sparse-entry budget,
 leave it unapplied, record the bounded recovery target, and request the earliest
@@ -466,7 +511,9 @@ path is unavailable. A new sequenced frontier never certifies coverage of
 legacy history. The implementation must preserve pre-migration local values
 and prevent automatic legacy op-log replay; merely tagging an operation as
 legacy is insufficient. Keep historical fixtures unchanged and test migration
-using copied fixtures.
+using copied fixtures. Sources advertise `baseline_required` for pre-sequence
+state, and receivers preserve that condition independently of their new
+contiguous prefixes.
 
 The current protocol requires exact version equality. A wire version that
 requires sequence metadata therefore rejects v0.1.5 peers before CRDT exchange;
@@ -507,8 +554,87 @@ Use the same deterministic tracker in production and tests. Cover, in order:
 10. Paginate summaries over more origins than fit one cycle; verify eventual
     visitation and that maxima never advance the receiver's contiguous frontier.
 
-The on-wire representation, exact schema versions, gap-limit values, migration
-command, and status/API surface remain open for review before implementation.
+Protocol 7 uses a private `History` wire variant carrying sequenced pushes,
+summary requests/replies, range requests, replay pages, and unavailable-range
+responses with attempt correlation. Protocol-6 development peers and existing
+v0.1.5 peers are rejected before admission. Store table
+`sequences` (id 15, version 2) holds the allocator, per-origin receipt records,
+usage accounting, and retained replay positions. Op-log schema 2 fences older
+runtimes that would otherwise write without updating sequence metadata. Its
+explicit `1 -> 2` migration validates and preserves the existing payloads:
+
+```sh
+nx migrate --datastore-path /path/to/data
+```
+
+The separate sequence-table `1 -> 2` migration preserves coverage and recounts
+receipt bytes at completion. It drops the old uncorrelated unavailable boolean;
+it cannot safely manufacture source/range evidence for an earlier result.
+
+`SyncHandle::replication_progress()` exposes contiguous and known-high
+sequences, sparse counts, source-unavailable status, and legacy baseline
+requirements. A source-unavailable result is specific evidence from one source;
+it does not prove that no other source can repair the gap. Resource failures
+are recorded through the existing sync-error metrics and logs. No HTTP endpoint
+or state-transfer implementation is added by D2. D3 still defines baseline
+transfer and recovery beyond retained history.
+
+Before applying a batch, validate UUID, retained position and payload together
+under the storage write lease, even after seen-ID eviction. Invalid pushes
+must not persist recovery targets; only typed recoverable tracking limits may
+leave a target for bounded repair. Evaluate global receipt budgets on the final
+atomic batch, not on origin-order-dependent intermediate totals.
+
+The focused regression suite is in `sync_manager/tests/sequencing.rs`, with
+tracker unit tests in `sync_manager/sequence.rs` and malformed replay tests in
+`sync_manager/replication.rs`. It covers all six CRDT families, delayed replay
+after eviction and restart, atomic remote crash outcomes, global origin and
+sparse budgets, relayed suffix recovery with the origin offline, bounded JSON
+replay, and unavailable history. Local process-crash tests also assert receipt
+frontiers and replay positions for every mutation case. These are deterministic
+tracker/component tests and local TCP tests, not evidence of the later 50-node
+loss/partition or one-hour membership criteria.
+
+Validation on 2026-10-17 reproduced an interference between independent tests:
+`intermittent_network_with_ten_percent_lost_pushes_converges` could exceed its
+five-second recovery wait in the parallel suite, even with both crash tests
+excluded. The receiver correctly reported missing coverage rather than false
+convergence. Changing the runtime to two workers did not resolve it.
+
+sled 0.34.7 uses a process-global concurrency-control lock. Its batches take
+an exclusive lock; reads in another database in the same process can therefore
+block, despite separate datastore directories. Stack sampling found remote
+sequence validation blocked in `Store::get` on this lock. A controlled run with
+only the recovery test and four bulk sequence tests in one process failed at
+97/100; the same workloads running concurrently in separate processes passed,
+with recovery taking approximately 2.86 seconds after the writes completed.
+This identifies cross-test storage contention, not a lost replay or an
+incorrectly advanced contiguous frontier.
+
+The timing-sensitive recovery test now runs its exact TCP scenario in a child
+of the same test binary, isolated from unrelated tests' sled batch locks.
+The parent propagates child failure and enforces a 60-second total process
+lifetime with termination and reaping on timeout. The scenario retains the
+original current-thread runtime, 100 operations, ten omitted initial sends,
+and five-second recovery wait. It checks materialized values and durable
+contiguous coverage of all 100 positions, with no sparse receipts remaining.
+An explicit monotonic elapsed-time assertion rejects late completion even
+when synchronous storage work delays polling.
+Bulk tests still run in the normal parallel suite. Temporary diagnostic code
+is removed; this test-isolation fix does not make production storage
+asynchronous or promise bounded recovery under arbitrary storage contention.
+
+After removing diagnostics, three consecutive complete parallel core runs pass
+(373 passed, 2 ignored each), as does `cargo test --workspace --verbose` with
+default parallelism (777 passed, 8 ignored). All include the explicit
+five-second recovery assertion and all bulk tests. A regression verifies that
+a nonzero child exit fails the parent rather than being accepted as success.
+Format, workspace all-target check and warning-denying Clippy pass. Four serial
+real-process smoke tests also pass, including JSON/Bincode protocol rejection,
+explicit migration and downgrade rejection against the real v0.1.5 binary.
+These results close D2's previously recorded validation blocker; they do not
+establish D3 recovery beyond retained history or the later 50-node membership
+and dissemination criteria.
 
 ### D3 — Recovery and state transfer
 

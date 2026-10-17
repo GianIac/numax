@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_u32_max_request_returns_a_bounded_v5_response() {
+    async fn remote_u32_max_request_returns_a_bounded_v6_response() {
         for format in [SerializationFormat::Bincode, SerializationFormat::Json] {
             let node = Node::try_new_with_bootstrap_server(
                 NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
@@ -853,7 +853,7 @@ mod tests {
                     candidates,
                     ..
                 } => {
-                    assert_eq!(protocol_version, 5);
+                    assert_eq!(protocol_version, PROTOCOL_VERSION);
                     assert_eq!(candidates, [bound.to_string()]);
                 }
                 other => panic!("unexpected bootstrap reply: {other:?}"),
@@ -1007,7 +1007,7 @@ mod tests {
             assert!(matches!(
                 hello.kind,
                 WireMessageKind::BootstrapHello {
-                    protocol_version: 5,
+                    protocol_version: PROTOCOL_VERSION,
                     ..
                 }
             ));

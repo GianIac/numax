@@ -303,6 +303,12 @@ impl NodeConfig {
 /// Node exit event (for runtime).
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
+    /// Protocol-7 sequenced replication and history exchange.
+    HistoryReceived {
+        from: NodeId,
+        addr: String,
+        message: nx_sync::HistoryMessage,
+    },
     /// received new operations from a peer.
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
@@ -744,6 +750,28 @@ impl Node {
         })
     }
 
+    /// Send protocol-7 history data without changing the legacy public message codec.
+    pub async fn broadcast_history(&self, message: nx_sync::HistoryMessage) -> NetResult<()> {
+        self.broadcast_message(WireMessage {
+            kind: WireMessageKind::History { message },
+        })
+        .await
+    }
+
+    pub async fn send_history_to_addr(
+        &self,
+        addr: &str,
+        message: nx_sync::HistoryMessage,
+    ) -> NetResult<()> {
+        self.send_message_to_addr(
+            addr,
+            WireMessage {
+                kind: WireMessageKind::History { message },
+            },
+        )
+        .await
+    }
+
     /// Send ops to all connected peers.
     pub async fn broadcast_ops(&self, ops: Vec<Op>) -> NetResult<()> {
         self.broadcast_message(Message::push_ops(ops)).await
@@ -765,7 +793,8 @@ impl Node {
             .await
     }
 
-    async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
+    async fn broadcast_message(&self, msg: impl Into<WireMessage>) -> NetResult<()> {
+        let msg = msg.into();
         let writers = {
             let peers = self.peers.read().await;
             peers
@@ -822,7 +851,8 @@ impl Node {
         Ok(())
     }
 
-    async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
+    async fn send_message_to_addr(&self, addr: &str, msg: impl Into<WireMessage>) -> NetResult<()> {
+        let msg = msg.into();
         let peer_writer = {
             let peers = self.peers.read().await;
             peers.get(addr).and_then(|conn| {
@@ -1550,7 +1580,7 @@ async fn read_messages(
                 continue;
             }
 
-            msg = read_message(&mut reader, max_message_size, socket_timeout) => {
+            msg = async { read_wire_message_with_format(&mut reader, max_message_size, socket_timeout).await.map(|(_, message)| message) } => {
                 match msg {
                     Ok(m) => m,
                     Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1562,6 +1592,25 @@ async fn read_messages(
             }
         };
 
+        let msg = match msg {
+            WireMessage {
+                kind: WireMessageKind::History { message },
+            } => {
+                send_node_event(
+                    &event_tx,
+                    &shutdown_for_events,
+                    "HistoryReceived",
+                    NodeEvent::HistoryReceived {
+                        from: peer_node_id.clone(),
+                        addr: addr.clone(),
+                        message,
+                    },
+                )
+                .await;
+                continue;
+            }
+            other => Message::try_from(other)?,
+        };
         match msg.kind {
             MessageKind::PushOps { ops } => {
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");

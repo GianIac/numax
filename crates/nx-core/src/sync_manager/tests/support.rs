@@ -181,6 +181,9 @@ pub(super) fn test_event_context(
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 ) -> NodeEventContext {
     NodeEventContext {
+        history_cursors: Arc::new(RwLock::new(HashMap::new())),
+        history_requests: Arc::new(RwLock::new(HashMap::new())),
+        history_request_timeout: Duration::from_secs(30),
         counters,
         pncounters: Arc::new(RwLock::new(HashMap::new())),
         lww_registers: Arc::new(RwLock::new(HashMap::new())),
@@ -418,14 +421,72 @@ pub(super) async fn apply_remote_rga_op_for_test(
 pub(super) async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if manager.get_counter_value(key).await == expected {
+        let actual = manager.get_counter_value(key).await;
+        if actual == expected {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "counter {key} did not reach {expected}"
+            "counter {key} did not reach {expected}: actual={actual}, progress={:?}",
+            manager.handle().replication_progress()
         );
         sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
+    use std::io::{Read, Seek};
+    use std::process::{Command, Stdio};
+
+    const CHILD_TEST: &str = "NUMAX_ISOLATED_SYNC_TEST";
+    assert_eq!(std::thread::current().name(), Some(test_name));
+    if std::env::var_os(CHILD_TEST).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+        return false;
+    }
+
+    let mut output = tempfile::tempfile().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = StdInstant::now() + std::time::Duration::from_secs(60);
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(error),
+        }
+        if StdInstant::now() >= deadline {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "isolated sync test exceeded its process lifetime",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if result.as_ref().is_ok_and(|status| status.success()) {
+        return true;
+    }
+    let cleanup = result.is_err().then(|| (child.kill(), child.wait()));
+    output.rewind().unwrap();
+    let mut bytes = Vec::new();
+    output.take(64 * 1024).read_to_end(&mut bytes).unwrap();
+    let diagnostics = String::from_utf8_lossy(&bytes);
+    panic!("isolated test {test_name} failed: {result:?}; cleanup={cleanup:?}\n{diagnostics}");
+}
+
+#[test]
+#[should_panic(
+    expected = "isolated test sync_manager::manager::tests::support::isolated_child_failure_is_reported failed"
+)]
+fn isolated_child_failure_is_reported() {
+    if !run_in_isolated_test_process(
+        "sync_manager::manager::tests::support::isolated_child_failure_is_reported",
+    ) {
+        std::process::exit(23);
     }
 }
 
@@ -522,21 +583,29 @@ pub(super) async fn wait_for_connected_peer(manager: &SyncManager) {
     }
 }
 
-pub(super) async fn wait_for_pull_request(
+pub(super) async fn wait_for_history_request(
     events: &mut mpsc::Receiver<NodeEvent>,
-) -> (String, Option<String>) {
+) -> (String, nx_sync::OpId, NodeId, u64, u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let NodeEvent::PullRequested {
-                addr, since_op_id, ..
+            if let NodeEvent::HistoryReceived {
+                addr,
+                message:
+                    nx_sync::HistoryMessage::Request {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                    },
+                ..
             } = events.recv().await.expect("peer event channel closed")
             {
-                return (addr, since_op_id);
+                return (addr, request_id, origin, start, end);
             }
         }
     })
     .await
-    .expect("peer did not receive an anti-entropy pull")
+    .expect("peer did not receive a history range request")
 }
 
 pub(super) async fn wait_for_peer_health(

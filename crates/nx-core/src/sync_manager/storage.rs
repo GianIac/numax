@@ -1,3 +1,6 @@
+mod sequence;
+pub(super) use sequence::*;
+
 use std::collections::HashMap;
 
 use nx_store::Store as NxStore;
@@ -737,7 +740,11 @@ pub(super) fn persist_local_gcounter_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -793,7 +800,11 @@ pub(super) fn persist_local_pncounter_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -847,7 +858,11 @@ pub(super) fn persist_local_lww_register_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), register.value()),
@@ -903,7 +918,11 @@ pub(super) fn persist_local_lww_map_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -955,7 +974,11 @@ pub(super) fn persist_local_orset_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -1007,7 +1030,11 @@ pub(super) fn persist_local_rga_op(
         .collect::<Vec<_>>();
 
     let lease = store.acquire_write_lease()?;
-    lease.apply_batch(
+    apply_local_sequence_batch(
+        &lease,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
         &[
             (state_key.as_slice(), state_json.as_bytes()),
             (materialized_key.as_slice(), materialized_value.as_slice()),
@@ -1055,7 +1082,12 @@ pub(super) fn collect_seen_delete_keys(evicted: &[String]) -> Vec<Vec<u8>> {
 pub(super) fn collect_op_log_delete_keys(evicted: &[Op]) -> Vec<Vec<u8>> {
     evicted
         .iter()
-        .map(|op| op_log_store_key(op.id.as_str()))
+        .flat_map(|op| {
+            [
+                op_log_store_key(op.id.as_str()),
+                position_key(op.id.as_str()),
+            ]
+        })
         .collect()
 }
 
@@ -1094,6 +1126,8 @@ pub(super) fn persist_remote_ops_batch(
     store: &NxStore,
     plans: &[OpPersistencePlan],
     updates: RemoteCrdtUpdateBatch<'_>,
+    lease: Option<&nx_store::StoreWriteLease<'_>>,
+    sequence_sets: &[(Vec<u8>, Vec<u8>)],
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1199,7 +1233,35 @@ pub(super) fn persist_remote_ops_batch(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    store.apply_batch(&sets, &deletes)?;
+    let mut sets = sets;
+    sets.extend(
+        sequence_sets
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice())),
+    );
+    if let Some(lease) = lease {
+        lease.apply_batch(&sets, &deletes)?;
+    } else {
+        store.apply_batch(&sets, &deletes)?;
+    }
+    Ok(())
+}
+
+fn apply_local_sequence_batch(
+    lease: &nx_store::StoreWriteLease<'_>,
+    op: &Op,
+    generation: u64,
+    state_sets: &[(&[u8], &[u8])],
+    deletes: &[&[u8]],
+) -> anyhow::Result<()> {
+    let sequence_sets = local_sequence_sets(lease, op, generation)?;
+    let mut sets = state_sets.to_vec();
+    sets.extend(
+        sequence_sets
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice())),
+    );
+    lease.apply_batch(&sets, deletes)?;
     Ok(())
 }
 

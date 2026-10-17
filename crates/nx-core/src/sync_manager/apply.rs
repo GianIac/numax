@@ -9,13 +9,35 @@ use super::replication::{
     apply_seen_insertions, plan_op_log_evictions, plan_seen_evictions,
     prune_op_log_and_return_evicted,
 };
-use super::storage::persist_remote_ops_batch;
+use super::storage::{persist_remote_ops_batch, remote_sequence_sets};
 use super::types::*;
 
+#[cfg(test)]
 pub(super) async fn apply_remote_ops(
     ops: &[Op],
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
+    apply_ops(ops, None, context).await
+}
+
+pub(super) async fn apply_sequenced_ops(
+    ops: &[nx_sync::SequencedOp],
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ops.len() <= 1024,
+        "sequenced batch exceeds operation budget"
+    );
+    let raw = ops.iter().map(|entry| entry.op.clone()).collect::<Vec<_>>();
+    apply_ops(&raw, Some(ops), context).await
+}
+
+async fn apply_ops(
+    input: &[Op],
+    sequenced: Option<&[nx_sync::SequencedOp]>,
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<()> {
+    let ops = input;
     if ops.is_empty() {
         return Ok(());
     }
@@ -30,6 +52,24 @@ pub(super) async fn apply_remote_ops(
     let mut lww_maps = context.lww_maps.write().await;
     let mut orsets = context.orsets.write().await;
     let mut rgas = context.rgas.write().await;
+    let sequence_lease = if sequenced.is_some() {
+        Some(context.store.acquire_write_lease()?)
+    } else {
+        None
+    };
+    let (accepted_entries, sequence_sets) = match (sequenced, sequence_lease.as_ref()) {
+        (Some(entries), Some(lease)) => remote_sequence_sets(lease, entries)?,
+        _ => (Vec::new(), Vec::new()),
+    };
+    let accepted_ops = accepted_entries
+        .iter()
+        .map(|entry| entry.op.clone())
+        .collect::<Vec<_>>();
+    let ops = if sequenced.is_some() {
+        accepted_ops.as_slice()
+    } else {
+        ops
+    };
     let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
     let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
     let mut inserted_ids = Vec::new();
@@ -44,6 +84,12 @@ pub(super) async fn apply_remote_ops(
 
     for op in ops {
         let op_id = op.id.as_str();
+        if sequenced.is_some() {
+            anyhow::ensure!(
+                !seen.ids.contains(op_id) && !inserted_ids.iter().any(|id| id == op_id),
+                "operation UUID reused at another sequence"
+            );
+        }
         if seen.ids.contains(op_id) || inserted_ids.iter().any(|id| id == op_id) {
             debug!(op_id = %op.id, "skipping duplicate op");
             continue;
@@ -72,11 +118,12 @@ pub(super) async fn apply_remote_ops(
     }
 
     let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
-    let op_log_evicted = plan_op_log_evictions(&log, inserted_ops.len(), context.op_log_limit);
+    let op_log_evicted = plan_op_log_evictions(&log, &inserted_ops, context.op_log_limit);
     let last_insert_index = inserted_ops.len().saturating_sub(1);
 
     for (index, op) in inserted_ops.iter().enumerate() {
         plans.push(OpPersistencePlan {
+            local_generation: None,
             op: op.clone(),
             seen_sequence: next_seen_sequence,
             op_log_sequence: next_op_log_sequence,
@@ -95,7 +142,7 @@ pub(super) async fn apply_remote_ops(
         next_op_log_sequence = next_op_log_sequence.saturating_add(1);
     }
 
-    let duplicate_count = ops.len().saturating_sub(inserted_ops.len());
+    let duplicate_count = input.len().saturating_sub(inserted_ops.len());
     if let Err(error) = persist_remote_ops_batch(
         context.store,
         &plans,
@@ -107,6 +154,8 @@ pub(super) async fn apply_remote_ops(
             orsets: &orset_updates,
             rgas: &rga_updates,
         },
+        sequence_lease.as_ref(),
+        &sequence_sets,
     ) {
         context.metrics.record_remote_op_batch(
             ops.len(),

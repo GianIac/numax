@@ -257,7 +257,44 @@ const RGA_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const RGA_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 // SEEN OPS AND OP LOG
 const SEEN_OPS_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
-const OP_LOG_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const OP_LOG_STEPS: &[MigrationStep] = &[
+    LEGACY_TO_V1,
+    MigrationStep {
+        from_version: 1,
+        to_version: 2,
+        // Payloads are preserved. The new header fences unsequenced old writers.
+        migrate_record: migrate_legacy_record,
+    },
+];
+const SEQUENCE_STEPS: &[MigrationStep] = &[
+    LEGACY_TO_V1,
+    MigrationStep {
+        from_version: 1,
+        to_version: 2,
+        migrate_record: migrate_sequence_evidence,
+    },
+];
+
+fn migrate_sequence_evidence(
+    table: StoreTable,
+    key: &[u8],
+    value: &[u8],
+) -> Result<RecordMigration, MigrationError> {
+    let replacement = super::storage::migrate_sequence_v1(key, value).map_err(|error| {
+        MigrationError::InvalidRecord {
+            table: table.name(),
+            key: key.to_vec(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(match replacement {
+        Some(value) => RecordMigration {
+            sets: vec![(key.to_vec(), value)],
+            deletes: Vec::new(),
+        },
+        None => RecordMigration::unchanged(),
+    })
+}
 
 impl MigrationCheckpoint {
     fn new(table: StoreTable, from_version: u16, to_version: u16) -> Self {
@@ -458,10 +495,24 @@ fn migrate_table_batch(
             table,
         }
         .encode();
-        lease.apply_batch(
-            &[(schema_key.as_slice(), schema_header.as_slice())],
-            &[checkpoint_key.as_slice()],
-        )?;
+        let usage = if table == StoreTable::Sequences && step.to_version == 2 {
+            Some(
+                super::storage::migrated_sequence_usage(store).map_err(|error| {
+                    MigrationError::InvalidRecord {
+                        table: table.name(),
+                        key: Vec::new(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut sets = vec![(schema_key.as_slice(), schema_header.as_slice())];
+        if let Some((key, value)) = &usage {
+            sets.push((key.as_slice(), value.as_slice()));
+        }
+        lease.apply_batch(&sets, &[checkpoint_key.as_slice()])?;
         return Ok(Some(MigrationProgress::TableCompleted {
             table: table.name(),
             from_version: step.from_version,
@@ -600,6 +651,7 @@ fn migration_steps(table: StoreTable) -> &'static [MigrationStep] {
         StoreTable::RgaState => RGA_STATE_STEPS,
         StoreTable::SeenOps => SEEN_OPS_STEPS,
         StoreTable::OpLog => OP_LOG_STEPS,
+        StoreTable::Sequences => SEQUENCE_STEPS,
     }
 }
 
@@ -751,6 +803,7 @@ fn migrate_legacy_record(
                 .map(|_| ())
                 .map_err(Into::into),
             StoreTable::RgaState => parse_durable_rga_state(value).map(|_| ()),
+            StoreTable::Sequences => super::storage::migrate_sequence_v1(key, value).map(|_| ()),
             StoreTable::SeenOps => parse_seen_op_sequence(value).map(|_| ()),
             StoreTable::OpLog => parse_durable_op_log_value(value).and_then(|(_, op)| {
                 let key_op_id = logical_key_for_prefix(key, table.data_prefix(), table.name())?;
@@ -796,6 +849,59 @@ mod tests {
             max_records: NonZeroU32::new(max_records).unwrap(),
             ..MigrationOptions::default()
         }
+    }
+
+    #[test]
+    fn sequence_v1_migration_preserves_coverage_and_recounts_evidence_bytes_on_resume() {
+        use crate::sync_manager::storage::replication_progress;
+        let store = temp_store();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        let table = StoreTable::Sequences;
+        store
+            .set(
+                &table.schema_key(),
+                &SchemaHeader { version: 1, table }.encode(),
+            )
+            .unwrap();
+        let key = b"__nx/crdt/sequence/origin/remote";
+        let sparse = BTreeMap::from([(2u64, (1u64, "second".to_owned()))]);
+        let value = serde_json::to_vec(&(0u64, 3u64, &sparse, true, true)).unwrap();
+        store.set(key, &value).unwrap();
+        store
+            .set(
+                b"__nx/crdt/sequence/usage",
+                &serde_json::to_vec(&(1usize, key.len() + value.len(), 1usize)).unwrap(),
+            )
+            .unwrap();
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        {
+            let mut migration = SyncSchemaMigration::new(&store, options(1)).unwrap();
+            assert!(matches!(
+                migration.step().unwrap(),
+                MigrationProgress::BatchValidated {
+                    table: "sequences",
+                    ..
+                }
+            ));
+        }
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        migrate_sync_schema(&store, options(1)).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        let progress = replication_progress(&store).unwrap();
+        assert_eq!(progress[0].contiguous_sequence, 0);
+        assert_eq!(progress[0].known_high_sequence, 3);
+        assert_eq!(progress[0].sparse_positions, 1);
+        assert!(progress[0].baseline_required);
+        // Schema 1 did not retain a source, range, or attempt: do not invent evidence.
+        assert!(!progress[0].source_unavailable);
+        let new_value = store.get(key).unwrap().unwrap();
+        let usage: (usize, usize, usize) =
+            serde_json::from_slice(&store.get(b"__nx/crdt/sequence/usage").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(usage, (1, key.len() + new_value.len(), 1));
+        let after = store.scan_prefix(b"__nx/crdt/sequence/").unwrap();
+        migrate_sync_schema(&store, options(1)).unwrap();
+        assert_eq!(store.scan_prefix(b"__nx/crdt/sequence/").unwrap(), after);
     }
 
     #[test]
@@ -1336,7 +1442,9 @@ mod tests {
     #[test]
     fn migrates_fixture_generated_by_v0_1_0_without_changing_payloads() {
         let records = parse_fixture(include_str!("fixtures/v0_1_0/records.hex"));
-        assert_eq!(records.len(), StoreTable::ALL.len());
+        // The historical fixture predates the additive sequence table.
+        assert_eq!(records.len(), 14);
+        assert!(records.iter().all(|(key, _)| !key.starts_with(super::super::storage::SEQUENCE_PREFIX.as_bytes())));
         assert!(
             records
                 .iter()
