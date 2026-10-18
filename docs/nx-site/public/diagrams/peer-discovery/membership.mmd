@@ -1,11 +1,27 @@
 stateDiagram-v2
-    [*] --> Candidate: endpoint observed
-    Candidate --> Connected: handshake and configured identity checks pass
-    Candidate --> Candidate: dial fails or retries
-    Connected --> Alive: membership admission
-    Alive --> Suspect: probe evidence
-    Suspect --> Alive: refutation or fresh evidence
-    Suspect --> Failed: suspicion policy expires
-    Alive --> Left: voluntary leave
-    Failed --> Alive: verified rejoin with newer incarnation
-    Left --> Alive: verified rejoin with newer incarnation
+    direction TB
+    accTitle: Proposed membership state machine
+    accDescr: Admission establishes Alive. Suspicion and matching failure evidence advance state. Only a newer owner announcement refutes suspicion or death; leave closes the epoch and requires a newer epoch to rejoin.
+    [*] --> Candidate: endpoint or relayed claim
+    Candidate --> Alive: normal admission + fresh owner Alive
+    Alive --> Suspect: failed probe attempt or valid suspicion
+    Suspect --> Dead: matching deadline or valid failure
+    Suspect --> Alive: owner Alive with newer incarnation
+    Dead --> Alive: owner Alive with newer incarnation
+    Alive --> Left: valid owner leave
+    Suspect --> Left: valid owner leave
+    Dead --> Left: valid owner leave
+    Left --> Alive: newer durable epoch + admission
+    note right of Candidate
+        Connection and membership are separate.
+        Relayed identity alone grants no admission.
+    end note
+    note right of Dead
+        Same pair: Dead > Suspect > Alive.
+        ACK alone does not refute a suspicion.
+        Persist rejection floor before terminal publication.
+    end note
+    note right of Left
+        Left closes the entire epoch.
+        Same-epoch updates cannot reopen it.
+    end note

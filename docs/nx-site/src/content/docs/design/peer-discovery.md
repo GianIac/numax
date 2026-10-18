@@ -78,13 +78,9 @@ absence of replication acknowledgements are specified in
 
 ### Membership and failure detection
 
-![Conceptual peer membership lifecycle](/numax/diagrams/peer-discovery/membership.svg)
-
-[Mermaid source for this diagram](/numax/diagrams/peer-discovery/membership.mmd)
-
-This lifecycle is conceptual: it does not define wire messages or final state
-transitions. Candidate, connected, and alive are distinct; suspicion can be
-refuted, while rejoining after a failure needs the newer identity evidence.
+The proposed [D4 state machine](#d4-member-identity-and-ordering) separates
+candidate admission, membership state and connection status. Suspicion can be
+refuted; restart and leave/rejoin obey explicit epoch/incarnation ordering.
 
 1. Keep endpoint discovery, identity verification, membership, active transport
    connections, and data recovery separate. A discovered endpoint can initiate a
@@ -716,29 +712,249 @@ future work.
 
 ### D4–D6 — Membership, trust, and failure detection
 
-Membership is an eventually consistent view of admitted node identities, not
-the reconnect health of an endpoint. A candidate first passes the normal
-handshake and identity policy. A member may then be probed directly and, after
-a missed response, indirectly through other admitted members. Missed probes
-create suspicion, not immediate proof of failure. A valid newer incarnation
-can refute suspicion. Leave is distinct from a timeout; rejoin and restart
-must present newer evidence, and stale control messages must not replace it.
-Nodes may disagree temporarily during a partition.
+The following is the proposed membership contract, not implemented behavior.
+It separates the member view (D4), evidence from probing and suspicion (D5),
+and control transport, admission and resource ownership (D6). Membership does
+not change D1–D3 acceptance, receipt tracking or baseline recovery.
 
-Use a SWIM-style membership protocol with Lifeguard-style adjustment for the
-local detector's scheduling health. A CPU-bound guest or slow storage can delay
-our own probes; suspicion timing must account for this instead of treating
-every local delay as a remote fault. This may increase true-failure detection
-latency, so measure both false declarations and real-failure latency. Do not
-add an independent phi-accrual detector without evidence that the selected
-model misses the release targets.
+#### Protocol basis and adaptation boundary
 
-Use the existing connection transport and its configured identity policy for
-control messages, with bounded control queues and a scheduling budget separate
-from data gossip. In insecure or unverified modes, a claimed identity remains
-unverified; a relayed membership claim never grants authenticated admission.
-Probe cadence, suspicion duration, incarnation persistence, tombstone lifetime,
-indirect probe limits, and replay protection remain to be specified and tested.
+[SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
+Protocol](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf),
+sections 4.1–4.3, supplies membership dissemination, suspicion/incarnation
+ordering and randomized round-robin probing. A failed direct probe is followed
+by bounded indirect probes; missing replies start suspicion before failure is
+declared. Updates are disseminated with bounded retransmission and piggybacking.
+
+[Lifeguard: Local Health Awareness for More Accurate Failure
+Detection](https://arxiv.org/html/1707.00788), section IV, supplies three
+extensions selected for this design:
+
+| Extension | Required behavior |
+| --- | --- |
+| Local Health Aware Probe (§IV-A) | A saturating local-health multiplier adapts probe interval and timeout. Feedback includes successful/failed probes, self-refutation and missing expected indirect negative replies. |
+| Local Health Aware Suspicion (§IV-B) | Suspicion starts with a conservative timeout. Distinct corroborating reporters shorten it toward a configured minimum; repeated reports by the same member do not count again. |
+| Buddy System (§IV-C) | Prioritize notifying a suspected member about its suspicion so that it can refute promptly. |
+
+Lifeguard extends SWIM; it is not a separate membership service. Its reported
+results and memberlist defaults do not establish Numax's performance or timing
+parameters. Numax must validate its TCP/TLS adaptation, scheduler and storage
+interactions. A partial implementation must identify omitted extensions and
+must not be described as the complete selected Lifeguard design. No independent
+phi-accrual detector is selected.
+
+#### D4: member identity and ordering
+
+![Proposed membership state machine with owner refutation and epoch-closed leave](/numax/diagrams/peer-discovery/membership.svg)
+
+[Mermaid source for the state machine](/numax/diagrams/peer-discovery/membership.mmd)
+
+The diagram shows the proposed local view of one member. A valid newer epoch
+supersedes an older epoch from any state after normal admission. Refutation
+within an epoch is allowed only while that epoch is open. Stale updates,
+responses from old sessions and superseded timers leave the current state
+unchanged; the transition table below defines the guards.
+
+Each member record identifies a `NodeId`, a membership start epoch, a
+self-issued incarnation, a state and bounded endpoint metadata. Connection
+instances, local observation timestamps and reporter identities are separate
+metadata. Wall-clock timestamps do not order membership updates.
+
+The proposed start epoch is a monotonic, durable counter bound to the local
+`NodeId`, advanced and flush-confirmed before that start announces membership.
+The incarnation starts at zero in a new epoch and increases when the member
+refutes a suspicion about itself. Only that member issues its newer epoch or
+incarnation; observers issue suspicion/failure evidence about an existing one.
+A self-refutation uses an incarnation greater than both the local value and the
+valid suspicion it refutes. Overflow, identity mismatch, corrupt metadata or an
+uncertain epoch flush prevents announcements under a new epoch.
+
+This is membership metadata, separate from the replication allocator. D2's
+`(origin, generation, sequence)` remains unchanged; a suspicion must not advance
+its generation or consume a CRDT sequence. Exact storage keys, table version
+and migration are part of the implementation specification. Losing or restoring
+an older identity store does not guarantee a newer epoch; automatic recovery of
+that situation is outside this contract.
+
+Compare epochs first, incarnations second. For the same pair, failure evidence
+has precedence `Dead > Suspect > Alive`. A valid owner-issued `Left` closes
+that epoch and cannot be undone by another update within it. Rejoin after leave
+requires a newer durable epoch. This leave rule is a Numax design choice, not
+a guarantee supplied by the papers.
+
+| Event | Required transition |
+| --- | --- |
+| Previously unknown endpoint or relayed identity | Keep as a bounded candidate/claim until the normal identity/admission policy succeeds; do not grant membership authority from the suggestion alone. |
+| Admitted member announces a fresh epoch | Establish `Alive` for that epoch; invalidate pending work for earlier epochs. |
+| Direct and indirect probe attempt fails for an `Alive` pair | Enter `Suspect`, capture the pair and start its suspicion deadline. |
+| Valid `Suspect` for an existing pair | Merge suspicion; duplicate delivery does not restart its deadline. |
+| Member receives valid suspicion or failure about itself | If not leaving, issue a newer self-incarnation and disseminate `Alive`. |
+| Valid newer owner-issued `Alive` | Replace the older suspicion/failure, unless the epoch was explicitly closed by `Left`. |
+| Suspicion deadline expires | Declare `Dead` only if its epoch/incarnation and timer still match the current suspicion. |
+| Valid owner-issued leave | Enter `Left`, cancel work for that epoch and disseminate leave within the shutdown budget. |
+| Stale pair, old connection response or canceled timer | Ignore without changing membership or completing newer work. |
+
+A matching probe acknowledgement proves reachability for its attempt. It does
+not by itself override a gossiped suspicion/death at the same incarnation;
+refutation requires the owner's newer `Alive`. `Dead` is a local failure
+judgment, not proof of permanent failure, identity revocation or data loss.
+A connected or `Alive` member may still require D3 recovery.
+
+Detailed dead/left records may expire only after a configured retention period.
+Compaction must retain a durable rejection floor, including epoch-closure
+information for leave, so that replay cannot resurrect an old member after
+restart. Persist the required rejection floor before publishing a terminal
+transition or discarding its detailed record. Storage/flush failure is local
+degradation and must not be presented as successful durable compaction. These
+floors and all member records count toward explicit global budgets. Exhaustion rejects new membership metadata visibly rather than
+silently evicting replay protection. No finite TTL alone makes unbounded delayed
+messages safe. The storage representation and any future floor-removal policy
+must be specified before implementation; unlimited identity churn is not promised.
+
+#### D5: probes, suspicion and local scheduling
+
+![Proposed SWIM direct and indirect probes with Lifeguard suspicion and refutation](/numax/diagrams/peer-discovery/membership-probes.svg)
+
+[Mermaid source for the probe sequence](/numax/diagrams/peer-discovery/membership-probes.mmd)
+
+The sequence shows one helper from a bounded set. With no eligible helper,
+the indirect branch has no sends and proceeds under the same attempt deadline.
+Buddy notification is prioritized on an available control path, not guaranteed
+delivery to an unreachable target. Local scheduling/send failure is handled as
+local degradation, outside the failed-remote-probe branches shown here.
+The exchange is a proposed design, not a protocol-8 message trace.
+
+Probe eligible known members through a seeded, randomized round-robin schedule;
+a member must not starve merely because repeated random choices select others.
+There is no probe for an empty view. A one-peer view cannot request independent
+helpers. Helpers exclude the target, self, duplicates and ineligible members.
+Indirect requests do not recursively create more indirect requests.
+
+Each attempt carries a fresh identifier, initiator and target identities,
+target epoch/incarnation, connection/session correlation and a deadline.
+Responses must match the active attempt and authorized response path. Late,
+duplicate or unsolicited acknowledgements and negative replies cannot complete
+another attempt or become independent confirmations. An indirect negative
+reply reports that helper's observation; it is not proof of target death.
+
+Bound the Lifeguard health multiplier and adapted intervals. Suspicion counts
+distinct reporter `NodeId`s, not messages, endpoints or connections. Its timer
+is measured from the first accepted suspicion using a monotonic clock;
+corroboration can shorten the deadline within its configured range, but cannot
+restart it indefinitely. Record enqueue, send and event-processing delay
+separately from reply latency. Failure to schedule or send locally is observable
+local degradation, not a completed remote probe. Arbitrary scheduler or network
+stalls have no guaranteed detection latency.
+
+The implementation specification must fix the health-feedback rules, negative
+reply timing, suspicion function, target-selection cycle and treatment of events
+arriving exactly at a deadline. Simulations and production must use the same
+rules. Calibrate timing against CPU-bound WASM, synchronous storage contention
+and data backpressure; report the tradeoff between false declarations and
+true-failure detection latency.
+
+#### D6: transport, authentication and dissemination
+
+Reuse the existing TCP/TLS transport and identity policy as the starting design.
+Secure TLS authenticates the immediate peer under the configured allowlist;
+insecure/unverified mode retains its documented limits. A relayed claim is not
+an end-to-end proof of the subject's identity. Unknown subjects require ordinary
+admission before becoming locally eligible members. Known-member claims are
+attributed to their admitted reporters under a cooperative, crash-fault model;
+Byzantine resistance or transferable owner signatures are not promised.
+Direct owner-issued updates must match the admitted session identity. Relayed
+updates retain their reporter attribution; transport authentication does not
+prove that the subject originated them. The precise authorization and
+validation rules for each control message remain an implementation prerequisite,
+including relay of owner-issued updates.
+
+The membership view may exceed the active connection set. Probing a known
+member without a current session requires a bounded, normally authenticated
+dial or a bounded indirect route. Member knowledge does not imply a permanent
+full mesh. Endpoint withdrawal alone does not evict an admitted member.
+Admission must preserve configured limits and local readiness with empty
+initial discovery.
+
+Disseminate membership changes independently of CRDT operations. Coalesce
+superseded updates, limit retransmissions and prioritize self-refutation and
+buddy notifications without starving other members. Periodic paginated member
+reconciliation repairs missed updates after churn or partition; it uses the
+same ordering, admission rules and budgets as incremental updates. It is
+separate from D2/D3 data anti-entropy. Retain bounded recovery contacts so that
+`Dead` judgments on both sides of a partition cannot permanently prevent rejoin.
+
+Control requires independent bounded queues and scheduling opportunities on
+both receive and send paths. The current `nx-net` writer lock and framed TCP
+stream are shared with data; data-event backpressure can also delay subsequent
+reads. Priority queues alone cannot preempt an in-flight frame. Measure this
+blocking with maximum-size frames and a slow reader before choosing between a
+shared stream with demonstrated delay bounds and a separate bounded control
+connection. A separate connection must use the same admission policy and have
+explicit connection/task limits. Final transport isolation is an open decision.
+
+Current protocol 8 does not define this control exchange. Introducing it requires
+an explicit wire-version change, bounded JSON/Bincode decoding and exact-version
+admission tests under [Wire Versioning](/numax/design/wire-versioning/).
+Persisted membership metadata needs its own documented schema/migration contract
+under [Schema Versioning](/numax/design/schema-versioning/); this proposal assigns
+no new version numbers and does not rewrite historical fixtures.
+
+| Resource | Required bound |
+| --- | --- |
+| Member knowledge | Members, candidate claims, endpoints, retained floors and serialized bytes |
+| Probing | Active attempts, helper fanout, temporary dials, timeouts and retries |
+| Dissemination | Queued entries/bytes, updates per frame, retransmissions and work per tick |
+| Reconciliation | Page entries/bytes, pending exchanges and cursor lifetime |
+| Execution | Control connections, tasks, send/receive work and shutdown duration |
+
+Numeric limits, defaults and configuration validation must be specified before
+network implementation. Local saturation must remain observable and must not
+be interpreted as proof of remote failure. Metrics use bounded labels; per-peer
+detail belongs in bounded introspection. Expose membership, endpoint reconnect
+health, active sessions and data-recovery status separately.
+
+#### Ownership and lifecycle
+
+Place the protocol state machine in dedicated `nx-core` membership modules,
+separating transitions, probe scheduling, dissemination and the runtime adapter.
+It consumes explicit events/time and emits bounded actions; production and
+simulation share these transitions, seeded randomness and stable event order.
+The adapter owns I/O and persistence; no storage or network await occurs inside
+a transition. `SyncManager` owns startup, cancellation and task completion.
+`peer.rs` retains endpoint reconnection responsibility; `nx-net` owns encoding,
+framing and transport. Membership does not belong in the CRDT domain `nx-sync`.
+
+An empty discovery set is valid. Local startup must not wait for remote probes
+or cluster convergence. Graceful shutdown attempts owner-issued leave within a
+finite budget, then cancels and joins owned work even if dissemination fails.
+Partial startup failure rolls back its resources. Shutdown remains terminal;
+crash recovery advances the durable start epoch before re-admission.
+Membership transitions never delete D2 receipt frontiers or establish D3 data
+completion.
+
+#### Membership acceptance criteria
+
+| Test boundary | Required evidence |
+| --- | --- |
+| Ordering | All state/pair combinations, duplicate updates, delayed messages, same-pair precedence and leave closure; timers for superseded pairs have no effect. |
+| Persistence | Restart and interrupted epoch/floor persistence preserve monotonicity or fail closed; corruption, overflow and write/flush errors do not publish a new epoch. |
+| Probing | Direct success, indirect success, all helpers timing out, no available helper, negative reply followed by timely success, and stale/session-mismatched replies. |
+| Lifeguard | Saturating health feedback and recovery, unique corroborators, suspicion deadline bounds, buddy priority and bounded fairness. |
+| Admission | Unknown relayed subjects stay candidates; direct owner/session mismatches and unauthorized routes are rejected under the configured identity policy; insecure mode remains unverified. |
+| Resources | Every configured limit, churn, queue saturation, slow readers and blocked data processing preserve bounded work and explicit degradation. |
+| Recovery | Sparse graphs, mutual failure judgments across a partition, reconciliation, restart, leave/rejoin and expired detailed records do not cause stale resurrection. |
+| Lifecycle | Empty startup, stalled handshake, partial-start rollback and shutdown with active probes leave no owned task running. |
+| Compatibility | JSON/Bincode frames and semantic validation, historical fixture preservation, exact-version rejection including the real v0.1.5 binary. |
+| Data integration | Membership churn leaves durable CRDT/receipt state intact across all six families; `Alive` never certifies data convergence. |
+
+Start with deterministic transition tests, then use real TCP/TLS and
+multiprocess integration under load. Record seeds, topology, membership size,
+limits, timing, scheduling delays, probe/ACK latency, refuted suspicions,
+false failure declarations, true-failure detection latency and resource use.
+Transport packet loss and simulated message loss require separate results.
+The one-hour nominal run and the combined 50-node partition/recovery criteria
+remain the release obligations in the [roadmap](/numax/roadmap/); unit tests and
+this proposed contract do not establish those results.
 
 ### D7 — Gossip and repair scheduling
 
@@ -783,7 +999,9 @@ The following aspects remain open for the proposed capabilities:
 
 - A failure model covering OS restart, power interruption or storage-device loss.
 - Recovery beyond the bounded D3 baseline and retention contract.
-- Membership ordering, control authentication, probe and suspicion parameters.
+- Membership control-message authorization/encoding, persisted record layout,
+  floor lifecycle, probe/suspicion parameters and numeric budgets.
+- Shared-stream versus separate-connection control isolation, supported by measurements.
 - Fanout defaults, neighbor rotation, scheduling and resource budgets.
 - Manual candidate removal and API error semantics.
 - Wire/schema contracts for membership and expanded state-transfer formats.
