@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use nx_store::{Store as NxStore, StoreWriteLease};
 use nx_sync::{HistorySummary, NodeId, Op, OpPosition, SequencedOp};
 
+use super::super::baseline::Rejected;
 use super::super::sequence::*;
+use nx_sync::BaselineFailure;
 
 pub(in crate::sync_manager) const SEQUENCE_PREFIX: &str = "__nx/crdt/sequence/";
 const LOCAL: &[u8] = b"__nx/crdt/sequence/local";
@@ -67,12 +69,18 @@ fn tracker_sets(
     let mut additions = (0usize, 0usize);
     for (origin, progress) in updates {
         let key = origin_key(&origin)?;
+        let mut coverage_changed = false;
         if let Some(old) = store.get(&key)? {
             bytes = bytes
                 .checked_sub(key.len() + old.len())
                 .ok_or_else(|| anyhow::anyhow!("corrupt tracking byte usage"))?;
+            let old_progress = ReceiptTracker::decode(&old)?;
+            coverage_changed = old_progress.contiguous != progress.contiguous
+                || old_progress.high != progress.high
+                || old_progress.sparse != progress.sparse
+                || old_progress.baseline_required != progress.baseline_required;
             sparse = sparse
-                .checked_sub(ReceiptTracker::decode(&old)?.sparse.len())
+                .checked_sub(old_progress.sparse.len())
                 .ok_or_else(|| anyhow::anyhow!("corrupt tracking sparse usage"))?;
         } else {
             origins = origins
@@ -80,8 +88,9 @@ fn tracker_sets(
                 .ok_or_else(|| anyhow::anyhow!("origin count overflow"))?;
         }
         let value = progress.encode()?;
-        if progress.missing_page().is_none()
-            && (!progress.baseline_required || has_baseline(store, &origin)?)
+        if (coverage_changed
+            || (progress.missing_page().is_none()
+                && (!progress.baseline_required || has_baseline(store, &origin)?)))
             && store.exists(&failure_key(&origin)?)?
         {
             sets.push((failure_key(&origin)?, b"null".to_vec()));
@@ -666,21 +675,46 @@ pub(in crate::sync_manager) fn record_recovery_failure(
     origin: &NodeId,
     source: &str,
     reason: nx_sync::BaselineFailure,
-) -> anyhow::Result<()> {
+    expected_revision: &[u8; 32],
+) -> anyhow::Result<bool> {
     anyhow::ensure!(
         !source.is_empty() && source.len() <= 512,
         "invalid recovery source"
     );
-    // A failure record is bounded to one per already tracked origin.
+    let lease = store.acquire_write_lease()?;
+    // A failure record is bounded to one per already tracked origin. A still-live
+    // request can have been superseded by another source or a newly discovered gap.
     anyhow::ensure!(
         store.exists(&origin_key(origin.as_str())?)?,
         "unknown recovery origin"
     );
-    store.set(
+    let progress = tracker(store, origin.as_str())?;
+    if recovery_revision(store, origin)? != *expected_revision
+        || (progress.missing_page().is_none() && !needs_baseline(store, origin.as_str())?)
+    {
+        return Ok(false);
+    }
+    lease.set(
         &failure_key(origin.as_str())?,
         &serde_json::to_vec(&(source, reason))?,
     )?;
-    Ok(())
+    Ok(true)
+}
+
+pub(in crate::sync_manager) fn recovery_revision(
+    store: &NxStore,
+    origin: &NodeId,
+) -> anyhow::Result<[u8; 32]> {
+    let progress = tracker(store, origin.as_str())?;
+    let coverage = serde_json::to_vec(&(
+        progress.contiguous,
+        progress.high,
+        &progress.sparse,
+        progress.baseline_required,
+        has_baseline(store, origin.as_str())?,
+        store.exists(BASELINE_UNCONFIRMED)?,
+    ))?;
+    Ok(*blake3::hash(&coverage).as_bytes())
 }
 
 /// Caller holds the write lease and all registries, so this is the cut of the exported state.
@@ -689,7 +723,7 @@ pub(in crate::sync_manager) fn baseline_origins(
 ) -> anyhow::Result<Vec<nx_sync::BaselineOrigin>> {
     anyhow::ensure!(
         !store.exists(BASELINE_UNCONFIRMED)?,
-        "unconfirmed baseline flush"
+        Rejected(BaselineFailure::SourceIncomplete)
     );
     let mut origins = Vec::new();
     for progress in replication_progress(store)? {
@@ -697,7 +731,7 @@ pub(in crate::sync_manager) fn baseline_origins(
             progress.contiguous_sequence == progress.known_high_sequence
                 && progress.sparse_positions == 0
                 && !progress.baseline_missing,
-            "source has incomplete history or baseline"
+            Rejected(BaselineFailure::SourceIncomplete)
         );
         origins.push(nx_sync::BaselineOrigin {
             origin: progress.origin,
@@ -717,13 +751,13 @@ pub(in crate::sync_manager) fn baseline_sequence_sets(
     let store = lease.store();
     anyhow::ensure!(
         origins.len() <= MAX_ORIGINS,
-        "baseline origin budget exceeded"
+        Rejected(BaselineFailure::BudgetExceeded)
     );
     anyhow::ensure!(
         origins
             .windows(2)
             .all(|p| p[0].origin.as_str() < p[1].origin.as_str()),
-        "unordered baseline origins"
+        Rejected(BaselineFailure::InvalidState)
     );
     let supplied = origins
         .iter()
@@ -738,12 +772,12 @@ pub(in crate::sync_manager) fn baseline_sequence_sets(
             .map_or(previous.contiguous, |(seq, _)| *seq);
         anyhow::ensure!(
             offered.map_or(last_applied == 0, |o| o.sequence >= last_applied),
-            "baseline does not cover applied operations"
+            Rejected(BaselineFailure::CoverageConflict)
         );
         if has_baseline(store, progress.origin.as_str())? {
             anyhow::ensure!(
                 offered.is_some_and(|o| o.legacy),
-                "baseline would discard legacy state"
+                Rejected(BaselineFailure::CoverageConflict)
             );
         }
     }
@@ -752,17 +786,17 @@ pub(in crate::sync_manager) fn baseline_sequence_sets(
     let mut extra = Vec::new();
     for offered in origins {
         let id = offered.origin.as_str();
-        origin_key(id)?;
+        origin_key(id).map_err(|error| error.context(Rejected(BaselineFailure::InvalidState)))?;
         if let Some((own, _, last)) = &allocator {
             anyhow::ensure!(
                 id != own || offered.sequence == *last,
-                "baseline claims unallocated local history"
+                Rejected(BaselineFailure::CoverageConflict)
             );
         }
         let mut progress = tracker(store, id)?;
         anyhow::ensure!(
             !progress.baseline_required || offered.legacy,
-            "baseline lacks known legacy provenance"
+            Rejected(BaselineFailure::CoverageConflict)
         );
         progress.contiguous = offered.sequence;
         progress.high = progress.high.max(offered.sequence);

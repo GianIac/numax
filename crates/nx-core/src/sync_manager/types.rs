@@ -215,6 +215,8 @@ pub(super) struct PendingHistoryRequest {
     pub(super) request_id: nx_sync::OpId,
     pub(super) start: u64,
     pub(super) end: u64,
+    /// Receipt coverage at baseline request time; never persisted or sent on the wire.
+    pub(super) baseline_revision: Option<[u8; 32]>,
     pub(super) deadline: std::time::Instant,
 }
 

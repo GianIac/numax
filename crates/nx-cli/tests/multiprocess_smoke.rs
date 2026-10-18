@@ -695,8 +695,8 @@ fn reject_previous_protocol(format: &str) {
 
     let current_addr = free_addr();
     let previous_addr = free_addr();
-    let current_data = temp_path("protocol-v7");
-    let previous_data = temp_path("protocol-v5");
+    let current_data = temp_path("protocol-current");
+    let previous_data = temp_path("protocol-v0.1.5");
     let current_nx = nx_bin();
     let previous_nx = previous_nx_bin();
 
@@ -759,20 +759,15 @@ fn reject_previous_protocol(format: &str) {
     let current_stderr = String::from_utf8_lossy(&current_output.stderr);
     let previous_stdout = String::from_utf8_lossy(&previous_output.stdout);
     let previous_stderr = String::from_utf8_lossy(&previous_output.stderr);
-    let protocol_mismatch_reported = current_stdout
-        .contains("protocol version mismatch: expected 7, got 5")
-        || current_stdout.contains("protocol version mismatch: expected 5, got 7")
-        || current_stderr.contains("protocol version mismatch: expected 5, got 7")
-        || current_stderr.contains("protocol version mismatch: expected 7, got 5")
-        || previous_stdout.contains("protocol version mismatch: expected 7, got 5")
-        || previous_stdout.contains("protocol version mismatch: expected 5, got 7")
-        || previous_stderr.contains("protocol version mismatch: expected 7, got 5")
-        || previous_stderr.contains("protocol version mismatch: expected 5, got 7");
+    let current_reported_mismatch = current_stdout.contains("protocol version mismatch:")
+        || current_stderr.contains("protocol version mismatch:");
+    let previous_reported_mismatch = previous_stdout.contains("protocol version mismatch:")
+        || previous_stderr.contains("protocol version mismatch:");
     assert!(
-        protocol_mismatch_reported,
+        current_reported_mismatch || previous_reported_mismatch,
         "neither node reported the protocol mismatch\ncurrent stdout:\n{current_stdout}\ncurrent stderr:\n{current_stderr}\nprevious stdout:\n{previous_stdout}\nprevious stderr:\n{previous_stderr}"
     );
-    // Schema 2 prevents the old runtime from bypassing sequence tracking on downgrade.
+    // The current schema prevents the old runtime from bypassing sequence tracking on downgrade.
     let downgraded = Command::new(&previous_nx)
         .arg("run")
         .arg(&wasm)

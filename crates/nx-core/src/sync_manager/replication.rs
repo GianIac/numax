@@ -560,7 +560,12 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
             };
             if let Err(error) = handle_history_message(&addr, message, context).await {
                 context.metrics.record_sync_error();
-                warn!(%from, %error, "replication history exchange failed");
+                if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>() {
+                    // Decoder errors can contain supplied values; log only the bounded reason.
+                    warn!(%from, reason = ?rejected.0, "replication baseline rejected");
+                } else {
+                    warn!(%from, error = %format_args!("{error:#}"), "replication history exchange failed");
+                }
             } else if let Some(id) = observed_id {
                 context
                     .anti_entropy_watermarks
@@ -672,6 +677,11 @@ async fn request_history_or_baseline(
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
     let request_id = nx_sync::OpId::generate();
+    let baseline_revision = if start == 0 {
+        Some(super::storage::recovery_revision(&context.store, &origin)?)
+    } else {
+        None
+    };
     {
         let mut requests = context.history_requests.write().await;
         let pending = requests.entry(addr.to_owned()).or_default();
@@ -690,6 +700,7 @@ async fn request_history_or_baseline(
                 request_id: request_id.clone(),
                 start,
                 end,
+                baseline_revision,
                 deadline,
             },
         );
@@ -728,7 +739,7 @@ async fn complete_history_request(
     start: u64,
     end: u64,
     context: &NodeEventContext,
-) -> bool {
+) -> Option<PendingHistoryRequest> {
     let mut requests = context.history_requests.write().await;
     if let Some(pending) = requests.get_mut(addr)
         && let Some(request) = pending.get(origin.as_str())
@@ -738,10 +749,9 @@ async fn complete_history_request(
         && end >= start
         && end <= request.end
     {
-        pending.remove(origin.as_str());
-        return true;
+        return pending.remove(origin.as_str());
     }
-    false
+    None
 }
 
 async fn handle_history_message(
@@ -907,7 +917,10 @@ async fn handle_history_message(
                     "replay position mismatch"
                 );
             }
-            if !complete_history_request(addr, &origin, &request_id, start, end, context).await {
+            if complete_history_request(addr, &origin, &request_id, start, end, context)
+                .await
+                .is_none()
+            {
                 debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited history replay");
                 return Ok(());
             }
@@ -923,7 +936,10 @@ async fn handle_history_message(
             end,
         } => {
             validate_range(start, end)?;
-            if !complete_history_request(addr, &origin, &request_id, start, end, context).await {
+            if complete_history_request(addr, &origin, &request_id, start, end, context)
+                .await
+                .is_none()
+            {
                 debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited unavailable history");
                 return Ok(());
             }
@@ -966,13 +982,16 @@ async fn handle_history_message(
                     digest: *blake3::hash(&payload).as_bytes(),
                     payload,
                 },
-                Err(error) => HistoryMessage::BaselineUnavailable {
-                    request_id,
-                    origin,
-                    reason: error
-                        .downcast_ref::<super::baseline::Rejected>()
-                        .map_or(nx_sync::BaselineFailure::SourceIncomplete, |r| r.0),
-                },
+                Err(error) => {
+                    let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>() else {
+                        return Err(error.context("baseline export failed"));
+                    };
+                    HistoryMessage::BaselineUnavailable {
+                        request_id,
+                        origin,
+                        reason: rejected.0,
+                    }
+                }
             };
             context.node.send_history_to_addr(addr, response).await?;
         }
@@ -983,10 +1002,12 @@ async fn handle_history_message(
             payload,
             digest,
         } => {
-            if !complete_history_request(addr, &origin, &request_id, 0, 0, context).await {
+            let Some(request) =
+                complete_history_request(addr, &origin, &request_id, 0, 0, context).await
+            else {
                 debug!(%addr, "ignoring stale or unsolicited baseline");
                 return Ok(());
-            }
+            };
             if let Err(error) = super::baseline::import(
                 version,
                 &payload,
@@ -996,11 +1017,19 @@ async fn handle_history_message(
             )
             .await
             {
-                let reason = error
-                    .downcast_ref::<super::baseline::Rejected>()
-                    .map_or(nx_sync::BaselineFailure::InvalidState, |r| r.0);
-                super::storage::record_recovery_failure(&context.store, &origin, addr, reason)?;
-                return Err(error);
+                if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>()
+                    && let Some(revision) = request.baseline_revision
+                    && let Err(record_error) = super::storage::record_recovery_failure(
+                        &context.store,
+                        &origin,
+                        addr,
+                        rejected.0,
+                        &revision,
+                    )
+                {
+                    warn!(%origin, record_error = %format_args!("{record_error:#}"), "could not record baseline rejection");
+                }
+                return Err(error.context("baseline import failed"));
             }
         }
         HistoryMessage::BaselineUnavailable {
@@ -1008,11 +1037,25 @@ async fn handle_history_message(
             origin,
             reason,
         } => {
-            if !complete_history_request(addr, &origin, &request_id, 0, 0, context).await {
+            let Some(request) =
+                complete_history_request(addr, &origin, &request_id, 0, 0, context).await
+            else {
                 debug!(%addr, "ignoring stale or unsolicited baseline refusal");
                 return Ok(());
+            };
+            let Some(revision) = request.baseline_revision else {
+                return Ok(());
+            };
+            if !super::storage::record_recovery_failure(
+                &context.store,
+                &origin,
+                addr,
+                reason,
+                &revision,
+            )? {
+                debug!(%origin, %addr, "ignoring baseline refusal superseded by changed receipt coverage");
+                return Ok(());
             }
-            super::storage::record_recovery_failure(&context.store, &origin, addr, reason)?;
             context.metrics.record_sync_error();
             warn!(%origin, ?reason, "gap unrecoverable from this source under the bounded baseline contract; other sources may still recover it");
         }
@@ -1204,6 +1247,401 @@ mod tests {
         }
     }
 
+    fn baseline_test_context() -> NodeEventContext {
+        test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(16))),
+            Arc::new(RwLock::new(Vec::new())),
+            temp_store(),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+    }
+
+    async fn arm_baseline_request(context: &NodeEventContext, origin: &NodeId) -> nx_sync::OpId {
+        let id = nx_sync::OpId::generate();
+        context
+            .history_requests
+            .write()
+            .await
+            .entry("source:1234".into())
+            .or_default()
+            .insert(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: id.clone(),
+                    start: 0,
+                    end: 0,
+                    baseline_revision: Some(
+                        super::super::storage::recovery_revision(&context.store, origin).unwrap(),
+                    ),
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            );
+        id
+    }
+
+    fn baseline_payload(origin: &NodeId, sequence: u64, legacy: bool) -> Vec<u8> {
+        let mut counter = GCounter::new();
+        counter.increment(origin, 7);
+        serde_json::to_vec(&nx_sync::CrdtBaseline {
+            origins: vec![nx_sync::BaselineOrigin {
+                origin: origin.clone(),
+                sequence,
+                legacy,
+            }],
+            records: vec![nx_sync::BaselineRecord {
+                family: 1,
+                key: "visits".into(),
+                state: counter.to_json().unwrap().into_bytes(),
+            }],
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn baseline_live_refusal_after_other_source_repair_cannot_describe_a_new_gap() {
+        for mode in ["complete", "partial", "legacy"] {
+            let context = baseline_test_context();
+            let origin = NodeId::new("origin");
+            let legacy = mode == "legacy";
+            super::super::storage::record_summary(
+                &context.store,
+                &nx_sync::HistorySummary {
+                    origin: origin.clone(),
+                    high_sequence: if legacy { 0 } else { 2 },
+                    baseline_required: legacy,
+                },
+            )
+            .unwrap();
+            let request_id = arm_baseline_request(&context, &origin).await;
+            if legacy {
+                let payload = baseline_payload(&origin, 0, true);
+                super::super::baseline::import(
+                    super::super::baseline::VERSION,
+                    &payload,
+                    blake3::hash(&payload).as_bytes(),
+                    &origin,
+                    &history_apply_context(&context),
+                )
+                .await
+                .unwrap();
+            } else {
+                let count = if mode == "partial" { 1 } else { 2 };
+                let entries = (1..=count)
+                    .map(|sequence| nx_sync::SequencedOp {
+                        op: Op::gcounter_increment(origin.clone(), "visits", 1),
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                apply_sequenced_ops(&entries, &history_apply_context(&context))
+                    .await
+                    .unwrap();
+            }
+            // Even an unexpired attempt is stale after another source changed coverage.
+            let before = context.store.scan_prefix(b"__nx/").unwrap();
+            handle_history_message(
+                "source:1234",
+                HistoryMessage::BaselineUnavailable {
+                    request_id,
+                    origin: origin.clone(),
+                    reason: nx_sync::BaselineFailure::SourceIncomplete,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                context.store.scan_prefix(b"__nx/").unwrap(),
+                before,
+                "{mode}"
+            );
+            super::super::storage::record_summary(
+                &context.store,
+                &nx_sync::HistorySummary {
+                    origin: origin.clone(),
+                    high_sequence: 3,
+                    baseline_required: legacy,
+                },
+            )
+            .unwrap();
+            assert!(
+                super::super::storage::replication_progress(&context.store).unwrap()[0]
+                    .recovery_failure
+                    .is_none(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_failure_is_invalidated_by_partial_repair_or_a_new_target() {
+        for change_high in [false, true] {
+            let context = baseline_test_context();
+            let origin = NodeId::new("origin");
+            let summary = nx_sync::HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 2,
+                baseline_required: false,
+            };
+            super::super::storage::record_summary(&context.store, &summary).unwrap();
+            let request_id = arm_baseline_request(&context, &origin).await;
+            handle_history_message(
+                "source:1234",
+                HistoryMessage::BaselineUnavailable {
+                    request_id,
+                    origin: origin.clone(),
+                    reason: nx_sync::BaselineFailure::BudgetExceeded,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            // Repeating the same summary must retain a still-relevant failure.
+            super::super::storage::record_summary(&context.store, &summary).unwrap();
+            assert!(
+                super::super::storage::replication_progress(&context.store).unwrap()[0]
+                    .recovery_failure
+                    .is_some()
+            );
+            if change_high {
+                super::super::storage::record_summary(
+                    &context.store,
+                    &nx_sync::HistorySummary {
+                        high_sequence: 3,
+                        ..summary
+                    },
+                )
+                .unwrap();
+            } else {
+                apply_sequenced_ops(
+                    &[nx_sync::SequencedOp {
+                        op: Op::gcounter_increment(origin, "visits", 1),
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: 1,
+                        },
+                    }],
+                    &history_apply_context(&context),
+                )
+                .await
+                .unwrap();
+            }
+            let progress = super::super::storage::replication_progress(&context.store).unwrap();
+            assert!(progress[0].contiguous_sequence < progress[0].known_high_sequence);
+            assert!(progress[0].recovery_failure.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_handler_preserves_storage_faults_and_does_not_label_them_invalid_state() {
+        use nx_store::StoreError;
+        for flush in [false, true] {
+            let context = baseline_test_context();
+            let origin = NodeId::new("origin");
+            super::super::storage::record_summary(
+                &context.store,
+                &nx_sync::HistorySummary {
+                    origin: origin.clone(),
+                    high_sequence: 1,
+                    baseline_required: false,
+                },
+            )
+            .unwrap();
+            let request_id = arm_baseline_request(&context, &origin).await;
+            let payload = baseline_payload(&origin, 1, false);
+            let before = context.store.scan_prefix(b"__nx/").unwrap();
+            if flush {
+                context.store.inject_disk_full_on_flush(true);
+            } else {
+                context.store.inject_disk_full_on_writes(true);
+            }
+            let error = handle_history_message(
+                "source:1234",
+                HistoryMessage::Baseline {
+                    request_id,
+                    origin,
+                    version: super::super::baseline::VERSION,
+                    digest: *blake3::hash(&payload).as_bytes(),
+                    payload,
+                },
+                &context,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<super::super::baseline::Rejected>()
+                    .is_none(),
+                "{error:#}"
+            );
+            if flush {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<StoreError>(),
+                        Some(StoreError::InjectedFlushFailure)
+                    ),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<StoreError>(),
+                        Some(StoreError::InjectedDiskFull)
+                    ),
+                    "{error:#}"
+                );
+                assert_eq!(context.store.scan_prefix(b"__nx/").unwrap(), before);
+            }
+            let progress = super::super::storage::replication_progress(&context.store).unwrap();
+            assert!(progress[0].recovery_failure.is_none());
+            assert_eq!(progress[0].baseline_unconfirmed, flush);
+            assert_eq!(context.counters.read().await.contains_key("visits"), flush);
+        }
+        let context = baseline_test_context();
+        context.store.inject_disk_full_on_flush(true);
+        let error = handle_history_message(
+            "source:1234",
+            HistoryMessage::BaselineRequest {
+                request_id: nx_sync::OpId::generate(),
+                origin: NodeId::new("origin"),
+                version: super::super::baseline::VERSION,
+            },
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<StoreError>(),
+                Some(StoreError::InjectedFlushFailure)
+            ),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .downcast_ref::<super::super::baseline::Rejected>()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_handler_preserves_metadata_errors_in_export_and_import() {
+        let origin = NodeId::new("origin");
+        let context = baseline_test_context();
+        super::super::storage::record_summary(
+            &context.store,
+            &nx_sync::HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let request_id = arm_baseline_request(&context, &origin).await;
+        let payload = baseline_payload(&origin, 1, false);
+        // Corrupt local accounting is an operational fault, not a source-cut conflict.
+        context
+            .store
+            .set(b"__nx/crdt/sequence/usage", b"invalid-local-accounting")
+            .unwrap();
+        let before = context.store.scan_prefix(b"__nx/").unwrap();
+        let error = handle_history_message(
+            "source:1234",
+            HistoryMessage::Baseline {
+                request_id,
+                origin: origin.clone(),
+                version: super::super::baseline::VERSION,
+                digest: *blake3::hash(&payload).as_bytes(),
+                payload,
+            },
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::baseline::Rejected>()
+                .is_none(),
+            "{error:#}"
+        );
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert_eq!(context.store.scan_prefix(b"__nx/").unwrap(), before);
+        assert!(context.counters.read().await.is_empty());
+
+        context
+            .store
+            .set(
+                b"__nx/crdt/sequence/origin/origin",
+                b"corrupt-local-receipt",
+            )
+            .unwrap();
+        let error = handle_history_message(
+            "source:1234",
+            HistoryMessage::BaselineRequest {
+                request_id: nx_sync::OpId::generate(),
+                origin,
+                version: super::super::baseline::VERSION,
+            },
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::baseline::Rejected>()
+                .is_none(),
+            "{error:#}"
+        );
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn baseline_handler_still_records_invalid_payload_rejections() {
+        let context = baseline_test_context();
+        let origin = NodeId::new("origin");
+        super::super::storage::record_summary(
+            &context.store,
+            &nx_sync::HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let request_id = arm_baseline_request(&context, &origin).await;
+        let error = handle_history_message(
+            "source:1234",
+            HistoryMessage::Baseline {
+                request_id,
+                origin,
+                version: super::super::baseline::VERSION,
+                payload: vec![1],
+                digest: [0; 32],
+            },
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<super::super::baseline::Rejected>()
+                .unwrap()
+                .0,
+            nx_sync::BaselineFailure::InvalidState
+        );
+        let progress = super::super::storage::replication_progress(&context.store).unwrap();
+        assert_eq!(
+            progress[0].recovery_failure.as_ref().unwrap().reason,
+            nx_sync::BaselineFailure::InvalidState
+        );
+        assert_eq!(progress[0].contiguous_sequence, 0);
+        assert!(context.counters.read().await.is_empty());
+    }
+
     #[tokio::test]
     async fn baseline_stale_unsolicited_and_expired_responses_cannot_change_recovery_state() {
         use nx_sync::{BaselineFailure, HistorySummary, OpId};
@@ -1250,6 +1688,9 @@ mod tests {
                         request_id: id.clone(),
                         start: 0,
                         end: 0,
+                        baseline_revision: Some(
+                            super::super::storage::recovery_revision(&store, &origin).unwrap(),
+                        ),
                         deadline,
                     },
                 )]),
@@ -1288,6 +1729,9 @@ mod tests {
                     request_id: id.clone(),
                     start: 0,
                     end: 0,
+                    baseline_revision: Some(
+                        super::super::storage::recovery_revision(&store, &origin).unwrap(),
+                    ),
                     deadline: StdInstant::now() + Duration::from_secs(30),
                 },
             )]),
@@ -1619,6 +2063,7 @@ mod tests {
                     request_id: old_id.clone(),
                     start: 2,
                     end: 2,
+                    baseline_revision: None,
                     deadline: StdInstant::now(),
                 },
             )]),
@@ -1645,6 +2090,7 @@ mod tests {
                     request_id: new_id.clone(),
                     start: 2,
                     end: 2,
+                    baseline_revision: None,
                     deadline: StdInstant::now() + Duration::from_secs(30),
                 },
             )]),
@@ -1795,6 +2241,7 @@ mod tests {
                     request_id: nx_sync::OpId::new("test-request"),
                     start: 1,
                     end: 2,
+                    baseline_revision: None,
                     deadline: StdInstant::now() + Duration::from_secs(30),
                 },
             )]),

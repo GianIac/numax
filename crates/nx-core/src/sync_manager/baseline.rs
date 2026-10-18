@@ -50,8 +50,7 @@ pub(super) async fn export(context: &RemoteOpApplyContext<'_>) -> anyhow::Result
     let sets = context.orsets.read().await;
     let rgas = context.rgas.read().await;
     let lease = context.store.acquire_write_lease()?;
-    let origins =
-        baseline_origins(lease.store()).map_err(|_| Rejected(BaselineFailure::SourceIncomplete))?;
+    let origins = baseline_origins(lease.store())?;
     let mut baseline = CrdtBaseline {
         origins,
         records: Vec::new(),
@@ -247,19 +246,40 @@ pub(super) async fn import(
     if payload.len() > MAX_BYTES {
         return Err(Rejected(BaselineFailure::BudgetExceeded).into());
     }
-    anyhow::ensure!(
-        blake3::hash(payload).as_bytes() == digest,
-        "baseline digest mismatch"
-    );
-    let baseline: CrdtBaseline = serde_json::from_slice(payload)?;
-    anyhow::ensure!(
-        baseline
-            .origins
-            .iter()
-            .any(|o| &o.origin == required_origin),
-        "baseline omits requested origin"
-    );
-    let decoded = Decoded::new(&baseline)?;
+    let baseline = decode(payload, digest, required_origin)?;
+    let decoded = Decoded::new(&baseline)
+        .map_err(|error| error.context(Rejected(BaselineFailure::InvalidState)))?;
+    install(baseline, decoded, context).await
+}
+
+fn decode(
+    payload: &[u8],
+    digest: &[u8; 32],
+    required_origin: &nx_sync::NodeId,
+) -> anyhow::Result<CrdtBaseline> {
+    let result = (|| {
+        anyhow::ensure!(
+            blake3::hash(payload).as_bytes() == digest,
+            "baseline digest mismatch"
+        );
+        let baseline: CrdtBaseline = serde_json::from_slice(payload)?;
+        anyhow::ensure!(
+            baseline
+                .origins
+                .iter()
+                .any(|o| &o.origin == required_origin),
+            "baseline omits requested origin"
+        );
+        Ok(baseline)
+    })();
+    result.map_err(|error: anyhow::Error| error.context(Rejected(BaselineFailure::InvalidState)))
+}
+
+async fn install(
+    baseline: CrdtBaseline,
+    decoded: Decoded,
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<()> {
     let _seen = context.seen_ops.write().await;
     let _log = context.op_log.write().await;
     let mut counters = context.counters.write().await;
@@ -269,8 +289,16 @@ pub(super) async fn import(
     let mut sets = context.orsets.write().await;
     let mut rgas = context.rgas.write().await;
     let lease = context.store.acquire_write_lease()?;
-    let sequence_sets = baseline_sequence_sets(&lease, &baseline.origins)
-        .map_err(|_| Rejected(BaselineFailure::CoverageConflict))?;
+    let sequence_sets = baseline_sequence_sets(&lease, &baseline.origins).map_err(|error| {
+        if error
+            .downcast_ref::<super::sequence::TrackingLimit>()
+            .is_some()
+        {
+            error.context(Rejected(BaselineFailure::BudgetExceeded))
+        } else {
+            error
+        }
+    })?;
     // Also check state inclusion: a cut alone cannot justify silently dropping an existing key,
     // a tombstone, or state from a legacy store. Compare canonical JSON values for counters too.
     macro_rules! check_inclusion {
