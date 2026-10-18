@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 mod e2e;
+mod recovery;
 mod sequencing;
 mod support;
 

@@ -10,6 +10,10 @@ const LOCAL: &[u8] = b"__nx/crdt/sequence/local";
 const USAGE: &[u8] = b"__nx/crdt/sequence/usage";
 const ORIGINS: &[u8] = b"__nx/crdt/sequence/origin/";
 const POSITIONS: &[u8] = b"__nx/crdt/sequence/replay/";
+const BASELINES: &[u8] = b"__nx/crdt/sequence/baseline/";
+const FAILURES: &[u8] = b"__nx/crdt/sequence/failure/";
+pub(in crate::sync_manager) const BASELINE_UNCONFIRMED: &[u8] =
+    b"__nx/crdt/sequence/baseline-unconfirmed";
 
 pub(in crate::sync_manager) type SequenceSets = Vec<(Vec<u8>, Vec<u8>)>;
 type LocalAllocator = (String, u64, u64);
@@ -76,6 +80,12 @@ fn tracker_sets(
                 .ok_or_else(|| anyhow::anyhow!("origin count overflow"))?;
         }
         let value = progress.encode()?;
+        if progress.missing_page().is_none()
+            && (!progress.baseline_required || has_baseline(store, &origin)?)
+            && store.exists(&failure_key(&origin)?)?
+        {
+            sets.push((failure_key(&origin)?, b"null".to_vec()));
+        }
         additions.0 = additions
             .0
             .checked_add(key.len() + value.len())
@@ -189,12 +199,22 @@ pub(in crate::sync_manager) fn initialize_sequence_origin(
         }
     }
     sets.push((LOCAL.to_vec(), value));
+    // Only this store's own legacy baseline is established by initialization.
+    // A summary received from another node is not evidence of baseline receipt.
+    let own_origin_key = origin_key(origin.as_str())?;
+    if tracker(store, origin.as_str())?.baseline_required
+        || sets.iter().any(|(key, _)| key == &own_origin_key)
+    {
+        sets.push((baseline_key(origin.as_str())?, vec![1]));
+    }
     let refs = sets
         .iter()
         .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect::<Vec<_>>();
     lease.apply_batch(&refs, &[])?;
     lease.flush()?;
+    // A successful restart flush covers any surviving, atomically imported baseline.
+    lease.delete(BASELINE_UNCONFIRMED)?;
     Ok(generation)
 }
 
@@ -475,8 +495,27 @@ pub(in crate::sync_manager) fn replication_progress(
                 known_high_sequence: progress.high,
                 sparse_positions: progress.sparse.len(),
                 source_unavailable: progress.unavailable.is_some(),
-                unavailable_evidence: progress.unavailable,
+                unavailable_evidence: progress.unavailable.clone(),
                 baseline_required: progress.baseline_required,
+                baseline_missing: progress.baseline_required && !has_baseline(store, origin)?,
+                baseline_unconfirmed: store.exists(BASELINE_UNCONFIRMED)?,
+                recovery_failure: if progress.missing_page().is_some()
+                    || (progress.baseline_required && !has_baseline(store, origin)?)
+                {
+                    store
+                        .get(&failure_key(origin)?)?
+                        .map(|bytes| {
+                            let failure: Option<(String, nx_sync::BaselineFailure)> =
+                                serde_json::from_slice(&bytes)?;
+                            Ok::<_, anyhow::Error>(
+                                failure.map(|(source, reason)| RecoveryFailure { source, reason }),
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                },
             });
             anyhow::ensure!(result.len() <= MAX_ORIGINS, "origin budget exceeded");
         }
@@ -489,7 +528,21 @@ pub(in crate::sync_manager) fn validate_sequence_record(
     key: &[u8],
     value: &[u8],
 ) -> anyhow::Result<()> {
-    if key == LOCAL || key.starts_with(POSITIONS) {
+    if key == BASELINE_UNCONFIRMED {
+        anyhow::ensure!(value == [1], "invalid baseline confirmation marker");
+    } else if key.starts_with(BASELINES) {
+        origin_key(std::str::from_utf8(&key[BASELINES.len()..])?)?;
+        anyhow::ensure!(value == [1], "invalid legacy baseline marker");
+    } else if key.starts_with(FAILURES) {
+        origin_key(std::str::from_utf8(&key[FAILURES.len()..])?)?;
+        let failure: Option<(String, nx_sync::BaselineFailure)> = serde_json::from_slice(value)?;
+        if let Some((source, _)) = failure {
+            anyhow::ensure!(
+                !source.is_empty() && source.len() <= 512,
+                "invalid recovery source"
+            );
+        }
+    } else if key == LOCAL || key.starts_with(POSITIONS) {
         let (origin, generation, _): LocalAllocator = serde_json::from_slice(value)?;
         origin_key(&origin)?;
         anyhow::ensure!(generation > 0, "zero stored generation");
@@ -520,19 +573,24 @@ pub(in crate::sync_manager) fn migrate_sequence_v1(
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if key.starts_with(ORIGINS) {
         origin_key(std::str::from_utf8(&key[ORIGINS.len()..])?)?;
-        let (contiguous, high, sparse, _unavailable, baseline_required): (
-            u64,
-            u64,
-            BTreeMap<u64, (u64, String)>,
-            bool,
-            bool,
-        ) = serde_json::from_slice(value)?;
-        let progress = ReceiptTracker {
-            contiguous,
-            high,
-            sparse,
-            unavailable: None,
-            baseline_required,
+        let record: serde_json::Value = serde_json::from_slice(value)?;
+        let progress = if record.get(3).is_some_and(serde_json::Value::is_boolean) {
+            let (contiguous, high, sparse, _unavailable, baseline_required): (
+                u64,
+                u64,
+                BTreeMap<u64, (u64, String)>,
+                bool,
+                bool,
+            ) = serde_json::from_value(record)?;
+            ReceiptTracker {
+                contiguous,
+                high,
+                sparse,
+                unavailable: None,
+                baseline_required,
+            }
+        } else {
+            ReceiptTracker::decode(value)?
         };
         let encoded = progress.encode()?;
         ReceiptTracker::decode(&encoded)?;
@@ -578,4 +636,152 @@ pub(in crate::sync_manager) fn migrated_sequence_usage(
         "history tracking accounting mismatch"
     );
     Ok((USAGE.to_vec(), serde_json::to_vec(&actual)?))
+}
+
+fn baseline_key(origin: &str) -> anyhow::Result<Vec<u8>> {
+    origin_key(origin)?;
+    Ok([BASELINES, origin.as_bytes()].concat())
+}
+
+fn failure_key(origin: &str) -> anyhow::Result<Vec<u8>> {
+    origin_key(origin)?;
+    Ok([FAILURES, origin.as_bytes()].concat())
+}
+
+pub(in crate::sync_manager) fn has_baseline(store: &NxStore, origin: &str) -> anyhow::Result<bool> {
+    Ok(store
+        .get(&baseline_key(origin)?)?
+        .is_some_and(|value| value == [1]))
+}
+
+pub(in crate::sync_manager) fn needs_baseline(
+    store: &NxStore,
+    origin: &str,
+) -> anyhow::Result<bool> {
+    Ok(tracker(store, origin)?.baseline_required && !has_baseline(store, origin)?)
+}
+
+pub(in crate::sync_manager) fn record_recovery_failure(
+    store: &NxStore,
+    origin: &NodeId,
+    source: &str,
+    reason: nx_sync::BaselineFailure,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !source.is_empty() && source.len() <= 512,
+        "invalid recovery source"
+    );
+    // A failure record is bounded to one per already tracked origin.
+    anyhow::ensure!(
+        store.exists(&origin_key(origin.as_str())?)?,
+        "unknown recovery origin"
+    );
+    store.set(
+        &failure_key(origin.as_str())?,
+        &serde_json::to_vec(&(source, reason))?,
+    )?;
+    Ok(())
+}
+
+/// Caller holds the write lease and all registries, so this is the cut of the exported state.
+pub(in crate::sync_manager) fn baseline_origins(
+    store: &NxStore,
+) -> anyhow::Result<Vec<nx_sync::BaselineOrigin>> {
+    anyhow::ensure!(
+        !store.exists(BASELINE_UNCONFIRMED)?,
+        "unconfirmed baseline flush"
+    );
+    let mut origins = Vec::new();
+    for progress in replication_progress(store)? {
+        anyhow::ensure!(
+            progress.contiguous_sequence == progress.known_high_sequence
+                && progress.sparse_positions == 0
+                && !progress.baseline_missing,
+            "source has incomplete history or baseline"
+        );
+        origins.push(nx_sync::BaselineOrigin {
+            origin: progress.origin,
+            sequence: progress.contiguous_sequence,
+            legacy: progress.baseline_required,
+        });
+    }
+    Ok(origins)
+}
+
+/// Replace receipt coverage only when the source cut includes every applied local position.
+/// Known but unreceived positions remain pending, even if beyond the offered cut.
+pub(in crate::sync_manager) fn baseline_sequence_sets(
+    lease: &StoreWriteLease<'_>,
+    origins: &[nx_sync::BaselineOrigin],
+) -> anyhow::Result<SequenceSets> {
+    let store = lease.store();
+    anyhow::ensure!(
+        origins.len() <= MAX_ORIGINS,
+        "baseline origin budget exceeded"
+    );
+    anyhow::ensure!(
+        origins
+            .windows(2)
+            .all(|p| p[0].origin.as_str() < p[1].origin.as_str()),
+        "unordered baseline origins"
+    );
+    let supplied = origins
+        .iter()
+        .map(|o| (o.origin.as_str(), o))
+        .collect::<BTreeMap<_, _>>();
+    for progress in replication_progress(store)? {
+        let previous = tracker(store, progress.origin.as_str())?;
+        let offered = supplied.get(progress.origin.as_str());
+        let last_applied = previous
+            .sparse
+            .last_key_value()
+            .map_or(previous.contiguous, |(seq, _)| *seq);
+        anyhow::ensure!(
+            offered.map_or(last_applied == 0, |o| o.sequence >= last_applied),
+            "baseline does not cover applied operations"
+        );
+        if has_baseline(store, progress.origin.as_str())? {
+            anyhow::ensure!(
+                offered.is_some_and(|o| o.legacy),
+                "baseline would discard legacy state"
+            );
+        }
+    }
+    let allocator = local(store)?;
+    let mut updates = BTreeMap::new();
+    let mut extra = Vec::new();
+    for offered in origins {
+        let id = offered.origin.as_str();
+        origin_key(id)?;
+        if let Some((own, _, last)) = &allocator {
+            anyhow::ensure!(
+                id != own || offered.sequence == *last,
+                "baseline claims unallocated local history"
+            );
+        }
+        let mut progress = tracker(store, id)?;
+        anyhow::ensure!(
+            !progress.baseline_required || offered.legacy,
+            "baseline lacks known legacy provenance"
+        );
+        progress.contiguous = offered.sequence;
+        progress.high = progress.high.max(offered.sequence);
+        progress.sparse.clear();
+        progress.unavailable = None;
+        progress.baseline_required |= offered.legacy;
+        updates.insert(id.to_owned(), progress);
+        if offered.legacy {
+            extra.push((baseline_key(id)?, vec![1]));
+        }
+    }
+    let mut sets = tracker_sets(store, updates)?;
+    sets.extend(
+        origins
+            .iter()
+            .map(|origin| Ok((failure_key(origin.origin.as_str())?, b"null".to_vec())))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
+    sets.extend(extra);
+    sets.push((BASELINE_UNCONFIRMED.to_vec(), vec![1]));
+    Ok(sets)
 }

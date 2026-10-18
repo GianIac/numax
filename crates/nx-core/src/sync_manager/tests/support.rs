@@ -1,6 +1,24 @@
 use super::*;
 use crate::sync_manager::schema::ensure_sync_schema;
 
+pub(super) fn remote_apply_context(manager: &SyncManager) -> RemoteOpApplyContext<'_> {
+    RemoteOpApplyContext {
+        counters: &manager.counters,
+        pncounters: &manager.pncounters,
+        lww_registers: &manager.lww_registers,
+        lww_maps: &manager.lww_maps,
+        orsets: &manager.orsets,
+        rgas: &manager.rgas,
+        seen_ops: &manager.seen_ops,
+        seen_ops_next_sequence: &manager.seen_ops_next_sequence,
+        op_log: &manager.op_log,
+        op_log_next_sequence: &manager.op_log_next_sequence,
+        op_log_limit: manager.config.op_log_limit,
+        store: &manager.store,
+        metrics: &manager.metrics,
+    }
+}
+
 /// Fails even on synchronous metadata/lifecycle access, not just on watch acquisition.
 pub(super) struct UntouchedDiscovery;
 

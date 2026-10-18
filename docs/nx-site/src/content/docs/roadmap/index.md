@@ -190,8 +190,8 @@ while peer discovery remains deliberately separated from authentication and auth
 - [x] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
 - [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([contract and evidence](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
 - [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
-- [ ] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
-- [ ] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
+- [x] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
+- [x] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 
 **Separate control and data responsibilities**:
 - [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)

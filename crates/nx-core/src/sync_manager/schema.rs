@@ -95,9 +95,9 @@ impl StoreTable {
     }
 
     pub(super) fn current_version(self) -> u16 {
-        // Version 2 also fences old runtimes that would bypass receipt tracking.
+        // Version 3 fences runtimes that cannot preserve transferred baselines.
         if matches!(self, Self::OpLog | Self::Sequences) {
-            2
+            3
         } else {
             INITIAL_SCHEMA_VERSION
         }

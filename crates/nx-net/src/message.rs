@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -1039,6 +1039,52 @@ mod tests {
                 let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
                 assert_eq!(decoded, message);
                 assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_v8_baseline_messages_roundtrip_json_and_bincode() {
+        use nx_sync::{BaselineFailure, HistoryMessage};
+        let request_id = nx_sync::OpId::new("baseline-attempt");
+        let origin = NodeId::new("origin");
+        let mut messages = vec![
+            HistoryMessage::BaselineRequest {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                version: 1,
+            },
+            HistoryMessage::Baseline {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                version: 1,
+                payload: vec![0, 1, 255],
+                digest: [42; 32],
+            },
+        ];
+        for reason in [
+            BaselineFailure::UnsupportedVersion,
+            BaselineFailure::SourceIncomplete,
+            BaselineFailure::BudgetExceeded,
+            BaselineFailure::CoverageConflict,
+            BaselineFailure::InvalidState,
+        ] {
+            messages.push(HistoryMessage::BaselineUnavailable {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                reason,
+            });
+        }
+        for message in messages {
+            let wire = WireMessage {
+                kind: WireMessageKind::History { message },
+            };
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let bytes = wire.to_bytes_with_format(format).unwrap();
+                assert_eq!(
+                    WireMessage::from_bytes_with_format(&bytes[4..]).unwrap().1,
+                    wire
+                );
             }
         }
     }

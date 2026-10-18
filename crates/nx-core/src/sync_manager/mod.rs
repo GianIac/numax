@@ -1,4 +1,5 @@
 mod apply;
+mod baseline;
 mod candidates;
 pub(crate) use candidates::canonicalize_endpoint;
 #[cfg(test)]
@@ -10,7 +11,7 @@ mod replication;
 mod schema;
 mod sequence;
 mod storage;
-pub use sequence::{ReplicationProgress, UnavailableHistory};
+pub use sequence::{RecoveryFailure, ReplicationProgress, UnavailableHistory};
 mod types;
 
 pub use manager::{SyncHandle, SyncManager};

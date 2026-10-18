@@ -45,6 +45,18 @@ pub struct ReplicationProgress {
     pub source_unavailable: bool,
     pub unavailable_evidence: Option<UnavailableHistory>,
     pub baseline_required: bool,
+    /// The advertised unsequenced baseline has not been installed here.
+    pub baseline_missing: bool,
+    /// A complete transfer batch exists, but its flush has not been confirmed.
+    pub baseline_unconfirmed: bool,
+    /// Failure of the bounded recovery contract at one source, not global loss proof.
+    pub recovery_failure: Option<RecoveryFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryFailure {
+    pub source: String,
+    pub reason: nx_sync::BaselineFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

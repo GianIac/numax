@@ -689,9 +689,87 @@ completion can be verified for each CRDT family. If neither route can establish
 complete state, report an unrecoverable gap; connection or membership must not
 be reported as data convergence. This also applies to a new node that joins
 after old operations have expired. The retention window, surviving-source
-assumptions, transfer format, and completion proof require a separate detailed
-contract. State transfer is deliberately brought forward from the later
+assumptions, transfer format, and completion proof are defined by the bounded
+contract below. State transfer is deliberately brought forward from the later
 snapshot work only to the extent required for v0.1.6 recovery.
+
+#### Selected bounded recovery contract
+
+**Status:** implemented and verified with recovery, migration, and real TCP
+JSON/Bincode tests. Release-scale convergence criteria remain separate.
+
+D3 retains the last `max(1, op_log_limit)` operations accepted at a node, across
+all origins (default 10,000), in insertion order. This is a count window, not a
+time guarantee: unrelated writes, imported operations and a smaller restart
+configuration can evict history. Recovery by replay requires a surviving,
+reachable, admitted source to retain every requested position; different sources
+may supply different ranges. Retained min/max positions alone do not prove a
+hole-free interval. The source answers from actual records and their durable
+positions. Receipt coverage survives replay eviction.
+
+When replay is unavailable, or a legacy baseline is advertised but absent, the
+receiver requests baseline format **1** over wire protocol **8**. The minimal
+subset is one complete, byte-bounded CRDT baseline in one frame: no application
+KV, executable modules, store identity, remote durability acknowledgements or
+general-purpose backup API. The source captures all six registries and their
+origin cut under the existing lock order and store write lease, and confirms a
+covering flush before sending. It must have no known history holes, sparse
+receipts, missing legacy baselines or unconfirmed baseline flush.
+
+The payload is JSON independently of the negotiated outer JSON/Bincode codec.
+It contains sorted unique origins with contiguous sequences and legacy provenance,
+and sorted unique `(family, key)` records containing full internal state JSON.
+LWW winners, ORSet add/remove tags and RGA elements/tombstones are preserved.
+BLAKE3 covers the exact payload bytes. Limits are 1 MiB encoded payload, 4,096
+records, 4,096 key bytes and the existing 1,024-origin budget. RGA baseline
+materialization additionally requires at most 4,096 elements and depth 128;
+cycles, mismatched element IDs and overflowing counter totals are rejected.
+The outer JSON byte-array encoding fits the existing default wire limit;
+smaller configured transport limits may refuse the transfer. There is no
+staging or partial publication: an interrupted frame installs nothing.
+
+The receiver only replaces state with a **dominating complete cut**: every
+already applied contiguous/sparse position and every installed legacy baseline
+must be represented, the local allocator must remain unchanged, and the offered
+state must include every existing key and dominate its internal state under that
+family's merge. A summary maximum is never sufficient. The stricter cut rule is
+necessary for additive operation-based counters: max-merging partial receipt
+sets then replaying the remaining increments is unsafe. Concurrent local writes
+or incomparable replicas can therefore refuse a baseline; D3 does not promise
+arbitrary divergent-replica reconciliation beyond retained history.
+
+Full state, materialized values, legacy coverage and receipt frontiers are
+installed in one atomic batch, then flushed. Imported prefixes suppress delayed
+duplicates even when their UUIDs no longer appear in the bounded seen/op logs.
+Existing replay records remain usable; new replay starts after the imported cut.
+Known maxima beyond that cut remain pending. A batch rejection publishes nothing.
+A flush failure is an uncertain outcome: the full batch may survive and is kept
+coherent in memory, but a persisted confirmation marker prevents successful
+export or reporting confirmed baseline completion until retry/restart flushes it.
+
+Sequence and op-log schema **3** fence runtimes lacking these baseline semantics.
+Version 2 records migrate without changing their payloads; the store's own
+pre-sequence baseline provenance is established at initialization. Advertised
+remote provenance never establishes receipt. Historical fixtures remain unchanged.
+
+Requests share the existing per-peer/origin request budget, correlation and
+deadlines. Stale or unsolicited replies are ignored. Unsupported versions,
+incomplete sources, budget exhaustion, invalid state and coverage conflicts are
+explicit failures. `replication_progress()` distinguishes missing legacy state,
+unconfirmed flush and the last **source-scoped** recovery failure. That failure
+is not a proof of global permanent loss: another source or later repair can still
+succeed, and periodic anti-entropy keeps trying. No disconnected/unknown peer is
+assumed to have lost its state. Data convergence requires no known missing ranges,
+no missing legacy baseline and no unconfirmed flush, relative to the discovered
+cut; it is not a certificate that every cluster operation has been discovered.
+
+This contract requires a surviving complete source within these budgets after
+replay expires. If none can supply one, recovery fails explicitly under this
+contract. In particular, a new node joining an old cluster must obtain replay or
+a validated baseline before being considered caught up. Permanent loss of the
+sole durable holder remains outside the guarantee. Larger paginated snapshots,
+arbitrary incomparable-cut merging and unrestricted lossless recovery remain
+future work.
 
 ### D4–D6 — Membership, trust, and failure detection
 

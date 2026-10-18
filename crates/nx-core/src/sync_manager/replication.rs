@@ -652,6 +652,25 @@ async fn request_history_range(
     end: u64,
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
+    request_history_or_baseline(addr, origin, start, end, context).await
+}
+
+async fn request_baseline(
+    addr: &str,
+    origin: nx_sync::NodeId,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    // Zero is not a valid replay sequence; it identifies the bounded baseline request.
+    request_history_or_baseline(addr, origin, 0, 0, context).await
+}
+
+async fn request_history_or_baseline(
+    addr: &str,
+    origin: nx_sync::NodeId,
+    start: u64,
+    end: u64,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
     let request_id = nx_sync::OpId::generate();
     {
         let mut requests = context.history_requests.write().await;
@@ -679,11 +698,19 @@ async fn request_history_range(
         .node
         .send_history_to_addr(
             addr,
-            HistoryMessage::Request {
-                request_id: request_id.clone(),
-                origin: origin.clone(),
-                start,
-                end,
+            if start == 0 {
+                HistoryMessage::BaselineRequest {
+                    request_id: request_id.clone(),
+                    origin: origin.clone(),
+                    version: super::baseline::VERSION,
+                }
+            } else {
+                HistoryMessage::Request {
+                    request_id: request_id.clone(),
+                    origin: origin.clone(),
+                    start,
+                    end,
+                }
             },
         )
         .await
@@ -793,8 +820,12 @@ async fn handle_history_message(
                 cursor.request_deadline = None;
             }
             for entry in entries {
-                if let Some((start, end)) = super::storage::record_summary(&context.store, &entry)?
+                let missing = super::storage::record_summary(&context.store, &entry)?;
+                if super::storage::needs_baseline(&context.store, entry.origin.as_str())?
+                    || context.store.exists(super::storage::BASELINE_UNCONFIRMED)?
                 {
+                    request_baseline(addr, entry.origin, context).await?;
+                } else if let Some((start, end)) = missing {
                     request_history_range(addr, entry.origin, start, end, context).await?;
                 }
             }
@@ -907,6 +938,83 @@ async fn handle_history_message(
                 },
             )?;
             warn!(%origin, start, end, "source cannot supply missing history; another source or state baseline is required");
+            if let Err(error) = request_baseline(addr, origin, context).await {
+                context.metrics.record_sync_error();
+                debug!(%addr, %error, "baseline request deferred after unavailable replay; periodic repair will retry");
+            }
+        }
+        HistoryMessage::BaselineRequest {
+            request_id,
+            origin,
+            version,
+        } => {
+            anyhow::ensure!(
+                !request_id.as_str().is_empty() && request_id.as_str().len() <= 128,
+                "invalid baseline request identity"
+            );
+            super::storage::summary_cursor(Some(origin.as_str()))?;
+            let result = if version != super::baseline::VERSION {
+                Err(super::baseline::Rejected(nx_sync::BaselineFailure::UnsupportedVersion).into())
+            } else {
+                super::baseline::export(&history_apply_context(context)).await
+            };
+            let response = match result {
+                Ok(payload) => HistoryMessage::Baseline {
+                    request_id,
+                    origin,
+                    version,
+                    digest: *blake3::hash(&payload).as_bytes(),
+                    payload,
+                },
+                Err(error) => HistoryMessage::BaselineUnavailable {
+                    request_id,
+                    origin,
+                    reason: error
+                        .downcast_ref::<super::baseline::Rejected>()
+                        .map_or(nx_sync::BaselineFailure::SourceIncomplete, |r| r.0),
+                },
+            };
+            context.node.send_history_to_addr(addr, response).await?;
+        }
+        HistoryMessage::Baseline {
+            request_id,
+            origin,
+            version,
+            payload,
+            digest,
+        } => {
+            if !complete_history_request(addr, &origin, &request_id, 0, 0, context).await {
+                debug!(%addr, "ignoring stale or unsolicited baseline");
+                return Ok(());
+            }
+            if let Err(error) = super::baseline::import(
+                version,
+                &payload,
+                &digest,
+                &origin,
+                &history_apply_context(context),
+            )
+            .await
+            {
+                let reason = error
+                    .downcast_ref::<super::baseline::Rejected>()
+                    .map_or(nx_sync::BaselineFailure::InvalidState, |r| r.0);
+                super::storage::record_recovery_failure(&context.store, &origin, addr, reason)?;
+                return Err(error);
+            }
+        }
+        HistoryMessage::BaselineUnavailable {
+            request_id,
+            origin,
+            reason,
+        } => {
+            if !complete_history_request(addr, &origin, &request_id, 0, 0, context).await {
+                debug!(%addr, "ignoring stale or unsolicited baseline refusal");
+                return Ok(());
+            }
+            super::storage::record_recovery_failure(&context.store, &origin, addr, reason)?;
+            context.metrics.record_sync_error();
+            warn!(%origin, ?reason, "gap unrecoverable from this source under the bounded baseline contract; other sources may still recover it");
         }
     }
     Ok(())
@@ -1094,6 +1202,140 @@ mod tests {
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
             peer_dead_after_failures: 2,
         }
+    }
+
+    #[tokio::test]
+    async fn baseline_stale_unsolicited_and_expired_responses_cannot_change_recovery_state() {
+        use nx_sync::{BaselineFailure, HistorySummary, OpId};
+        let store = temp_store();
+        let context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&store),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        let origin = NodeId::new("origin");
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let id = OpId::generate();
+        let addr = "source-a:1234";
+        let before = store.scan_prefix(b"__nx/").unwrap();
+        for (source, request_id, deadline) in [
+            (addr, id.clone(), StdInstant::now()),
+            (
+                "other:1234",
+                id.clone(),
+                StdInstant::now() + Duration::from_secs(30),
+            ),
+            (
+                addr,
+                OpId::generate(),
+                StdInstant::now() + Duration::from_secs(30),
+            ),
+        ] {
+            context.history_requests.write().await.insert(
+                addr.into(),
+                HashMap::from([(
+                    origin.as_str().to_owned(),
+                    PendingHistoryRequest {
+                        request_id: id.clone(),
+                        start: 0,
+                        end: 0,
+                        deadline,
+                    },
+                )]),
+            );
+            handle_history_message(
+                source,
+                HistoryMessage::Baseline {
+                    request_id: request_id.clone(),
+                    origin: origin.clone(),
+                    version: 0,
+                    payload: vec![1],
+                    digest: [0; 32],
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            handle_history_message(
+                source,
+                HistoryMessage::BaselineUnavailable {
+                    request_id,
+                    origin: origin.clone(),
+                    reason: BaselineFailure::BudgetExceeded,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(before, store.scan_prefix(b"__nx/").unwrap());
+        }
+        context.history_requests.write().await.insert(
+            addr.into(),
+            HashMap::from([(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: id.clone(),
+                    start: 0,
+                    end: 0,
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            )]),
+        );
+        handle_history_message(
+            addr,
+            HistoryMessage::BaselineUnavailable {
+                request_id: id,
+                origin: origin.clone(),
+                reason: BaselineFailure::BudgetExceeded,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        let failure = super::super::storage::replication_progress(&store).unwrap()[0]
+            .recovery_failure
+            .clone()
+            .unwrap();
+        assert_eq!(failure.source, addr);
+        assert_eq!(failure.reason, BaselineFailure::BudgetExceeded);
+        // Actual replay from another source clears this failure without inventing a baseline.
+        apply_sequenced_ops(
+            &[nx_sync::SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "visits", 1),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            }],
+            &history_apply_context(&context),
+        )
+        .await
+        .unwrap();
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin,
+                high_sequence: 2,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            super::super::storage::replication_progress(&store).unwrap()[0]
+                .recovery_failure
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1678,7 +1920,7 @@ mod tests {
             &addr,
             HistoryMessage::Unavailable {
                 request_id,
-                origin,
+                origin: origin.clone(),
                 start: 1,
                 end: 3,
             },
@@ -1686,7 +1928,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(context.history_requests.read().await[&addr].is_empty());
+        let pending = context.history_requests.read().await;
+        let baseline_request = &pending[&addr][origin.as_str()];
+        assert_eq!((baseline_request.start, baseline_request.end), (0, 0));
+        drop(pending);
+        assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::BaselineRequest {
+                origin: requested_origin,
+                version: super::super::baseline::VERSION,
+                ..
+            },
+            ..
+        } if requested_origin == origin
+        ));
         assert!(
             super::super::storage::replication_progress(&context.store).unwrap()[0]
                 .source_unavailable

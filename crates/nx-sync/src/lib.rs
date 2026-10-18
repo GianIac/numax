@@ -15,4 +15,7 @@ pub use crdt::pncounter::PNCounter;
 pub use crdt::rga::{Rga, RgaElement, RgaElementId};
 
 mod history;
-pub use history::{HistoryMessage, HistorySummary, OpPosition, SequencedOp};
+pub use history::{
+    BaselineFailure, BaselineOrigin, BaselineRecord, CrdtBaseline, HistoryMessage, HistorySummary,
+    OpPosition, SequencedOp,
+};

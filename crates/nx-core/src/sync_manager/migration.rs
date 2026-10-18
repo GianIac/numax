@@ -265,6 +265,11 @@ const OP_LOG_STEPS: &[MigrationStep] = &[
         // Payloads are preserved. The new header fences unsequenced old writers.
         migrate_record: migrate_legacy_record,
     },
+    MigrationStep {
+        from_version: 2,
+        to_version: 3,
+        migrate_record: migrate_legacy_record,
+    },
 ];
 const SEQUENCE_STEPS: &[MigrationStep] = &[
     LEGACY_TO_V1,
@@ -272,6 +277,11 @@ const SEQUENCE_STEPS: &[MigrationStep] = &[
         from_version: 1,
         to_version: 2,
         migrate_record: migrate_sequence_evidence,
+    },
+    MigrationStep {
+        from_version: 2,
+        to_version: 3,
+        migrate_record: migrate_legacy_record,
     },
 ];
 
@@ -932,7 +942,7 @@ mod tests {
                 Err(SchemaError::OlderVersion {
                     table: StoreTable::OpLog,
                     found: 1,
-                    current: 2
+                    current: 3
                 })
             ));
             assert_eq!(store.scan_prefix(b"").unwrap(), records);
