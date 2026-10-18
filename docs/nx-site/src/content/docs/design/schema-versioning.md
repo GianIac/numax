@@ -39,12 +39,12 @@ accepted for another. Each table owns its schema version independently.
 
 ## Sequenced replication in v0.1.6
 
-The op-log table (id 14) now uses schema 2. Its `1 -> 2` migration validates
+The op-log table (id 14) now uses schema 3. Its `1 -> 2` migration validates
 existing operation payloads without assigning historical sequences or rewriting
 those payloads. The version change also makes v0.1.5 reject an upgraded store
 before it can mutate CRDT state without updating sequence metadata.
 
-The additive `sequences` table (id 15, schema 2) uses `__nx/crdt/sequence/`:
+The additive `sequences` table (id 15, schema 3) uses `__nx/crdt/sequence/`:
 
 - `local`: the bound origin, current generation, and allocated sequence;
 - `origin/<origin>`: contiguous prefix, known high sequence, sparse identities,
@@ -52,13 +52,39 @@ The additive `sequences` table (id 15, schema 2) uses `__nx/crdt/sequence/`:
   legacy baseline requirement;
 - `usage`: origin count, serialized receipt bytes, and sparse-position count;
 - `replay/<OpId>`: original origin/generation/sequence, retained alongside the
-  corresponding replay record and deleted when that record expires.
+  corresponding replay record and deleted when that record expires;
+- `baseline/<origin>`: installed coverage of that origin's pre-sequence state;
+- `failure/<origin>`: the current source/reason rejection tuple, or JSON `null`
+  after invalidation (at most one record per tracked origin);
+- `baseline-unconfirmed`: a marker installed with a baseline batch and removed
+  only after a covering flush succeeds.
 
 The sequence-table `1 -> 2` migration preserves contiguous coverage, sparse
 identities, known maxima and baseline requirements. It discards the old
 uncorrelated unavailable boolean instead of inventing a source or interval.
 Migration is resumable; receipt-byte accounting is recomputed and committed
 atomically with the schema-2 header and checkpoint removal at completion.
+
+The op-log and sequence-table `2 -> 3` steps validate and preserve payloads,
+then advance their headers to fence runtimes that do not preserve transferred
+baselines. Other CRDT tables remain at schema 1. Initialization establishes only
+the store's own legacy baseline provenance; receiving an advertisement from
+another origin never establishes receipt of that baseline.
+
+Baseline state, materialized values, per-origin receipt coverage and installed
+legacy provenance commit together. A rejected batch publishes nothing. After
+a failed flush, the complete batch may survive and its in-memory state is kept
+coherent, but `baseline-unconfirmed` remains set and the store rejects writes
+until reopen. A successful restart flush covers surviving state before clearing
+that marker. An accepted transfer does not synthesize or replay old UUID-only
+operations, and known maxima beyond its cut remain pending.
+
+Failure records describe one source under the current recovery target; they do
+not prove permanent cluster-wide loss. Local pending requests include a receipt
+fingerprint, so a still-live refusal after another source repaired the gap is
+ignored. Recorded failures are invalidated when receipt coverage or known history
+changes. The fingerprint is local request metadata; the schema-3 record layout is unchanged.
+Storage faults retain their original cause rather than becoming data rejections.
 
 Local state and sequence allocation commit in one batch before the covering
 flush. Remote state, positions, and receipt metadata likewise commit atomically
@@ -78,12 +104,13 @@ transition is deliberately explicit:
 | Input | Current runtime / migration result |
 | --- | --- |
 | Empty store | Initialize current table headers |
-| v0.1.0 unversioned sync records | Runtime rejects; offline migration validates `0 -> 1`, then upgrades the op log to 2 |
-| v0.1.5 schema-1 store | Runtime rejects the old op-log schema; offline migration validates its payloads and upgrades that header to 2 |
-| Development sequence-table schema 1 | Offline `1 -> 2` migration converts receipts, drops uncorrelated unavailable flags and recomputes byte usage |
-| Current store | Open normally; migration is idempotent |
+| v0.1.0 unversioned sync records | Runtime rejects; offline migration validates `0 -> 1`, then upgrades op log and sequences to 3 |
+| v0.1.5 schema-1 store | Runtime rejects the old op-log schema; offline migration validates its payloads and upgrades op-log and sequence headers to 3 |
+| Development sequence-table schema 1 | Offline `1 -> 2` migration converts receipts, drops uncorrelated unavailable flags and recomputes byte usage, then validates `2 -> 3` |
+| Development schema-2 op-log/sequence tables | Runtime rejects; offline `2 -> 3` validates payloads and advances the headers |
+| Current schema-3 store | Open normally; migration is idempotent |
 | Unknown future schema or malformed source | Reject; do not interpret it as empty data |
-| v0.1.5 opening an upgraded store | Old runtime rejects op-log schema 2 before CRDT mutations |
+| v0.1.5 opening an upgraded store | Old runtime rejects op-log schema 3 before CRDT mutations |
 
 Stop the runtime and preserve an offline backup before running `nx migrate
 --datastore-path /path/to/data`. Reopen with the new runtime only after migration
@@ -108,40 +135,47 @@ receipt frontiers. Old operations are excluded from sequenced replay; incoming
 legacy replay is rejected even after its UUIDs have left the seen cache.
 A connected new peer therefore cannot infer historical convergence from a
 successful handshake or complete coverage of new operations. Recovery of that
-baseline requires D3 state transfer, which remains unimplemented.
+baseline uses the implemented, bounded D3 state-transfer contract. A source
+with incomplete coverage, an oversized payload or an incompatible receiver cut
+may refuse recovery explicitly; no unrestricted lossless recovery is promised.
 
 A downgrade cannot safely write this store: the old writer would bypass sequence
 tracking. There is no reverse migration. Restoring an offline pre-upgrade backup
 is a separate operator action and does not preserve writes accepted since that
-backup. Mixed protocol-5/protocol-7 replication is also rejected; plan deployment
+backup. Mixed protocol-5/protocol-8 replication is also rejected; plan deployment
 for that communication interruption rather than assuming a rolling upgrade
 continues replication across the version boundary.
 
-### Regression evidence
+<span id="regression-evidence"></span>
 
-Immutable logical fixtures live in `sync_manager/fixtures/v0_1_0/` and
-`sync_manager/fixtures/v0_1_5/`, with source tags, pinned commits and reproduction
-instructions. The v0.1.5 fixture covers all six families and tombstones, seen IDs,
-UUID-only replay, schema-1 headers and an application key. Its generator uses
-historical release crates, never current encoders. Tests reconstruct disposable
-stores and compare preserved bytes; do not regenerate historical fixtures to
-make a new migration pass.
+### Compatibility verification
 
-Migration tests cover a reopened record checkpoint, every op-log record/header
-write boundary under injected storage failure, corrupted replay and retry after
-repair, and process termination before/after the final op-log header batch.
-The development sequence migration is tested across reopening with partially
-converted records and across a rejected transformation write.
-Manager tests verify all-family values after migration, real eviction and
-restart, unchanged durable/materialized payloads under legacy replay, and
-persistent baseline requirements after new writes. TCP tests in both JSON and
-Bincode verify baseline advertisement and unavailable-range responses instead
-of inventing historical sequence positions. These checks do not establish D3
-state-transfer completeness or recovery beyond retained history.
+Historical fixtures are immutable logical-store records produced by their
+release encoders. They include source tags, pinned commits and reproduction
+instructions; current encoders must not regenerate them to fit a migration.
 
-The focused checks are reproducible with:
+| Fixture | Contents |
+| --- | --- |
+| `sync_manager/fixtures/v0_1_0/` | Unversioned sync records and operation payloads |
+| `sync_manager/fixtures/v0_1_5/` | Six CRDT families, tombstones, seen IDs, UUID-only replay, schema-1 headers and an application key |
+
+Verification reconstructs disposable stores and checks the following boundaries:
+
+- Payload bytes and unrelated application records survive migration unchanged.
+- Record checkpoints resume after reopen, including partially converted receipts.
+- Storage rejection or corrupted input does not advance the failed record's checkpoint.
+- Final schema headers and checkpoint removal remain atomic across process termination.
+- Legacy replay remains rejected after real seen-ID and op-log eviction.
+- A new sequence frontier does not establish receipt of a historical baseline.
+- Baseline installation preserves full internal state, receipt coverage and legacy
+  provenance across restart, delayed duplicates and flush failure.
+- Recovery refusal remains specific to the requested source and current coverage;
+  an alternate source can still complete recovery.
+
+Focused verification entry points:
 
 ```sh
+cargo test -p nx-core baseline_
 cargo test -p nx-core v015
 cargo test -p nx-core sequence_v1_migration
 cargo test -p nx-core migrates_fixture_generated_by_v0_1_0
@@ -210,10 +244,12 @@ gaps and double-processing.
 ## Legacy migration
 
 The migration engine supports `v0 -> v1` for the original tables and
-`v1 -> v2` for the op log. Version `0` means either
+`v1 -> v2 -> v3` for op log and sequences. Version `0` means either
 legacy data without metadata or an explicit version-zero header.
 
-This migration certifies existing payloads without rewriting them:
+The original-table `v0 -> v1` and op-log steps validate existing payloads without
+rewriting them. The sequence-table `1 -> 2` receipt conversion is described
+above. Each original-table validation step proceeds as follows:
 
 1. process at most a configured number of records per batch;
 2. validate each key and payload with its table-specific decoder;
@@ -242,7 +278,6 @@ The engine does not perform implicit migration during `Runtime::new`.
 If validation fails, the checkpoint is not advanced and the schema header is
 not written. Existing payload bytes remain unchanged.
 
-Compatibility with the legacy layout is covered by a committed logical-store
-fixture generated from tag `v0.1.0`. The test reconstructs the sled records,
-migrates them with the current engine, verifies every payload byte is
-unchanged, and validates the resulting CRDT state and operation log.
+The `v0.1.0` logical-store fixture supplies the original layout for the
+[compatibility verification](#compatibility-verification), including byte
+preservation and validation of the resulting CRDT state and operation log.

@@ -3,12 +3,11 @@ title: Gossip Protocol
 description: How Numax moves operations between peers.
 ---
 
-This page explains what gossip means in Numax, what the current sync layer already does, and what will arrive in the peer-discovery releases.
-
-The short version: **Numax discovers connection candidates, broadcasts directly
-to active peers, and repairs missed operations through periodic anti-entropy.**
-Discovery is dynamic in `v0.1.5`; SWIM-style membership and K-fanout data gossip
-remain future work.
+Numax discovers connection candidates, admits peers through the wire handshake,
+and broadcasts accepted CRDT operations to active connections. Periodic
+anti-entropy repairs missed operations through bounded replay or a verified
+CRDT baseline. SWIM/Lifeguard membership and K-fanout are proposed extensions
+for v0.1.6; the implemented transport still uses direct broadcast.
 
 ---
 
@@ -35,10 +34,9 @@ the bounded UUID cache expires; the largest UUID is not a completeness frontier.
 
 ---
 
-## What exists today
+## Replication architecture
 
-The current data-replication implementation remains intentionally simple and
-deterministic. A node obtains endpoint candidates from static, bootstrap, mDNS,
+A node obtains endpoint candidates from static, bootstrap, mDNS,
 DNS-SRV or file providers. The same bounded, updateable candidate snapshot feeds
 initial dialing and reconnect. Anti-entropy uses all active connections,
 including inbound peers and connections whose candidates have been removed.
@@ -55,10 +53,12 @@ connected peers.
 
 [Mermaid source for this diagram](/numax/diagrams/concepts/current-broadcast.mmd)
 
-The direct-broadcast topology remains current; the diagram's `PushOps` label
-predates the development protocol-7 `History::Push` envelope.
+The diagram uses the legacy `PushOps` label. Protocol 8 carries sequenced
+operations in the `History::Push` envelope with the same direct-broadcast topology.
 
-This is not SWIM and it is not K-fanout yet. It is a full broadcast to connected peers, bounded by `max_peers`, with batching and backpressure through the operation queue.
+Broadcast is bounded by `max_peers`, with batching and backpressure through
+the operation queue. It does not maintain a SWIM membership view or select
+K-fanout neighbors.
 
 ---
 
@@ -77,12 +77,12 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 | `Error` | Structured wire error sent before rejecting a request or closing a connection. |
 | `BootstrapHello` | Start a one-shot authenticated bootstrap request with cluster, advertisement and result limit. |
 | `BootstrapAck` | Return the seed identity, matching cluster, negotiated format, bounded endpoint suggestions and their lease. |
-| `History` | Private protocol-7 envelope for sequenced pushes, paginated summaries, correlated range requests/replay and unavailable-history responses. |
+| `History` | Private protocol-8 envelope for sequenced pushes, paginated summaries, correlated range requests/replay, unavailable-history responses and bounded baseline recovery. |
 
-The v0.1.6 development protocol is `7`; the released v0.1.5 protocol is `5`.
+The v0.1.6 development protocol is `8`; the released v0.1.5 protocol is `5`.
 Peers require equal versions before negotiating `Bincode` (implemented with
 `wincode`) or `Json`. Preserving legacy codec bytes does not make protocol-5
-peers compatible with protocol 7. See [Wire Versioning](/numax/design/wire-versioning/)
+peers compatible with protocol 8. See [Wire Versioning](/numax/design/wire-versioning/)
 for rejection tests and deployment implications.
 
 ---
@@ -163,7 +163,7 @@ socket time and concurrent client queries are all bounded.
 
 ## Broadcast path
 
-In the v0.1.6 development checkout, local success follows an atomic batch of
+Local CRDT success follows an atomic batch of
 CRDT state, materialized value, UUID, seen/replay metadata and sequence position,
 then a covering flush. Only then does the operation become eligible for network
 propagation. The broadcast loop drains the bounded queue and sends sequenced
@@ -202,7 +202,7 @@ requested history it reports that interval unavailable; this does not prove
 that every other source also lacks it.
 
 The following diagram shows the older v0.1.5 bounded-log pull, not a trace of
-protocol-7 messages:
+protocol-8 messages:
 
 ![Historical v0.1.5 anti-entropy after a disconnect](/numax/diagrams/concepts/current-anti-entropy.svg)
 
@@ -212,8 +212,14 @@ Migrated UUID-only history is preserved locally and excluded from automatic
 replay. Its `baseline_required` condition survives new sequenced writes and
 restart; a fresh peer cannot infer historical convergence from new frontiers.
 The [schema migration contract](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract)
-specifies this boundary. D3 state transfer and the recoverable retention window
-remain separate work; the bounded log is not an unlimited recovery archive.
+specifies this boundary. The log retains a configured count of operations
+(10,000 by default), rather than a guaranteed duration. After expiry, protocol 8 can transfer a bounded, versioned
+full CRDT baseline when the source cut covers the receiver's applied history and
+state. The payload budget is 1 MiB including encoding overhead, so even a single
+otherwise legal large guest value can exceed it. Incomplete sources, oversized
+state and incomparable cuts fail explicitly; another source may still recover
+the gap. See the [D3 contract](/numax/design/peer-discovery/#selected-bounded-recovery-contract).
+The bounded log and baseline subset are not an unlimited recovery archive.
 
 ---
 
@@ -241,34 +247,33 @@ peers. It is not a full membership protocol yet.
 
 ---
 
-## What is not implemented yet
+## Proposed extensions
 
-The current release line does **not** yet provide:
+The following capabilities are outside the implemented discovery and replication path:
 
 - SWIM membership,
 - Lifeguard-style failure detection,
 - phi-accrual failure detection,
 - K-fanout dissemination,
 - adaptive gossip rate,
-- NAT traversal,
-- verified versioned state transfer for legacy baselines and expired history.
+- NAT traversal.
 
-If you see "gossip" in the current docs, distinguish bootstrap gossip — a
-bounded exchange of endpoint suggestions — from data gossip. Current CRDT
-propagation is still a broadcast to all active peers, with anti-entropy as its
-repair path. Bootstrap suggestions are not membership state.
+Versioned baseline recovery for legacy state and expired history is implemented
+within the [D3 limits](/numax/design/peer-discovery/#selected-bounded-recovery-contract).
+Larger snapshots and arbitrary incomparable-cut reconciliation remain outside
+that contract.
+
+Bootstrap gossip exchanges bounded endpoint suggestions. Data dissemination
+uses admitted connections and direct broadcast, with anti-entropy for repair.
+Bootstrap suggestions do not establish membership or data readiness.
 
 ---
 
-## Current foundations and next steps
+## Discovery integration and proposed dissemination
 
-Peer discovery foundations are implemented in the current `v0.1.5` release;
-membership and K-fanout remain planned for `v0.1.6`.
+### Discovery providers
 
-### v0.1.5 - Peer Discovery: Foundations
-
-This release introduces the `PeerDiscovery` contract and five Rust provider
-implementations: static configuration, authenticated bootstrap, LAN mDNS,
+The `PeerDiscovery` contract supports five providers: static configuration, authenticated bootstrap, LAN mDNS,
 DNS-SRV and an externally updated peer file. Snapshot/watch handoff is atomic,
 delivery is bounded with explicit overflow, and provider tasks are owned and
 stopped by runtime shutdown.
@@ -281,11 +286,9 @@ they are not reinterpreted as bootstrap seeds. Embedders can also compose the
 public providers through the `nx-core` Rust API. The detailed semantics are in the
 [Peer Discovery Contract](/numax/design/discovery-contract/).
 
-### v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout
+### Proposed membership and K-fanout
 
-This is where the protocol becomes a real dynamic cluster protocol.
-
-Planned split:
+The proposed architecture separates three responsibilities:
 
 | Channel | Responsibility |
 |---|---|
@@ -293,7 +296,10 @@ Planned split:
 | Failure detection | Suspicion and dead-peer detection without relying only on configured addresses. |
 | Data dissemination | K-fanout gossip for CRDT operations. |
 
-K-fanout means a node does not send every update to every peer. Instead, it sends each update to `K` selected peers. Those peers forward it further. With a good value of `K`, the cluster gets fast propagation without every operation becoming a full-cluster broadcast.
+K-fanout selects `K` eligible peers for each update; those peers forward the
+original operation after persistence. Duplicate suppression prevents repeated
+effects and forwarding cycles. A bounded, rotating neighbor set and periodic
+anti-entropy remain necessary for sparse topologies and healed partitions.
 
 The planned default is based on cluster size:
 
@@ -301,9 +307,15 @@ The planned default is based on cluster size:
 K = ceil(log2(N) + c)
 ```
 
-where `N` is the known cluster size and `c` is a small safety constant.
+where `N` is the local estimate of eligible membership and `c` is a calibrated
+constant. The implementation must clamp `K` to available peers and configured
+budgets, including empty and small clusters. The formula alone does not
+establish connectivity or convergence.
 
-The roadmap also includes adaptive fanout based on load and RTT, controlled backpressure, periodic anti-entropy as a repair path, and seedable randomness so tests can reproduce gossip behavior.
+The proposed scheduler includes load/RTT adaptation, bounded backpressure and
+seeded randomness for deterministic simulation of the production state machine.
+These parameters remain subject to the
+[peer-discovery design](/numax/design/peer-discovery/).
 
 ---
 
@@ -315,8 +327,8 @@ Anti-entropy is the repair path. It catches up nodes that were offline, partitio
 
 Numax needs both because local-first systems must tolerate temporary
 disconnection. CRDTs define convergence semantics; dissemination moves
-operations between peers, and anti-entropy repairs missed operations while the
-required operation and deduplication history remains available.
+operations between peers. Anti-entropy repairs retained history by replay and
+can establish a baseline after expiry within the declared state-transfer limits.
 
 ---
 

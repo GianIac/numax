@@ -3,18 +3,20 @@ title: Peer Discovery, Membership, and Gossip (draft)
 description: How Numax finds peers, tracks membership, disseminates CRDT operations, and repairs missed updates.
 ---
 
-> **Status: in development.** Endpoint discovery, connection admission, direct broadcast, and bounded anti-entropy exist today.
+This RFC defines the replication contracts and proposed membership architecture
+for v0.1.6. Endpoint discovery, connection admission, direct broadcast,
+sequenced anti-entropy and bounded CRDT baseline recovery are implemented.
+SWIM/Lifeguard membership, K-fanout and runtime peer addition are proposed
+capabilities; their contracts and open parameters are specified separately.
 
-> **Planning note.** I use this file mainly to plan the development of v0.1.6 as well as I can and to make each decision once and for all. This version is already giving me a hard time, even before I have really started writing code.
-
-## What this feature does
+## System boundaries
 
 Numax peers first need to find one another, then decide which connections satisfy
 the configured identity policy. Membership tracks which admitted nodes are
 believed reachable. Gossip will spread accepted CRDT operations to a subset of
 members, while anti-entropy repairs missed updates after loss or a partition.
 
-> Discovery, connection, membership, and synchronized data are separate states. 
+> Discovery, connection, membership, and synchronized data are separate states.
 > Ordinary local KV writes do not automatically enter this CRDT replication path.
 
 ![Peer discovery, admission, membership, gossip, and repair](/numax/diagrams/peer-discovery/overview.svg)
@@ -24,20 +26,20 @@ members, while anti-entropy repairs missed updates after loss or a partition.
 > The diagram shows the intended feature, including components still in development.
 
 A node can already start with no candidates, discover endpoints later, verify
-connections, and exchange CRDT operations with a bounded repair path. 
-The intended experience is that a candidate becomes an admitted peer only after the normal
-handshake, a missed probe can raise suspicion without proving failure, and an
-accepted operation can move across multiple peers without a full broadcast.
+connections, and exchange CRDT operations with a bounded repair path.
+Admission requires the normal handshake. The proposed membership detector
+uses suspicion before declaring failure; planned gossip forwarding preserves
+the identity of accepted operations across multiple peers.
 If history needed for repair is unavailable, the node must report that condition
 instead of claiming convergence.
 
-Local service readiness must remain independent of peer discovery and cluster
+Local service readiness is independent of peer discovery and cluster
 convergence. `SyncManager::start()` returns when local services and their loops
 are ready, even if there are no candidates or an initial handshake stalls.
 An admitted peer may still be recovering data; connection and membership status
 must not be mistaken for synchronized state.
 
-### Terms used here
+### Terminology
 
 | Term | Meaning |
 | --- | --- |
@@ -45,31 +47,30 @@ must not be mistaken for synchronized state.
 | Admitted peer | Remote node whose connection passed the configured handshake and identity policy. Admission is distinct from discovery and from a membership vote. |
 | Member | Node represented in the new, weakly consistent membership view. The exact admission and removal transitions remain open. |
 | Suspect | Member believed unreachable pending confirmation or refutation; not proof of failure. |
-| Accepted operation | A CRDT operation that has reached its documented persistence boundary. Local writes now batch state and replay metadata and wait for flush; remote apply still has a separate durability contract to review. |
+| Accepted operation | A CRDT operation that has reached its documented persistence boundary. Local writes batch state and replay metadata and wait for flush; remote apply has the separate persistence boundary specified below. |
 | Recoverable gap | Missing accepted history for which the chosen repair source and retention contract can still supply the needed information. |
 | Unrecoverable gap | Missing required history beyond that contract. It must become visible as a recovery error. |
-| Anti-entropy | Periodic reconciliation independent of the fast gossip path. Today it pulls a bounded operation log; a future replacement requires its own contract. |
+| Anti-entropy | Periodic reconciliation independent of the fast gossip path. It repairs retained history by replay or requests a verified baseline within the D3 recovery limits. |
 
-## Scope and existing contracts
-The following statements describe the inspected checkout and its published
-contracts.
+## Current architecture
 
-| Existing contract | Evidence and consequence |
+The following contracts apply to the implemented discovery and replication path.
+
+| Responsibility | Contract |
 | --- | --- |
 | Discovery publishes candidates, not authority | `crates/nx-core/src/discovery.rs` and [Discovery Contract](/numax/design/discovery-contract/). Static, bootstrap gossip, mDNS, DNS-SRV, and file sources feed a bounded coordinator. Provider snapshots, revisions, leases, overflow recovery, and shutdown ownership must remain coherent. |
 | Connection identity depends on transport policy | `crates/nx-net/src/node.rs::verify_peer_identity` rejects the local `NodeId`; secure TLS binds the claimed ID to a certificate and checks the peer allowlist. In insecure or non-TLS mode, the reported identity is unverified. A discovered address or cluster name is not proof of trust. |
 | Peer health is not SWIM membership | `crates/nx-core/src/sync_manager/peer.rs` tracks per-endpoint reconnection health. Its `Suspect` and `Dead` labels do not constitute a cluster-wide, incarnation-aware membership protocol. |
 | Local acceptance is flush-confirmed | Local CRDT mutations persist state, `OpId`, seen metadata, and replay in one atomic batch. Success follows the covering flush and does not imply remote receipt. |
-| Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. Preserve this error ordering when adding forwarding; verify failure behavior and flush semantics separately. |
-| The present repair path is limited | `sync_manager/replication.rs` exchanges paginated per-origin summaries and bounded replay ranges over active connections. Durable contiguous prefixes and sparse receipt metadata suppress delayed duplicates independently of replay retention. Unavailable history is reported; UUID order and advertised maxima are not receipt frontiers. |
-| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 7; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
-| Management lists peers today | `GET /api/v1/peers` exists in `crates/nx-api/src/routes.rs`. The proposed POST is not yet a runtime admission API. Control cases belong behind `nx-core/src/control.rs`. |
+| Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. The remote batch precedes in-memory publication and does not explicitly await a covering flush. |
+| Data recovery | `sync_manager/replication.rs` exchanges paginated per-origin summaries and bounded replay ranges over active connections. Durable contiguous prefixes and sparse receipt metadata suppress delayed duplicates independently of replay retention. Unavailable history triggers bounded baseline recovery; UUID order and advertised maxima are not receipt frontiers. |
+| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 8; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
+| Management | `GET /api/v1/peers` exists in `crates/nx-api/src/routes.rs`. The proposed POST is not yet a runtime admission API. Control cases belong behind `nx-core/src/control.rs`. |
 
 `nx-store::Store::apply_batch` and `flush` are distinct operations. An atomic
 batch application, a completed flush, a local API response, and remote replication
-must not be described with the same durability promise. Local acceptance is
-implemented as specified in [D1](#d1--local-acceptance-and-durability), within
-its documented verification limits. The current remote persistence boundary and
+have distinct durability guarantees. Local acceptance follows
+[D1](#d1--local-acceptance-and-durability) and its bounded failure model. The current remote persistence boundary and
 absence of replication acknowledgements are specified in
 [Acknowledgement semantics](#acknowledgement-semantics).
 
@@ -172,16 +173,14 @@ connections, replication progress, and unrecoverable gaps. Publish bounded
 metrics for probes, suspicion/refutation, fanout, queues, retry, and recovery.
 Do not make per-operation or per-remote-address metric labels unbounded.
 
-## Decisions for v0.1.6
+## Replication contracts and membership design
 
-These are approved design directions. Only the implemented and tested portions
-change current behavior. The [remaining specifications](#remaining-specifications)
-are deliberately open; choosing a direction does not select an unmeasured
-timeout, retention limit, wire layout, or performance guarantee.
+D1–D3 specify the implemented acceptance, sequencing and recovery contracts.
+D4–D10 describe the proposed membership, dissemination and management design.
+The [remaining specifications](#remaining-specifications) identify parameters
+that have no fixed value or performance guarantee.
 
 ### D1 — Local acceptance and durability
-
-**Status:** implemented and verified for the current local CRDT mutation APIs.
 
 D1 defines when Numax may report a local CRDT mutation as successful and what
 the current delivery path confirms. It does not guarantee remote durability or
@@ -280,10 +279,10 @@ or quorum, or expose a per-operation remote durability result.
 | Storage `flush()` covering the local batch returns successfully | The local durability boundary required by D1 has been reached, within the failure model below. | Any remote receipt, application, or durable copy. |
 | Local mutation returns success | The D1 acceptance sequence completed for the new operation. ORSet remove without observed tags is a successful no-op. | Remote replication or cluster convergence. |
 | Network send returns successfully | The local transport write and stream flush completed without a reported error. | The peer application received, applied, or flushed the operation. A stream flush is not a storage flush. |
-| Receiver emits `NodeEvent::OpsReceived` | The decoded batch reached the network event path. | Successful CRDT application or persistence; this event is internal, not an acknowledgement to the sender. |
+| Receiver emits `NodeEvent::HistoryReceived` | The decoded batch reached the network event path. | Successful CRDT application or persistence; this event is internal, not an acknowledgement to the sender. |
 | Remote apply returns successfully for new operations | The receiver applied the state, seen metadata, and replay records in an atomic storage batch before publishing the updates in memory. | A covering storage flush has completed; the remote apply path does not explicitly wait for one before publication. |
 
-`Node::broadcast_ops()` can return success with no connected peers. With peers,
+`Node::broadcast_history()` can return success with no connected peers. With peers,
 its success concerns local transport writes to the selected connections, not
 remote application. A failed broadcast can also have delivered operations to
 some peers; it does not undo local acceptance or prove that nobody received
@@ -309,18 +308,21 @@ then holds the flushed operation, but B has no confirmed copy. Permanent loss
 of A's storage before another durable copy exists is outside the local
 acceptance guarantee.
 
-Implementation evidence: `nx-store/src/store.rs` separates batch and flush;
+Implementation boundaries: `nx-store/src/store.rs` separates batch and flush;
 `nx-core/src/sync_manager/storage.rs` flushes local batches but not remote
 batches before returning; `nx-core/src/sync_manager/apply.rs` publishes after
 the remote batch; `nx-net/src/node.rs` implements transport sends and dispatches
 received messages; `nx-net/src/message.rs` retains the unused ACK variant.
 These paths are relative to `crates/`.
 
-#### Verified failure model
+<span id="verified-failure-model"></span>
 
-Verification covers the current local mutation variants, concurrent writes,
-shutdown, uncertain guest responses, flush errors, and process termination at
-these boundaries:
+#### Process-crash model
+
+The local acceptance contract assumes process termination with an intact
+datastore that can be reopened. Concurrent writes, shutdown, interrupted guest
+responses and flush errors obey the same acceptance boundary. Restart behavior
+is defined at the following points:
 
 | Termination point | Restart requirement |
 | --- | --- |
@@ -332,14 +334,14 @@ The datastore is reopened intact after process termination. The `BeforeFlush`
 checkpoint stops before calling `sled::flush()`; it does not interrupt sled
 while the flush is executing.
 
-This evidence does not cover OS reboot, power loss, storage-device loss,
-interruption inside `sled::flush()`, remote acknowledgement, or transactional
-isolation for direct internal reads of reserved storage keys.
+OS reboot, power loss, storage-device loss, interruption inside
+`sled::flush()`, remote acknowledgement and transactional isolation for direct
+internal reads of reserved storage keys are outside this failure model.
 
 ### D2 — Identity, missing history, and duplicates
 
-**Implementation present; the D2 validation results and limits are recorded below.**
-Recovery beyond retained history remains D3.
+D2 defines durable operation positions and receiver coverage. Recovery beyond
+retained history follows [D3](#d3--recovery-and-state-transfer).
 The UUID `OpId` remains the unique operation identity, with a logical position
 `(origin, generation, sequence)` carried by the replication envelope.
 The sequence is monotonic per origin across process restarts; generation
@@ -368,7 +370,7 @@ earlier generation stopped.
   and duplicate safety after the bounded `seen-op` cache evicts an ID.
 
 The store binding, generation, local sequence, received frontier, and sparse
-positions use versioned schema records. Protocol 7 carries the replication
+positions use versioned schema records. Protocol 8 carries the replication
 envelopes; the legacy public `Op` and message encodings remain unchanged.
 See [Wire Versioning](/numax/design/wire-versioning/) and
 [Schema Versioning](/numax/design/schema-versioning/).
@@ -440,7 +442,7 @@ Compare the advertised high-water mark with the receiver's contiguous frontier
 and sparse positions to identify missing ranges, including a missing suffix.
 Never advance the receiver's frontier from an advertisement. It advances only
 when the corresponding operations and tracking metadata have been persisted
-together, or when a future D3 state-transfer contract establishes an equivalent
+together, or when the D3 state-transfer contract establishes an equivalent
 baseline. A matching frontier certifies coverage only through that advertised
 sequence, not global or instantaneous cluster convergence. Without contact
 with a source or relay that knows about a lost operation, its existence cannot
@@ -522,7 +524,8 @@ Do not claim lossless recovery of legacy history or across expired retention.
 
 #### D2 acceptance tests
 
-Use the same deterministic tracker in production and tests. Cover, in order:
+The deterministic receipt tracker is shared by production and tests. Its
+acceptance criteria are:
 
 1. In-order delivery and sparse arrivals, such as `2, 1`, with frontier and
    sparse set asserted after each event.
@@ -554,132 +557,66 @@ Use the same deterministic tracker in production and tests. Cover, in order:
 10. Paginate summaries over more origins than fit one cycle; verify eventual
     visitation and that maxima never advance the receiver's contiguous frontier.
 
-Protocol 7 uses a private `History` wire variant carrying sequenced pushes,
-summary requests/replies, range requests, replay pages, and unavailable-range
-responses with attempt correlation. Protocol-6 development peers and existing
-v0.1.5 peers are rejected before admission. Store table
-`sequences` (id 15, version 2) holds the allocator, per-origin receipt records,
-usage accounting, and retained replay positions. Op-log schema 2 fences older
-runtimes that would otherwise write without updating sequence metadata. Its
-explicit `1 -> 2` migration validates and preserves the existing payloads:
+#### Replication interfaces
 
-```sh
-nx migrate --datastore-path /path/to/data
-```
-
-The separate sequence-table `1 -> 2` migration preserves coverage and recounts
-receipt bytes at completion. It drops the old uncorrelated unavailable boolean;
-it cannot safely manufacture source/range evidence for an earlier result.
+The private protocol-8 `History` envelope carries sequenced pushes, paginated
+summaries, correlated replay ranges and baseline recovery messages. Peers with
+other wire versions are rejected before admission. The `sequences` and op-log
+tables use schema 3; the [schema contract](/numax/design/schema-versioning/)
+defines their records and offline migration steps.
 
 `SyncHandle::replication_progress()` exposes contiguous and known-high
-sequences, sparse counts, source-unavailable status, and legacy baseline
-requirements. A source-unavailable result is specific evidence from one source;
-it does not prove that no other source can repair the gap. Resource failures
-are recorded through the existing sync-error metrics and logs. No HTTP endpoint
-or state-transfer implementation is added by D2. D3 still defines baseline
-transfer and recovery beyond retained history.
+sequences, sparse counts, unavailable-range evidence, missing legacy baselines,
+unconfirmed baseline flush and source-scoped recovery failures. None of these
+source-specific observations proves permanent cluster-wide loss. Resource and
+operational errors are reported through sync-error metrics and logs.
 
-Before applying a batch, validate UUID, retained position and payload together
-under the storage write lease, even after seen-ID eviction. Invalid pushes
-must not persist recovery targets; only typed recoverable tracking limits may
-leave a target for bounded repair. Evaluate global receipt budgets on the final
-atomic batch, not on origin-order-dependent intermediate totals.
+UUID, retained position and payload are validated together under the storage
+write lease, including after seen-ID eviction. Invalid pushes do not persist
+recovery targets; typed recoverable tracking limits can leave a target for
+bounded repair. Global receipt budgets apply to the final atomic batch, rather
+than origin-order-dependent intermediate totals.
 
-The focused regression suite is in `sync_manager/tests/sequencing.rs`, with
-tracker unit tests in `sync_manager/sequence.rs` and malformed replay tests in
-`sync_manager/replication.rs`. It covers all six CRDT families, delayed replay
-after eviction and restart, atomic remote crash outcomes, global origin and
-sparse budgets, relayed suffix recovery with the origin offline, bounded JSON
-replay, and unavailable history. Local process-crash tests also assert receipt
-frontiers and replay positions for every mutation case. These are deterministic
-tracker/component tests and local TCP tests, not evidence of the later 50-node
-loss/partition or one-hour membership criteria.
+The implementation and verification entry points are:
 
-Validation on 2026-10-17 reproduced an interference between independent tests:
-`intermittent_network_with_ten_percent_lost_pushes_converges` could exceed its
-five-second recovery wait in the parallel suite, even with both crash tests
-excluded. The receiver correctly reported missing coverage rather than false
-convergence. Changing the runtime to two workers did not resolve it.
-
-sled 0.34.7 uses a process-global concurrency-control lock. Its batches take
-an exclusive lock; reads in another database in the same process can therefore
-block, despite separate datastore directories. Stack sampling found remote
-sequence validation blocked in `Store::get` on this lock. A controlled run with
-only the recovery test and four bulk sequence tests in one process failed at
-97/100; the same workloads running concurrently in separate processes passed,
-with recovery taking approximately 2.86 seconds after the writes completed.
-This identifies cross-test storage contention, not a lost replay or an
-incorrectly advanced contiguous frontier.
-
-The timing-sensitive recovery test now runs its exact TCP scenario in a child
-of the same test binary, isolated from unrelated tests' sled batch locks.
-The parent propagates child failure and enforces a 60-second total process
-lifetime with termination and reaping on timeout. The scenario retains the
-original current-thread runtime, 100 operations, ten omitted initial sends,
-and five-second recovery wait. It checks materialized values and durable
-contiguous coverage of all 100 positions, with no sparse receipts remaining.
-An explicit monotonic elapsed-time assertion rejects late completion even
-when synchronous storage work delays polling.
-Bulk tests still run in the normal parallel suite. Temporary diagnostic code
-is removed; this test-isolation fix does not make production storage
-asynchronous or promise bounded recovery under arbitrary storage contention.
-
-After removing diagnostics, three consecutive complete parallel core runs pass
-(373 passed, 2 ignored each), as does `cargo test --workspace --verbose` with
-default parallelism (777 passed, 8 ignored). All include the explicit
-five-second recovery assertion and all bulk tests. A regression verifies that
-a nonzero child exit fails the parent rather than being accepted as success.
-Format, workspace all-target check and warning-denying Clippy pass. Four serial
-real-process smoke tests also pass, including JSON/Bincode protocol rejection,
-explicit migration and downgrade rejection against the real v0.1.5 binary.
-These results close D2's previously recorded validation blocker; they do not
-establish D3 recovery beyond retained history or the later 50-node membership
-and dissemination criteria.
+| Responsibility | Module |
+| --- | --- |
+| Receipt transitions and compacted duplicate suppression | `sync_manager/sequence.rs` |
+| Per-origin allocation, receipt records and budgets | `sync_manager/storage/sequence.rs` |
+| Request correlation, replay validation and anti-entropy | `sync_manager/replication.rs` |
+| Manager integration, restart and transport scenarios | `sync_manager/tests/sequencing.rs` |
+| Baseline state validation and atomic installation | `sync_manager/baseline.rs` |
+| Recovery across expiry, legacy state, restart and storage failure | `sync_manager/tests/recovery.rs` |
 
 #### Wire/schema evolution and historical-data verification
 
-The compatibility matrix and offline upgrade procedure are specified in
+Wire and storage versions are independent. Protocol 8 requires exact peer
+version equality; op-log and sequence schema 3 reject writers that cannot
+preserve baseline and receipt metadata. The compatibility matrix and offline
+upgrade procedure are specified in
 [Schema Versioning](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract).
-The exact-version admission and deployment contract is in
-[Wire Versioning](/numax/design/wire-versioning/#development-protocol-7-validation-and-deployment).
+[Wire Versioning](/numax/design/wire-versioning/#compatibility-verification-and-deployment)
+defines admission, message encoding and deployment boundaries.
 
-The immutable v0.1.0 fixture remains unchanged. An additional logical fixture
-comes from the pinned v0.1.5 release crates and is reproducible independently
-of current encoders. It includes all six CRDT families, tombstones, schema
-headers, UUID-only replay and an unrelated application key. Migration tests
-check preserved bytes, record-checkpoint resumption after reopening, storage
-failures at every op-log write boundary, corrupted source records, and process
-termination around the atomic final header/checkpoint update. The sequence
-schema-1 migration also resumes after reopening with partially converted data.
+Historical fixtures are immutable input to migration and compatibility tests:
 
-Manager regression tests combine migration, real seen/replay eviction and
-restart before rejecting legacy replay for all families. New sequence coverage
-must leave the baseline requirement intact. Real TCP tests verify that both
-JSON and Bincode advertise that requirement and respond with unavailable history
-instead of renumbering historical records. Frozen protocol-7 frame hashes guard
-new message layouts alongside the unchanged historical codec references.
-These tests establish preservation and safe refusal, not D3 baseline recovery.
-
-Validation on 2026-10-18, on macOS x86_64 with Rust 1.98.0:
-
-| Check | Result |
+| Fixture | Required preservation |
 | --- | --- |
-| `cargo fmt --all -- --check` | Pass |
-| `cargo check --workspace --all-targets` | Pass |
-| `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
-| `cargo test --workspace --verbose` | 784 passed, 0 failed, 8 ignored; core: 380 passed, 2 ignored |
-| Focused `cargo test -p nx-core v015` | 6 passed, including migration process-crash and JSON/Bincode TCP tests |
-| Real-process `different_protocol_versions_reject_connection_without_exchanging_ops`, explicitly `--ignored` | Pass in 12.34 s; JSON and Bincode, migration, downgrade rejection, reopen and new write |
-| Independent v0.1.5 fixture regeneration using the release lockfile | Byte-identical; SHA-256 recorded beside the fixture |
+| `sync_manager/fixtures/v0_1_0/` | Unversioned records, CRDT state and original operation payloads |
+| `sync_manager/fixtures/v0_1_5/` | Six CRDT families, tombstones, schema-1 headers, seen IDs, UUID-only replay and an unrelated application key |
 
-The previous CLI binary was rebuilt from sources verified against
-`refs/tags/v0.1.5` at `471a2281d0ffc8b7a3c20550320854812b8af726`.
-The v0.1.0 fixture and older codec references were not modified.
+Fixtures use their release encoders and pinned source revisions. Migration
+preserves historical payloads, supports checkpoint resumption, and rejects
+corrupted records without advancing that record's checkpoint. Historical
+UUID-only log indices never become per-origin sequence positions. A legacy
+baseline requirement remains independent of new sequence coverage.
 
-The workspace's other ignored tests were not enabled by these checks. Neither
-these results nor the successful finite reopen establish mixed-version
-replication, D3 state transfer, power-loss durability, or the later 50-node and
-one-hour membership criteria.
+Frozen protocol-7 frame hashes and older codec references protect their
+respective layouts; they do not grant mixed-version admission. Current codec
+and transport verification covers JSON and Bincode, safe rejection against the
+v0.1.5 binary, explicit migration and downgrade protection. Reproducible commands
+are listed under
+[compatibility verification](/numax/design/schema-versioning/#compatibility-verification).
 
 ### D3 — Recovery and state transfer
 
@@ -694,9 +631,6 @@ contract below. State transfer is deliberately brought forward from the later
 snapshot work only to the extent required for v0.1.6 recovery.
 
 #### Selected bounded recovery contract
-
-**Status:** implemented and verified with recovery, migration, and real TCP
-JSON/Bincode tests. Release-scale convergence criteria remain separate.
 
 D3 retains the last `max(1, op_log_limit)` operations accepted at a node, across
 all origins (default 10,000), in insertion order. This is a count window, not a
@@ -745,7 +679,9 @@ Existing replay records remain usable; new replay starts after the imported cut.
 Known maxima beyond that cut remain pending. A batch rejection publishes nothing.
 A flush failure is an uncertain outcome: the full batch may survive and is kept
 coherent in memory, but a persisted confirmation marker prevents successful
-export or reporting confirmed baseline completion until retry/restart flushes it.
+export or reporting confirmed baseline completion until the store is reopened
+and a restart flush confirms it. A failed flush fences further writes; an
+in-process retry cannot clear that fence.
 
 Sequence and op-log schema **3** fence runtimes lacking these baseline semantics.
 Version 2 records migrate without changing their payloads; the store's own
@@ -753,10 +689,17 @@ pre-sequence baseline provenance is established at initialization. Advertised
 remote provenance never establishes receipt. Historical fixtures remain unchanged.
 
 Requests share the existing per-peer/origin request budget, correlation and
-deadlines. Stale or unsolicited replies are ignored. Unsupported versions,
+deadlines. Baseline requests capture a local fingerprint of receipt coverage.
+A refusal after another source changed that coverage is ignored even if the
+attempt has not expired; stored failures are invalidated on later coverage or
+known-history changes. This fingerprint adds no wire or storage fields. Stale or
+unsolicited replies are ignored. Unsupported versions,
 incomplete sources, budget exhaustion, invalid state and coverage conflicts are
-explicit failures. `replication_progress()` distinguishes missing legacy state,
-unconfirmed flush and the last **source-scoped** recovery failure. That failure
+explicit contract failures. Storage/metadata errors keep their original cause
+and reach sync-error logs/metrics rather than being converted to those
+rejections. An operational export failure sends no misleading baseline refusal;
+the request may expire and retry. `replication_progress()` distinguishes missing
+legacy state, unconfirmed flush and the last **source-scoped** recovery failure. That failure
 is not a proof of global permanent loss: another source or later repair can still
 succeed, and periodic anti-entropy keeps trying. No disconnected/unknown peer is
 assumed to have lost its state. Data convergence requires no known missing ranges,
@@ -799,7 +742,7 @@ indirect probe limits, and replay protection remain to be specified and tested.
 
 ### D7 — Gossip and repair scheduling
 
-Introduce K-fanout only after D1–D3 establish accepted operations and recovery.
+The proposed K-fanout path depends on the D1–D3 acceptance and recovery contracts.
 Estimate `N` from eligible members, clamp `K = ceil(log2(N) + c)` to available
 peers and configured budgets, and handle empty and small clusters explicitly.
 Rotate a bounded neighbor set and retain useful recovery contacts so sparse
@@ -836,28 +779,32 @@ an explicit failed recovery state, never a successful convergence result.
 
 ### Remaining specifications
 
-Before coding the affected behavior, document and review: an expanded OS or
-power-interruption crash model; retention limits and state-transfer completeness; membership
-state ordering and control message authentication; fanout defaults and budgets;
-manual candidate removal; and wire/schema evolution for the future state-transfer
-and membership messages. These details are implementation gates, not permissions to silently choose a protocol
-or weaken the release criteria.
+The following aspects remain open for the proposed capabilities:
+
+- A failure model covering OS restart, power interruption or storage-device loss.
+- Recovery beyond the bounded D3 baseline and retention contract.
+- Membership ordering, control authentication, probe and suspicion parameters.
+- Fanout defaults, neighbor rotation, scheduling and resource budgets.
+- Manual candidate removal and API error semantics.
+- Wire/schema contracts for membership and expanded state-transfer formats.
+
+The RFC does not assign defaults or guarantees to these unspecified parameters.
 
 ## Failure scenarios that define the contract
 
 | Scenario | Required observation or unresolved choice |
 | --- | --- |
-| Crash between local state and replay persistence | D1 now writes both in one atomic batch for all six families; recovery must not expose a surviving new state without its operation identity and replay metadata. The batch may survive before flush without having been accepted. |
+| Crash between local state and replay persistence | D1 writes both in one atomic batch for all six families; recovery must not expose a surviving new state without its operation identity and replay metadata. The batch may survive before flush without having been accepted. |
 | Crash after a batch but before flush or response | The documented D1 durability and retry semantics must match what survives a restart; unknown outcomes cannot be silently turned into acknowledged success. |
 | Remote op persisted but forwarding fails | The accepted op remains recoverable by the repair path; a send failure consumes bounded work and does not silently lose the sole source. |
-| Sole durable holder fails permanently | No recovery guarantee can be claimed without a surviving replica or equivalent state; D1 and D3 must state whether this case is outside the failure model or requires a remote durability acknowledgement. |
+| Sole durable holder fails permanently | Permanent loss of the sole durable copy is outside the D1/D3 guarantee. Local acceptance does not require a remote durability acknowledgement. |
 | A newer op arrives before an older one | The receiver must find and request a genuine hole or reconcile safely. Neither `last OpId` nor timestamp order alone establishes completeness. |
-| Duplicates arrive after seen-ID eviction | Deduplication and CRDT application must remain safe under the chosen D2/D3 window; beyond it, recovery fails explicitly if safety cannot be established. |
+| Duplicates arrive after seen-ID eviction | Compacted receipt prefixes suppress covered positions independently of seen-ID and replay retention. Missing history requires replay or a validated baseline. |
 | Partition outlasts retention | Joining partitions report an unrecoverable gap or use an explicitly selected state-transfer path. No false convergence signal. |
 | New member joins after useful history expires | Admission and membership visibility are separate from data readiness; the node cannot claim caught-up state without a validated bootstrap/recovery path. |
 | Peer connects before finishing repair | Connection and membership may be healthy while data is still incomplete. Report pending or failed recovery until the D10 completion proof succeeds. |
 | Healthy member is CPU- or storage-stalled | Suspect and refutation are observed separately from a final failure declaration; control work remains schedulable under load. |
-| Node restarts, then an old packet arrives | Incarnation ordering rejects stale membership and replay; an old endpoint cannot overwrite a verified newer identity or generation. |
+| Node restarts, then an old packet arrives | Durable per-origin coverage suppresses old sequenced replay. The proposed membership protocol separately orders incarnations and rejects stale identity updates. |
 | Discovery withdraws one candidate | Only that source's contribution disappears. A live admitted connection follows the existing discovery contract; membership changes are governed separately. |
 | API candidate is invalid, duplicate, or untrusted | The request is bounded and authenticated; accepted candidacy never claims connection or membership. |
 | All nodes shut down at once | State recovery is tested separately from rolling restart. No guarantee inferred from the one-at-a-time scenario. |
@@ -917,7 +864,7 @@ For any incompatible control or data message, apply the
 [wire versioning procedure](/numax/design/wire-versioning/): test JSON and
 Bincode bytes and semantics, update rejection tests, and run a v0.1.5 binary
 against the new binary. A mismatch must be rejected before peer registration or
-CRDT exchange, without panic or datastore mutation. 
+CRDT exchange, without panic or datastore mutation.
 A storage change needs an explicit migration and historic fixture checks under [schema versioning](/numax/design/schema-versioning/); never rewrite fixtures to match new behavior.
 
 Use real sockets and controlled packet loss for at least the transport-sensitive
@@ -951,13 +898,18 @@ or fails explicitly. In particular, a failed send after local acceptance must
 leave a recoverable durable source; an expired history window must not be
 reported as synchronized merely because the peers are connected.
 
-### Detailed test plan
+### Verification boundaries
 
-Implement the tests in dependency order: D1 persistence and crash/restart;
-D2 out-of-order delivery and duplicate handling; D3 replay and state transfer;
-D4–D6 membership and transport under load; D7 fanout and repair; D8–D10 API,
-compatibility, and convergence evidence. Use component tests near the owning
-module, integration tests for storage/network boundaries, and end-to-end tests
-for each CRDT family. The [roadmap](/numax/roadmap/) closing criterion remains
-unchanged; report missing environmental dependencies and tests not run rather
-than treating planned tests as completed evidence.
+| Contract | Verification boundary |
+| --- | --- |
+| D1 | Atomic persistence, flush-confirmed success, uncertain outcomes and process restart |
+| D2 | Out-of-order delivery, compacted duplicate suppression, bounded gap tracking and replay |
+| D3 | Complete-cut baseline installation, expiry, legacy state and explicit recovery refusal |
+| Proposed D4–D6 | Membership transitions, authentication and detector behavior under load |
+| Proposed D7 | Sparse topologies, bounded fanout, forwarding and anti-entropy |
+| Proposed D8–D10 | Management API, compatibility, readiness and convergence evidence |
+
+Component tests exercise the owning state machine; integration tests cover
+storage/network boundaries; end-to-end cases cover each CRDT family. The
+[roadmap](/numax/roadmap/) defines the release-scale criteria. Unit and local TCP
+coverage do not establish the 50-node loss/partition or one-hour detector targets.

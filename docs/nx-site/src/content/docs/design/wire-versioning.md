@@ -10,17 +10,18 @@ independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
 
-The v0.1.6 development checkout uses `7`. Version `5`, shipped by v0.1.5,
+The v0.1.6 development checkout uses `8`. Version `5`, shipped by v0.1.5,
 introduced the one-shot bootstrap handshake described below. The development
 protocol `6` introduced sequenced replication and bounded history exchange;
-version `7` adds required attempt identifiers to range requests, replay pages,
-and unavailable-range responses. Exact version matching rejects both protocol
-`6` and v0.1.5 before peer registration or CRDT exchange.
+version `7` added required attempt identifiers to range requests, replay pages,
+and unavailable-range responses. Version `8` adds bounded, versioned full CRDT
+baseline recovery. Exact version matching rejects earlier development protocols
+and v0.1.5 before peer registration or CRDT exchange.
 
-Protocol 7 uses a private `History` variant after the existing private
+Protocol 8 retains the private `History` variant after the existing private
 bootstrap variants. Its messages carry sequenced operations, paginated
-per-origin summaries, replay interval requests and pages, and unavailable-range
-responses. The UUID `Op`, existing public `MessageKind` discriminants, and frozen
+per-origin summaries, replay interval requests and pages, unavailable-range
+responses, and baseline requests/results. The UUID `Op`, existing public `MessageKind` discriminants, and frozen
 v0.1.4/v0.1.5 codec fixtures are preserved. A history summary advertises known
 existence; it is neither a contiguous receipt frontier nor a durability ACK.
 Range responses must match the pending source connection, origin, request ID,
@@ -168,31 +169,83 @@ Bincode golden hashes and direct public/private byte comparisons protect every
 legacy public variant. They preserve encoding references; they do not grant
 mixed-version admission.
 
-## Development protocol 7 validation and deployment
+<span id="development-protocol-7-validation-and-deployment"></span>
 
-Unit handshake tests cover incoming `Hello` and outgoing `HelloAck` rejection
-for versions 5, 6 and 8 in both JSON and Bincode. They assert the version error,
-closed socket, zero admitted peers and absence of connection/CRDT events.
-History codec tests cover every protocol-7 message variant in both formats,
-with frozen SHA-256 references for complete frames as well as round trips.
+## Compatibility verification and deployment
 
-The real-process compatibility test is
+Compatibility verification applies to JSON and Bincode (`wincode`):
+
+| Boundary | Required assertions |
+| --- | --- |
+| Incoming `Hello` / outgoing `HelloAck` | Exact version match; mismatch closes the socket before peer registration or CRDT events |
+| Codec layout | Round trips for each variant and unchanged golden references for historical layouts |
+| Baseline recovery | Correlated attempts, complete-cut validation, bounded payloads and explicit contract refusals |
+| Superseded baseline failures | A late refusal cannot describe receipt coverage changed by another source |
+| Storage failure | Original error cause remains observable; operational faults are not classified as invalid remote state |
+| Previous binary | Protocol-5/protocol-8 rejection, separate local data, explicit migration and protected downgrade refusal |
+
+Frozen protocol-7 history frames and older public codec fixtures remain
+compatibility references. They describe their encoded layouts and do not grant
+mixed-version admission.
+
+The real-process entry point is
 `different_protocol_versions_reject_connection_without_exchanging_ops` in
-`crates/nx-cli/tests/multiprocess_smoke.rs`. It runs both JSON and Bincode,
-checks the protocol-5/protocol-7 mismatch and separate local counter values,
-then checks explicit store migration, preserved values plus a new write, and
-old-runtime downgrade rejection followed by a successful reopen and new write
-on the protected store. Unit admission assertions complement the
-real-process data-isolation assertions; no single counter check alone proves
-absence of peer registration.
-
-CI builds the previous binary from `refs/tags/v0.1.5` and verifies its peeled
-commit is `471a2281d0ffc8b7a3c20550320854812b8af726`. A similarly named branch
-is not a substitute. The older v0.1.4 codec fixtures remain frozen references.
+`crates/nx-cli/tests/multiprocess_smoke.rs`. CI builds the previous binary from
+`refs/tags/v0.1.5` and checks its peeled commit against
+`471a2281d0ffc8b7a3c20550320854812b8af726`. A mutable branch name does not identify
+that release artifact. Reproducible commands and prerequisites are listed under
+[Schema Versioning](/numax/design/schema-versioning/#compatibility-verification).
 
 Exact matching interrupts replication between old and upgraded nodes during
 deployment. Persisted-data migration does not translate wire traffic or provide
-mixed-version rolling replication. See [Schema Versioning](/numax/design/schema-versioning/)
-for offline upgrade, downgrade protection and the historical baseline boundary.
-Future state-transfer or membership wire additions must follow the same version
-procedure; protocol 7 does not implicitly reserve a compatible transfer format.
+mixed-version rolling replication. The
+[schema migration contract](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract)
+defines offline upgrade, downgrade protection and the historical baseline boundary.
+Future baseline-format or membership additions follow the same versioning rules;
+protocol 8 does not reserve compatibility for arbitrary snapshots.
+
+## Protocol 8 bounded baseline recovery
+
+Protocol 8 appends these variants to the private history exchange, preserving
+all protocol-7 and older golden codec references:
+
+| Message | Fields |
+| --- | --- |
+| `BaselineRequest` | attempt `request_id`, requested `origin`, baseline `version` |
+| `Baseline` | matching `request_id` and `origin`, `version`, `payload`, 32-byte BLAKE3 `digest` |
+| `BaselineUnavailable` | matching `request_id` and `origin`, bounded `reason` enum |
+
+Baseline format 1 is independent of wire, package and store-schema versions.
+The payload is JSON containing complete origin cuts and full internal state
+records for GCounter, PNCounter, LwwRegister, LwwMap, ORSet and Rga. The outer
+frame uses the negotiated JSON or Bincode (`wincode`) encoding. The digest
+covers the exact payload bytes; it does not replace transport identity policy.
+The existing admitted connection and configured TLS/allowlist policy apply.
+
+The source must have complete known coverage, including its legacy baselines,
+and flush the captured cut before responding. The receiver validates version,
+digest, structure, budgets and a cut dominating its applied history and internal
+state before atomic installation. The 1 MiB encoded payload, record/key limits,
+RGA validation and refusal cases are specified in the
+[D3 recovery contract](/numax/design/peer-discovery/#selected-bounded-recovery-contract).
+This is a limited recovery subset, not a general snapshot or backup protocol.
+
+Baseline attempts share the existing bounded per-peer/origin request map and
+deadlines. Responses must match the live attempt. A negative result is recorded
+only if the receiver's receipt coverage still matches the local fingerprint
+captured at request time. Repair by another source, new known history or newly
+installed legacy coverage invalidates that evidence. The fingerprint is local
+request metadata and does not add wire fields or persisted schema records.
+
+`UnsupportedVersion`, `SourceIncomplete`, `BudgetExceeded`, `CoverageConflict`
+and `InvalidState` are contract rejections. Storage and metadata faults preserve
+their original error chain and reach local sync-error logs/metrics; they are not
+sent or recorded as one of those data rejections. If export fails operationally,
+the source sends no misleading refusal and the request may expire and retry.
+A failed import flush retains the uncertain-outcome fence until store reopen.
+
+Exact matching rejects protocol 7 as well as v0.1.5 (protocol 5). Deployment
+therefore requires the same explicit communication interruption and offline
+schema migration as documented above; no mixed-version rolling replication is
+promised. Reproduce the previous-binary check with the command in
+[Schema Versioning](/numax/design/schema-versioning/#compatibility-verification).
