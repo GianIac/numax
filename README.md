@@ -21,7 +21,7 @@ Three things, and only three:
 You write a WASM module. numax runs it. The state is there. Sync just happens.
 
 <p align="center">
-  <img src="docs/numax-demo.gif" alt="numax demo" width="820" />
+  <img src="./docs/assets/numax-punti.gif" width="1200" alt="demo">
 </p>
 
 ---
