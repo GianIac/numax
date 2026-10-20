@@ -1330,6 +1330,8 @@ mod tests {
                 reconnect_max_delay: Some("5s".into()),
                 peer_dead_after_failures: Some(4),
                 anti_entropy_interval: Some("2s".into()),
+                gossip_fanout_constant: Some(2),
+                gossip_max_fanout: Some(6),
             };
 
             let cfg = apply_limit_config(SyncConfig::new(), Some(&limits)).unwrap();
@@ -1344,6 +1346,8 @@ mod tests {
             assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(5));
             assert_eq!(cfg.peer_dead_after_failures, 4);
             assert_eq!(cfg.anti_entropy_interval, Duration::from_secs(2));
+            assert_eq!(cfg.gossip_fanout_constant, 2);
+            assert_eq!(cfg.gossip_max_fanout, 6);
         }
 
         #[test]
@@ -1359,6 +1363,8 @@ mod tests {
                 reconnect_max_delay: None,
                 peer_dead_after_failures: None,
                 anti_entropy_interval: None,
+                gossip_fanout_constant: None,
+                gossip_max_fanout: None,
             };
 
             assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());

@@ -194,20 +194,20 @@ while peer discovery remains deliberately separated from authentication and auth
 - [x] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 
 **Separate control and data responsibilities**:
-- [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)
-- [ ] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
-- [ ] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
-- [ ] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
-- [ ] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
-- [ ] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
+- [x] **Membership**: SWIM / Lifeguard (who is in the cluster)
+- [x] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
+- [x] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
+- [x] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
+- [x] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
+- [x] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
 
 **Adaptive K-fanout gossip**:
 - [ ] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits
-- [ ] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
+- [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
 - [ ] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect
 - [ ] Adaptive rate based on load/RTT
 - [ ] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
-- [ ] Periodic, byte-bounded and paginated anti-entropy complementing gossip
+- [x] Periodic, byte-bounded and paginated anti-entropy complementing gossip
 
 **Runtime peer management**:
 - [ ] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded

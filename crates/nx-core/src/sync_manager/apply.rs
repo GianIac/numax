@@ -17,13 +17,23 @@ pub(super) async fn apply_remote_ops(
     ops: &[Op],
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
-    apply_ops(ops, None, context).await
+    apply_ops(ops, None, context).await.map(drop)
 }
 
+#[cfg(test)]
 pub(super) async fn apply_sequenced_ops(
     ops: &[nx_sync::SequencedOp],
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
+    apply_sequenced_ops_and_collect(ops, context)
+        .await
+        .map(drop)
+}
+
+pub(super) async fn apply_sequenced_ops_and_collect(
+    ops: &[nx_sync::SequencedOp],
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<Vec<nx_sync::SequencedOp>> {
     anyhow::ensure!(
         ops.len() <= 1024,
         "sequenced batch exceeds operation budget"
@@ -36,10 +46,10 @@ async fn apply_ops(
     input: &[Op],
     sequenced: Option<&[nx_sync::SequencedOp]>,
     context: &RemoteOpApplyContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<nx_sync::SequencedOp>> {
     let ops = input;
     if ops.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let apply_started = Instant::now();
@@ -167,6 +177,13 @@ async fn apply_ops(
         return Err(error);
     }
 
+    let forward_entries = sequenced
+        .into_iter()
+        .flatten()
+        .filter(|entry| inserted_ids.iter().any(|id| id == entry.op.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
     let applied_count = plans.len();
     apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
     log.extend(inserted_ops);
@@ -208,7 +225,7 @@ async fn apply_ops(
         false,
     );
 
-    Ok(())
+    Ok(forward_entries)
 }
 
 trait OpApplier {

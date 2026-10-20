@@ -164,6 +164,8 @@ struct IncomingContext {
     event_tx: mpsc::Sender<NodeEvent>,
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
+    connection_slots: Arc<Semaphore>,
+    control: Arc<crate::control::ControlService>,
     shutdown_rx: watch::Receiver<bool>,
     bootstrap_server: Option<Arc<BootstrapServer>>,
 }
@@ -400,6 +402,9 @@ pub struct Node {
     tasks: Arc<StdMutex<TaskRegistry>>,
     shutdown_lock: Mutex<()>,
     bootstrap_server: Option<Arc<BootstrapServer>>,
+    control: Arc<crate::control::ControlService>,
+    control_rx: Option<mpsc::Receiver<crate::ControlIncoming>>,
+    handshake_slots: Arc<Semaphore>,
 }
 
 impl Node {
@@ -409,6 +414,7 @@ impl Node {
         let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let max_peers = config.max_peers;
+        let (control, control_rx) = crate::control::ControlService::new(max_peers);
 
         Self {
             config,
@@ -422,6 +428,9 @@ impl Node {
             tasks: Arc::new(StdMutex::new(TaskRegistry::default())),
             shutdown_lock: Mutex::new(()),
             bootstrap_server: None,
+            control: Arc::new(control),
+            control_rx: Some(control_rx),
+            handshake_slots: Arc::new(Semaphore::new(crate::MAX_CONTROL_REQUESTS)),
         }
     }
 
@@ -448,6 +457,115 @@ impl Node {
         self.event_rx.take()
     }
 
+    pub fn take_control_receiver(&mut self) -> Option<mpsc::Receiver<crate::ControlIncoming>> {
+        self.control_rx.take()
+    }
+
+    pub async fn control_request(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+    ) -> NetResult<(NodeId, crate::ControlReply)> {
+        self.control_request_tracked(addr, request, budget, None)
+            .await
+    }
+
+    pub async fn control_request_tracked(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+        dispatched: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, crate::ControlReply)> {
+        let _slot = Arc::clone(&self.control.outgoing)
+            .try_acquire_owned()
+            .map_err(|_| NetError::PeerLimitReached(crate::MAX_CONTROL_REQUESTS))?;
+        let request_id = request.request_id;
+        if request.owner.member != self.config.node_id.to_string() || budget.is_zero() {
+            return Err(NetError::InvalidMessage(
+                "control owner/budget mismatch".into(),
+            ));
+        }
+        let work = async {
+            if let Some(dispatched) = dispatched {
+                let _ = dispatched.send(());
+            }
+            let (stream, _) = connect_transport(addr, self.config.tls.as_ref(), budget).await?;
+            let certificate = stream.peer_cert_der();
+            if self.config.tls.as_ref().is_some_and(|tls| !tls.insecure) {
+                let certificate = certificate
+                    .as_ref()
+                    .ok_or_else(|| NetError::TlsError("missing peer certificate".into()))?;
+                let expected = crate::tls::derive_protocol_node_id_from_cert(certificate)?;
+                verify_peer_identity(
+                    &self.config.node_id,
+                    &expected,
+                    Some(certificate),
+                    self.config.tls.as_ref(),
+                )?;
+            }
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let formats = supported_formats_for(self.config.serialization_format);
+            let hello = WireMessage {
+                kind: WireMessageKind::ControlHello {
+                    node_id: self.config.node_id.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    supported_formats: formats.clone(),
+                    preferred_format: self.config.serialization_format,
+                    request,
+                },
+            };
+            write_message(
+                &mut writer,
+                &hello,
+                self.config.serialization_format,
+                budget,
+            )
+            .await?;
+            let (format, response) = read_wire_message_with_format(
+                &mut reader,
+                crate::MAX_CONTROL_FRAME.min(self.config.max_message_size),
+                budget,
+            )
+            .await?;
+            match response.kind {
+                WireMessageKind::ControlAck {
+                    node_id,
+                    protocol_version,
+                    selected_format,
+                    reply,
+                } => {
+                    if !is_protocol_version_compatible(protocol_version) {
+                        return Err(protocol_version_mismatch(protocol_version));
+                    }
+                    verify_peer_identity(
+                        &self.config.node_id,
+                        &node_id,
+                        certificate.as_ref(),
+                        self.config.tls.as_ref(),
+                    )?;
+                    if !formats.contains(&selected_format)
+                        || format != selected_format
+                        || reply.request_id != request_id
+                        || reply.owner.member != node_id.to_string()
+                    {
+                        return Err(NetError::InvalidMessage(
+                            "uncorrelated control response".into(),
+                        ));
+                    }
+                    Ok((node_id, reply))
+                }
+                WireMessageKind::Error { error } => Err(NetError::Wire(error.try_into()?)),
+                _ => Err(NetError::InvalidMessage("expected ControlAck".into())),
+            }
+        };
+        tokio::select! {
+            _ = wait_for_stop(self.shutdown_tx.subscribe()) => Err(NetError::ConnectionFailed("node is shut down".into())),
+            result = timeout(budget.min(self.config.socket_timeout), work) => result.map_err(|_| NetError::Timeout)?,
+        }
+    }
+
     /// Start listener TCP.
     ///
     /// Returns the actual bound address (useful when binding to port 0 in tests).
@@ -462,6 +580,8 @@ impl Node {
         let event_tx = self.event_tx.clone();
         let tls = self.config.tls.clone();
         let connection_slots = Arc::clone(&self.connection_slots);
+        let handshake_slots = Arc::clone(&self.handshake_slots);
+        let control = Arc::clone(&self.control);
         let tasks = Arc::clone(&self.tasks);
         let limits = NodeLimits {
             max_peers: self.config.max_peers,
@@ -489,7 +609,7 @@ impl Node {
                         match accepted {
                             Ok((stream, addr)) => {
                                 info!(%addr, "incoming connection");
-                                let slot = match Arc::clone(&connection_slots).try_acquire_owned() {
+                                let slot = match Arc::clone(&handshake_slots).try_acquire_owned() {
                                     Ok(slot) => slot,
                                     Err(_) => {
                                         warn!(%addr, limit = limits.max_peers, "rejecting incoming connection: peer limit reached");
@@ -503,6 +623,8 @@ impl Node {
                                 let limits = limits;
                                 let shutdown_rx = shutdown_tx.subscribe();
                                 let bootstrap_server = bootstrap_server.clone();
+                                let connection_slots = Arc::clone(&connection_slots);
+                                let control = Arc::clone(&control);
 
                                 let admitted = spawn_task(&tasks, async move {
                                     let context = IncomingContext {
@@ -512,6 +634,8 @@ impl Node {
                                         event_tx,
                                         limits,
                                         slot,
+                                        connection_slots,
+                                        control,
                                         shutdown_rx,
                                         bootstrap_server,
                                     };
@@ -1049,7 +1173,9 @@ async fn handle_incoming(
         peers,
         event_tx,
         limits,
-        slot,
+        slot: handshake_slot,
+        connection_slots,
+        control,
         shutdown_rx,
         bootstrap_server,
     } = context;
@@ -1067,9 +1193,106 @@ async fn handle_incoming(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Wait for HELLO
-    let (hello_format, msg) =
-        read_wire_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
-            .await?;
+    let (hello_format, msg) = read_wire_message_with_format(
+        &mut reader,
+        limits.max_message_size.min(crate::MAX_CONTROL_FRAME),
+        limits.socket_timeout,
+    )
+    .await?;
+    let msg = match msg {
+        WireMessage {
+            kind:
+                WireMessageKind::ControlHello {
+                    node_id,
+                    protocol_version,
+                    supported_formats,
+                    preferred_format: _,
+                    request,
+                },
+        } => {
+            if !is_protocol_version_compatible(protocol_version) {
+                let _ = write_message(
+                    &mut writer,
+                    &WireMessage::wire_error(WireError::protocol_mismatch(protocol_version).into()),
+                    hello_format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(protocol_version_mismatch(protocol_version));
+            }
+            verify_peer_identity(&our_node_id, &node_id, peer_cert.as_ref(), tls.as_ref())?;
+            if request.owner.member != node_id.to_string() {
+                return Err(NetError::InvalidMessage(
+                    "control owner is not the admitted sender".into(),
+                ));
+            }
+            let format =
+                negotiate_serialization_format(limits.serialization_format, &supported_formats)
+                    .ok_or_else(|| NetError::InvalidMessage("no control codec in common".into()))?;
+            let _slot = match Arc::clone(&control.incoming).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    return write_message(
+                        &mut writer,
+                        &WireMessage::wire_error(ProtocolWireError::RateLimited {
+                            retry_after_ms: Some(100),
+                        }),
+                        format,
+                        limits.socket_timeout,
+                    )
+                    .await;
+                }
+            };
+            drop(handshake_slot);
+            let request_id = request.request_id;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            if control
+                .events
+                .try_send(crate::ControlIncoming {
+                    from: node_id,
+                    verification: identity_verification(tls.as_ref()),
+                    request,
+                    respond_to,
+                })
+                .is_err()
+            {
+                return write_message(
+                    &mut writer,
+                    &WireMessage::wire_error(ProtocolWireError::RateLimited {
+                        retry_after_ms: Some(100),
+                    }),
+                    format,
+                    limits.socket_timeout,
+                )
+                .await;
+            }
+            let reply = tokio::select! {
+                _ = wait_for_stop(shutdown_rx.clone()) => return Ok(()),
+                reply = timeout(limits.socket_timeout.min(Duration::from_secs(2)), response) =>
+                    reply.map_err(|_| NetError::Timeout)?.map_err(|_| NetError::ConnectionFailed("control service unavailable".into()))?,
+            };
+            if reply.request_id != request_id || reply.owner.member != our_node_id.to_string() {
+                return Err(NetError::InvalidMessage(
+                    "invalid local control response".into(),
+                ));
+            }
+            let ack = WireMessage {
+                kind: WireMessageKind::ControlAck {
+                    node_id: our_node_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    selected_format: format,
+                    reply,
+                },
+            };
+            write_message(&mut writer, &ack, format, limits.socket_timeout).await?;
+            return Ok(());
+        }
+        other => other,
+    };
+    let slot = connection_slots
+        .try_acquire_owned()
+        .map_err(|_| NetError::PeerLimitReached(limits.max_peers))?;
+    drop(handshake_slot);
     let handshake = match msg.kind {
         WireMessageKind::Hello {
             node_id,
@@ -1774,6 +1997,149 @@ mod tests {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
 
+    #[tokio::test]
+    async fn control_rpc_meets_local_budget_while_maximum_data_frame_is_blocked() {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        fn owner(member: &NodeId) -> crate::MembershipRecord {
+            crate::MembershipRecord {
+                member: member.to_string(),
+                reporter: member.to_string(),
+                version: crate::MembershipVersion {
+                    epoch: 1,
+                    incarnation: 0,
+                },
+                state: crate::MembershipState::Alive,
+                endpoint: None,
+            }
+        }
+        let pki = TestPki::generate().unwrap();
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for secure in [false, true] {
+                let mut client_config = NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_max_peers(1)
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format);
+                let mut server_config = NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_max_peers(1)
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format);
+                if secure {
+                    client_config.node_id = crate::tls::derive_protocol_node_id_from_cert(
+                        &CertificateDer::from_pem_slice(pki.node2_cert.as_bytes()).unwrap(),
+                    )
+                    .unwrap();
+                    server_config.node_id = crate::tls::derive_protocol_node_id_from_cert(
+                        &CertificateDer::from_pem_slice(pki.node1_cert.as_bytes()).unwrap(),
+                    )
+                    .unwrap();
+                    client_config.tls = Some(pki.node2_config());
+                    server_config.tls = Some(pki.node1_config());
+                }
+                let client_owner = owner(&client_config.node_id);
+                let server_owner = owner(&server_config.node_id);
+                let client = Node::new(client_config);
+                let mut server = Node::new(server_config);
+                let mut incoming = server.take_control_receiver().unwrap();
+                let address = server.start_listener().await.unwrap();
+                let endpoint = if secure {
+                    format!("localhost:{}", address.port())
+                } else {
+                    address.to_string()
+                };
+                client.connect_to_peer(&endpoint).await.unwrap();
+                assert_eq!(client.connection_slots.available_permits(), 0);
+                assert_eq!(server.connection_slots.available_permits(), 0);
+                let (peer_addr, _) = server.connected_peers().await.remove(0);
+                server
+                    .send_message_to_addr(
+                        &peer_addr,
+                        Message {
+                            kind: MessageKind::PushOps { ops: vec![] },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let empty = Message {
+                    kind: MessageKind::Error {
+                        error: WireError::Internal {
+                            reason: String::new(),
+                        },
+                    },
+                };
+                let overhead = empty.to_bytes_with_format(format).unwrap().len() - 4;
+                let maximum = Message {
+                    kind: MessageKind::Error {
+                        error: WireError::Internal {
+                            reason: "x".repeat(DEFAULT_MAX_MESSAGE_SIZE - overhead),
+                        },
+                    },
+                };
+                let bytes = maximum.to_bytes_with_format(format).unwrap();
+                assert_eq!(bytes.len() - 4, DEFAULT_MAX_MESSAGE_SIZE);
+                let writer = Arc::clone(
+                    server.peers.read().await[&peer_addr]
+                        .writer
+                        .as_ref()
+                        .unwrap(),
+                );
+                let data_writer = Arc::clone(&writer);
+                let mut blocked = tokio_test::task::spawn(async move {
+                    write_bytes(
+                        &mut *data_writer.lock().await,
+                        &bytes,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                });
+                assert!(blocked.poll().is_pending());
+                assert!(writer.try_lock().is_err());
+                assert_eq!(client.event_tx.capacity(), 0);
+                let started = std::time::Instant::now();
+                let request = crate::ControlRequest {
+                    request_id: 81,
+                    owner: client_owner,
+                    updates: vec![],
+                    kind: crate::ControlKind::Exchange { after: None },
+                };
+                let serve = async {
+                    let event = incoming.recv().await.unwrap();
+                    event
+                        .respond_to
+                        .send(crate::ControlReply {
+                            request_id: 81,
+                            owner: server_owner,
+                            ack: false,
+                            nack: false,
+                            records: vec![],
+                            next: None,
+                        })
+                        .unwrap();
+                };
+                let budget = Duration::from_millis(500);
+                let (reply, ()) = timeout(Duration::from_secs(2), async {
+                    tokio::join!(client.control_request(&endpoint, request, budget), serve)
+                })
+                .await
+                .unwrap();
+                reply.unwrap();
+                let elapsed = started.elapsed();
+                assert!(elapsed <= budget, "{format:?}, TLS={secure}: {elapsed:?}");
+                assert!(blocked.poll().is_pending());
+                assert!(writer.try_lock().is_err());
+                eprintln!(
+                    "control-maximum-frame {}",
+                    serde_json::json!({"format": format!("{format:?}"), "tls": secure,
+                    "data_payload_bytes": DEFAULT_MAX_MESSAGE_SIZE, "data_slots_available": 0,
+                    "data_event_capacity": 1, "control_budget_ms": budget.as_millis(), "control_elapsed_us": elapsed.as_micros()})
+                );
+                drop(blocked);
+                assert!(writer.try_lock().is_ok());
+                client.shutdown().await;
+                server.shutdown().await;
+            }
+        }
+    }
+
     #[test]
     fn node_config_validates_semaphore_boundaries_without_allocating_them() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0");
@@ -2071,6 +2437,167 @@ mod tests {
             assert!(events.try_recv().is_err());
             drop(held_writer);
             drop(shutdown_tx);
+        }
+    }
+
+    struct ControlTestPath {
+        remote: TcpStream,
+        reader: tokio::io::ReadHalf<NetStream>,
+        context: ReadLoopContext,
+        events: mpsc::Receiver<NodeEvent>,
+        instance: ConnectionInstance,
+        shutdown: watch::Sender<bool>,
+        frame_bytes: usize,
+        send_started: std::time::Instant,
+        send_finished: std::time::Instant,
+    }
+
+    async fn control_test_path(
+        format: SerializationFormat,
+        messages: Vec<Message>,
+    ) -> ControlTestPath {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut remote, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        for message in messages {
+            bytes.extend(message.to_bytes_with_format(format).unwrap());
+        }
+        let send_started = std::time::Instant::now();
+        remote.write_all(&bytes).await.unwrap();
+        let send_finished = std::time::Instant::now();
+        let mut peek = vec![0; bytes.len()];
+        timeout(Duration::from_secs(5), async {
+            while stream.peek(&mut peek).await.unwrap() < bytes.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reader, writer) = tokio::io::split(NetStream::Plain(stream));
+        let (event_tx, events) = mpsc::channel(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let instance = ConnectionInstance::new();
+        let closed_rx = instance.closed_tx.subscribe();
+        ControlTestPath {
+            remote,
+            reader,
+            events,
+            instance,
+            shutdown,
+            frame_bytes: bytes.len(),
+            send_started,
+            send_finished,
+            context: ReadLoopContext {
+                peer_node_id: NodeId::new("control-experiment-peer"),
+                addr: "control-experiment-peer".into(),
+                event_tx,
+                writer: Arc::new(Mutex::new(writer)),
+                serialization_format: format,
+                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                socket_timeout: Duration::from_secs(5),
+                shutdown_rx,
+                closed_rx,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn control_progress_isolated_from_shared_writer_and_event_backpressure() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for blocked_on_writer in [false, true] {
+                let data_message = || {
+                    Message::push_ops(vec![Op::gcounter_increment(
+                        NodeId::new("control-experiment-peer"),
+                        "control-experiment-counter",
+                        1,
+                    )])
+                };
+                let mut messages = vec![data_message()];
+                if !blocked_on_writer {
+                    messages.push(data_message());
+                }
+                messages.push(Message::ping());
+                let mut shared = control_test_path(format, messages).await;
+                let mut independent = control_test_path(format, vec![Message::ping()]).await;
+                let shared_writer = Arc::clone(&shared.context.writer);
+                let independent_writer = Arc::clone(&independent.context.writer);
+                let held_writer = if blocked_on_writer {
+                    Some(shared_writer.lock().await)
+                } else {
+                    None
+                };
+                let mut shared_read =
+                    tokio_test::task::spawn(read_loop(shared.reader, shared.context));
+                let mut independent_read =
+                    tokio_test::task::spawn(read_loop(independent.reader, independent.context));
+                let (received_format, pong) = timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        biased;
+                        result = &mut shared_read => panic!("shared reader exited before release: {result:?}"),
+                        result = &mut independent_read => panic!("independent reader exited: {result:?}"),
+                        reply = read_message_with_format(&mut independent.remote, DEFAULT_MAX_MESSAGE_SIZE, Duration::from_secs(5)) => reply,
+                    }
+                }).await.unwrap().unwrap();
+                assert_eq!(received_format, format);
+                assert_eq!(pong, Message::pong());
+                assert_eq!(shared.events.len(), 1);
+                let independent_observed = independent.send_started.elapsed();
+                let mut shared_reply = tokio_test::task::spawn(read_message_with_format(
+                    &mut shared.remote,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    Duration::from_secs(5),
+                ));
+                assert!(shared_reply.poll().is_pending());
+                let resumed_at = std::time::Instant::now();
+                if blocked_on_writer {
+                    drop(held_writer);
+                } else {
+                    assert!(matches!(
+                        shared.events.try_recv(),
+                        Ok(NodeEvent::OpsReceived { .. })
+                    ));
+                }
+                let (received_format, pong) = timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        biased;
+                        result = &mut shared_read => panic!("shared reader exited before Pong: {result:?}"),
+                        reply = &mut shared_reply => reply,
+                    }
+                }).await.unwrap().unwrap();
+                assert_eq!(received_format, format);
+                assert_eq!(pong, Message::pong());
+                eprintln!(
+                    "control-isolation {}",
+                    serde_json::json!({
+                        "format": format!("{format:?}"),
+                        "blocked_on": if blocked_on_writer { "writer" } else { "event_queue" },
+                        "event_capacity": 1, "shared_frame_bytes": shared.frame_bytes,
+                        "independent_frame_bytes": independent.frame_bytes,
+                        "shared_write_us": shared.send_finished.duration_since(shared.send_started).as_micros(),
+                        "independent_write_us": independent.send_finished.duration_since(independent.send_started).as_micros(),
+                        "independent_write_start_to_pong_us": independent_observed.as_micros(),
+                        "shared_write_end_to_release_us": resumed_at.duration_since(shared.send_finished).as_micros(),
+                        "shared_release_to_pong_us": resumed_at.elapsed().as_micros(),
+                    })
+                );
+                shared.instance.closed_tx.send_replace(true);
+                independent.instance.closed_tx.send_replace(true);
+                shared.shutdown.send_replace(true);
+                independent.shutdown.send_replace(true);
+                timeout(Duration::from_secs(5), shared_read)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                timeout(Duration::from_secs(5), independent_read)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(Arc::strong_count(&shared_writer), 1);
+                assert_eq!(Arc::strong_count(&independent_writer), 1);
+            }
         }
     }
 
@@ -2790,23 +3317,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_idle_handshake_consumes_peer_slot() {
+    async fn incoming_idle_handshake_consumes_bounded_handshake_not_peer_slot() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
             .with_max_peers(1)
             .with_socket_timeout(Duration::from_secs(5));
-        let node = Node::new(config);
+        let mut node = Node::new(config);
+        node.handshake_slots = Arc::new(Semaphore::new(1));
         let addr = node.start_listener().await.unwrap();
 
         let first = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        timeout(Duration::from_secs(1), async {
+            while node.handshake_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
-        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.connection_slots.available_permits(), 1);
         assert_eq!(node.connected_peer_count().await, 0);
 
-        let second = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(1), second.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
 
-        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.handshake_slots.available_permits(), 0);
+        assert_eq!(node.connection_slots.available_permits(), 1);
         assert_eq!(node.connected_peer_count().await, 0);
 
         drop(second);

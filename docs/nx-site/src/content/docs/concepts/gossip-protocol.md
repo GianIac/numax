@@ -3,11 +3,7 @@ title: Gossip Protocol
 description: How Numax moves operations between peers.
 ---
 
-Numax discovers connection candidates, admits peers through the wire handshake,
-and broadcasts accepted CRDT operations to active connections. Periodic
-anti-entropy repairs missed operations through bounded replay or a verified
-CRDT baseline. SWIM/Lifeguard membership and K-fanout are proposed extensions
-for v0.1.6; the implemented transport still uses direct broadcast.
+Numax discovers connection candidates, admits peers through the wire handshake, and sends accepted CRDT operations to a bounded, rotating selection of active connections. Receivers forward newly persisted operations; periodic anti-entropy repairs missed operations through bounded replay or a verified CRDT baseline.
 
 ---
 
@@ -46,19 +42,20 @@ connection machinery. Local readiness does not imply peer convergence.
 Candidates are not members or peers yet. A candidate becomes an active peer
 only after connection admission, the normal wire handshake, TLS identity
 binding when configured, and allowlist authorization. When an operation is
-produced locally, the sync manager queues it and sends it to the currently
-connected peers.
+produced locally, the sync manager queues it and sends it to K selected active
+connections. Receivers forward newly accepted operations only after persistence,
+preserving their origin and excluding the immediate sender.
 
-![Current direct broadcast to connected peers](/numax/diagrams/concepts/current-broadcast.svg)
+![Bounded K-fanout and persistence-before-forwarding](/numax/diagrams/concepts/current-broadcast.svg)
 
 [Mermaid source for this diagram](/numax/diagrams/concepts/current-broadcast.mmd)
 
-The diagram uses the legacy `PushOps` label. Protocol 8 carries sequenced
-operations in the `History::Push` envelope with the same direct-broadcast topology.
-
-Broadcast is bounded by `max_peers`, with batching and backpressure through
-the operation queue. It does not maintain a SWIM membership view or select
-K-fanout neighbors.
+Protocol 9 carries sequenced operations in `History::Push`. Local pushes and
+remote forwarding share a rotating recipient cursor. Batching, bounded queues
+and byte budgets constrain work; duplicates do not trigger forwarding again.
+Recipients remain active data connections, not neighbors selected from the
+independent membership view. Rotation does not repair sparse or partitioned
+connection topologies; a bounded neighbor set and recovery contacts remain open.
 
 ---
 
@@ -78,11 +75,12 @@ Peer communication is handled by `nx-net`. The current wire protocol defines the
 | `BootstrapHello` | Start a one-shot authenticated bootstrap request with cluster, advertisement and result limit. |
 | `BootstrapAck` | Return the seed identity, matching cluster, negotiated format, bounded endpoint suggestions and their lease. |
 | `History` | Private protocol-8 envelope for sequenced pushes, paginated summaries, correlated range requests/replay, unavailable-history responses and bounded baseline recovery. |
+| `ControlHello` / `ControlAck` | Protocol-9 one-shot membership RPCs: owner metadata, direct/indirect probes, ACK/NACK and paginated reconciliation on independent TCP/TLS connections. |
 
-The v0.1.6 development protocol is `8`; the released v0.1.5 protocol is `5`.
+The v0.1.6 development protocol is `9`; the released v0.1.5 protocol is `5`.
 Peers require equal versions before negotiating `Bincode` (implemented with
 `wincode`) or `Json`. Preserving legacy codec bytes does not make protocol-5
-peers compatible with protocol 8. See [Wire Versioning](/numax/design/wire-versioning/)
+peers compatible with protocol 9. See [Wire Versioning](/numax/design/wire-versioning/)
 for rejection tests and deployment implications.
 
 ---
@@ -167,7 +165,10 @@ Local CRDT success follows an atomic batch of
 CRDT state, materialized value, UUID, seen/replay metadata and sequence position,
 then a covering flush. Only then does the operation become eligible for network
 propagation. The broadcast loop drains the bounded queue and sends sequenced
-`History::Push` batches through `nx-net`; local success is not a remote ACK.
+`History::Push` batches to K active connections through `nx-net`; local success
+is not a remote ACK. Newly persisted remote operations enter a separate bounded
+forwarding queue. A full queue or failed send drops the immediate attempt, not
+the durable replay/recovery metadata.
 See the [acceptance contract](/numax/design/peer-discovery/#d1--local-acceptance-and-durability).
 
 The important boundaries are:
@@ -242,8 +243,11 @@ Reconnect uses exponential backoff:
 | Dead after failures | `3` |
 | Anti-entropy interval | `30s` |
 
-This is simple failure tracking for discovery candidates, including configured
-peers. It is not a full membership protocol yet.
+This is connection failure tracking for discovery candidates, including configured
+peers. It is separate from the implemented SWIM/Lifeguard membership detector,
+which uses independent one-shot control RPCs, durable terminal floors and
+per-epoch owner sessions. Membership status does not itself establish data
+connectivity or successful recovery.
 
 ---
 
@@ -251,10 +255,8 @@ peers. It is not a full membership protocol yet.
 
 The following capabilities are outside the implemented discovery and replication path:
 
-- SWIM membership,
-- Lifeguard-style failure detection,
 - phi-accrual failure detection,
-- K-fanout dissemination,
+- membership-aware bounded neighbors and topology repair,
 - adaptive gossip rate,
 - NAT traversal.
 
@@ -264,12 +266,12 @@ Larger snapshots and arbitrary incomparable-cut reconciliation remain outside
 that contract.
 
 Bootstrap gossip exchanges bounded endpoint suggestions. Data dissemination
-uses admitted connections and direct broadcast, with anti-entropy for repair.
+uses admitted connections and K-fanout forwarding, with anti-entropy for repair.
 Bootstrap suggestions do not establish membership or data readiness.
 
 ---
 
-## Discovery integration and proposed dissemination
+## Discovery integration and dissemination
 
 ### Discovery providers
 
@@ -286,9 +288,9 @@ they are not reinterpreted as bootstrap seeds. Embedders can also compose the
 public providers through the `nx-core` Rust API. The detailed semantics are in the
 [Peer Discovery Contract](/numax/design/discovery-contract/).
 
-### Proposed membership and K-fanout
+### Membership and K-fanout
 
-The proposed architecture separates three responsibilities:
+The development implementation separates three responsibilities:
 
 | Channel | Responsibility |
 |---|---|
@@ -296,25 +298,27 @@ The proposed architecture separates three responsibilities:
 | Failure detection | Suspicion and dead-peer detection without relying only on configured addresses. |
 | Data dissemination | K-fanout gossip for CRDT operations. |
 
-K-fanout selects `K` eligible peers for each update; those peers forward the
+K-fanout selects `K` eligible connections for each batch; those peers forward the
 original operation after persistence. Duplicate suppression prevents repeated
 effects and forwarding cycles. A bounded, rotating neighbor set and periodic
 anti-entropy remain necessary for sparse topologies and healed partitions.
 
-The planned default is based on cluster size:
+The current selection uses:
 
 ```text
-K = ceil(log2(N) + c)
+N = 1 + active data connections
+K = min(ceil(log2(N)) + c, gossip_max_fanout, eligible connections)
 ```
 
-where `N` is the local estimate of eligible membership and `c` is a calibrated
-constant. The implementation must clamp `K` to available peers and configured
-budgets, including empty and small clusters. The formula alone does not
+`c` defaults to `1` and `gossip_max_fanout` to `64`; both are configurable under
+`[limits]` in TOML. With no eligible connections K is zero. Source exclusion
+applies to forwarding, while N still counts all active connections. Membership
+size estimation and calibration of c remain open. The formula alone does not
 establish connectivity or convergence.
 
-The proposed scheduler includes load/RTT adaptation, bounded backpressure and
-seeded randomness for deterministic simulation of the production state machine.
-These parameters remain subject to the
+Load/RTT adaptation, jitter and topology repair remain planned. The membership
+state machine has an injectable clock and seeded scheduling for deterministic
+simulation; this is not evidence of cluster-wide data convergence. See the
 [peer-discovery design](/numax/design/peer-discovery/).
 
 ---

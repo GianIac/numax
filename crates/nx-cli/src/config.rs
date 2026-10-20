@@ -81,6 +81,8 @@ pub(crate) struct LimitsFileConfig {
     pub(crate) reconnect_max_delay: Option<String>,
     pub(crate) peer_dead_after_failures: Option<u32>,
     pub(crate) anti_entropy_interval: Option<String>,
+    pub(crate) gossip_fanout_constant: Option<usize>,
+    pub(crate) gossip_max_fanout: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,8 +424,16 @@ impl EffectiveRunConfig {
                 sync.peer_dead_after_failures
             ));
             out.push_str(&format!(
-                "anti_entropy_interval = \"{}\"\n\n",
+                "anti_entropy_interval = \"{}\"\n",
                 render_duration(sync.anti_entropy_interval)
+            ));
+            out.push_str(&format!(
+                "gossip_fanout_constant = {}\n",
+                sync.gossip_fanout_constant
+            ));
+            out.push_str(&format!(
+                "gossip_max_fanout = {}\n\n",
+                sync.gossip_max_fanout
             ));
         } else {
             out.push_str("# Sync limits are inactive because sync is disabled.\n\n");
@@ -476,6 +486,8 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
+gossip_fanout_constant = 1
+gossip_max_fanout = 64
 
 [discovery]
 mode = "static"
@@ -1533,6 +1545,16 @@ pub(crate) fn apply_limit_config(
     if let Some(anti_entropy_interval) = &limits.anti_entropy_interval {
         let interval = parse_duration(anti_entropy_interval).map_err(|e| anyhow::anyhow!("{e}"))?;
         sync = sync.with_anti_entropy_interval(interval);
+    }
+    if let Some(gossip_max_fanout) = limits.gossip_max_fanout {
+        validate_non_zero("limits.gossip_max_fanout", gossip_max_fanout)?;
+    }
+    if limits.gossip_fanout_constant.is_some() || limits.gossip_max_fanout.is_some() {
+        let fanout_constant = limits
+            .gossip_fanout_constant
+            .unwrap_or(sync.gossip_fanout_constant);
+        let max_fanout = limits.gossip_max_fanout.unwrap_or(sync.gossip_max_fanout);
+        sync = sync.with_gossip_fanout(fanout_constant, max_fanout);
     }
 
     Ok(sync)

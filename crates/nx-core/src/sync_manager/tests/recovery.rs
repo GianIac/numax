@@ -179,6 +179,45 @@ async fn baseline_all_families_cover_expired_history_sparse_receipts_and_delayed
 }
 
 #[tokio::test]
+async fn remote_apply_forwards_only_new_persisted_operations_for_all_families() {
+    let target = manager("forward-target", temp_store());
+    let entries = operations();
+
+    let forwarded = apply_sequenced_ops_and_collect(&entries, &remote_apply_context(&target))
+        .await
+        .unwrap();
+    assert_eq!(forwarded, entries);
+    assert_eq!(target.get_counter_value("counter").await, 10);
+    assert_eq!(target.get_pncounter_value("pn").await, 5);
+    assert_eq!(
+        target.get_lww_register_value("register").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(target.get_lww_map_entries("map").await.is_empty());
+    assert!(target.get_orset_elements("set").await.is_empty());
+    assert_eq!(target.get_rga_values("rga").await, vec![vec![2]]);
+
+    let duplicate = apply_sequenced_ops_and_collect(&entries, &remote_apply_context(&target))
+        .await
+        .unwrap();
+    assert!(duplicate.is_empty());
+}
+
+#[tokio::test]
+async fn remote_apply_storage_failure_returns_no_forwardable_operations() {
+    let target = manager("forward-failed", temp_store());
+    target.store.inject_disk_full_on_writes(true);
+
+    assert!(
+        apply_sequenced_ops_and_collect(&operations(), &remote_apply_context(&target))
+            .await
+            .is_err()
+    );
+    assert_eq!(target.get_counter_value("counter").await, 0);
+    assert!(target.op_log.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn baseline_rejects_incomparable_cuts_and_preserves_local_writes() {
     let source = manager("source", temp_store());
     let target = manager("target", temp_store());

@@ -1,0 +1,33 @@
+flowchart TB
+    accTitle: Illustrative Lifeguard suspicion timeline
+    accDescr: Suspicion starts at zero with a six-second deadline. A distinct additional reporter at one second shortens the deadline to four seconds from the original start. A duplicate at two seconds changes nothing. Alternative outcomes show a valid newer owner Alive processed at three seconds canceling the old timer, or expiry at four seconds after state and persistence checks. Durations are illustrative, not Numax defaults.
+
+    START["t = 0 s: first suspicion<br/>Capture epoch 7, incarnation 1<br/>Deadline = 6 s"]
+    CONFIRM["t = 1 s: distinct additional reporter<br/>Deadline becomes 4 s from t = 0<br/>3 s remain; the old 6 s deadline is replaced"]
+    DUPLICATE["t = 2 s: same report delivered again<br/>Not a new reporter<br/>Deadline stays at 4 s"]
+    START --> CONFIRM --> DUPLICATE
+
+    subgraph REFUTATION["Alternative A: refutation"]
+        ALIVE["t = 3 s: valid owner Alive is processed<br/>Same open epoch 7, newer incarnation 2"]
+        CANCEL["Apply Alive; cancel the old suspicion<br/>Any queued old expiry has no effect"]
+        ALIVE --> CANCEL
+    end
+
+    subgraph EXPIRY["Alternative B: expiry"]
+        TIMEOUT["t = 4 s: no valid refutation processed<br/>Expiry must still match the current<br/>epoch, incarnation and suspicion timer"]
+        PERSIST["Persist required rejection floor<br/>If persistence fails: report local degradation<br/>Do not publish a successful Dead transition"]
+        DEAD["Only after successful required persistence:<br/>publish Dead as a local failure judgment<br/>Not identity revocation or proof of data loss"]
+        TIMEOUT --> PERSIST --> DEAD
+    end
+
+    DUPLICATE --> ALIVE
+    DUPLICATE --> TIMEOUT
+
+    classDef neutral fill:#eef2f5,stroke:#52616b,color:#17212b
+    classDef alive fill:#e2f3e8,stroke:#28784b,color:#153c27
+    classDef suspect fill:#fff3cc,stroke:#957018,color:#4d390b
+    classDef failed fill:#fbe5e5,stroke:#a73e3e,color:#5b2020
+    class START,CONFIRM,DUPLICATE suspect
+    class ALIVE,CANCEL alive
+    class TIMEOUT,PERSIST neutral
+    class DEAD failed

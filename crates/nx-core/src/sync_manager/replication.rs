@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant as StdInstant};
 
 use nx_net::{NetError, NodeEvent, WireRetryPolicy};
@@ -12,7 +13,7 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::apply::apply_sequenced_ops;
+use super::apply::apply_sequenced_ops_and_collect;
 use super::manager::AcceptedLocalOp;
 use super::peer::{
     ConfiguredPeerConnectContext, ConfiguredPeerConnectOutcome, PeerReconnectState,
@@ -21,7 +22,7 @@ use super::peer::{
 };
 use super::sequence::{REPLAY_BYTES, REPLAY_PAGE, SUMMARY_PAGE};
 use super::types::*;
-use nx_sync::HistoryMessage;
+use nx_sync::{HistoryMessage, NodeId};
 
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
@@ -54,6 +55,38 @@ pub(super) fn spawn_broadcast_loop(
             }
         }
         debug!("broadcast loop terminated");
+    })
+}
+
+pub(super) fn spawn_forward_loop(
+    context: ForwardLoopContext,
+    mut forwarded_rx: mpsc::Receiver<ForwardedOp>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut pending = None;
+        loop {
+            let first = tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        debug!("forward loop shutdown requested; durable history remains available for repair");
+                        break;
+                    }
+                    continue;
+                }
+                forwarded = async {
+                    match pending.take() {
+                        Some(forwarded) => Some(forwarded),
+                        None => forwarded_rx.recv().await,
+                    }
+                } => forwarded,
+            };
+            let Some(first) = first else {
+                break;
+            };
+            forward_batch(&context, &mut forwarded_rx, first, &mut pending).await;
+        }
+        debug!("forward loop terminated");
     })
 }
 
@@ -413,6 +446,156 @@ pub(super) fn normalize_seen_ops_limit(limit: usize) -> usize {
     limit.max(1)
 }
 
+pub(super) fn select_gossip_peers(
+    peers: &[(String, NodeId)],
+    excluded_addr: Option<&str>,
+    fanout_constant: usize,
+    max_fanout: usize,
+    cursor: &AtomicUsize,
+) -> Vec<String> {
+    let cluster_size = peers.len().saturating_add(1);
+    let logarithmic_fanout = if cluster_size <= 1 {
+        0
+    } else {
+        (usize::BITS - (cluster_size - 1).leading_zeros()) as usize
+    };
+    let requested = logarithmic_fanout
+        .saturating_add(fanout_constant)
+        .min(max_fanout);
+    let mut eligible = peers
+        .iter()
+        .filter(|(addr, _)| excluded_addr != Some(addr.as_str()))
+        .map(|(addr, _)| addr.clone())
+        .collect::<Vec<_>>();
+    eligible.sort_unstable();
+
+    let count = requested.min(eligible.len());
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let start = cursor.fetch_add(count, Ordering::Relaxed) % eligible.len();
+    (0..count)
+        .map(|offset| eligible[(start + offset) % eligible.len()].clone())
+        .collect()
+}
+
+async fn forward_batch(
+    context: &ForwardLoopContext,
+    forwarded_rx: &mut mpsc::Receiver<ForwardedOp>,
+    first: ForwardedOp,
+    pending: &mut Option<ForwardedOp>,
+) {
+    let source_addr = first.source_addr;
+    let mut entries = vec![first.entry];
+    let byte_budget = context
+        .max_message_size
+        .min(REPLAY_BYTES)
+        .saturating_sub(256);
+    let mut encoded_bytes = serde_json::to_vec(&entries)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX);
+    if encoded_bytes > byte_budget {
+        context.metrics.record_sync_error();
+        warn!(%source_addr, byte_budget, "forwarded operation exceeds gossip byte budget; durable history remains available for repair");
+        return;
+    }
+
+    tokio::time::sleep(BROADCAST_COALESCE_DELAY).await;
+    while entries.len() < BROADCAST_BATCH_MAX {
+        match forwarded_rx.try_recv() {
+            Ok(forwarded) if forwarded.source_addr == source_addr => {
+                let item_size = match serde_json::to_vec(&forwarded.entry) {
+                    Ok(encoded) => encoded.len().saturating_add(1),
+                    Err(error) => {
+                        context.metrics.record_sync_error();
+                        warn!(%error, "failed to size forwarded operation");
+                        continue;
+                    }
+                };
+                if encoded_bytes.saturating_add(item_size) > byte_budget {
+                    *pending = Some(forwarded);
+                    break;
+                }
+                encoded_bytes = encoded_bytes.saturating_add(item_size);
+                entries.push(forwarded.entry);
+            }
+            Ok(forwarded) => {
+                *pending = Some(forwarded);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let peers = context.node.connected_peers().await;
+    let recipients = select_gossip_peers(
+        &peers,
+        Some(&source_addr),
+        context.fanout_constant,
+        context.max_fanout,
+        &context.fanout_cursor,
+    );
+    if recipients.is_empty() {
+        return;
+    }
+
+    let count = entries.len();
+    let started = std::time::Instant::now();
+    let mut sent = 0;
+    let mut failed = 0;
+    for peer in recipients {
+        match context
+            .node
+            .send_history_to_addr(
+                &peer,
+                HistoryMessage::Push {
+                    ops: entries.clone(),
+                },
+            )
+            .await
+        {
+            Ok(()) => sent += 1,
+            Err(error) => {
+                failed += 1;
+                debug!(%peer, %error, count, "forward send failed; durable history remains available for repair");
+            }
+        }
+    }
+    if sent > 0 {
+        context.metrics.record_broadcast_batch(count);
+        context.metrics.record_sync_latency(started.elapsed());
+    }
+    if failed > 0 {
+        context.metrics.record_sync_error();
+        warn!(
+            count,
+            sent,
+            failed,
+            "forward batch partially failed; durable history remains available for repair"
+        );
+    }
+}
+
+fn enqueue_forwarded_ops(
+    addr: &str,
+    entries: Vec<nx_sync::SequencedOp>,
+    context: &NodeEventContext,
+) {
+    let Some(forward_tx) = context.forward_tx.as_ref() else {
+        return;
+    };
+    for entry in entries {
+        if let Err(error) = forward_tx.try_send(ForwardedOp {
+            source_addr: addr.to_owned(),
+            entry,
+        }) {
+            context.metrics.record_sync_error();
+            warn!(%addr, %error, "forward queue is full or shutting down; durable history remains available for repair");
+        }
+    }
+}
+
 pub(super) async fn broadcast_batch(
     context: &BroadcastLoopContext,
     op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
@@ -437,18 +620,47 @@ pub(super) async fn broadcast_batch(
         .map(AcceptedLocalOp::into_sequenced)
         .collect::<Vec<_>>();
     let count = batch.len();
+    let peers = context.node.connected_peers().await;
+    let recipients = select_gossip_peers(
+        &peers,
+        None,
+        context.fanout_constant,
+        context.max_fanout,
+        &context.fanout_cursor,
+    );
+    if recipients.is_empty() {
+        return;
+    }
+
     let started = std::time::Instant::now();
-    if let Err(e) = context
-        .node
-        .broadcast_history(HistoryMessage::Push { ops: batch })
-        .await
-    {
-        context.metrics.record_sync_error();
-        warn!(error = %e, count, "broadcast partially failed; ops dropped for failed peers");
-    } else {
+    let mut sent = 0;
+    let mut failed = 0;
+    for peer in recipients {
+        match context
+            .node
+            .send_history_to_addr(&peer, HistoryMessage::Push { ops: batch.clone() })
+            .await
+        {
+            Ok(()) => sent += 1,
+            Err(error) => {
+                failed += 1;
+                debug!(%peer, %error, count, "gossip send failed; durable history remains available for repair");
+            }
+        }
+    }
+    if sent > 0 {
         context.metrics.record_broadcast_batch(count);
         context.metrics.record_sync_latency(started.elapsed());
-        debug!(count, "broadcast batch sent");
+        debug!(count, recipients = sent, failed, "gossip batch sent");
+    }
+    if failed > 0 {
+        context.metrics.record_sync_error();
+        warn!(
+            count,
+            sent,
+            failed,
+            "gossip batch partially failed; durable history remains available for repair"
+        );
     }
 }
 
@@ -765,14 +977,22 @@ async fn handle_history_message(
                 ops.len() <= 1024,
                 "sequenced batch exceeds operation budget"
             );
-            let result = apply_sequenced_ops(&ops, &history_apply_context(context)).await;
-            if let Err(error) = &result
-                && error
-                    .downcast_ref::<super::sequence::TrackingLimit>()
-                    .is_none()
+            let (accepted, tracking_error) = match apply_sequenced_ops_and_collect(
+                &ops,
+                &history_apply_context(context),
+            )
+            .await
             {
-                return result;
-            }
+                Ok(accepted) => (accepted, None),
+                Err(error)
+                    if error
+                        .downcast_ref::<super::sequence::TrackingLimit>()
+                        .is_some() =>
+                {
+                    (Vec::new(), Some(error))
+                }
+                Err(error) => return Err(error),
+            };
             let mut origins = std::collections::BTreeMap::<String, u64>::new();
             for entry in &ops {
                 anyhow::ensure!(
@@ -797,7 +1017,10 @@ async fn handle_history_message(
                     request_history_range(addr, summary.origin, start, end, context).await?;
                 }
             }
-            result?;
+            if let Some(error) = tracking_error {
+                return Err(error);
+            }
+            enqueue_forwarded_ops(addr, accepted, context);
         }
         HistoryMessage::SummaryRequest { after_origin } => {
             let cursor = super::storage::summary_cursor(after_origin.as_deref())?;
@@ -924,7 +1147,9 @@ async fn handle_history_message(
                 debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited history replay");
                 return Ok(());
             }
-            apply_sequenced_ops(&ops, &history_apply_context(context)).await?;
+            let accepted =
+                apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await?;
+            enqueue_forwarded_ops(addr, accepted, context);
             if let Some((start, end)) = super::storage::missing_range(&context.store, &origin)? {
                 request_history_range(addr, origin, start, end, context).await?;
             }
@@ -1068,6 +1293,7 @@ async fn handle_history_message(
 mod tests {
     use super::*;
     use crate::observability::RuntimeMetrics;
+    use crate::sync_manager::apply::apply_sequenced_ops;
     use crate::sync_manager::peer::{PeerHealth, PeerHealthState};
     use crate::sync_manager::storage::materialized_gcounter_key;
     use nx_net::{Node, NodeConfig, PROTOCOL_VERSION, WireError};
@@ -1091,6 +1317,28 @@ mod tests {
 
     fn metrics() -> Arc<RuntimeMetrics> {
         Arc::new(RuntimeMetrics::default())
+    }
+
+    #[test]
+    fn gossip_fanout_is_clamped_excludes_sender_and_rotates_neighbors() {
+        let peers = (0..5)
+            .map(|index| {
+                (
+                    format!("peer-{index}"),
+                    NodeId::new(format!("node-{index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cursor = AtomicUsize::new(0);
+
+        let first = select_gossip_peers(&peers, None, 0, 3, &cursor);
+        let second = select_gossip_peers(&peers, None, 0, 3, &cursor);
+        assert_eq!(first, vec!["peer-0", "peer-1", "peer-2"]);
+        assert_eq!(second, vec!["peer-3", "peer-4", "peer-0"]);
+
+        let excluded = select_gossip_peers(&peers, Some("peer-2"), usize::MAX, 8, &cursor);
+        assert_eq!(excluded.len(), 4);
+        assert!(!excluded.iter().any(|peer| peer == "peer-2"));
     }
 
     #[test]
@@ -1240,6 +1488,7 @@ mod tests {
                 NodeId::generate(),
                 "127.0.0.1:0",
             ))),
+            forward_tx: None,
             peer_health,
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),

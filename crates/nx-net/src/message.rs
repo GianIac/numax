@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -244,6 +244,19 @@ pub(crate) enum WireMessageKind {
     History {
         message: nx_sync::HistoryMessage,
     },
+    ControlHello {
+        node_id: NodeId,
+        protocol_version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        request: crate::ControlRequest,
+    },
+    ControlAck {
+        node_id: NodeId,
+        protocol_version: u32,
+        selected_format: SerializationFormat,
+        reply: crate::ControlReply,
+    },
 }
 
 #[derive(
@@ -417,7 +430,8 @@ impl WireMessage {
     }
 
     pub(crate) fn to_bytes_with_format(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
-        encode_frame(
+        self.validate_control()?;
+        let bytes = encode_frame(
             format,
             || serde_json::to_vec(self).map_err(NetError::from),
             || {
@@ -426,15 +440,48 @@ impl WireMessage {
                     wincode::config::Configuration::default().disable_preallocation_size_limit(),
                 )?)
             },
-        )
+        )?;
+        if self.is_control() {
+            validate_payload_len(bytes.len() - 4, crate::MAX_CONTROL_FRAME)?;
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn from_bytes_with_format(bytes: &[u8]) -> NetResult<(SerializationFormat, Self)> {
-        decode_frame(
+        let (format, message): (_, Self) = decode_frame(
             bytes,
             |payload| serde_json::from_slice(payload),
             deserialize_binary_wire_message,
+        )?;
+        if message.is_control() {
+            validate_payload_len(bytes.len(), crate::MAX_CONTROL_FRAME)?;
+        }
+        message.validate_control()?;
+        Ok((format, message))
+    }
+
+    fn is_control(&self) -> bool {
+        matches!(
+            self.kind,
+            WireMessageKind::ControlHello { .. } | WireMessageKind::ControlAck { .. }
         )
+    }
+
+    fn validate_control(&self) -> NetResult<()> {
+        match &self.kind {
+            WireMessageKind::ControlHello {
+                request,
+                supported_formats,
+                ..
+            } => {
+                if supported_formats.is_empty() || supported_formats.len() > 2 {
+                    return Err(NetError::InvalidMessage("invalid control formats".into()));
+                }
+                request.validate()
+            }
+            WireMessageKind::ControlAck { reply, .. } => reply.validate(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -548,7 +595,9 @@ impl TryFrom<WireMessage> for Message {
             },
             WireMessageKind::BootstrapHello { .. }
             | WireMessageKind::BootstrapAck { .. }
-            | WireMessageKind::History { .. } => {
+            | WireMessageKind::History { .. }
+            | WireMessageKind::ControlHello { .. }
+            | WireMessageKind::ControlAck { .. } => {
                 return Err(NetError::InvalidMessage(
                     "bootstrap wire messages are not public protocol messages".into(),
                 ));

@@ -37,6 +37,68 @@ encoding.
 The table identifier prevents valid metadata for one namespace from being
 accepted for another. Each table owns its schema version independently.
 
+## Membership metadata
+
+The private membership storage adapter owns a separate version-1 namespace.
+`SyncManager` invokes it during runtime startup. It does not add a sync-table id,
+change CRDT schemas or consume replication sequence numbers.
+
+| Key | Value |
+| --- | --- |
+| `__nx/membership/schema` | Eight bytes: `NXMB`, version `u16 BE` equal to 1, reserved `u16 BE` equal to 0 |
+| `__nx/membership/local` | JSON object with bound local `member` and nonzero `epoch` |
+| `__nx/membership/floor/<member>` | JSON object with nonzero `epoch`, `incarnation`, terminal `status` (`dead` or `left`) and nullable `closed_epoch` |
+
+Identities are UTF-8 strings of 1 through 256 bytes. Floor key suffixes contain
+the identity bytes directly, not a filesystem path. Epochs and incarnations are
+unsigned 64-bit counters; epoch zero is invalid. The local identity in metadata
+must match the caller's configured identity, which is a trusted adapter input,
+not proof of authentication.
+
+For example, a floor with `epoch: 8`, `incarnation: 0`, `status: "dead"` and
+`closed_epoch: 7` rejects old terminal pairs and retains the closure of epoch 7.
+
+Floor merge keeps the maximum pair and maximum closed epoch independently.
+When the maximum pair belongs to the closed epoch, its effective status is `left`, regardless of incarnation. 
+This is a rejection floor, not a newly owner-issued announcement. The merge is idempotent, commutative and associative.
+
+The adapter rejects malformed/inconsistent fields, unknown namespace keys, unsupported headers, missing metadata and identity mismatches. 
+`left` requires its own epoch to be closed; a `dead` floor may retain a lower closed epoch but
+cannot reopen a closed one. A local floor must be `left` and cannot name an epoch beyond the stored local allocator. 
+An empty membership namespace is initialized additively: the schema header and first bound epoch share one batch.
+A partial or unknown namespace is never interpreted as empty or auto-repaired.
+
+Restoration reads pages of at most 64 records and 128 KiB, rejects records over
+2 KiB including their keys, and retains at most the configured number of remote floors (up to 4,096), one local floor and the schema/local records. 
+Exhaustion fails visibly without deleting rejection protection. There is no TTL or compaction. Floor restoration establishes terminal ordering constraints only; it does not restore sessions, authentication, timers or active membership.
+
+An exclusive store write lease covers read/merge/write and flush. Startup
+advances the recovered epoch with checked arithmetic and confirms initial
+`Alive` only after a flush covering its atomic header/local batch and all
+surviving floors. Terminal persistence validates the pending action before
+writing and checks that the stored local epoch still matches the instance.
+Only a successful covering flush permits terminal publication. Runtime terminal
+writes use one blocking worker and at most 64 queued actions. The core remains
+available to serve control while I/O is pending; completion must still match
+the pending token and pair before publication. A superseded in-flight floor
+can remain durable without authorizing a stale announcement.
+
+A storage failure fences the affected core. A rejected write publishes nothing;
+an uncertain flush may have persisted the whole batch, so reopening reads and
+retains surviving records instead of assuming rollback. The existing datastore
+durability fence prevents further writes on a handle whose flush failed.
+The next successful start confirms a new covering flush before publication.
+Losing the datastore or restoring an older backup does not guarantee a newer
+epoch and is outside this recovery contract.
+
+For the moment no historical membership format or upgrade migration is supported. Future
+versions require an explicit migration path; this adapter rejects them without
+mutation. `nx migrate` still governs sync tables, not this separate namespace.
+Historical CRDT fixtures and current sync-table versions are unchanged. Older
+runtimes may ignore membership metadata: its presence alone is not a downgrade
+fence. Protocol 9 supplies an exact-version network boundary; the existing
+sync schema supplies the tested datastore downgrade boundary against v0.1.5.
+
 ## Sequenced replication in v0.1.6
 
 The op-log table (id 14) now uses schema 3. Its `1 -> 2` migration validates

@@ -16,6 +16,179 @@ mod support;
 
 use support::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wildcard_membership_preserves_optional_advertisement_and_valid_control_contact() {
+    for (bind, contact_ip) in [("0.0.0.0:0", "127.0.0.1"), ("[::]:0", "::1")] {
+        for advertise in [false, true] {
+            let reservation = std::net::TcpListener::bind(bind).unwrap();
+            let bound = reservation.local_addr().unwrap();
+            drop(reservation);
+            let policy = if advertise {
+                DiscoveryRuntimeConfig::new().with_advertised_endpoint(if contact_ip == "::1" {
+                    "[::1]:0"
+                } else {
+                    "127.0.0.1:0"
+                })
+            } else {
+                DiscoveryRuntimeConfig::new()
+            };
+            let mut manager = SyncManager::try_new_with_discovery(
+                NodeId::new("wildcard"),
+                SyncConfig::new().with_listen_addr(bound.to_string()),
+                temp_store(),
+                metrics(),
+                vec![DiscoveryProvider::new(
+                    "static",
+                    Arc::new(StaticDiscovery::new(Vec::new())),
+                )],
+                policy,
+            )
+            .unwrap();
+            manager.start().await.unwrap();
+            let snapshot = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager
+                    .membership
+                    .as_mut()
+                    .unwrap()
+                    .snapshot
+                    .wait_for(|snapshot| !snapshot.records.is_empty()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .clone();
+            let announcement = snapshot
+                .records
+                .iter()
+                .find(|record| record.member == "wildcard")
+                .unwrap()
+                .clone();
+            assert_eq!(announcement.endpoint.is_some(), advertise);
+            if let Some(endpoint) = &announcement.endpoint {
+                let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+                assert!(!endpoint.ip().is_unspecified());
+                assert_eq!(
+                    endpoint.ip(),
+                    contact_ip.parse::<std::net::IpAddr>().unwrap()
+                );
+            }
+            let contact =
+                std::net::SocketAddr::new(contact_ip.parse().unwrap(), bound.port()).to_string();
+            let peer = Node::new(NodeConfig::new(NodeId::new("contact"), "127.0.0.1:0"));
+            peer.start_listener().await.unwrap();
+            let reply = peer
+                .control_request(
+                    &contact,
+                    nx_net::ControlRequest {
+                        request_id: 41,
+                        owner: nx_net::MembershipRecord {
+                            member: "contact".into(),
+                            reporter: "contact".into(),
+                            version: nx_net::MembershipVersion {
+                                epoch: 1,
+                                incarnation: 0,
+                            },
+                            state: nx_net::MembershipState::Alive,
+                            endpoint: None,
+                        },
+                        updates: vec![],
+                        kind: nx_net::ControlKind::Probe {
+                            target: announcement.member.clone(),
+                            version: announcement.version,
+                        },
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
+                .1;
+            assert!(reply.ack);
+            assert_eq!(reply.owner.endpoint, announcement.endpoint);
+            peer.shutdown().await;
+            manager.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn sync_manager_owns_automatic_membership_and_durable_leave() {
+    let mut alice = SyncManager::new(
+        NodeId::new("membership-alice"),
+        SyncConfig::new().with_listen_addr("127.0.0.1:0"),
+        temp_store(),
+        metrics(),
+    );
+    alice.start().await.unwrap();
+    let alice_endpoint = alice
+        .membership
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .wait_for(|snapshot| !snapshot.records.is_empty())
+        .await
+        .unwrap()
+        .records[0]
+        .endpoint
+        .clone()
+        .unwrap();
+    let mut bob = SyncManager::new(
+        NodeId::new("membership-bob"),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(alice_endpoint),
+        temp_store(),
+        metrics(),
+    );
+    bob.start().await.unwrap();
+    for manager in [&mut alice, &mut bob] {
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager
+                .membership
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .wait_for(|snapshot| {
+                    snapshot.error.is_some()
+                        || snapshot.records.len() == 2 && snapshot.successful_probes > 0
+                }),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.failed_probes, 0);
+    }
+    bob.shutdown().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        alice
+            .membership
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .wait_for(|snapshot| {
+                snapshot.records.iter().any(|record| {
+                    record.member == "membership-bob"
+                        && record.state == nx_net::MembershipState::Left
+                })
+            }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        alice
+            .store
+            .get(b"__nx/membership/floor/membership-bob")
+            .unwrap()
+            .is_some()
+    );
+    alice.shutdown().await.unwrap();
+}
+
 struct TestDynamicDiscovery {
     state: StdMutex<(u64, Vec<String>)>,
     events: tokio::sync::broadcast::Sender<crate::DiscoveryEvent>,
@@ -5063,6 +5236,55 @@ async fn reconnect_loop_connects_configured_peer_that_starts_later() {
 
     wait_for_counter(&manager_b, key, 1).await;
     assert_eq!(read_materialized(&store_b, key), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_push_is_forwarded_to_a_connected_neighbor() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let addr_c = free_addr();
+        let (mut alice, handle_a, _store_a) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_a)
+                .with_serialization_format(format),
+        )
+        .await;
+        let (mut bob, _handle_b, _store_b) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_b.clone())
+                .with_serialization_format(format),
+        )
+        .await;
+        let (mut carol, _handle_c, store_c) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_c)
+                .with_serialization_format(format),
+        )
+        .await;
+
+        alice.connect_to_peer(&addr_b).await.unwrap();
+        carol.connect_to_peer(&addr_b).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bob.connected_peer_count().await < 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("relay node did not connect to both neighbors");
+
+        local_increment(&handle_a, "gossip-chain", 7).await;
+        wait_for_counter(&bob, "gossip-chain", 7).await;
+        wait_for_counter(&carol, "gossip-chain", 7).await;
+        assert_eq!(read_materialized(&store_c, "gossip-chain"), 7);
+
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+        carol.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

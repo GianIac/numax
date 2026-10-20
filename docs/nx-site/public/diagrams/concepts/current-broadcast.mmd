@@ -2,8 +2,8 @@ sequenceDiagram
     participant Guest as Guest
     participant Host as Host API
     participant Store as Local store
-    participant Broadcast as Broadcast loop
-    participant Peers as Connected peers
+    participant Broadcast as Fanout loop
+    participant Peers as Selected connections
     Guest->>Host: CRDT update
     Host->>Host: Validate and reserve bounded queue space
     Host->>Host: Create OpId and compute updated state
@@ -12,5 +12,8 @@ sequenceDiagram
     Host->>Host: Publish state in memory
     Host->>Broadcast: Enqueue accepted operation
     Broadcast->>Broadcast: Drain and batch accepted operations
-    Broadcast->>Peers: PushOps via nx-net to each connected peer
-    Note over Broadcast,Peers: Direct broadcast now. K-fanout is planned
+    Broadcast->>Broadcast: Rotate K recipients among active connections
+    Broadcast->>Peers: History::Push via nx-net
+    Peers->>Peers: Persist new operations before forwarding
+    Note over Broadcast,Peers: Forwarding excludes sender, duplicates do not forward
+    Note over Broadcast,Peers: Topology repair remains open, anti-entropy repairs gaps

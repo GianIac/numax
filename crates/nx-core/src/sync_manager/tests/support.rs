@@ -219,6 +219,7 @@ pub(super) fn test_event_context(
             NodeId::generate(),
             "127.0.0.1:0",
         ))),
+        forward_tx: None,
         peer_health,
         active_connections: Arc::new(RwLock::new(HashMap::new())),
         anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),

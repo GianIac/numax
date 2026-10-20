@@ -10,12 +10,13 @@ independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
 
-The v0.1.6 development checkout uses `8`. Version `5`, shipped by v0.1.5,
+The v0.1.6 development checkout uses `9`. Version `5`, shipped by v0.1.5,
 introduced the one-shot bootstrap handshake described below. The development
 protocol `6` introduced sequenced replication and bounded history exchange;
 version `7` added required attempt identifiers to range requests, replay pages,
 and unavailable-range responses. Version `8` adds bounded, versioned full CRDT
-baseline recovery. Exact version matching rejects earlier development protocols
+baseline recovery. Version `9` adds isolated membership control RPCs.
+Exact version matching rejects earlier development protocols
 and v0.1.5 before peer registration or CRDT exchange.
 
 Protocol 8 retains the private `History` variant after the existing private
@@ -29,6 +30,49 @@ unexpired deadline and requested interval. Retried requests receive fresh IDs;
 late responses cannot complete or mark unavailable a later attempt.
 
 ## Compatibility policy
+
+### Protocol 9 membership control
+
+Private `ControlHello` and `ControlAck` variants are appended after `History`.
+Each bounded one-shot TCP/TLS exchange uses the existing listener but has its
+own writer, ingress channel and admission permits. It neither registers a
+data peer nor delivers an event into the replication queue. Both codecs retain
+the frozen public message discriminants and historical fixture bytes.
+
+`ControlHello` carries the immediate node identity, exact protocol version,
+supported/preferred codecs and a `ControlRequest`. Requests have a nonzero
+`request_id`, an owner record, up to four updates and one of:
+
+| Kind | Fields | Meaning |
+| --- | --- | --- |
+| `Probe` | Target identity and epoch/incarnation | Request an ACK for that exact owner pair |
+| `Indirect` | Target identity and epoch/incarnation | Ask one admitted helper to perform a direct probe, without recursive relaying |
+| `Exchange` | Optional `after` identity | Reconcile a bounded membership page |
+
+`ControlAck` carries the responder identity, version, selected codec and a
+`ControlReply`: matching request ID, owner record, ACK/NACK flags, up to four
+records and an optional next-page cursor. ACK and NACK cannot both be true.
+The response frame must use the selected codec. Version, identity, codec and
+request correlation are checked before delivery to the membership adapter.
+
+Every owner record must name the immediate sender and identify itself as its
+reporter. Secure TLS binds that identity to the certificate and allowlist on
+every exchange; plain/insecure connections remain unverified. A third-party
+`Alive` is only an endpoint hint until direct owner revalidation. `Left` may
+be relayed by an admitted cooperative peer for an already-known exact pair;
+this is a crash-fault trust rule, not an owner signature or Byzantine proof.
+Forwarded suspicions are not counted as new reporter evidence.
+
+Control payloads are limited to 16 KiB and four records per direction. IDs and
+reporters are limited to 256 bytes, endpoints to 512 bytes, with control
+characters rejected. Incoming and outgoing control admission are separately
+limited to `min(max_peers, 64)` each. Pre-handshake sockets have a separate
+64-slot limit and configured socket timeout. Saturated admitted control work
+returns `RateLimited`; local rejection is not remote failure evidence. The
+runtime additionally bounds concurrent outgoing jobs to eight and serializes
+terminal writes through one worker with at most 64 queued actions.
+
+The multiprocess compatibility test also verifies protocol-5 rejection against the actual v0.1.5 binary in JSON and Bincode, no operation exchange and existing sync-schema downgrade protection. Membership metadata remains a separate version-1 namespace; it does not itself prevent older binaries from opening a datastore.
 
 Numax currently requires an exact version match:
 
@@ -182,7 +226,7 @@ Compatibility verification applies to JSON and Bincode (`wincode`):
 | Baseline recovery | Correlated attempts, complete-cut validation, bounded payloads and explicit contract refusals |
 | Superseded baseline failures | A late refusal cannot describe receipt coverage changed by another source |
 | Storage failure | Original error cause remains observable; operational faults are not classified as invalid remote state |
-| Previous binary | Protocol-5/protocol-8 rejection, separate local data, explicit migration and protected downgrade refusal |
+| Previous binary | Protocol-5/protocol-9 rejection, separate local data, explicit migration and protected downgrade refusal |
 
 Frozen protocol-7 history frames and older public codec fixtures remain
 compatibility references. They describe their encoded layouts and do not grant

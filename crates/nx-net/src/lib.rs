@@ -1,4 +1,5 @@
 mod bootstrap;
+mod control;
 mod error;
 mod message;
 mod node;
@@ -10,6 +11,11 @@ pub use bootstrap::{
     BootstrapServerConfig, DEFAULT_BOOTSTRAP_CACHE_CAPACITY, DEFAULT_BOOTSTRAP_CANDIDATE_TTL,
     DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY, DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES,
     MAX_BOOTSTRAP_CANDIDATE_TTL, MAX_BOOTSTRAP_RESPONSE_CAPACITY,
+};
+pub use control::{
+    ControlIncoming, ControlKind, ControlReply, ControlRequest, MAX_CONTROL_FRAME,
+    MAX_CONTROL_RECORDS, MAX_CONTROL_REQUESTS, MembershipRecord, MembershipState,
+    MembershipVersion,
 };
 pub use error::{BootstrapError, BootstrapResult, NetError, NetResult, NodeConfigError};
 pub use message::{

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
@@ -26,7 +26,7 @@ use super::replication::{
     apply_seen_insertions, drain_node_events, handle_node_event, normalize_op_log_limit,
     normalize_seen_ops_limit, plan_op_log_evictions, plan_seen_evictions,
     prune_op_log_and_return_evicted, spawn_anti_entropy_loop, spawn_broadcast_loop,
-    spawn_reconnect_loop, try_connect_configured_peer,
+    spawn_forward_loop, spawn_reconnect_loop, try_connect_configured_peer,
 };
 use super::schema::ensure_sync_schema;
 use super::storage::{
@@ -702,6 +702,7 @@ pub struct SyncManager {
     /// Network node. Wrapped in `Arc` so the broadcast drain task spawned
     /// by `start` can share ownership with the manager.
     node: Option<Arc<Node>>,
+    membership: Option<crate::membership::runtime::Handle>,
 
     /// GCounter
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
@@ -748,6 +749,9 @@ pub struct SyncManager {
     /// Last received OpId per peer NodeId, for observation only, not a causal frontier.
     anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 
+    /// Shared deterministic rotation cursor for bounded data gossip.
+    fanout_cursor: Arc<AtomicUsize>,
+
     /// Channel to send Ops to broadcast.
     op_tx: mpsc::Sender<AcceptedLocalOp>,
 
@@ -762,6 +766,9 @@ pub struct SyncManager {
 
     /// Outbound broadcast drain task.
     broadcast_task: Option<JoinHandle<()>>,
+
+    /// Outbound task forwarding newly persisted remote operations.
+    forward_task: Option<JoinHandle<()>>,
 
     /// Configured peer reconnect task.
     reconnect_task: Option<JoinHandle<()>>,
@@ -861,6 +868,7 @@ impl SyncManager {
             discovery_config,
             discovery_coordinator: None,
             node: None,
+            membership: None,
             counters,
             pncounters,
             lww_registers,
@@ -876,11 +884,13 @@ impl SyncManager {
             peer_health: Arc::new(RwLock::new(peer_health)),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
+            fanout_cursor: Arc::new(AtomicUsize::new(0)),
             op_tx,
             op_rx: Some(op_rx),
             shutdown_tx,
             event_task: None,
             broadcast_task: None,
+            forward_task: None,
             reconnect_task: None,
             anti_entropy_task: None,
         })
@@ -961,6 +971,9 @@ impl SyncManager {
         let Some(mut event_rx) = node.take_event_receiver() else {
             anyhow::bail!("network event receiver is unavailable");
         };
+        let control_rx = node
+            .take_control_receiver()
+            .ok_or_else(|| anyhow::anyhow!("membership event receiver is unavailable"))?;
 
         // Provider watches are acquired before binding so discovery startup is
         // atomic with respect to network resources. All later failures roll back.
@@ -987,6 +1000,23 @@ impl SyncManager {
                 node.shutdown().await;
                 rollback_discovery(&mut discovery_coordinator).await;
                 return Err(error.into());
+            }
+        };
+        let node = Arc::new(node);
+        let membership = match crate::membership::runtime::start(
+            self.node_id.to_string(),
+            advertised_endpoint.clone(),
+            Arc::clone(&node),
+            Arc::clone(&self.store),
+            control_rx,
+        )
+        .await
+        {
+            Ok(membership) => membership,
+            Err(error) => {
+                node.shutdown().await;
+                rollback_discovery(&mut discovery_coordinator).await;
+                return Err(error);
             }
         };
         if let Some(endpoint) = &advertised_endpoint
@@ -1018,10 +1048,12 @@ impl SyncManager {
         };
 
         // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
-        let node = Arc::new(node);
+        self.membership = Some(membership);
         self.node = Some(Arc::clone(&node));
 
-        // Inbound loop: apply remote ops into the counter registry.
+        let (forward_tx, forward_rx) = mpsc::channel(self.config.queued_ops_limit.max(1));
+
+        // Inbound loop: apply remote ops into the CRDT registries.
         let event_context = NodeEventContext {
             history_cursors: Arc::clone(&self.history_cursors),
             history_requests: Arc::new(RwLock::new(HashMap::new())),
@@ -1040,6 +1072,7 @@ impl SyncManager {
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             node: Arc::clone(&node),
+            forward_tx: Some(forward_tx),
             peer_health: Arc::clone(&self.peer_health),
             active_connections: Arc::clone(&self.active_connections),
             anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
@@ -1074,8 +1107,24 @@ impl SyncManager {
             BroadcastLoopContext {
                 node: Arc::clone(&node),
                 metrics: Arc::clone(&self.metrics),
+                fanout_constant: self.config.gossip_fanout_constant,
+                max_fanout: self.config.gossip_max_fanout,
+                fanout_cursor: Arc::clone(&self.fanout_cursor),
             },
             op_rx,
+            self.shutdown_tx.subscribe(),
+        ));
+
+        self.forward_task = Some(spawn_forward_loop(
+            ForwardLoopContext {
+                node: Arc::clone(&node),
+                metrics: Arc::clone(&self.metrics),
+                fanout_constant: self.config.gossip_fanout_constant,
+                max_fanout: self.config.gossip_max_fanout,
+                max_message_size: self.config.max_message_size,
+                fanout_cursor: Arc::clone(&self.fanout_cursor),
+            },
+            forward_rx,
             self.shutdown_tx.subscribe(),
         ));
 
@@ -1205,6 +1254,15 @@ impl SyncManager {
     /// Gracefully stop sync tasks and close network connections.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(true);
+        let membership_error = if let Some(membership) = self.membership.take() {
+            let snapshot = membership.snapshot.borrow().clone();
+            debug!(members = snapshot.records.len(), health = snapshot.health,
+                successful_probes = snapshot.successful_probes, failed_probes = snapshot.failed_probes,
+                error = ?snapshot.error, "stopping membership service");
+            membership.shutdown().await.err()
+        } else {
+            None
+        };
         let mut discovery_coordinator = self.discovery_coordinator.take();
         if let Some(coordinator) = discovery_coordinator.as_ref() {
             coordinator.request_shutdown();
@@ -1247,8 +1305,16 @@ impl SyncManager {
             warn!(error = %e, "event task failed during shutdown");
         }
 
+        if let Some(task) = self.forward_task.take()
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, "forward task failed during shutdown");
+        }
+
         info!("sync manager shut down");
-        discovery_error.map_or(Ok(()), |error| Err(error.into()))
+        membership_error
+            .or_else(|| discovery_error.map(Into::into))
+            .map_or(Ok(()), Err)
     }
 }
 

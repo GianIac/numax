@@ -1,6 +1,7 @@
 pub mod control;
 pub mod discovery;
 pub mod host_api;
+mod membership;
 pub mod observability;
 pub mod runtime;
 pub mod sync_config;

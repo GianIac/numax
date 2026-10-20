@@ -6,8 +6,6 @@ description: How Numax finds peers, tracks membership, disseminates CRDT operati
 This RFC defines the replication contracts and proposed membership architecture
 for v0.1.6. Endpoint discovery, connection admission, direct broadcast,
 sequenced anti-entropy and bounded CRDT baseline recovery are implemented.
-SWIM/Lifeguard membership, K-fanout and runtime peer addition are proposed
-capabilities; their contracts and open parameters are specified separately.
 
 ## System boundaries
 
@@ -45,7 +43,7 @@ must not be mistaken for synchronized state.
 | --- | --- |
 | Candidate | Endpoint suggested by a discovery source or a future manual addition. It may be stale or untrusted. |
 | Admitted peer | Remote node whose connection passed the configured handshake and identity policy. Admission is distinct from discovery and from a membership vote. |
-| Member | Node represented in the new, weakly consistent membership view. The exact admission and removal transitions remain open. |
+| Member | Node represented in the new, weakly consistent membership view. Internal transitions are specified below; runtime admission and lifecycle integration remain pending. |
 | Suspect | Member believed unreachable pending confirmation or refutation; not proof of failure. |
 | Accepted operation | A CRDT operation that has reached its documented persistence boundary. Local writes batch state and replay metadata and wait for flush; remote apply has the separate persistence boundary specified below. |
 | Recoverable gap | Missing accepted history for which the chosen repair source and retention contract can still supply the needed information. |
@@ -64,7 +62,7 @@ The following contracts apply to the implemented discovery and replication path.
 | Local acceptance is flush-confirmed | Local CRDT mutations persist state, `OpId`, seen metadata, and replay in one atomic batch. Success follows the covering flush and does not imply remote receipt. |
 | Remote apply has a persistence boundary | `crates/nx-core/src/sync_manager/apply.rs` plans remote updates and persists the batch before publishing them in memory. The remote batch precedes in-memory publication and does not explicitly await a covering flush. |
 | Data recovery | `sync_manager/replication.rs` exchanges paginated per-origin summaries and bounded replay ranges over active connections. Durable contiguous prefixes and sparse receipt metadata suppress delayed duplicates independently of replay retention. Unavailable history triggers bounded baseline recovery; UUID order and advertised maxima are not receipt frontiers. |
-| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 8; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
+| Wire and storage are versioned separately | `crates/nx-net/src/message.rs` defines protocol 9; [Wire Versioning](/numax/design/wire-versioning/) requires an exact version match. [Schema Versioning](/numax/design/schema-versioning/) governs persisted sync namespaces. Both JSON and the `wincode` implementation of the public `Bincode` format matter. |
 | Management | `GET /api/v1/peers` exists in `crates/nx-api/src/routes.rs`. The proposed POST is not yet a runtime admission API. Control cases belong behind `nx-core/src/control.rs`. |
 
 `nx-store::Store::apply_batch` and `flush` are distinct operations. An atomic
@@ -712,10 +710,157 @@ future work.
 
 ### D4–D6 — Membership, trust, and failure detection
 
-The following is the proposed membership contract, not implemented behavior.
-It separates the member view (D4), evidence from probing and suspicion (D5),
-and control transport, admission and resource ownership (D6). Membership does
-not change D1–D3 acceptance, receipt tracking or baseline recovery.
+The membership contract separates the member view (D4), evidence from probing
+and suspicion (D5), and control transport, admission and resource ownership
+(D6). The development runtime integrates the shared D4/D5 state machine,
+durable metadata and isolated protocol-9 control RPCs through `SyncManager`.
+Membership does not
+change D1–D3 acceptance, receipt tracking or baseline recovery.
+
+#### Internal core and integration boundary
+
+`crates/nx-core/src/membership/` is private. Its domain core is independent of
+async I/O; its runtime adapter owns the concrete network and storage boundary:
+
+| Module | Responsibility |
+| --- | --- |
+| `state.rs` | Admitted-member view, epoch/incarnation ordering, refutation, terminal-state persistence requests, floor restoration and coordination of probe results |
+| `probe.rs` | Correlated direct/indirect attempts, dispatch confirmation, ACK/NACK validation, cancellation and randomized round-robin target selection |
+| `suspicion.rs` | Validated timing inputs, saturating local health and logarithmically shortened suspicion deadlines |
+| `schema.rs` | Version-1 membership metadata, identity binding and monotonic rejection-floor merge |
+| `storage.rs` | Synchronous datastore adapter, bounded restoration, exclusive write lease, atomic batch and covering-flush confirmation |
+| `runtime.rs` | Owned Tokio lifecycle, per-epoch admitted sessions, dispatch notifications, helper service, reconciliation, clock/PRNG adapter and serial blocking storage worker |
+
+The caller supplies nondecreasing logical time as elapsed `Duration` values,
+admitted identities with nonzero session identifiers, persistence results and
+bounded random-index choices. The same event and choice trace produces the
+same actions without sleeping or opening sockets. The core performs no identity
+authentication: admission is a trusted adapter input, not a replacement for the
+normal handshake. The runtime seeds SplitMix64 from `getrandom` and supplies
+bounded choices to the same deterministic schedule. Its monotonic logical clock
+cancels active attempts and excludes a locally missed interval over 100 ms
+rather than classifying that scheduling delay as remote failure. This can
+increase detection latency; it is not an arbitrary-stall latency guarantee.
+
+The core emits bounded actions instead of performing network or storage work:
+publish an update, retain an attributed suspicion for dissemination, prioritize
+a buddy notification, send a correlated probe, or persist an epoch/rejection
+floor. A covering-flush confirmation is required before publishing initial
+`Alive`, `Dead` or `Left`. Pure state-machine tests can inject confirmations;
+the storage adapter produces them only after a real covering flush succeeds.
+An uncertain startup flush fences announcements. An accepted owner leave closes its epoch
+in memory even if floor persistence fails; its terminal publication still
+requires successful persistence. Superseded persistence tokens are ignored.
+
+| Core limit | Accepted range |
+| --- | --- |
+| Remote member records, including retained terminal records | 1 through 4,096 configured slots |
+| Identity length | 1 through 256 bytes |
+| Simultaneous probe attempts | 1 through 64 |
+| Helpers per attempt | 0 through 16 |
+| Additional suspicion confirmations | 0 through 64 |
+| Maximum local health score | 0 through 1,024 |
+
+These are constructor validation ceilings. Runtime defaults are a two-second
+probe period, 500 ms direct timeout, one active attempt, three helpers, 5–15 s
+suspicion bounds, three additional confirmations and health capped at eight.
+Direct timeout and period scale with health as specified below. These defaults
+are exercised by local tests, not calibrated as universal production settings.
+Terminal
+records are not evicted or compacted by the core. Admitting a new identity when
+slots are exhausted fails explicitly. Probe action batches are bounded by the
+configured attempt and helper limits; byte budgets for encoded messages remain
+part of D6. Local leave cancels owned attempts and prevents further probing.
+
+`SyncManager` allocates and flushes the local epoch before announcing readiness,
+owns the control adapter and attempts durable leave before closing the network.
+Discovery may be empty; startup does not wait for a successful remote exchange.
+The adapter serves direct/indirect probes, prioritizes buddy updates, coalesces
+membership records and reconciles four-record pages. It retains known endpoints
+for bounded revalidation after disconnection or partition. CRDT replication and
+endpoint reconnection retain their existing responsibilities and topology.
+
+The runtime has at most eight outgoing control jobs, one reconciliation start
+per 250 ms, 64 unvalidated endpoint hints and 4,096 member/session records.
+Transport has independent control ingress/egress limits, a 16 KiB payload limit
+and a separate bounded pre-handshake pool. Terminal I/O uses one blocking worker
+and at most 64 queued actions; the core continues serving probes while a flush
+is pending. Only a matching successful completion publishes the terminal state.
+Storage failure fences the service and remains observable in its internal
+snapshot and shutdown result. A stale queued write is skipped; a superseded
+in-flight write cannot authorize a stale publication.
+
+Shutdown bounds leave dissemination to two seconds and adapter completion to
+five seconds. Cancellation aborts the owned adapter and network jobs. A running
+filesystem operation cannot be forcibly interrupted and may complete afterward,
+but it cannot publish through the canceled adapter. Package versions and CRDT
+schemas are unchanged; the wire version is now 9. Public management expansion,
+K-fanout and release-scale acceptance remain separate work.
+
+##### Durable membership metadata
+
+The adapter owns the separate versioned `__nx/membership/` namespace described
+in [Schema Versioning](/numax/design/schema-versioning/#membership-metadata).
+It does not change CRDT table versions, replication generations or operation
+sequences. Existing application and sync records remain untouched.
+
+Startup reads bounded pages under a datastore write lease, validates the schema
+and local identity binding, restores remote terminal floors without sessions,
+and allocates the next checked local epoch. The schema header and bound epoch
+commit in one batch. A covering flush completes before initial `Alive` is
+returned; it also covers any surviving metadata from an interrupted write.
+Restored `Dead` and `Left` records are not announced as fresh observations and
+are not eligible for probing. Fresh admission is required to acquire authority.
+
+For terminal transitions, the adapter checks that the token, member, pair and
+status still match pending work before touching storage. It verifies that the
+stored local epoch still belongs to this instance, merges the persisted floor,
+writes and flushes it, then confirms the transition. Duplicate or superseded
+actions produce no storage write or publication. The floor retains both the
+greatest terminal pair and the greatest closed epoch, even when a later `Dead`
+supersedes an earlier `Left`. No floor expires automatically.
+
+Storage, metadata and capacity failures fence that core, including outstanding
+confirmation callbacks. A failed batch does not imply successful persistence;
+a failed flush has an uncertain outcome and requires reopening the datastore.
+Recovery retains every surviving floor and completes a new covering flush
+before announcing the next epoch. Errors preserve the original storage cause.
+The adapter does not restore live sessions, timers, health, PRNG state or probe
+attempts, and does not recreate authenticated peers from disk.
+
+Tests pause real flushes to check publication ordering and terminate child
+processes before/after batch and flush, across initial creation, restart and
+leave. This establishes the bounded process-crash contract, not power-loss or
+storage-device guarantees. Runtime integration must still own exactly one
+membership lifecycle for the local identity and schedule blocking storage work
+without stalling control traffic; the synchronous adapter starts no tasks.
+
+#### Membership in plain language
+
+Discovery supplies possible addresses. Admission checks who is at an address
+under the configured identity policy. Membership is each node's changing view
+of which admitted nodes appear reachable. It is not a central attendance list:
+two nodes can temporarily disagree, especially during a network partition.
+
+Suppose Alice, Bob and Carol are admitted nodes. Alice asks Bob to reply to a
+small liveness check, called a probe. If Bob does not reply in time, Alice asks
+Carol to try as well. Carol might reach Bob even when Alice cannot. If neither
+path returns a valid reply before the attempt expires, Alice suspects Bob; she
+does not yet declare him dead. Bob might simply be busy, or Alice might be slow
+at processing replies. With no eligible Carol, Alice has no independent helper;
+she must not invent an extra confirmation.
+
+Suspicion gives Bob a chance to answer the accusation. He announces a newer
+version of his own liveness record, called a refutation. If the suspicion expires
+without a valid refutation, Alice can mark Bob `Dead`. This means "my detector
+judges this member unreachable", not "the machine is permanently gone". It does
+not revoke Bob's identity, delete his CRDT data or prove that any data is lost.
+Likewise, `Alive` means neither that all nodes agree nor that Bob is caught up.
+
+Lifeguard adds a second question: "Could the observer be slow?" A node that misses
+expected feedback becomes more cautious. Separate reports from other members
+can shorten a suspicion, while repeated copies of one report cannot. A node
+also prioritizes telling Bob that he is suspected, so Bob can refute promptly.
 
 #### Protocol basis and adaptation boundary
 
@@ -742,6 +887,16 @@ parameters. Numax must validate its TCP/TLS adaptation, scheduler and storage
 interactions. A partial implementation must identify omitted extensions and
 must not be described as the complete selected Lifeguard design. No independent
 phi-accrual detector is selected.
+
+The [Lifeguard paper, revision 2](https://arxiv.org/html/1707.00788v2),
+sections IV-A through IV-C, is the algorithmic reference. The official
+[memberlist implementation at revision 4e3e17f](https://github.com/hashicorp/memberlist/tree/4e3e17fc20e38ac48982ab6f65fec243fd139ef9)
+is an implementation comparison, not a second interchangeable specification.
+In that revision, `probeNode` scales the overall probe interval but deliberately
+does not scale the direct UDP wait; failed-probe health feedback also depends
+on the number of missing NACKs. Those choices differ from a literal reading of
+the paper's rules below. Numax uses TCP/TLS, not that UDP-plus-TCP-fallback path;
+any departure must be named and tested, rather than silently combining both.
 
 #### D4: member identity and ordering
 
@@ -771,10 +926,17 @@ uncertain epoch flush prevents announcements under a new epoch.
 
 This is membership metadata, separate from the replication allocator. D2's
 `(origin, generation, sequence)` remains unchanged; a suspicion must not advance
-its generation or consume a CRDT sequence. Exact storage keys, table version
-and migration are part of the implementation specification. Losing or restoring
+its generation or consume a CRDT sequence. Storage keys, versioning and
+initialization are specified in [Schema Versioning](/numax/design/schema-versioning/#membership-metadata). Losing or restoring
 an older identity store does not guarantee a newer epoch; automatic recovery of
 that situation is outside this contract.
+
+For example, `(epoch 7, incarnation 2)` is newer than `(7, 1)`, but older than
+`(8, 0)`. The epoch distinguishes durable starts; the incarnation distinguishes
+self-refutations within one start. These are logical counters, not wall-clock
+times. If Bob leaves epoch 7, even `(7, 100)` cannot reopen it: he must rejoin
+with a newer durable epoch. This durable epoch and closed-leave design is a
+Numax extension, not a persistence guarantee inherited from SWIM or Lifeguard.
 
 Compare epochs first, incarnations second. For the same pair, failure evidence
 has precedence `Dead > Suspect > Alive`. A valid owner-issued `Left` closes
@@ -808,8 +970,8 @@ transition or discarding its detailed record. Storage/flush failure is local
 degradation and must not be presented as successful durable compaction. These
 floors and all member records count toward explicit global budgets. Exhaustion rejects new membership metadata visibly rather than
 silently evicting replay protection. No finite TTL alone makes unbounded delayed
-messages safe. The storage representation and any future floor-removal policy
-must be specified before implementation; unlimited identity churn is not promised.
+messages safe. The version-1 storage representation is specified in [Schema Versioning](/numax/design/schema-versioning/#membership-metadata).
+Any future floor-removal policy requires an explicit contract; unlimited identity churn is not promised.
 
 #### D5: probes, suspicion and local scheduling
 
@@ -822,7 +984,7 @@ the indirect branch has no sends and proceeds under the same attempt deadline.
 Buddy notification is prioritized on an available control path, not guaranteed
 delivery to an unreachable target. Local scheduling/send failure is handled as
 local degradation, outside the failed-remote-probe branches shown here.
-The exchange is a proposed design, not a protocol-8 message trace.
+The exchange illustrates the model, not literal protocol-9 frame contents.
 
 Probe eligible known members through a seeded, randomized round-robin schedule;
 a member must not starve merely because repeated random choices select others.
@@ -846,12 +1008,141 @@ separately from reply latency. Failure to schedule or send locally is observable
 local degradation, not a completed remote probe. Arbitrary scheduler or network
 stalls have no guaranteed detection latency.
 
-The implementation specification must fix the health-feedback rules, negative
-reply timing, suspicion function, target-selection cycle and treatment of events
-arriving exactly at a deadline. Simulations and production must use the same
-rules. Calibrate timing against CPU-bound WASM, synchronous storage contention
-and data backpressure; report the tradeoff between false declarations and
-true-failure detection latency.
+The production adapter now records test-only tick lateness in a bounded sample
+buffer. On macOS, one CPU-bound WASM run collected 80 tick samples over 1.745 s:
+p50 15.821 ms, p95 21.376 ms and max 22.265 ms; one probe succeeded, none
+failed, and all observed members remained `Alive`. A separate paused-membership-
+flush run collected 40 samples: p50 1.323 ms, p95 1.984 ms and max 2.050 ms;
+there were no failed probes or false state transitions, and a control probe
+received an ACK before the flush was released. These are single-run local
+observations, not calibrated thresholds, percentiles across repetitions, or a
+combined WASM-plus-storage stress result. Reproduce them with:
+
+```sh
+cargo test -p nx-core production_adapter_makes_progress_with_cpu_bound_wasm -- --nocapture
+cargo test -p nx-core production_adapter_serves_probes_during_flush_and_fences_storage_errors -- --nocapture
+```
+
+##### Paper-derived health and suspicion rules
+
+In Lifeguard section IV-A, local health is a saturating counter `h` between zero
+and a configured maximum `S`. Zero is the healthiest score; a larger score
+means the local detector should be more cautious.
+
+| Feedback in the paper | Change to `h` |
+| --- | --- |
+| Successful direct or indirect probe | -1 |
+| Failed probe | +1 |
+| Refuting a suspicion about self | +1 |
+| Probe with a missing expected negative reply (NACK) | +1 |
+
+The paper scales both the probe interval and timeout:
+
+```text
+probe_interval(h) = base_interval * (h + 1)
+probe_timeout(h)  = base_timeout  * (h + 1)
+```
+
+A NACK means an enlisted helper did not obtain the target's reply within its
+helper wait. It is not a death certificate or an independent suspicion vote.
+Missing an expected NACK can indicate slow local processing, which is why it
+affects the observer's health score. A NACK must not close an attempt that can
+still receive a timely ACK through another authorized path.
+
+The core applies feedback once when an attempt completes. A failed attempt
+adds one point, plus one further point if any dispatched helper lacks a NACK;
+the extra point is per attempt, not per missing message. Success subtracts one
+point even if an earlier helper sent a NACK. Self-refutation adds one point
+only when it advances the local incarnation. Duplicate replies or repeated
+delivery of an older self-accusation add nothing.
+
+Direct/overall deadlines start at confirmed direct dispatch, using the health
+score captured when the attempt was created. An unsent direct request has a
+bounded queue lifetime. If selected helper work was not dispatched before the
+overall expiry, the result is local degradation, not remote failure. With no
+eligible helpers, a dispatched direct attempt can expire normally. Only
+dispatched helpers create NACK expectations. Explicit send failure cancels the
+attempt without changing remote state or health. The helper-side handler and
+its negative-reply deadline remain transport-integration requirements.
+
+In section IV-B, suspicion begins conservatively and shortens with distinct
+additional reporters. Rename the paper's `K` to `q` here to avoid confusing it
+with D7's data fanout. For `q > 0`:
+
+```text
+c = min(distinct_additional_reporters, q)
+duration(c) = max(Tmin, Tmax - (Tmax - Tmin) * log(c + 1) / log(q + 1))
+deadline(c) = first_suspicion_time + duration(c)
+```
+
+The initial reporter is not an additional confirmation. Repeated messages from
+that reporter, or forwarding its report through different connections, do not
+increase `c`. Independent here means distinct reporting members, not proof of
+statistically independent observations. Reporter attribution must survive relay.
+The paper also re-gossips the first `q` independent confirmations; coalescing
+must preserve the distinct evidence needed to shorten the deadline.
+
+For an illustrative `Tmin = 2 s`, `Tmax = 6 s`, `q = 3`, the durations are
+`6 s`, `4 s`, approximately `2.83 s`, and `2 s` for zero through three additional
+reporters. These are durations from the original start, not fresh waits. If the
+first confirmation arrives one second after suspicion began, the new deadline
+is four seconds after that start: three seconds remain. If a shortened deadline
+is already past, process its expiry with the normal state/pair guards.
+These example numbers are not proposed Numax defaults.
+
+![Illustrative suspicion timeline: a distinct reporter shortens the deadline, a duplicate does not, and refutation or guarded expiry determines the outcome](/numax/diagrams/peer-discovery/suspicion-timeline.svg)
+
+[Mermaid source for the suspicion timeline](/numax/diagrams/peer-discovery/suspicion-timeline.mmd)
+
+The two branches are alternative outcomes of the same example, not consecutive
+steps. Both use `Tmin = 2 s`, `Tmax = 6 s`, `q = 3` and the original start at
+`t = 0`. The refutation branch assumes a valid newer owner `Alive` is processed
+before expiry while the epoch is still open. The expiry branch requires the
+suspicion to remain current and the required rejection floor to be persisted
+before publishing `Dead`.
+
+At suspicion creation, the core freezes `q` to the lesser of the configured
+threshold and the number of other currently eligible reporters, excluding the
+target and initial reporter. With `q = 0`, it uses `Tmin` directly without
+evaluating the logarithmic expression. Memberlist also uses the minimum for
+a zero effective threshold, but its rule for reducing that threshold differs.
+This small-cluster policy is an explicit Numax adaptation.
+
+Section IV-C's Buddy System prioritizes carrying the suspicion when probing the
+suspected member, including a helper's probe. In plain terms: tell Bob about the
+accusation at the next usable opportunity instead of letting unrelated gossip
+occupy that space. This improves his opportunity to refute; it cannot guarantee
+delivery across a broken connection or partition.
+
+The paper reports `base_interval = 1 s`, `base_timeout = 500 ms`, `S = 8` and
+`q = 3` as reference settings. Its section V-C relates suspicion bounds to
+group size using `Tmin = alpha * log10(n) * probe_interval` and
+`Tmax = beta * Tmin`. These are experimental reference settings and relations,
+not validated Numax defaults. The core takes explicit minimum/maximum durations
+and freezes them at suspicion creation. A future runtime configuration must
+define any size-derived policy, including the estimate of `n` and whether its
+interval is base or health-adjusted. Membership churn does not restart timers.
+
+Target selection begins from stable identity order and applies Fisher-Yates
+shuffling through injected, range-checked random choices. Waiting members keep
+their positions across churn; new candidates for that cycle join behind them.
+Empty membership produces no probe. Calls before the next allowed probe time
+produce no send, and missed periods do not cause catch-up bursts. Helpers are
+distinct eligible `Alive` members, excluding self and target.
+
+Probe replies at or after the overall deadline cannot succeed. Corroboration
+that shortens a suspicion past the current time immediately requests the
+guarded terminal persistence action. Otherwise, equal-time events follow the
+caller's explicit event order; timer callbacks always recheck the current pair
+and token. Duration arithmetic is checked for overflow; logarithmic durations
+use `f64` and Rust's checked conversion to nanosecond-resolution `Duration`,
+with a minimum clamp and exact `Tmin` at the threshold. Identical traces are
+reproducible on the same execution platform; cross-platform bit-exact floating
+point results are not an additional guarantee.
+
+Runtime validation must calibrate timing against CPU-bound WASM, synchronous
+storage contention and data backpressure, reporting the tradeoff between false
+declarations and true-failure detection latency.
 
 #### D6: transport, authentication and dissemination
 
@@ -864,9 +1155,52 @@ attributed to their admitted reporters under a cooperative, crash-fault model;
 Byzantine resistance or transferable owner signatures are not promised.
 Direct owner-issued updates must match the admitted session identity. Relayed
 updates retain their reporter attribution; transport authentication does not
-prove that the subject originated them. The precise authorization and
-validation rules for each control message remain an implementation prerequisite,
-including relay of owner-issued updates.
+prove that the subject originated them. The authority matrix below specifies
+the enforced separation. Owner `Alive` is revalidated directly; a known-pair
+`Left` may use the explicit cooperative relay rule below.
+
+##### Control authority matrix
+
+The matrix describes the protocol-9 adapter's contract. The internal core assumes trusted
+admission/session inputs; it is not a network authentication boundary.
+
+| Control input | Required source and correlation | Authority and limits |
+| --- | --- | --- |
+| Admission and initial owner `Alive` | Normal handshake and identity policy, followed by valid owner metadata | An endpoint, certificate connection or relayed claim alone does not create a member. Secure TLS binds the immediate peer identity; plain/insecure modes remain unverified. |
+| Direct owner `Alive` or refutation | Subject equals the admitted immediate peer; current session and valid epoch/incarnation ordering | Only the owner's newer pair refutes its suspicion/death while the epoch is open. A closed epoch cannot be reopened by a greater incarnation. |
+| Direct owner `Left` | Subject equals the admitted immediate peer; exact current pair and session | Close the epoch. Publish the terminal transition only after its rejection floor has been flushed. Neither a probe ACK nor a reporter can act as an owner leave. |
+| Direct `Suspect` or `Dead` evidence | Admitted reporter on its current session, distinct from the subject; current known subject pair | Attribute the observation to that reporter. Self-accusations reach the local refutation rule; remote terminal publication still requires floor persistence. This is crash-fault evidence, not proof of permanent failure. |
+| Forwarded suspicion evidence | Original reporter and subject pair remain separate from the immediate forwarder | Ingress accepts suspicion only when its reporter equals the immediate admitted sender. Other forwarded suspicions are ignored rather than counted as new evidence. |
+| Relayed owner `Alive` | Admitted immediate reporter, separately identified owner and bounded endpoint hint | Revalidate the owner directly before admission or refutation. A forwarded record never creates an owner session. |
+| Relayed owner `Left` | Admitted immediate reporter and exact already-known subject pair | The explicit cooperative relay handler may close that subject epoch after floor persistence. It authenticates the relay, not owner origination; unknown subjects and local-self leave claims are rejected. |
+| Direct probe and indirect request | Admitted initiator; bounded known target and captured request context | Direct ACK requires the exact local owner pair. A helper directly probes only a known matching target, without recursive indirect requests; missing or ineligible targets produce no positive evidence. |
+| Direct or indirect ACK | Active attempt; exact target pair; current captured target session or a dispatched helper's captured identity/session | Complete only that attempt. A helper ACK is an attributed helper response, not transferable owner authentication. Success does not override same-pair suspicion/death or establish CRDT recovery. |
+| Helper NACK | Active attempt and matching dispatched helper/session, received before expiry | Negative helper feedback, not a suspicion confirmation or death verdict. A timely authorized ACK may still succeed afterward. |
+| Buddy notification or reconciliation record | Admitted sender; preserve subject, owner/reporter attribution and applicable ordering guards | Delivery priority, a snapshot or a different envelope grants no extra authority. Unknown subjects remain bounded claims until admitted. |
+
+For example, if Alice's secure connection is with Carol and Carol forwards
+`Alive(Bob)`, the certificate proves Carol's immediate identity, not Bob's
+origination of that update. A cooperative crash-fault relay policy may trust
+such claims once specified; this is not Byzantine resistance or an owner
+signature. Only known-pair `Left` has cooperative relay authority. Every RPC
+authenticates its immediate peer afresh; the adapter assigns a nonzero core
+session to that admitted identity's epoch. A newer epoch replaces that session
+and invalidates captured probes; request IDs isolate individual TCP exchanges.
+This logical session is not a transferable identity proof or a data connection.
+
+The adapter commits a session only after the core confirms that exact owner
+version and session as `Alive`. Restored terminal floors have no live session:
+a rejected owner does not populate the session map, so a later valid refutation
+can still be admitted. Attached records, pagination and probe replies require
+the session accepted for that specific RPC, never a newer session looked up by
+identity. Stale owners cannot borrow current authority. At the 4,096-session
+limit, known identities may replace their epoch; new identities are rejected
+with an observable capacity warning.
+
+The existing keepalive `Ping`/`Pong` has no D5 attempt correlation. It is useful
+for exercising the transport path, but is not a membership probe or a failure
+detector. Expiry and local queue/send rejection are local events; a peer cannot
+manufacture those observations by supplying its own timestamps.
 
 The membership view may exceed the active connection set. Probing a known
 member without a current session requires a bounded, normally authenticated
@@ -874,6 +1208,13 @@ dial or a bounded indirect route. Member knowledge does not imply a permanent
 full mesh. Endpoint withdrawal alone does not evict an admitted member.
 Admission must preserve configured limits and local readiness with empty
 initial discovery.
+
+The owner's advertised endpoint is optional. A wildcard listener (`0.0.0.0`
+or `::`) without an explicit advertised endpoint starts normally but publishes
+no owner endpoint; it must not advertise the wildcard as a dialable contact.
+Existing concrete outbound contacts remain available for control exchanges.
+An explicitly configured advertised endpoint uses the resolved listener port
+when its configured port is zero.
 
 Disseminate membership changes independently of CRDT operations. Coalesce
 superseded updates, limit retransmissions and prioritize self-refutation and
@@ -883,21 +1224,109 @@ same ordering, admission rules and budgets as incremental updates. It is
 separate from D2/D3 data anti-entropy. Retain bounded recovery contacts so that
 `Dead` judgments on both sides of a partition cannot permanently prevent rejoin.
 
-Control requires independent bounded queues and scheduling opportunities on
-both receive and send paths. The current `nx-net` writer lock and framed TCP
-stream are shared with data; data-event backpressure can also delay subsequent
-reads. Priority queues alone cannot preempt an in-flight frame. Measure this
-blocking with maximum-size frames and a slow reader before choosing between a
-shared stream with demonstrated delay bounds and a separate bounded control
-connection. A separate connection must use the same admission policy and have
-explicit connection/task limits. Final transport isolation is an open decision.
+Control uses separate bounded one-shot TCP/TLS connections on the existing
+listener, not the data writer or data event queue. Priority queues on a shared
+stream cannot preempt a frame or blocked event delivery. The measurements below
+validate the separate path against those dependencies; CPU, network capacity,
+pre-handshake admission and executor scheduling remain shared resources.
 
-Current protocol 8 does not define this control exchange. Introducing it requires
-an explicit wire-version change, bounded JSON/Bincode decoding and exact-version
-admission tests under [Wire Versioning](/numax/design/wire-versioning/).
-Persisted membership metadata needs its own documented schema/migration contract
-under [Schema Versioning](/numax/design/schema-versioning/); this proposal assigns
-no new version numbers and does not rewrite historical fixtures.
+##### Transport decision experiment
+
+TCP delivers bytes in order. A control message behind a large data frame cannot
+overtake it merely because its queue has higher priority. A separate connection
+can remove that particular dependency, but still shares CPU, network capacity
+and possibly runtime scheduling with data traffic. Neither paper determines
+which adaptation is sufficient for Numax.
+
+Validation uses a declared load envelope and control-delay budget. Sustained
+and deployment-scale measurements must complement the local dependency tests:
+
+| Condition | Measurements and required observation |
+| --- | --- |
+| Idle and nominal data load | Baseline enqueue-to-send delay, reply latency and event-processing delay |
+| Maximum permitted data frames and slow reader | Writer blocking and receive-path delay; whether control meets the predeclared budget |
+| Saturated data and control queues | Bounded memory/work, explicit admission or enqueue rejection, no remote failure inferred from local rejection |
+| CPU-bound WASM and slow storage | Local scheduling delay, health feedback, refuted suspicions and false failure declarations |
+| Real peer failure and restored partition | Detection latency, reconciliation and useful recovery contacts |
+
+Record distributions and maxima over the declared run, frame sizes, queue
+limits, resource use and violations. Meeting a budget in that envelope is
+measurement evidence, not a bound under arbitrary stalls. Choose a shared
+stream only with evidence that its blocking is acceptable; a separate path
+must also pass the lifecycle, authentication and resource-limit checks.
+
+###### Reader-level causal check
+
+`node::tests::control_progress_isolated_from_shared_writer_and_event_backpressure`
+uses the production reader and frame codecs on two plain loopback TCP streams.
+The input frames are confirmed queued before the reader is polled. It runs
+both JSON and Bincode with an event-channel capacity of one:
+
+| Barrier | Shared path | Independent test path |
+| --- | --- | --- |
+| Held writer mutex | A `PushOps` event is delivered, then replying to `Ping` waits for the writer | Its separate reader/writer returns `Pong` while the shared writer is still held |
+| Full event channel | A second `PushOps` waits for event delivery before the following `Ping` can be processed | Its separate reader/writer returns `Pong` before the shared event channel is drained |
+
+Both reader futures are driven while waiting for the independent reply. The
+shared reply remains pending before the explicit release and completes after
+it. Shutdown then completes both readers and releases their writer references.
+Five-second timeouts bound test liveness only; they are not detector parameters
+or latency acceptance budgets.
+
+Run the scoped check and print its four JSON observation records with:
+
+```sh
+cargo test -p nx-net control_progress --lib -- --nocapture
+```
+
+Each record reports codec, barrier, frame sizes, channel capacity, local
+`write_all` durations, independent write-start-to-observed-Pong time, and shared
+write-end-to-release/release-to-observed-Pong times in microseconds. These are
+test-observer intervals: the independent interval includes reader setup and
+scheduling, not just network RTT. Socket write completion is not remote
+application acceptance. No tight timing assertion determines success.
+
+The check establishes reader/writer and event-path dependency separation for
+small frames. It bypasses TLS, handshake/admission and the `NetNode` connection
+registry; it does not implement a second production control connection. It
+does not measure maximum-frame or slow-reader blocking, queue byte budgets,
+CPU-bound WASM, slow storage, partitions or sustained-load latency. The full
+experiment above and a declared control-delay budget remain necessary before
+selecting transport isolation. Plain TCP results do not establish secure TLS
+performance or control-message authorization.
+
+###### Production-path validation
+
+`control_rpc_meets_local_budget_while_maximum_data_frame_is_blocked` exercises
+the actual protocol-9 handshake and RPC path in JSON/Bincode and plain TCP/mTLS.
+One data connection exhausts the configured peer limit, its event queue has
+capacity one and is full, and a 16 MiB maximum payload remains blocked on its
+writer until after the control response. The predeclared local response budget
+is 500 ms. Observed responses were approximately 0.5–0.7 ms for TCP and
+2.9–3.3 ms for mTLS. The test prints structured observations and asserts that
+data remains blocked throughout. This is a local envelope, not a WAN SLA.
+
+RPC tests also reject a certificate/claimed-ID mismatch, wrong request IDs,
+inconsistent codecs and incompatible versions. Saturation returns `RateLimited`
+without registering a data peer. Three-node runtime tests exercise automatic
+probes, helper ACK/NACK, self-refutation, crash detection, durable leave and
+restart with a greater epoch. Storage-pause tests obtain probe ACKs before
+releasing a terminal flush; fault tests fence without publishing `Left`.
+A current-thread test runs a real infinite-loop WASM guest while a probe
+completes, with zero failure declarations in that short observation.
+
+```sh
+cargo test -p nx-net control_rpc --lib -- --nocapture
+cargo test -p nx-core production_adapter --lib -- --nocapture
+cargo test -p nx-core sync_manager_owns_automatic_membership --lib
+```
+
+Protocol 9 defines the control exchange under
+[Wire Versioning](/numax/design/wire-versioning/). Persisted membership metadata
+retains its separate version-1 contract under
+[Schema Versioning](/numax/design/schema-versioning/#membership-metadata).
+Historical fixtures are unchanged. The actual v0.1.5 binary is rejected in both
+codecs by the multiprocess compatibility test; no CRDT operations are exchanged.
 
 | Resource | Required bound |
 | --- | --- |
@@ -907,11 +1336,25 @@ no new version numbers and does not rewrite historical fixtures.
 | Reconciliation | Page entries/bytes, pending exchanges and cursor lifetime |
 | Execution | Control connections, tasks, send/receive work and shutdown duration |
 
-Numeric limits, defaults and configuration validation must be specified before
-network implementation. Local saturation must remain observable and must not
+Numeric runtime limits and defaults are specified above. Local saturation must remain observable and must not
 be interpreted as proof of remote failure. Metrics use bounded labels; per-peer
 detail belongs in bounded introspection. Expose membership, endpoint reconnect
 health, active sessions and data-recovery status separately.
+
+##### Required integration contracts
+
+The integration enforces the following contracts. Local tests establish these
+boundaries; unmeasured deployment settings are not production guarantees.
+
+| Boundary | Implemented contract | Discriminating check |
+| --- | --- | --- |
+| Durable identity and replay rejection | Version-1 metadata, checked epoch, serial blocking worker and guarded completion | Interrupted writes and flushes preserve rejection or fail closed; probes progress during pending I/O |
+| Control authority | Immediate TLS identity, per-epoch sessions, direct owner revalidation and explicit known-pair leave relay | Identity mismatch and unknown relayed subjects do not acquire authority |
+| Probe and local health | Dispatch notification, bounded helper/NACK service and local scheduling-delay cancellation | ACK/NACK correlation, genuine crash detection and no remote evidence from local rejection |
+| Suspicion | Health-scaled timing, distinct admitted reporters, bounded coalescing and reconciliation | Repeated confirmations do not reset the start; owner refutation supersedes old timers |
+| Deterministic time | Explicit core time/choice inputs; monotonic clock and seeded PRNG in the adapter | Identical core event/choice traces yield identical actions |
+| Transport and resources | Independent control path and numeric admission/queue/frame limits | Maximum-frame and saturated-data tests meet the local budget; control saturation is explicit |
+| Compatibility | Protocol 9 and unchanged membership schema 1 | JSON/Bincode rejection, actual previous binary and unchanged historical fixtures |
 
 #### Ownership and lifecycle
 
@@ -958,19 +1401,37 @@ this proposed contract do not establish those results.
 
 ### D7 — Gossip and repair scheduling
 
-The proposed K-fanout path depends on the D1–D3 acceptance and recovery contracts.
-Estimate `N` from eligible members, clamp `K = ceil(log2(N) + c)` to available
-peers and configured budgets, and handle empty and small clusters explicitly.
-Rotate a bounded neighbor set and retain useful recovery contacts so sparse
-topologies and healed partitions can reconnect. A newly accepted remote op
-becomes eligible for onward forwarding only after persistence, with its original
-identity; duplicate delivery must not create a forwarding cycle.
+The runtime now sends local operations to a bounded K-fanout and forwards newly
+accepted remote `Push` and `Replay` entries only after persistence and in-memory
+publication. The original sequenced entry is preserved; duplicates and
+`TrackingLimit` rejections are not forwarded. No wire message or schema change
+was required.
 
-Periodic anti-entropy must be paginated and byte-bounded. A failed or dropped
-send attempt does not delete the durable source needed for repair. Calibrate
-`c`, timing, jitter, load/RTT adaptation, queue sizes, and retry budgets from
-deterministic and real-transport measurements rather than fixing arbitrary
-defaults in this RFC.
+The current local estimate is `N = 1 + connected data peers`; it is not a
+cluster-wide membership count. The requested fanout is
+`min(ceil(log2(N) + c), gossip_max_fanout, eligible peers)`. Empty and small
+views naturally clamp to available peers. The implementation sorts active
+connection addresses and advances a shared cursor to rotate the selected peers;
+remote forwarding excludes the immediate source. `SyncConfig` and the CLI expose
+`gossip_fanout_constant` (default 1) and `gossip_max_fanout` (default 64) through
+`SyncConfig` and the CLI's `[limits]` TOML section, not dedicated flags.
+These defaults are provisional: `c` has not been empirically calibrated, and
+the current neighbor selection is not topology-aware.
+
+The remote forwarding queue is bounded by `queued_ops_limit`; a forward batch
+is bounded by the existing operation limit and by the smaller of
+`max_message_size` and the replay byte budget, with room reserved for framing.
+A full queue or failed send drops only that forwarding attempt. The persisted
+per-origin history and existing paginated, byte-bounded anti-entropy remain the
+repair path within D3 retention. A three-node TCP test verifies multi-hop
+forwarding with both JSON and Bincode, and apply tests cover all six CRDT
+families plus duplicate suppression.
+
+Adaptive pacing based on load/RTT, jitter, calibrated retry budgets, topology-
+aware contacts and the 50-node loss/partition acceptance run are not yet
+implemented or validated. In particular, a send completion duration is not
+being treated as peer RTT. Do not infer convergence beyond the bounded D3
+history/retention contract from a successful gossip send.
 
 ### D8–D10 — Management, compatibility, and readiness
 
@@ -999,12 +1460,13 @@ The following aspects remain open for the proposed capabilities:
 
 - A failure model covering OS restart, power interruption or storage-device loss.
 - Recovery beyond the bounded D3 baseline and retention contract.
-- Membership control-message authorization/encoding, persisted record layout,
-  floor lifecycle, probe/suspicion parameters and numeric budgets.
+- Membership control-message authorization/encoding, future floor compaction,
+  runtime probe/suspicion parameters and transport byte budgets.
 - Shared-stream versus separate-connection control isolation, supported by measurements.
-- Fanout defaults, neighbor rotation, scheduling and resource budgets.
+- Empirical fanout calibration, topology-aware neighbor selection, jitter and
+   adaptive pacing based on load/RTT.
 - Manual candidate removal and API error semantics.
-- Wire/schema contracts for membership and expanded state-transfer formats.
+- Membership wire compatibility, future metadata migrations and expanded state-transfer formats.
 
 The RFC does not assign defaults or guarantees to these unspecified parameters.
 
@@ -1123,7 +1585,7 @@ reported as synchronized merely because the peers are connected.
 | D1 | Atomic persistence, flush-confirmed success, uncertain outcomes and process restart |
 | D2 | Out-of-order delivery, compacted duplicate suppression, bounded gap tracking and replay |
 | D3 | Complete-cut baseline installation, expiry, legacy state and explicit recovery refusal |
-| Proposed D4–D6 | Membership transitions, authentication and detector behavior under load |
+| D4–D6 runtime membership | Shared core, durable recovery, owned lifecycle, authenticated control, real-node probes/refutation/leave/restart, maximum-frame isolation and short CPU/storage-load tests; release-scale detector criteria remain open |
 | Proposed D7 | Sparse topologies, bounded fanout, forwarding and anti-entropy |
 | Proposed D8–D10 | Management API, compatibility, readiness and convergence evidence |
 
