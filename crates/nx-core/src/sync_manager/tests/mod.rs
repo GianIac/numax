@@ -16,6 +16,119 @@ mod support;
 
 use support::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual TCP fanout calibration with anti-entropy explicitly stopped"]
+async fn gossip_fanout_tcp_calibration() {
+    const NODES: usize = 16;
+    for constant in [1, 3] {
+        let mut managers = Vec::new();
+        let mut endpoints = Vec::new();
+        for index in 0..NODES {
+            let mut manager = SyncManager::new(
+                NodeId::new(format!("tcp-calibration-{index}")),
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_gossip_fanout(constant, 64),
+                temp_store(),
+                metrics(),
+            );
+            manager.start().await.unwrap();
+            if let Some(task) = manager.anti_entropy_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let snapshot = manager
+                .membership
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .wait_for(|snapshot| !snapshot.records.is_empty())
+                .await
+                .unwrap()
+                .clone();
+            endpoints.push(
+                snapshot
+                    .records
+                    .iter()
+                    .find(|record| record.member == format!("tcp-calibration-{index}"))
+                    .unwrap()
+                    .endpoint
+                    .clone()
+                    .unwrap(),
+            );
+            managers.push(manager);
+        }
+        for (index, manager) in managers.iter().enumerate() {
+            for endpoint in endpoints.iter().skip(index + 1) {
+                manager
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .connect_to_peer(endpoint)
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                let mut ready = true;
+                for manager in &managers {
+                    ready &=
+                        manager.node.as_ref().unwrap().connected_peers().await.len() == NODES - 1;
+                }
+                if ready {
+                    break;
+                }
+                poll.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut complete = 0;
+        let mut reached = 0;
+        let mut latencies = Vec::new();
+        for origin in 0..NODES {
+            let key = format!("fanout-calibration-{origin}");
+            let start = StdInstant::now();
+            local_increment(&managers[origin].handle(), &key, 1).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut poll = tokio::time::interval(Duration::from_millis(2));
+            loop {
+                let mut observed = 0;
+                for manager in &managers {
+                    observed += usize::from(manager.get_counter_value(&key).await == 1);
+                }
+                if observed == NODES || Instant::now() >= deadline {
+                    reached += observed;
+                    if observed == NODES {
+                        complete += 1;
+                        latencies.push(start.elapsed().as_micros() as u64);
+                    }
+                    break;
+                }
+                poll.tick().await;
+            }
+        }
+        latencies.sort_unstable();
+        println!(
+            "FANOUT_TCP_CALIBRATION {}",
+            serde_json::json!({
+                "nodes": NODES, "c": constant, "samples": NODES, "topology": "full-mesh",
+                "transport": "TCP loopback Bincode (wincode)", "loss_percent": 0, "anti_entropy": false,
+                "complete": complete, "coverage": reached as f64 / (NODES * NODES) as f64,
+                "complete_latency_micros": latencies,
+            })
+        );
+        for manager in &mut managers {
+            manager.shutdown().await.unwrap();
+        }
+        if constant == 3 {
+            assert_eq!(complete, NODES);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn wildcard_membership_preserves_optional_advertisement_and_valid_control_contact() {
     for (bind, contact_ip) in [("0.0.0.0:0", "127.0.0.1"), ("[::]:0", "::1")] {

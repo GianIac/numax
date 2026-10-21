@@ -486,7 +486,7 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
-gossip_fanout_constant = 1
+gossip_fanout_constant = 3
 gossip_max_fanout = 64
 
 [discovery]

@@ -306,15 +306,23 @@ anti-entropy remain necessary for sparse topologies and healed partitions.
 The current selection uses:
 
 ```text
-N = 1 + active data connections
+N = count(unique(local identity + Alive/Suspect membership + active data identities))
 K = min(ceil(log2(N)) + c, gossip_max_fanout, eligible connections)
 ```
 
-`c` defaults to `1` and `gossip_max_fanout` to `64`; both are configurable under
-`[limits]` in TOML. With no eligible connections K is zero. Source exclusion
-applies to forwarding, while N still counts all active connections. Membership
-size estimation and calibration of c remain open. The formula alone does not
-establish connectivity or convergence.
+`c` defaults to `3` and `gossip_max_fanout` to `64`; both are configurable under
+`[limits]` in TOML. N is a local estimate, not an exact cluster census. Suspected
+members remain counted; terminal membership records contribute only if their
+identity still has an active data connection. Repeated endpoints or restart
+generations do not count the same identity twice. With no eligible connections
+K is zero. Source exclusion applies to forwarding, not to the estimate of N.
+
+Each node hashes its identity with the connection addresses to obtain its own
+deterministic recipient order, then rotates through that order. This avoids
+every node starting from the same address prefix. The
+[calibration results](/numax/design/peer-discovery/#fanout-calibration) explain
+the choice of c and its traffic cost. The formula alone does not establish
+connectivity or convergence.
 
 Load/RTT adaptation, jitter and topology repair remain planned. The membership
 state machine has an injectable clock and seeded scheduling for deterministic

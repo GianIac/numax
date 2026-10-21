@@ -246,7 +246,7 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
-gossip_fanout_constant = 1
+gossip_fanout_constant = 3
 gossip_max_fanout = 64
 
 [discovery]
@@ -429,7 +429,7 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
-gossip_fanout_constant = 1
+gossip_fanout_constant = 3
 gossip_max_fanout = 64
 ```
 
@@ -445,16 +445,20 @@ gossip_max_fanout = 64
 | `reconnect_max_delay` | duration | Maximum backoff for reconnect attempts |
 | `peer_dead_after_failures` | integer | Consecutive failures before a peer is marked dead |
 | `anti_entropy_interval` | duration | Interval between anti-entropy repair cycles |
-| `gossip_fanout_constant` | nonnegative integer | Additive constant `c` in `ceil(log2(N)) + c`; default `1` |
+| `gossip_fanout_constant` | nonnegative integer | Additive constant `c` in `ceil(log2(N)) + c`; default `3` |
 | `gossip_max_fanout` | positive integer | Maximum immediate-push recipients; default `64`, also limited by eligible active connections |
 
 `reconnect_initial_delay` and `reconnect_max_delay` must be provided together.
 `reconnect_initial_delay` must be less than or equal to `reconnect_max_delay`.
 
-Fanout uses `N = 1 + active data connections`, not the membership size.
-Recipients rotate in deterministic address order; remote forwarding excludes
-the immediate sender. These TOML settings do not create or repair connections
-and have no dedicated CLI flags or environment overrides.
+Fanout estimates N from the union of the local identity, `Alive`/`Suspect`
+membership identities and active data-peer identities, deduplicated by `NodeId`.
+Only active connections are recipients. They rotate in a deterministic order
+hashed by local identity and address; remote forwarding excludes the immediate
+sender. These TOML settings do not create or repair connections and have no
+dedicated CLI flags or environment overrides. The default `c = 3` is based on
+the [bounded calibration](/numax/design/peer-discovery/#fanout-calibration),
+not a universal delivery or latency guarantee.
 
 ### [discovery]
 

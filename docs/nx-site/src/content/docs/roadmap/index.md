@@ -202,7 +202,7 @@ while peer discovery remains deliberately separated from authentication and auth
 - [x] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
 
 **Adaptive K-fanout gossip**:
-- [ ] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits
+- [x] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits ([bounded calibration, c = 3](/numax/design/peer-discovery/#fanout-calibration))
 - [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
 - [ ] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect
 - [ ] Adaptive rate based on load/RTT

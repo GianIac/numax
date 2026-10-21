@@ -1048,6 +1048,7 @@ impl SyncManager {
         };
 
         // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
+        let membership_snapshot = membership.snapshot.clone();
         self.membership = Some(membership);
         self.node = Some(Arc::clone(&node));
 
@@ -1105,6 +1106,8 @@ impl SyncManager {
         // Outbound loop: drain locally-produced ops into the network.
         self.broadcast_task = Some(spawn_broadcast_loop(
             BroadcastLoopContext {
+                local_id: self.node_id.clone(),
+                membership: membership_snapshot.clone(),
                 node: Arc::clone(&node),
                 metrics: Arc::clone(&self.metrics),
                 fanout_constant: self.config.gossip_fanout_constant,
@@ -1117,6 +1120,8 @@ impl SyncManager {
 
         self.forward_task = Some(spawn_forward_loop(
             ForwardLoopContext {
+                local_id: self.node_id.clone(),
+                membership: membership_snapshot,
                 node: Arc::clone(&node),
                 metrics: Arc::clone(&self.metrics),
                 fanout_constant: self.config.gossip_fanout_constant,

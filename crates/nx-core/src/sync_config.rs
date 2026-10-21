@@ -48,7 +48,7 @@ pub const DEFAULT_PEER_DEAD_AFTER_FAILURES: u32 = 3;
 pub const DEFAULT_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Additive term in the default `ceil(log2(N) + c)` gossip fanout.
-pub const DEFAULT_GOSSIP_FANOUT_CONSTANT: usize = 1;
+pub const DEFAULT_GOSSIP_FANOUT_CONSTANT: usize = 3;
 
 /// Upper bound on peers selected for one gossip batch.
 pub const DEFAULT_GOSSIP_MAX_FANOUT: usize = DEFAULT_MAX_PEERS;

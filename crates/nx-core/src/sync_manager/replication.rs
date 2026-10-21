@@ -446,14 +446,37 @@ pub(super) fn normalize_seen_ops_limit(limit: usize) -> usize {
     limit.max(1)
 }
 
-pub(super) fn select_gossip_peers(
+pub(super) fn estimate_gossip_size(
+    local_id: &NodeId,
+    records: &[nx_net::MembershipRecord],
     peers: &[(String, NodeId)],
+) -> usize {
+    let mut identities = HashSet::new();
+    identities.insert(local_id.clone());
+    identities.extend(
+        records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    nx_net::MembershipState::Alive | nx_net::MembershipState::Suspect
+                )
+            })
+            .map(|record| NodeId::new(record.member.clone())),
+    );
+    identities.extend(peers.iter().map(|(_, identity)| identity.clone()));
+    identities.len()
+}
+
+pub(super) fn select_gossip_peers(
+    local_id: &NodeId,
+    peers: &[(String, NodeId)],
+    cluster_size: usize,
     excluded_addr: Option<&str>,
     fanout_constant: usize,
     max_fanout: usize,
     cursor: &AtomicUsize,
 ) -> Vec<String> {
-    let cluster_size = peers.len().saturating_add(1);
     let logarithmic_fanout = if cluster_size <= 1 {
         0
     } else {
@@ -467,7 +490,10 @@ pub(super) fn select_gossip_peers(
         .filter(|(addr, _)| excluded_addr != Some(addr.as_str()))
         .map(|(addr, _)| addr.clone())
         .collect::<Vec<_>>();
-    eligible.sort_unstable();
+    eligible.sort_by_cached_key(|addr| {
+        let digest = blake3::hash(format!("numax-gossip/{local_id}/{addr}").as_bytes());
+        (*digest.as_bytes(), addr.clone())
+    });
 
     let count = requested.min(eligible.len());
     if count == 0 {
@@ -529,8 +555,15 @@ async fn forward_batch(
     }
 
     let peers = context.node.connected_peers().await;
-    let recipients = select_gossip_peers(
+    let cluster_size = estimate_gossip_size(
+        &context.local_id,
+        &context.membership.borrow().records,
         &peers,
+    );
+    let recipients = select_gossip_peers(
+        &context.local_id,
+        &peers,
+        cluster_size,
         Some(&source_addr),
         context.fanout_constant,
         context.max_fanout,
@@ -621,8 +654,15 @@ pub(super) async fn broadcast_batch(
         .collect::<Vec<_>>();
     let count = batch.len();
     let peers = context.node.connected_peers().await;
-    let recipients = select_gossip_peers(
+    let cluster_size = estimate_gossip_size(
+        &context.local_id,
+        &context.membership.borrow().records,
         &peers,
+    );
+    let recipients = select_gossip_peers(
+        &context.local_id,
+        &peers,
+        cluster_size,
         None,
         context.fanout_constant,
         context.max_fanout,
@@ -1331,14 +1371,291 @@ mod tests {
             .collect::<Vec<_>>();
         let cursor = AtomicUsize::new(0);
 
-        let first = select_gossip_peers(&peers, None, 0, 3, &cursor);
-        let second = select_gossip_peers(&peers, None, 0, 3, &cursor);
-        assert_eq!(first, vec!["peer-0", "peer-1", "peer-2"]);
-        assert_eq!(second, vec!["peer-3", "peer-4", "peer-0"]);
+        let local = NodeId::new("local");
+        let first = select_gossip_peers(&local, &peers, 6, None, 0, 3, &cursor);
+        let second = select_gossip_peers(&local, &peers, 6, None, 0, 3, &cursor);
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(first.iter().chain(&second).collect::<HashSet<_>>().len(), 5);
+        let mut reversed = peers.clone();
+        reversed.reverse();
+        assert_eq!(
+            first,
+            select_gossip_peers(&local, &reversed, 6, None, 0, 3, &AtomicUsize::new(0))
+        );
+        let orders = (0..16)
+            .map(|index| {
+                select_gossip_peers(
+                    &NodeId::new(format!("local-{index}")),
+                    &peers,
+                    6,
+                    None,
+                    0,
+                    3,
+                    &AtomicUsize::new(0),
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert!(orders.len() > 8);
 
-        let excluded = select_gossip_peers(&peers, Some("peer-2"), usize::MAX, 8, &cursor);
+        let excluded =
+            select_gossip_peers(&local, &peers, 6, Some("peer-2"), usize::MAX, 8, &cursor);
         assert_eq!(excluded.len(), 4);
         assert!(!excluded.iter().any(|peer| peer == "peer-2"));
+    }
+
+    #[test]
+    fn gossip_fanout_uses_membership_estimate_and_configured_limits() {
+        let peers = (0..16)
+            .map(|index| {
+                (
+                    format!("peer-{index}"),
+                    NodeId::new(format!("node-{index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let records = (0..49)
+            .map(|index| nx_net::MembershipRecord {
+                member: format!("node-{index}"),
+                reporter: format!("node-{index}"),
+                version: nx_net::MembershipVersion {
+                    epoch: 1,
+                    incarnation: 0,
+                },
+                state: nx_net::MembershipState::Alive,
+                endpoint: None,
+            })
+            .collect::<Vec<_>>();
+        let local = NodeId::new("local");
+        let size = estimate_gossip_size(&local, &records, &peers);
+        assert_eq!(size, 50);
+        let cursor = AtomicUsize::new(0);
+        assert_eq!(
+            select_gossip_peers(&local, &peers, size, None, 1, 64, &cursor).len(),
+            7
+        );
+        assert_eq!(
+            select_gossip_peers(&local, &peers, size, None, 1, 3, &cursor).len(),
+            3
+        );
+        assert_eq!(
+            select_gossip_peers(&local, &peers, size, None, usize::MAX, 64, &cursor).len(),
+            16
+        );
+        assert!(select_gossip_peers(&local, &[], size, None, 1, 64, &cursor).is_empty());
+        assert!(select_gossip_peers(&local, &peers, size, None, 1, 0, &cursor).is_empty());
+        for (size, expected) in [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (8, 3),
+            (9, 4),
+        ] {
+            assert_eq!(
+                select_gossip_peers(&local, &peers, size, None, 0, 64, &cursor).len(),
+                expected
+            );
+        }
+        assert_eq!(
+            select_gossip_peers(&local, &peers, size, Some("peer-0"), 3, 64, &cursor).len(),
+            9
+        );
+        assert_eq!(
+            select_gossip_peers(&local, &peers, usize::MAX, None, usize::MAX, 64, &cursor).len(),
+            16
+        );
+    }
+
+    #[test]
+    fn gossip_size_deduplicates_identity_and_preserves_active_terminal_contacts() {
+        let mut record = nx_net::MembershipRecord {
+            member: "peer".into(),
+            reporter: "peer".into(),
+            version: nx_net::MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state: nx_net::MembershipState::Alive,
+            endpoint: None,
+        };
+        let local = NodeId::new("local");
+        assert_eq!(estimate_gossip_size(&local, &[], &[]), 1);
+        for state in [
+            nx_net::MembershipState::Alive,
+            nx_net::MembershipState::Suspect,
+            nx_net::MembershipState::Dead,
+            nx_net::MembershipState::Left,
+        ] {
+            record.state = state;
+            let expected = if matches!(
+                state,
+                nx_net::MembershipState::Alive | nx_net::MembershipState::Suspect
+            ) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                estimate_gossip_size(&local, &[record.clone()], &[]),
+                expected
+            );
+            let peers = vec![
+                ("old-endpoint".into(), NodeId::new("peer")),
+                ("new-endpoint".into(), NodeId::new("peer")),
+            ];
+            record.version.epoch += 1;
+            assert_eq!(
+                estimate_gossip_size(&local, &[record.clone(), record.clone()], &peers),
+                2
+            );
+        }
+        record.member = "local".into();
+        record.state = nx_net::MembershipState::Alive;
+        assert_eq!(estimate_gossip_size(&local, &[record], &[]), 1);
+    }
+
+    #[test]
+    #[ignore = "manual reproducible selector calibration, not a transport benchmark"]
+    fn gossip_fanout_calibration() {
+        let payload = HistoryMessage::Push {
+            ops: vec![nx_sync::SequencedOp {
+                op: Op::lww_register_set(
+                    NodeId::new("calibration-origin"),
+                    "calibration-payload",
+                    vec![0; 256],
+                    1,
+                ),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            }],
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap().len();
+        fn random(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        for nodes in [8, 16, 32, 50] {
+            for constant in 0..=3 {
+                for loss_percent in [0, 10] {
+                    for shared_order in [false, true] {
+                        let mut totals = [(0usize, 0usize, 0usize, 0usize, 0usize); 2];
+                        for seed in 1..=16 {
+                            let mut rng = seed;
+                            let peers = (0..nodes)
+                                .map(|local| {
+                                    let mut ranks = (0..nodes).collect::<Vec<_>>();
+                                    if !shared_order {
+                                        for index in (1..nodes).rev() {
+                                            let other = random(&mut rng) as usize % (index + 1);
+                                            ranks.swap(index, other);
+                                        }
+                                    }
+                                    (0..nodes)
+                                        .filter(|remote| *remote != local)
+                                        .map(|remote| {
+                                            (
+                                                format!("{:04}-{remote}", ranks[remote]),
+                                                NodeId::new(format!("node-{remote}")),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect::<Vec<_>>();
+                            let cursors =
+                                (0..nodes).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+                            for sample in 0..32 {
+                                let origin = random(&mut rng) as usize % nodes;
+                                let mut seen = vec![false; nodes];
+                                let mut events =
+                                    std::collections::VecDeque::from([(origin, None, 0usize)]);
+                                let mut reached = 0;
+                                let mut messages = 0;
+                                let mut duplicates = 0;
+                                let mut max_hops = 0;
+                                while let Some((local, source, hops)) = events.pop_front() {
+                                    if seen[local] {
+                                        duplicates += 1;
+                                        continue;
+                                    }
+                                    seen[local] = true;
+                                    reached += 1;
+                                    max_hops = max_hops.max(hops);
+                                    let excluded = source.and_then(|source: usize| {
+                                        peers[local]
+                                            .iter()
+                                            .find(|(_, identity)| {
+                                                *identity == NodeId::new(format!("node-{source}"))
+                                            })
+                                            .map(|(addr, _)| addr.as_str())
+                                    });
+                                    let identity = NodeId::new(format!("seed-{seed}-node-{local}"));
+                                    for addr in select_gossip_peers(
+                                        &identity,
+                                        &peers[local],
+                                        nodes,
+                                        excluded,
+                                        constant,
+                                        64,
+                                        &cursors[local],
+                                    ) {
+                                        messages += 1;
+                                        if random(&mut rng) % 100 < loss_percent {
+                                            continue;
+                                        }
+                                        let remote = addr
+                                            .split_once('-')
+                                            .unwrap()
+                                            .1
+                                            .parse::<usize>()
+                                            .unwrap();
+                                        events.push_back((remote, Some(local), hops + 1));
+                                    }
+                                }
+                                let total = &mut totals[usize::from(sample != 0)];
+                                total.0 += reached;
+                                total.1 += usize::from(reached == nodes);
+                                total.2 += messages;
+                                total.3 += duplicates;
+                                total.4 = total.4.max(max_hops);
+                                assert!(messages <= nodes * (nodes - 1));
+                            }
+                        }
+                        for (phase, (reached, complete, messages, duplicates, hops)) in
+                            totals.into_iter().enumerate()
+                        {
+                            let samples = if phase == 0 { 16 } else { 16 * 31 };
+                            if constant == crate::sync_config::DEFAULT_GOSSIP_FANOUT_CONSTANT {
+                                assert!(reached as f64 / (samples * nodes) as f64 >= 0.999);
+                                assert!(complete as f64 / samples as f64 >= 0.99);
+                            }
+                            println!(
+                                "FANOUT_CALIBRATION {}",
+                                serde_json::json!({
+                                    "schema": 1, "nodes": nodes, "c": constant, "seeds": [1, 16],
+                                    "samples": samples, "loss_percent": loss_percent,
+                                    "address_order": if shared_order { "shared" } else { "per-node-seeded" },
+                                    "phase": if phase == 0 { "cold" } else { "rotating" },
+                                    "coverage": reached as f64 / (samples * nodes) as f64,
+                                    "complete_fraction": complete as f64 / samples as f64,
+                                    "messages_per_op": messages as f64 / samples as f64,
+                                    "json_history_bytes_per_op": messages as f64 * payload_bytes as f64 / samples as f64,
+                                    "value_bytes": 256, "single_push_payload_bytes": payload_bytes,
+                                    "duplicate_deliveries_per_op": duplicates as f64 / samples as f64,
+                                    "max_hops": hops, "anti_entropy": false,
+                                })
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -155,6 +155,8 @@ pub(super) struct AntiEntropyLoopContext {
 }
 
 pub(super) struct BroadcastLoopContext {
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
     pub(super) node: Arc<Node>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) fanout_constant: usize,
@@ -163,6 +165,8 @@ pub(super) struct BroadcastLoopContext {
 }
 
 pub(super) struct ForwardLoopContext {
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
     pub(super) node: Arc<Node>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) fanout_constant: usize,
