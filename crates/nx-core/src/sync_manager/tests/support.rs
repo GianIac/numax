@@ -789,3 +789,121 @@ pub(super) async fn started_manager_with_config(
     manager.start().await.unwrap();
     (manager, handle, store)
 }
+
+/// Data-path partition gate. Closing it terminates all proxied TCP streams;
+/// the membership detector is tested separately, not inferred from this gate.
+pub(super) struct TestDataGate {
+    pub(super) endpoint: String,
+    pub(super) open: tokio::sync::watch::Sender<bool>,
+    pub(super) rejected: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestDataGate {
+    pub(super) async fn new(target: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let (open, mut changed) = tokio::sync::watch::channel(false);
+        let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failures = Arc::clone(&rejected);
+        let task = tokio::spawn(async move {
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    result = changed.changed() => {
+                        if result.is_err() { break; }
+                        if !*changed.borrow_and_update() {
+                            streams.abort_all();
+                            while streams.join_next().await.is_some() {}
+                        }
+                    }
+                    Some(_) = streams.join_next(), if !streams.is_empty() => {}
+                    accepted = listener.accept() => {
+                        let Ok((mut incoming, _)) = accepted else { break; };
+                        if !*changed.borrow() || streams.len() >= 8 {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        let target = target.clone();
+                        streams.spawn(async move {
+                            if let Ok(mut outgoing) = tokio::net::TcpStream::connect(target).await {
+                                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            endpoint,
+            open,
+            rejected,
+            task,
+        }
+    }
+}
+
+impl Drop for TestDataGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(super) async fn stop_test_reconnect(manager: &mut SyncManager) {
+    if let Some(task) = manager.reconnect_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+pub(super) async fn test_owner_record(manager: &mut SyncManager) -> nx_net::MembershipRecord {
+    let id = manager.node_id.to_string();
+    manager
+        .membership
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .wait_for(|snapshot| snapshot.records.iter().any(|record| record.member == id))
+        .await
+        .unwrap()
+        .records
+        .iter()
+        .find(|record| record.member == id)
+        .unwrap()
+        .clone()
+}
+
+/// Run the production reconnect adapter with an explicit membership fixture and
+/// accelerated topology time. Returned senders keep its input streams alive.
+pub(super) async fn test_topology_reconnect(
+    manager: &mut SyncManager,
+    records: Vec<nx_net::MembershipRecord>,
+    rotation_interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<Arc<Vec<String>>>,
+    tokio::sync::watch::Sender<crate::membership::runtime::Snapshot>,
+) {
+    stop_test_reconnect(manager).await;
+    let (candidates_tx, candidates_rx) = tokio::sync::watch::channel(Arc::new(vec![]));
+    let (membership_tx, membership) =
+        tokio::sync::watch::channel(crate::membership::runtime::Snapshot {
+            records,
+            ..Default::default()
+        });
+    manager.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
+        local_id: manager.node_id.clone(),
+        membership,
+        rotation_interval,
+        node: Arc::clone(manager.node.as_ref().unwrap()),
+        candidates_rx,
+        max_peers: manager.config.max_peers,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(40),
+        peer_dead_after_failures: 1,
+        shutdown_rx: manager.shutdown_tx.subscribe(),
+        metrics: Arc::clone(&manager.metrics),
+        peer_health: Arc::clone(&manager.peer_health),
+    });
+    (candidates_tx, membership_tx)
+}

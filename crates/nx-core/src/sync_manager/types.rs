@@ -128,6 +128,9 @@ impl SeenOps {
 }
 
 pub(super) struct ReconnectLoopContext {
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
+    pub(super) rotation_interval: Duration,
     pub(super) node: Arc<Node>,
     pub(super) candidates_rx: watch::Receiver<Arc<Vec<String>>>,
     pub(super) max_peers: usize,

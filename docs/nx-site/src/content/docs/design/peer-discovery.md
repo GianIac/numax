@@ -1407,16 +1407,83 @@ publication. The original sequenced entry is preserved; duplicates and
 `TrackingLimit` rejections are not forwarded. No wire message or schema change
 was required.
 
-The current local estimate is `N = 1 + connected data peers`; it is not a
-cluster-wide membership count. The requested fanout is
+The local estimate `N` counts distinct identities across the local node,
+`Alive`/`Suspect` membership and active data connections. The requested fanout is
 `min(ceil(log2(N) + c), gossip_max_fanout, eligible peers)`. Empty and small
-views naturally clamp to available peers. The implementation sorts active
-connection addresses and advances a shared cursor to rotate the selected peers;
-remote forwarding excludes the immediate source. `SyncConfig` and the CLI expose
-`gossip_fanout_constant` (default 1) and `gossip_max_fanout` (default 64) through
-`SyncConfig` and the CLI's `[limits]` TOML section, not dedicated flags.
-These defaults are provisional: `c` has not been empirically calibrated, and
-the current neighbor selection is not topology-aware.
+views naturally clamp to available peers. `SyncConfig` and the CLI's `[limits]`
+TOML section expose `gossip_fanout_constant` (default 3) and
+`gossip_max_fanout` (default 64). Recipient rotation and connection-topology
+rotation have separate responsibilities.
+
+#### Bounded neighbors and recovery contacts
+
+`sync_manager/neighbors.rs` defines the deterministic topology policy used by
+the production reconnect adapter. Inputs are explicit discovery snapshots,
+admitted membership records, local identity and monotonic time. No new task,
+wire message, persisted namespace or dependency is introduced.
+
+Active data neighbors remain bounded by `max_peers`, including inbound sessions.
+The reconnect pool combines the bounded discovery snapshot with at most 64
+canonical, dialable membership endpoints per recovery window. Membership records
+already have a 4,096-member budget; these records retain the recovery information
+for this runtime's lifetime. An endpoint from an inbound socket's ephemeral
+source port is never promoted to a recovery contact. A member's advertised
+endpoint may supply the contact instead. Existing connections to the same
+membership identity satisfy that contact, avoiding a redundant reverse dial.
+
+The first dial candidate advances each turn, independently of full slots and
+failed attempts. A turn attempts at most eight dials, preserving existing
+per-endpoint backoff and fatal-wire rejection. Every 30 seconds the recovery
+window advances, even if no peer is reachable. If slots are full and an eligible
+alternative is due, at most one managed connection is released in that interval
+before trying the alternative. Other connections remain stable. Replacement
+failure does not remove durable operations; the former neighbor remains eligible
+for a later turn. A slot is released and the old reader/writer generation is
+cancelled before disconnect-event delivery. Shutdown cancels in-flight dialing
+and event delivery through the existing reconnect task's ownership.
+
+`Dead` is not a reason to discard a contact: both sides of a partition may make
+that judgment. `Left` excludes the endpoint until a fresh owner admission
+supersedes it. Discovery withdrawal suppresses new attempts at the withdrawn
+endpoint, including through retained membership; a later discovery addition can
+restore it. Withdrawal alone does not close an admitted session, and such a
+session is excluded from topology replacement while withdrawn. Suppression is
+bounded by a 4,096-endpoint withdrawal cache, retained even if admission arrives
+late. If this cache fills, membership-only data recovery fails closed until
+restart, with a sync-error metric and warning; current discovery candidates
+remain usable. Withdrawals are never silently evicted to authorize stale
+contacts. A recovery contact
+only supplies a candidate: every data dial still passes ordinary version,
+identity and allowlist checks. Authentication-policy rejection never grants
+membership authority or data readiness.
+
+Reconnection requires a retained, valid, reachable cross-component contact,
+scheduling opportunities and normal admission capacity over time. There is no
+connectivity proof for arbitrary graphs, NAT traversal or latency guarantee.
+Contacts and the suppression cache are runtime state, not a persistent manual
+peer registry. After restart, discovery must bootstrap membership again. Data
+convergence remains conditional on D2/D3 recovery limits.
+
+Deterministic component tests cover bounded rotating recovery windows, fair
+first turns, `Dead`, `Left`, withdrawal/re-addition and invalid/local endpoints.
+Real loopback TCP tests cover a full one-slot relay recovering all six CRDT
+families with JSON and Bincode, and two full pairs reconnecting after a gated
+data partition with mutual `Dead` inputs. The tests feed explicit membership
+fixtures into the production adapter; they do not measure detector accuracy or
+claim packet-loss results. Storage assertions check materialized values and complete durable state,
+including ORSet removal tags and RGA tombstones. A further TCP test admits an
+owner through real membership control and obtains its data endpoint without
+discovery or a fabricated membership snapshot. A transport regression verifies identity-guarded slot release even when
+the disconnect-event queue is full. The 50-node and one-hour release criteria
+remain separate obligations.
+
+Reproduce these focused checks with:
+
+```sh
+cargo test -p nx-core sync_manager::neighbors
+cargo test -p nx-core topology::
+cargo test -p nx-net topology_disconnect
+```
 
 The remote forwarding queue is bounded by `queued_ops_limit`; a forward batch
 is bounded by the existing operation limit and by the smaller of
@@ -1427,9 +1494,8 @@ repair path within D3 retention. A three-node TCP test verifies multi-hop
 forwarding with both JSON and Bincode, and apply tests cover all six CRDT
 families plus duplicate suppression.
 
-Adaptive pacing based on load/RTT, jitter, calibrated retry budgets, topology-
-aware contacts and the 50-node loss/partition acceptance run are not yet
-implemented or validated. In particular, a send completion duration is not
+Adaptive pacing based on load/RTT, jitter, calibrated retry budgets and the
+50-node loss/partition acceptance run are not yet implemented or validated. In particular, a send completion duration is not
 being treated as peer RTT. Do not infer convergence beyond the bounded D3
 history/retention contract from a successful gossip send.
 
@@ -1463,8 +1529,8 @@ The following aspects remain open for the proposed capabilities:
 - Membership control-message authorization/encoding, future floor compaction,
   runtime probe/suspicion parameters and transport byte budgets.
 - Shared-stream versus separate-connection control isolation, supported by measurements.
-- Empirical fanout calibration, topology-aware neighbor selection, jitter and
-   adaptive pacing based on load/RTT.
+- Broader fanout calibration, topology-aware optimization beyond bounded rotation,
+  jitter and adaptive pacing based on load/RTT.
 - Manual candidate removal and API error semantics.
 - Membership wire compatibility, future metadata migrations and expanded state-transfer formats.
 

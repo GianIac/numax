@@ -24,6 +24,8 @@ use super::sequence::{REPLAY_BYTES, REPLAY_PAGE, SUMMARY_PAGE};
 use super::types::*;
 use nx_sync::{HistoryMessage, NodeId};
 
+const MAX_RECONNECT_ATTEMPTS_PER_TURN: usize = 8;
+
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
     mut op_rx: mpsc::Receiver<AcceptedLocalOp>,
@@ -185,6 +187,9 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
 
 pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
     let ReconnectLoopContext {
+        local_id,
+        membership,
+        rotation_interval,
         node,
         mut candidates_rx,
         max_peers,
@@ -201,19 +206,48 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         let max_delay = max_delay.max(initial_delay);
         let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
         let mut state = Vec::new();
-        let initial_candidates = Arc::clone(&candidates_rx.borrow());
-        reconcile_reconnect_candidates(
-            &mut state,
-            initial_candidates.as_ref(),
-            initial_delay,
-            &peer_health,
-        )
-        .await;
+        let mut neighbors = super::neighbors::Neighbors::new(StdInstant::now());
+        let mut victim_cursor = 0usize;
 
         'reconnect: loop {
             if *shutdown_rx.borrow() {
                 break;
             }
+            let mut rotation_due = neighbors.rotate(StdInstant::now(), rotation_interval);
+            let discovery = Arc::clone(&candidates_rx.borrow_and_update());
+            let records = membership.borrow().records.clone();
+            let was_suppressed = neighbors.recovery_suppressed();
+            let candidates = neighbors.candidates(&discovery, &records, local_id.as_str());
+            if !was_suppressed && neighbors.recovery_suppressed() {
+                metrics.record_sync_error();
+                warn!(
+                    "withdrawal budget exhausted; membership-only data recovery disabled until restart; live discovery remains usable"
+                );
+            }
+            reconcile_reconnect_candidates(&mut state, &candidates, initial_delay, &peer_health)
+                .await;
+            neighbors.advance();
+            let connected = node.connected_peers().await;
+            let connected_ids: HashSet<_> = connected.iter().map(|(_, id)| id.as_str()).collect();
+            let mut connected_endpoints: HashSet<_> =
+                connected.iter().map(|(addr, _)| addr.clone()).collect();
+            let candidate_set: HashSet<_> = candidates.iter().map(String::as_str).collect();
+            let mut replaceable_ids = HashSet::new();
+            for record in &records {
+                if let Some(endpoint) = record
+                    .endpoint
+                    .as_ref()
+                    .and_then(|endpoint| super::canonicalize_endpoint(endpoint).ok())
+                {
+                    if connected_ids.contains(record.member.as_str()) {
+                        connected_endpoints.insert(endpoint.clone());
+                    }
+                    if candidate_set.contains(endpoint.as_str()) {
+                        replaceable_ids.insert(record.member.as_str());
+                    }
+                }
+            }
+            let mut attempts = 0usize;
             let mut sleep_for: Option<Duration> = None;
             let now = StdInstant::now();
             let connect_context = ConfiguredPeerConnectContext {
@@ -231,7 +265,9 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     continue;
                 }
 
-                if node.is_connected_addr(peer_addr).await {
+                if connected_endpoints.contains(peer_addr)
+                    || node.is_connected_addr(peer_addr).await
+                {
                     mark_peer_success(&peer_health, peer_addr).await;
                     peer.reset(initial_delay, StdInstant::now());
                     continue;
@@ -242,6 +278,32 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                 {
                     sleep_for = Some(sleep_for.map_or(wait, |current| current.min(wait)));
                     continue;
+                }
+
+                // Bound dialing work per turn. Advancing the first candidate on
+                // every turn prevents a slow prefix or full slots from starving bridges.
+                if attempts == MAX_RECONNECT_ATTEMPTS_PER_TURN {
+                    break;
+                }
+                attempts += 1;
+                if node.connected_peer_count().await >= max_peers {
+                    let replaceable: Vec<_> = connected
+                        .iter()
+                        .filter(|(addr, id)| {
+                            candidate_set.contains(addr.as_str())
+                                || replaceable_ids.contains(id.as_str())
+                        })
+                        .collect();
+                    if !replaceable.is_empty() && rotation_due {
+                        rotation_due = false;
+                        let (addr, id) = replaceable[victim_cursor % replaceable.len()];
+                        victim_cursor = victim_cursor.wrapping_add(1);
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
+                            _ = node.disconnect_peer(addr, id) => {},
+                        }
+                    }
                 }
 
                 // The task owns the dial future: shutdown drops an in-flight
@@ -310,13 +372,6 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     if changed.is_err() {
                         break;
                     }
-                    let candidates = Arc::clone(&candidates_rx.borrow_and_update());
-                    reconcile_reconnect_candidates(
-                        &mut state,
-                        candidates.as_ref(),
-                        initial_delay,
-                        &peer_health,
-                    ).await;
                 }
                 _ = tokio::time::sleep_until(deadline) => {}
             }
@@ -1701,7 +1756,12 @@ mod tests {
     async fn reconnect_task_exits_without_panicking_on_sleep_deadline_overflow() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_candidates_tx, candidates_rx) = watch::channel(Arc::new(Vec::new()));
+        let (_membership_tx, membership) =
+            watch::channel(crate::membership::runtime::Snapshot::default());
         let task = spawn_reconnect_loop(ReconnectLoopContext {
+            local_id: NodeId::new("overflow"),
+            membership,
+            rotation_interval: super::super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
             node: Arc::new(
                 Node::try_new(NodeConfig::new(NodeId::generate(), "127.0.0.1:0")).unwrap(),
             ),

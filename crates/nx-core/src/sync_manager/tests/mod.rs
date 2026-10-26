@@ -13,6 +13,7 @@ mod e2e;
 mod recovery;
 mod sequencing;
 mod support;
+mod topology;
 
 use support::*;
 

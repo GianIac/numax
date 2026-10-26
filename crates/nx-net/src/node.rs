@@ -1069,6 +1069,34 @@ impl Node {
         connected
     }
 
+    /// Release a topology slot only while the address still belongs to the
+    /// expected peer. Removal cancels the reader/writer generation before event
+    /// delivery, so a saturated event queue cannot retain the admission permit.
+    pub async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool {
+        let peers_connected = {
+            let mut peers = self.peers.write().await;
+            if !peers.get(addr).is_some_and(|peer| {
+                peer.state == PeerState::Connected && peer.info.node_id.as_ref() == Some(expected)
+            }) {
+                return false;
+            }
+            drop(peers.remove(addr));
+            connected_peer_count(&peers)
+        };
+        send_node_event(
+            &self.event_tx,
+            &self.shutdown_tx.subscribe(),
+            "PeerDisconnected",
+            NodeEvent::PeerDisconnected {
+                node_id: expected.clone(),
+                addr: addr.to_string(),
+                peers_connected,
+            },
+        )
+        .await;
+        true
+    }
+
     /// Returns true when the configured peer address currently has an active connection.
     pub async fn is_connected_addr(&self, addr: &str) -> bool {
         let peers = self.peers.read().await;
@@ -2250,6 +2278,55 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn topology_disconnect_checks_identity_and_releases_slot_before_event_delivery() {
+        let mut node = Node::try_new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_max_peers(1)
+                .with_event_channel_capacity(1),
+        )
+        .unwrap();
+        let mut events = node.take_event_receiver().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _remote = open_raw_peer(&node, &listener, None).await;
+        let Some(NodeEvent::PeerConnected { addr, .. }) = events.recv().await else {
+            panic!("missing connection event");
+        };
+        assert!(
+            !node
+                .disconnect_peer(&addr, &NodeId::new("wrong-owner"))
+                .await
+        );
+        assert_eq!(node.connected_peer_count().await, 1);
+        node.event_tx
+            .send(NodeEvent::PeerDisconnected {
+                node_id: NodeId::new("queue-filler"),
+                addr: "unused".into(),
+                peers_connected: 1,
+            })
+            .await
+            .unwrap();
+        let expected = NodeId::new("raw-peer");
+        let disconnect = node.disconnect_peer(&addr, &expected);
+        tokio::pin!(disconnect);
+        timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = &mut disconnect => panic!("full event queue must block delivery"),
+            _ = async {
+                while node.connection_slots.available_permits() == 0 { tokio::task::yield_now().await; }
+            } => {}
+        }
+        }).await.unwrap();
+        assert_eq!(node.connected_peer_count().await, 0);
+        events.recv().await.unwrap();
+        assert!(disconnect.await);
+        assert!(
+            matches!(events.recv().await, Some(NodeEvent::PeerDisconnected { node_id, .. }) if node_id == NodeId::new("raw-peer"))
+        );
+        assert!(!node.disconnect_peer(&addr, &NodeId::new("raw-peer")).await);
+        node.shutdown().await;
     }
 
     #[tokio::test]

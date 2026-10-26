@@ -1121,7 +1121,7 @@ impl SyncManager {
         self.forward_task = Some(spawn_forward_loop(
             ForwardLoopContext {
                 local_id: self.node_id.clone(),
-                membership: membership_snapshot,
+                membership: membership_snapshot.clone(),
                 node: Arc::clone(&node),
                 metrics: Arc::clone(&self.metrics),
                 fanout_constant: self.config.gossip_fanout_constant,
@@ -1134,6 +1134,9 @@ impl SyncManager {
         ));
 
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
+            local_id: self.node_id.clone(),
+            membership: membership_snapshot,
+            rotation_interval: super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
             node: Arc::clone(&node),
             candidates_rx,
             max_peers: self.config.max_peers,

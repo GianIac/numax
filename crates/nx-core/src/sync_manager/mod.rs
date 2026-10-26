@@ -6,6 +6,7 @@ pub(crate) use candidates::canonicalize_endpoint;
 mod fixtures;
 mod manager;
 mod migration;
+mod neighbors;
 mod peer;
 mod replication;
 mod schema;

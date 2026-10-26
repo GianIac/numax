@@ -53,9 +53,15 @@ preserving their origin and excluding the immediate sender.
 Protocol 9 carries sequenced operations in `History::Push`. Local pushes and
 remote forwarding share a rotating recipient cursor. Batching, bounded queues
 and byte budgets constrain work; duplicates do not trigger forwarding again.
-Recipients remain active data connections, not neighbors selected from the
-independent membership view. Rotation does not repair sparse or partitioned
-connection topologies; a bounded neighbor set and recovery contacts remain open.
+Recipients are active data connections. A separate topology policy combines
+discovery with up to 64 admitted membership recovery contacts per window,
+including `Dead` contacts. It rotates dial priority and can replace at most one
+managed neighbor every 30 seconds when slots are full. `Left` and withdrawn
+discovery endpoints are excluded from new attempts. Normal handshake and
+identity checks still apply. Anti-entropy repairs data after reconnection;
+recovery requires a valid reachable contact and retained history or an eligible
+baseline. See [bounded neighbors and recovery contacts](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts)
+for limits and test evidence.
 
 ---
 
