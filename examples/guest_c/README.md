@@ -49,6 +49,16 @@ guest.wasm
 
 The output is written to the `examples/guest_c` directory.
 
+### ABI smoke test
+
+After building guest.wasm, run:
+
+```bash
+node test.mjs
+```
+
+> The smoke test verifies the WebAssembly ABI exposed by the C guest and performs a minimal runtime check using mock Numax host functions
+
 ## Run
 
 From the repository root:
