@@ -1,6 +1,22 @@
 use nx_net::{SerializationFormat, TlsConfig};
 use std::time::Duration;
 
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SyncConfigError {
+    Invalid(String),
+}
+
+impl std::fmt::Display for SyncConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SyncConfigError {}
+
 /// Default maximum number of simultaneously connected peers.
 pub const DEFAULT_MAX_PEERS: usize = nx_net::DEFAULT_MAX_PEERS;
 
@@ -99,6 +115,43 @@ impl Default for SyncConfig {
 }
 
 impl SyncConfig {
+    /// Validate allocation bounds and timer deadlines before starting services.
+    /// Zero retry delays and anti-entropy intervals retain their 1 ms normalization.
+    pub fn validate(&self) -> Result<(), SyncConfigError> {
+        for (name, limit) in [
+            ("queued_ops_limit", self.queued_ops_limit),
+            ("max_peers", self.max_peers),
+        ] {
+            if limit > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(SyncConfigError::Invalid(format!(
+                    "{name} exceeds the supported channel/semaphore capacity"
+                )));
+            }
+        }
+        let now = std::time::Instant::now();
+        for (name, duration) in [
+            ("reconnect_initial_delay", self.reconnect_initial_delay),
+            ("reconnect_max_delay", self.reconnect_max_delay),
+            ("anti_entropy_interval", self.anti_entropy_interval),
+            ("socket_timeout", self.socket_timeout),
+        ] {
+            if now
+                .checked_add(duration.max(Duration::from_millis(1)))
+                .is_none()
+            {
+                return Err(SyncConfigError::Invalid(format!(
+                    "{name} exceeds the supported deadline range"
+                )));
+            }
+        }
+        if self.socket_timeout.is_zero() {
+            return Err(SyncConfigError::Invalid(
+                "socket_timeout must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -178,6 +231,18 @@ impl SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_preserves_zero_normalization_and_disabled_peer_admission() {
+        SyncConfig::default().validate().unwrap();
+        SyncConfig::new()
+            .with_max_peers(0)
+            .with_queued_ops_limit(0)
+            .with_reconnect_backoff(Duration::ZERO, Duration::ZERO)
+            .with_anti_entropy_interval(Duration::ZERO)
+            .validate()
+            .unwrap();
+    }
 
     #[test]
     fn test_is_enabled_requires_listen() {

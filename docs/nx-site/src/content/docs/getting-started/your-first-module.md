@@ -16,7 +16,7 @@ Any language that compiles to WASM can be a Numax module. This page shows Rust
 
 ## What you need
 
-Numax already built from the [Quickstart](/getting-started/quickstart-5-min/).
+Numax already built from the [Quickstart](/numax/getting-started/quickstart-5-min/).
 If not:
 
 ```bash
@@ -381,6 +381,6 @@ In the meantime, browse everything already available in the
 
 ## Next steps
 
-- Make it distributed - [Quickstart: 5 Minutes](/getting-started/quickstart-5-min/)
+- Make it distributed - [Quickstart: 5 Minutes](/numax/getting-started/quickstart-5-min/)
 - Explore the full SDK: `nx_sdk::crdt`, `nx_sdk::net`, `nx_sdk::system`, `nx_sdk::time`
 - Browse the [examples directory](https://github.com/GianIac/numax/tree/main/examples)

@@ -138,6 +138,18 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
+        let mut discovery = crate::RuntimeDiscoveryConfig::default();
+        if let Some(sync) = &config.sync {
+            discovery.max_candidates = discovery.max_candidates.max(sync.peers.len());
+        }
+        Self::new_with_discovery(config, discovery)
+    }
+
+    /// Create a runtime with an explicitly resolved peer discovery policy.
+    pub fn new_with_discovery(
+        config: RuntimeConfig,
+        discovery: crate::RuntimeDiscoveryConfig,
+    ) -> Result<Self> {
         // Engine: async support is required so wasmtime can yield across host calls
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
@@ -187,11 +199,15 @@ impl Runtime {
         // Initialize SyncManager if configured, and derive its handle up-front so every HostState built afterwards sees the same op channel.
         let (sync_manager, sync_handle) = if let Some(ref sync_config) = config.sync {
             let node_id = load_or_create_node_id(&store)?;
-            let manager = SyncManager::try_new(
+            let (providers, discovery_runtime) =
+                crate::discovery::build_runtime_discovery(&node_id, sync_config, &discovery)?;
+            let manager = SyncManager::try_new_with_discovery(
                 node_id,
                 sync_config.clone(),
                 Arc::clone(&store),
                 Arc::clone(&metrics),
+                providers,
+                discovery_runtime,
             )?;
             let handle = manager.handle();
             (Some(manager), Some(handle))

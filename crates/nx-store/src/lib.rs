@@ -259,6 +259,47 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_prefix_page_after_bounded_returns_empty_when_max_records_is_zero() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:a", b"1").unwrap();
+
+        let rows = store
+            .scan_prefix_page_after_bounded(b"app:", None, 0, 100)
+            .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_scan_prefix_page_after_bounded_includes_record_at_exact_byte_budget() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:a", b"1111").unwrap();
+        store.set(b"app:b", b"2222").unwrap();
+
+        let rows = store
+            .scan_prefix_page_after_bounded(b"app:", None, 10, 18)
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_prefix_page_after_bounded_stops_when_next_record_exceeds_budget_by_one_byte() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set(b"app:a", b"1111").unwrap();
+        store.set(b"app:b", b"2222").unwrap();
+
+        let rows = store
+            .scan_prefix_page_after_bounded(b"app:", None, 10, 17)
+            .unwrap();
+
+        assert_eq!(rows, vec![(b"app:a".to_vec(), b"1111".to_vec())]);
+    }
+
+    #[test]
     fn test_keys_prefix_page_paginates_visible_keys() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

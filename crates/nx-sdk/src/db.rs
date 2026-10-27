@@ -206,7 +206,7 @@ pub fn scan_page_after(
     }
 }
 
-/// keys_page(prefix, cursor, limit) -> Result<Vec<key>, NxError>
+/// `keys_page(prefix, cursor, limit) -> Result<Vec<key>, NxError>`
 #[must_use = "this SDK call can fail; handle the Result"]
 pub fn keys_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<Vec<u8>>> {
     let mut cap: usize = 256;
@@ -243,7 +243,7 @@ pub fn keys_page(prefix: &str, cursor: u64, limit: u32) -> Result<Vec<Vec<u8>>> 
     }
 }
 
-/// keys_page_after(prefix, start_after_key, limit) -> Result<Vec<key>, NxError>
+/// `keys_page_after(prefix, start_after_key, limit) -> Result<Vec<key>, NxError>`
 #[must_use = "this SDK call can fail; handle the Result"]
 pub fn keys_page_after(
     prefix: &str,
@@ -286,7 +286,7 @@ pub fn keys_page_after(
     }
 }
 
-/// scan(prefix) -> Result<Vec<(key, value)>, NxError>
+/// `scan(prefix) -> Result<Vec<(key, value)>, NxError>`
 #[must_use = "this SDK call can fail; handle the Result"]
 pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut last_key: Option<Vec<u8>> = None;
@@ -308,7 +308,7 @@ pub fn scan(prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     }
 }
 
-/// keys(prefix) -> Result<Vec<key>, NxError>
+/// `keys(prefix) -> Result<Vec<key>, NxError>`
 #[must_use = "this SDK call can fail; handle the Result"]
 pub fn keys(prefix: &str) -> Result<Vec<Vec<u8>>> {
     let mut last_key: Option<Vec<u8>> = None;

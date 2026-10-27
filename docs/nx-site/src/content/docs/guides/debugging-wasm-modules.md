@@ -345,7 +345,7 @@ If the values diverge, `--log-level debug` shows which ops were received and app
 
 ## Related
 
-- [WASM execution](/concepts/wasm-execution/) - sandbox, entry point and HostState
-- [CRDT and state](/concepts/crdt-and-state/) - how ops are applied and propagated
-- [Observability](/guides/observability/) - full metrics and health check setup
-- [CLI reference](/reference/cli/) - all available flags
+- [WASM execution](/numax/concepts/wasm-execution/) - sandbox, entry point and HostState
+- [CRDT and state](/numax/concepts/crdt-and-state/) - how ops are applied and propagated
+- [Observability](/numax/guides/observability/) - full metrics and health check setup
+- [CLI reference](/numax/reference/cli/) - all available flags

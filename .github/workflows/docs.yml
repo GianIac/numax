@@ -6,12 +6,14 @@ on:
     paths:
       - "docs/api/**"
       - "docs/nx-site/**"
+      - "docs/scripts/**"
       - ".github/workflows/docs.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "docs/api/**"
       - "docs/nx-site/**"
+      - "docs/scripts/**"
       - ".github/workflows/docs.yml"
 
 permissions:

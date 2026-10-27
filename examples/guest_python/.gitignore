@@ -1,0 +1,4 @@
+# ignore the generated .wasm file
+# since other modules under example/ doesnt commit the .wasm 
+# but rather generates it post-build under the target/ dir which is ignored anyways 
+*.wasm

@@ -1,8 +1,9 @@
 use super::*;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::sync_manager::{apply::*, peer::*, replication::*, storage::*};
-use nx_net::NodeEvent;
+use nx_net::{ConnectionDirection, NodeEvent, PeerIdentityVerification};
 use nx_sync::OpKind;
+use std::sync::Mutex as StdMutex;
 use std::time::Instant as StdInstant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
@@ -11,6 +12,68 @@ mod e2e;
 mod support;
 
 use support::*;
+
+struct TestDynamicDiscovery {
+    state: StdMutex<(u64, Vec<String>)>,
+    events: tokio::sync::broadcast::Sender<crate::DiscoveryEvent>,
+}
+
+impl TestDynamicDiscovery {
+    fn empty() -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        Self {
+            state: StdMutex::new((0, Vec::new())),
+            events,
+        }
+    }
+
+    fn add(&self, endpoint: String) {
+        let mut state = self.state.lock().unwrap();
+        state.0 += 1;
+        state.1.push(endpoint.clone());
+        let _ = self.events.send(crate::DiscoveryEvent {
+            revision: state.0,
+            change: crate::DiscoveryChange::Added(endpoint),
+        });
+    }
+
+    fn remove(&self, endpoint: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.0 += 1;
+        state.1.retain(|candidate| candidate != endpoint);
+        let _ = self.events.send(crate::DiscoveryEvent {
+            revision: state.0,
+            change: crate::DiscoveryChange::Removed(endpoint.to_string()),
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::PeerDiscovery for TestDynamicDiscovery {
+    async fn discover(&self) -> Result<crate::DiscoverySnapshot, crate::DiscoveryError> {
+        let state = self.state.lock().unwrap();
+        Ok(crate::DiscoverySnapshot::new(state.0, state.1.clone()))
+    }
+
+    async fn announce(
+        &self,
+        _announcement: &crate::PeerAnnouncement,
+    ) -> Result<(), crate::DiscoveryError> {
+        Err(crate::DiscoveryError::Unsupported {
+            provider: "test-dynamic".to_string(),
+            operation: "announcement",
+        })
+    }
+
+    async fn watch(&self) -> Result<crate::DiscoveryWatch, crate::DiscoveryError> {
+        let state = self.state.lock().unwrap();
+        let events = self.events.subscribe();
+        Ok(crate::DiscoveryWatch::new(
+            crate::DiscoverySnapshot::new(state.0, state.1.clone()),
+            events,
+        ))
+    }
+}
 
 #[test]
 fn crdt_store_keys_roundtrip_through_generic_namespace_helpers() {
@@ -240,7 +303,7 @@ fn peer_reconnect_state_tracks_next_attempt_per_peer() {
     let mut state = PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), now);
 
     let first_delay = state.record_failure(Duration::from_secs(5), now);
-    assert_eq!(first_delay, Duration::from_millis(500));
+    assert_eq!(first_delay, Some(Duration::from_millis(500)));
     assert_eq!(state.delay, Duration::from_secs(1));
     assert_eq!(state.next_attempt_at, now + Duration::from_millis(500));
 
@@ -256,7 +319,9 @@ fn peer_reconnect_state_schedules_backoff_from_failure_time() {
     let mut state =
         PeerReconnectState::new("peer-a".to_string(), Duration::from_millis(500), started_at);
 
-    state.record_failure(Duration::from_secs(5), failed_at);
+    state
+        .record_failure(Duration::from_secs(5), failed_at)
+        .unwrap();
 
     assert_eq!(
         state.next_attempt_at,
@@ -1463,6 +1528,197 @@ fn manager_rejects_corrupted_durable_crdt_state() {
 }
 
 #[tokio::test]
+async fn static_peer_lists_keep_their_historical_finite_size_at_startup() {
+    let peers = (0..=nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY)
+        .map(|index| format!("peer-{index}.invalid:9000"))
+        .collect::<Vec<_>>();
+    // Disable outbound admission: this tests real candidate retention, not DNS/dials.
+    let mut config = SyncConfig::new()
+        .with_listen_addr("127.0.0.1:0")
+        .with_max_peers(0);
+    config.peers = peers.clone();
+
+    let mut manager =
+        SyncManager::try_new(NodeId::new("local-node"), config, temp_store(), metrics()).unwrap();
+
+    assert_eq!(manager.discovery_config.max_candidates(), peers.len());
+    manager.start().await.unwrap();
+    assert_eq!(manager.peer_candidates(), peers);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dynamic_provider_modes_accept_aggregate_capacity_above_bootstrap_response_limit() {
+    let peers = vec![
+        "peer-a.invalid:9000".to_string(),
+        "peer-b.invalid:9000".to_string(),
+    ];
+    // Controlled snapshots isolate the manager contract from platform discovery I/O.
+    for mode in ["mdns", "dns-srv", "file"] {
+        let discovery = Arc::new(TestDynamicDiscovery::empty());
+        discovery.state.lock().unwrap().1 = peers.clone();
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new()
+                .with_listen_addr("127.0.0.1:0")
+                .with_max_peers(0),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(mode, discovery)],
+            DiscoveryRuntimeConfig::default()
+                .with_max_candidates(nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY + 1),
+        )
+        .unwrap();
+
+        manager.start().await.unwrap();
+        assert_eq!(manager.peer_candidates(), peers, "{mode}");
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_responses_are_capped_without_reducing_the_aggregate_cache() {
+    use nx_net::{BootstrapClient, BootstrapClientConfig, BootstrapRequest};
+    let cap = nx_net::MAX_BOOTSTRAP_RESPONSE_CAPACITY;
+    let discovery_config = DiscoveryRuntimeConfig::default().with_max_candidates(cap + 1);
+    let cluster = discovery_config.cluster_id().to_string();
+    let addr = free_addr();
+    let mut manager = SyncManager::try_new_with_discovery(
+        NodeId::new("bootstrap-seed"),
+        SyncConfig::new().with_listen_addr(&addr),
+        temp_store(),
+        metrics(),
+        vec![],
+        discovery_config,
+    )
+    .unwrap();
+    manager.start().await.unwrap();
+
+    let client = |index: usize| {
+        let mut config =
+            BootstrapClientConfig::new(NodeId::new(format!("bootstrap-client-{index}")));
+        config.max_response_candidates = cap;
+        BootstrapClient::new(config).unwrap()
+    };
+    // Fill the actual server cache through one-shot handshakes, requesting only
+    // one result while filling so the regression does not transfer quadratic data.
+    for index in 0..=cap {
+        client(index)
+            .query(
+                &addr,
+                BootstrapRequest::new(&cluster, 1)
+                    .with_advertised_endpoint(format!("peer-{index}.invalid:9000")),
+            )
+            .await
+            .unwrap();
+    }
+    let response = client(cap + 1)
+        .query(&addr, BootstrapRequest::new(&cluster, cap))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoints.len(), cap);
+    assert!(
+        !response
+            .endpoints
+            .contains(&format!("peer-{cap}.invalid:9000"))
+    );
+
+    // Free two earlier entries. The last contribution must emerge; a cache
+    // incorrectly clamped to 4096 would have discarded it during admission.
+    client(0)
+        .query(&addr, BootstrapRequest::new(&cluster, 1))
+        .await
+        .unwrap();
+    let response = client(1)
+        .query(&addr, BootstrapRequest::new(&cluster, cap))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoints.len(), cap);
+    assert!(
+        response
+            .endpoints
+            .contains(&format!("peer-{cap}.invalid:9000"))
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[test]
+fn manager_rejects_invalid_public_sync_config_before_channel_allocation() {
+    let store = temp_store();
+    for (field, config) in invalid_sync_configs() {
+        let Err(error) = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            config,
+            Arc::clone(&store),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            DiscoveryRuntimeConfig::default(),
+        ) else {
+            panic!("invalid {field} was accepted");
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::SyncConfigError>(),
+            Some(crate::SyncConfigError::Invalid(_))
+        ));
+        assert!(error.to_string().contains(field), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn manager_revalidates_timer_and_node_limits_before_touching_providers() {
+    for (field, config) in invalid_sync_configs() {
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new(),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            DiscoveryRuntimeConfig::default(),
+        )
+        .unwrap();
+        manager.config = config.with_listen_addr("127.0.0.1:0");
+        let error = manager.start().await.unwrap_err();
+        assert!(error.to_string().contains(field), "{error}");
+        assert!(manager.node.is_none());
+        assert!(manager.discovery_coordinator.is_none());
+        assert!(manager.op_rx.is_some());
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manager_rejects_invalid_bootstrap_policy_before_touching_providers() {
+    for discovery_config in [
+        DiscoveryRuntimeConfig::default().with_cluster_id("x".repeat(256)),
+        DiscoveryRuntimeConfig::default().with_max_candidates(0),
+    ] {
+        let mut manager = SyncManager::try_new_with_discovery(
+            NodeId::new("local-node"),
+            SyncConfig::new().with_listen_addr("127.0.0.1:0"),
+            temp_store(),
+            metrics(),
+            vec![DiscoveryProvider::new(
+                "untouched",
+                Arc::new(UntouchedDiscovery),
+            )],
+            discovery_config,
+        )
+        .unwrap();
+        assert!(manager.start().await.is_err());
+        assert!(manager.node.is_none());
+        assert!(manager.discovery_coordinator.is_none());
+        assert!(manager.op_rx.is_some());
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn manager_hydrates_pncounter_registry_from_durable_state() {
     let store = temp_store();
     let node_a = NodeId::new("node-a");
@@ -1789,6 +2045,360 @@ async fn reconnect_loop_connects_configured_peer_that_starts_later() {
 
     wait_for_counter(&manager_b, key, 1).await;
     assert_eq!(read_materialized(&store_b, key), 1);
+}
+
+#[tokio::test]
+async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let discovery = Arc::new(TestDynamicDiscovery::empty());
+    let config_a = SyncConfig::new()
+        .with_listen_addr(addr_a)
+        .with_anti_entropy_interval(Duration::from_millis(10))
+        .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(50));
+    let mut manager_a = SyncManager::try_new_with_discovery(
+        NodeId::generate(),
+        config_a,
+        temp_store(),
+        metrics(),
+        vec![DiscoveryProvider::new("test-dynamic", discovery.clone())],
+        DiscoveryRuntimeConfig::default(),
+    )
+    .unwrap();
+    manager_a.start().await.unwrap();
+    assert_eq!(manager_a.connected_peer_count().await, 0);
+
+    let config_b = SyncConfig::new().with_listen_addr(addr_b.clone());
+    let (mut manager_b, handle_b, _store_b) = started_manager_with_config(config_b).await;
+
+    discovery.add(addr_b.clone());
+    wait_for_connected_peer(&manager_a).await;
+
+    let handle_a = manager_a.handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let connections = loop {
+        let connections = handle_a.active_connections().await;
+        if !connections.is_empty() {
+            break connections;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection metadata was not published"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(connections.len(), 1);
+    assert_eq!(
+        connections[0].dialed_endpoint.as_deref(),
+        Some(addr_b.as_str())
+    );
+    assert_eq!(connections[0].direction, ConnectionDirection::Outbound);
+    assert_eq!(
+        connections[0].identity.verification,
+        PeerIdentityVerification::Unverified
+    );
+
+    discovery.remove(&addr_b);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if manager_a.peer_candidates().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "removed discovery candidate remained visible"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        manager_a.connected_peer_count().await,
+        1,
+        "removing a candidate must not terminate an admitted connection"
+    );
+
+    // The connection remains an anti-entropy target even after its discovery
+    // contribution is removed. No broadcast can deliver this operation.
+    dropped_local_increment(&manager_b, &handle_b, "removed-candidate", 7).await;
+    wait_for_counter(&manager_a, "removed-candidate", 7).await;
+    assert_eq!(read_materialized(&manager_a.store, "removed-candidate"), 7);
+
+    manager_a.shutdown().await.unwrap();
+    manager_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
+    let interval = Duration::from_millis(200);
+    // A controlled peer never broadcasts or answers connection-time requests.
+    let source_id = NodeId::generate();
+    let mut source = Node::new(NodeConfig::new(source_id.clone(), "127.0.0.1:0"));
+    let mut source_events = source.take_event_receiver().unwrap();
+    let source_addr = source.start_listener().await.unwrap().to_string();
+    let discovery = Arc::new(TestDynamicDiscovery::empty());
+    discovery.add(source_addr);
+    let mut target = SyncManager::try_new_with_discovery(
+        NodeId::generate(),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_max_peers(1)
+            .with_anti_entropy_interval(interval),
+        temp_store(),
+        metrics(),
+        vec![DiscoveryProvider::new("test-dynamic", discovery.clone())],
+        DiscoveryRuntimeConfig::default(),
+    )
+    .unwrap();
+    target.start().await.unwrap();
+    wait_for_connected_peer(&target).await;
+
+    // Reserve the unused endpoint; churn must not create additional connections.
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused_addr = unused.local_addr().unwrap().to_string();
+    let mut candidates = target.discovery_coordinator.as_ref().unwrap().candidates();
+    let (updates_tx, mut updates_rx) = tokio::sync::watch::channel(Instant::now());
+    let churn = async {
+        let mut cadence = tokio::time::interval(Duration::from_millis(10));
+        cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut added = false;
+        loop {
+            cadence.tick().await;
+            added = !added;
+            if added {
+                discovery.add(unused_addr.clone());
+            } else {
+                discovery.remove(&unused_addr);
+            }
+            // Observe each published change rather than just enqueueing events.
+            candidates
+                .wait_for(|snapshot| snapshot.contains(&unused_addr) == added)
+                .await
+                .unwrap();
+            updates_tx.send_replace(Instant::now());
+        }
+    };
+    let recovery = async {
+        let mut ops = Vec::new();
+        for expected in 1..=3 {
+            ops.push(Op::gcounter_increment(source_id.clone(), "churn", 1));
+            updates_rx.changed().await.unwrap();
+            let first_change = *updates_rx.borrow_and_update();
+            // Observe distinct published changes spanning a full anti-entropy
+            // interval, rather than assuming a scheduler-dependent update count.
+            let last_change = *updates_rx
+                .wait_for(|changed_at| *changed_at >= first_change + interval)
+                .await
+                .unwrap();
+            assert!(last_change.duration_since(first_change) >= interval);
+
+            // Discard all earlier requests, including any eager startup pull.
+            // Only a fresh periodic request may recover this missing operation.
+            while let Ok(event) = source_events.try_recv() {
+                assert!(matches!(
+                    event,
+                    NodeEvent::PeerConnected { .. } | NodeEvent::PullRequested { .. }
+                ));
+            }
+            let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+            assert_eq!(since, None);
+            let change_at_pull = *updates_rx.borrow_and_update();
+            updates_rx.changed().await.unwrap();
+            assert!(*updates_rx.borrow_and_update() > change_at_pull);
+            assert_eq!(target.get_counter_value("churn").await, expected - 1);
+            source
+                .send_ops_to_addr(&reply_addr, ops.clone())
+                .await
+                .unwrap();
+
+            // FIFO on this connection makes the reply to our pull an apply
+            // barrier: the target must have processed the preceding ops first.
+            source
+                .send_pull_since_to_addr(&reply_addr, None)
+                .await
+                .unwrap();
+            loop {
+                match source_events
+                    .recv()
+                    .await
+                    .expect("peer event channel closed")
+                {
+                    NodeEvent::OpsReceived { ops: received, .. } => {
+                        assert_eq!(received, ops);
+                        break;
+                    }
+                    NodeEvent::PullRequested { .. } => {}
+                    event => panic!("unexpected event during recovery: {event:?}"),
+                }
+            }
+            assert_eq!(target.get_counter_value("churn").await, expected);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = churn => unreachable!("churn must continue until recovery completes"),
+            _ = recovery => {}
+        }
+    })
+    .await
+    .expect("anti-entropy did not recover missing ops while candidate updates continued");
+    assert_eq!(target.connected_peer_count().await, 1);
+    assert_eq!(read_materialized(&target.store, "churn"), 3);
+    assert_eq!(target.op_log.read().await.len(), 3);
+    assert_eq!(target.seen_ops.read().await.len(), 3);
+    target.shutdown().await.unwrap();
+    source.shutdown().await;
+}
+
+#[tokio::test]
+async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
+    let addr = free_addr();
+    let (mut target, _, store) = started_manager_with_config(
+        SyncConfig::new()
+            .with_listen_addr(addr.clone())
+            .with_max_peers(1)
+            .with_anti_entropy_interval(Duration::from_millis(10)),
+    )
+    .await;
+    let source_id = NodeId::generate();
+    let mut source = Node::new(NodeConfig::new(source_id.clone(), "127.0.0.1:0"));
+    let mut source_events = source.take_event_receiver().unwrap();
+    source.connect_to_peer(&addr).await.unwrap();
+    wait_for_connected_peer(&target).await;
+    assert!(target.peer_candidates().is_empty());
+    assert_eq!(target.connected_peer_count().await, 1);
+
+    let older = Op::gcounter_increment(source_id.clone(), "missing", 3);
+    let newer = Op::gcounter_increment(source_id.clone(), "received", 7);
+    source
+        .send_ops_to_addr(&addr, vec![newer.clone()])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "received", 7).await;
+    assert_eq!(target.get_counter_value("missing").await, 0);
+    assert_eq!(
+        target.anti_entropy_watermarks.read().await.get(&source_id),
+        Some(&newer.id.as_str().to_string())
+    );
+    let connections = target.handle().active_connections().await;
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].direction, ConnectionDirection::Inbound);
+    assert!(connections[0].dialed_endpoint.is_none());
+
+    // A newer received op must not become a causal frontier. The inbound
+    // transport address (not an advertised candidate) is the only valid target.
+    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+    assert_eq!(since, None);
+    source
+        .send_ops_to_addr(&reply_addr, vec![older.clone(), newer.clone()])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "missing", 3).await;
+
+    // Repeated full bounded-log pulls must still deduplicate previously seen ops.
+    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
+    assert_eq!(since, None);
+    let barrier = Op::gcounter_increment(source_id, "barrier", 1);
+    source
+        .send_ops_to_addr(&reply_addr, vec![older, newer, barrier])
+        .await
+        .unwrap();
+    wait_for_counter(&target, "barrier", 1).await;
+    assert_eq!(target.get_counter_value("missing").await, 3);
+    assert_eq!(target.get_counter_value("received").await, 7);
+    assert_eq!(read_materialized(&store, "missing"), 3);
+    assert_eq!(read_durable_gcounter_state(&store, "missing").value(), 3);
+    assert_eq!(target.op_log.read().await.len(), 3);
+    assert_eq!(target.seen_ops.read().await.len(), 3);
+    target.shutdown().await.unwrap();
+    source.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_unresponsive_candidates_do_not_block_startup_or_shutdown() {
+    use tokio::io::AsyncReadExt;
+
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first.local_addr().unwrap().to_string();
+    let second_addr = second.local_addr().unwrap().to_string();
+    let mut manager = SyncManager::new(
+        NodeId::generate(),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(first_addr.clone())
+            .with_peer(second_addr.clone())
+            .with_socket_timeout(Duration::from_secs(60)),
+        temp_store(),
+        metrics(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), manager.start())
+        .await
+        .expect("startup waited for initial peer handshakes")
+        .unwrap();
+    assert!(manager.start().await.is_err(), "start remains one-shot");
+    assert!(manager.event_task.is_some());
+    assert!(manager.broadcast_task.is_some());
+    assert!(manager.reconnect_task.is_some());
+    assert!(manager.anti_entropy_task.is_some());
+
+    let (mut stalled, _) = tokio::time::timeout(Duration::from_secs(1), first.accept())
+        .await
+        .expect("initial reconnect dial did not start")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_exact(&mut [0; 1]))
+        .await
+        .expect("initial dial did not send its Hello")
+        .unwrap();
+    let error = manager.connect_to_peer(&second_addr).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<nx_net::NetError>(),
+        Some(nx_net::NetError::ConnectionFailed(message))
+            if message.contains("outbound connection attempt limit reached: 1")
+    ));
+    assert_eq!(manager.connected_peer_count().await, 0);
+
+    // Broadcast persistence and event processing are already running while the
+    // first candidate has stalled and the second has not yet been attempted.
+    local_increment(&manager.handle(), "startup", 1).await;
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("shutdown waited for the in-flight dial timeout")
+        .unwrap();
+    assert_eq!(manager.op_log.read().await.len(), 1);
+    assert!(manager.reconnect_task.is_none());
+    assert!(manager.event_task.is_none());
+    assert!(manager.broadcast_task.is_none());
+    assert!(manager.anti_entropy_task.is_none());
+    assert!(
+        manager.start().await.is_err(),
+        "shutdown must not allow restart"
+    );
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_to_end(&mut Vec::new()))
+        .await
+        .expect("canceled dial kept its transport open")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn immediate_shutdown_cancels_initial_dial_before_task_first_poll() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (mut manager, _, _) = started_manager_with_config(
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(listener.local_addr().unwrap().to_string())
+            .with_socket_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .expect("pre-signaled shutdown must not wait for an initial dial")
+        .unwrap();
+    assert!(manager.reconnect_task.is_none());
+    assert_eq!(manager.connected_peer_count().await, 0);
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 
 info:
   title: Numax Management API
-  version: 0.1.4
+  version: 0.1.5
   description: |
     Authenticated API for operating a single Numax node.
 

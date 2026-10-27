@@ -6,11 +6,17 @@ import config from 'virtual:starlight/user-config';
 import { Icon } from '@astrojs/starlight/components';
 
 import GiscusComments from './GiscusComments.astro';
+
+const basePath = import.meta.env.BASE_URL;
 ---
 
 <GiscusComments />
 
 <footer class="sl-flex">
+	<a class="footer-brand" href={`${basePath}/`} aria-label="Numax home">
+		<img src={`${basePath}/favicon.png`} width="20" height="20" alt="" />
+		<span>Numax</span>
+	</a>
 	<div class="meta sl-flex">
 		<EditLink />
 		<LastUpdated />
@@ -31,6 +37,26 @@ import GiscusComments from './GiscusComments.astro';
 		flex-direction: column;
 		gap: 1.5rem;
 	}
+	.footer-brand {
+		align-items: center;
+		gap: 0.5rem;
+		align-self: flex-start;
+		color: var(--sl-color-gray-2);
+		font-size: var(--sl-text-sm);
+		font-weight: 600;
+		text-decoration: none;
+	}
+
+	.footer-brand img {
+		width: 1.25rem;
+		height: 1.25rem;
+	}
+
+	.footer-brand:hover,
+	.footer-brand:focus-visible {
+		color: var(--sl-color-white);
+	}
+
 	.meta {
 		gap: 0.75rem 3rem;
 		justify-content: space-between;

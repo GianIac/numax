@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,26 @@ struct NodeArgs {
     /// Peer addresses to connect to (can be repeated). Requires --listen.
     #[arg(long = "peer", value_name = "ADDR")]
     peers: Vec<String>,
+
+    /// Peer discovery provider.
+    #[arg(long, value_enum, value_name = "MODE")]
+    discovery_mode: Option<DiscoveryMode>,
+
+    /// Bootstrap endpoint (can be repeated).
+    #[arg(long = "bootstrap-seed", value_name = "URL")]
+    bootstrap_seeds: Vec<String>,
+
+    /// mDNS instance name advertised by this node.
+    #[arg(long, value_name = "NAME")]
+    mdns_instance: Option<String>,
+
+    /// DNS-SRV service name to resolve.
+    #[arg(long, value_name = "NAME")]
+    dns_srv_name: Option<String>,
+
+    /// Path to the watched peer list.
+    #[arg(long, value_name = "PATH")]
+    peer_file: Option<PathBuf>,
 
     /// Maximum time allowed for shutdown before returning an error.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -367,6 +387,11 @@ fn resolve_node_args(node: NodeArgs) -> Result<ResolvedNodeArgs> {
         config,
         listen,
         peers,
+        discovery_mode,
+        bootstrap_seeds,
+        mdns_instance,
+        dns_srv_name,
+        peer_file,
         shutdown_timeout,
         verbose,
         log_level,
@@ -395,6 +420,11 @@ fn resolve_node_args(node: NodeArgs) -> Result<ResolvedNodeArgs> {
         verbose,
         log_level,
         log_format,
+        discovery_mode,
+        bootstrap_seeds,
+        mdns_instance,
+        dns_srv_name,
+        peer_file,
     };
 
     Ok(ResolvedNodeArgs {
@@ -407,7 +437,8 @@ fn resolve_node_args(node: NodeArgs) -> Result<ResolvedNodeArgs> {
 fn runtime_config_from_effective(
     effective: EffectiveRunConfig,
     module_id: Option<String>,
-) -> RuntimeConfig {
+) -> (RuntimeConfig, nx_core::RuntimeDiscoveryConfig) {
+    let discovery = effective.discovery;
     let mut config = RuntimeConfig::default();
     if let Some(path) = effective.datastore_path {
         config.datastore_path = path;
@@ -426,7 +457,7 @@ fn runtime_config_from_effective(
         config.sync = Some(sync);
     }
     config.observability = effective.observability;
-    config
+    (config, discovery)
 }
 
 async fn real_main(cli: Cli) -> Result<()> {
@@ -443,6 +474,7 @@ async fn real_main(cli: Cli) -> Result<()> {
             print_orset,
             print_rga,
         } => {
+            check_module_path(&module)?;
             let resolved = resolve_node_args(node)?;
             let effective = resolved.effective;
 
@@ -463,14 +495,15 @@ async fn real_main(cli: Cli) -> Result<()> {
             validate_print_rga(&effective.sync, &print_rga)?;
 
             // Read the wasm module
-            let bytes = fs::read(&module)?;
+            let bytes = fs::read(&module).map_err(|e| {
+                anyhow::anyhow!("cannot read WASM module at `{}`: {e}", module.display())
+            })?;
 
-            let cfg = runtime_config_from_effective(
+            let (cfg, discovery) = runtime_config_from_effective(
                 effective,
                 Some(module.to_string_lossy().into_owned()),
             );
-
-            let mut rt = Runtime::new(cfg)?;
+            let mut rt = Runtime::new_with_discovery(cfg, discovery)?;
             let run_result: Result<()> = async {
                 rt.start_observability().await?;
                 rt.start_sync().await?;
@@ -560,8 +593,8 @@ async fn real_main(cli: Cli) -> Result<()> {
             let has_active_service = effective.sync.is_some()
                 || effective.observability.is_some()
                 || management_config.is_some();
-            let cfg = runtime_config_from_effective(effective, None);
-            let mut rt = Runtime::new(cfg)?;
+            let (cfg, discovery) = runtime_config_from_effective(effective, None);
+            let mut rt = Runtime::new_with_discovery(cfg, discovery)?;
             let mut management_server = None;
             let serve_result: Result<()> = async {
                 rt.start_observability().await?;
@@ -632,6 +665,25 @@ async fn real_main(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Fails early with an actionable message when `nx run` is given a module path
+/// that is missing or is not a file, instead of a bare I/O error from loading.
+fn check_module_path(module: &Path) -> Result<()> {
+    match fs::metadata(module) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "`{}` is not a file; pass the path to a compiled `.wasm` module",
+            module.display()
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => anyhow::bail!(
+            "WASM module not found at `{}`\n\
+             hint: did you build it? (`cargo build --release --target wasm32-unknown-unknown`); \
+             relative paths are resolved from the current directory",
+            module.display()
+        ),
+        Err(e) => anyhow::bail!("cannot read WASM module at `{}`: {e}", module.display()),
+    }
+}
+
 fn parse_nonzero_u32(input: &str) -> Result<NonZeroU32> {
     let value = input.parse::<u32>()?;
     NonZeroU32::new(value).ok_or_else(|| anyhow::anyhow!("value must be greater than zero"))
@@ -646,6 +698,40 @@ fn parse_nonzero_byte_size(input: &str) -> Result<NonZeroUsize> {
 mod tests {
     use super::*;
     use nx_core::{SerializationFormat, SyncConfig, TlsConfig};
+
+    mod check_module_path {
+        use super::*;
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("nx-cli-module-path-{name}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn missing_module_names_the_path_and_hints_at_building() {
+            let path = temp_dir("missing").join("does_not_exist.wasm");
+            let err = check_module_path(&path).unwrap_err().to_string();
+            assert!(err.contains("WASM module not found at"), "{err}");
+            assert!(err.contains("does_not_exist.wasm"), "{err}");
+            assert!(err.contains("hint: did you build it?"), "{err}");
+        }
+
+        #[test]
+        fn directory_is_rejected_as_not_a_file() {
+            let dir = temp_dir("dir");
+            let err = check_module_path(&dir).unwrap_err().to_string();
+            assert!(err.contains("is not a file"), "{err}");
+        }
+
+        #[test]
+        fn existing_file_is_accepted() {
+            let path = temp_dir("file").join("module.wasm");
+            fs::write(&path, b"\0asm").unwrap();
+            assert!(check_module_path(&path).is_ok());
+        }
+    }
     use std::path::PathBuf;
 
     fn p(s: &str) -> Option<PathBuf> {
@@ -781,6 +867,11 @@ mod tests {
                 verbose: false,
                 log_level: None,
                 log_format: None,
+                discovery_mode: None,
+                bootstrap_seeds: Vec::new(),
+                mdns_instance: None,
+                dns_srv_name: None,
+                peer_file: None,
             }
         }
 
@@ -990,6 +1081,142 @@ mod tests {
         }
 
         #[test]
+        fn discovery_precedence_is_cli_then_env_then_file() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "127.0.0.1:9000"
+
+                [discovery]
+                mode = "mdns"
+                instance_name = "from-file"
+                "#,
+            )
+            .unwrap();
+            let mut cli = cli_defaults();
+            cli.mdns_instance = Some("from-cli".into());
+            let env_config = EnvRunConfig {
+                discovery_instance_name: Some("from-env".into()),
+                ..EnvRunConfig::default()
+            };
+
+            let effective =
+                EffectiveRunConfig::resolve_with_env(cli, env_config, &file_config).unwrap();
+
+            let nx_core::RuntimeDiscoveryMode::Mdns(settings) = effective.discovery.mode else {
+                panic!("expected mdns discovery");
+            };
+            assert_eq!(settings.instance_name, "from-cli");
+        }
+
+        #[test]
+        fn cli_discovery_mode_ignores_lower_priority_provider_fields() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "127.0.0.1:9000"
+
+                [discovery]
+                mode = "mdns"
+                instance_name = "from-file"
+                "#,
+            )
+            .unwrap();
+            let mut cli = cli_defaults();
+            cli.discovery_mode = Some(DiscoveryMode::Static);
+
+            let effective =
+                EffectiveRunConfig::resolve_with_env(cli, EnvRunConfig::default(), &file_config)
+                    .unwrap();
+
+            assert!(matches!(
+                effective.discovery.mode,
+                nx_core::RuntimeDiscoveryMode::Static
+            ));
+        }
+
+        #[test]
+        fn discovery_rejects_fields_from_another_mode() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [discovery]
+                mode = "static"
+                service_name = "_numax._tcp.example.com"
+                "#,
+            )
+            .unwrap();
+
+            let error = EffectiveRunConfig::resolve_with_env(
+                cli_defaults(),
+                EnvRunConfig::default(),
+                &file_config,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("not valid for mode static"));
+        }
+
+        #[test]
+        fn dynamic_discovery_requires_provider_selector() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "127.0.0.1:9000"
+
+                [discovery]
+                mode = "dns-srv"
+                "#,
+            )
+            .unwrap();
+
+            let error = EffectiveRunConfig::resolve_with_env(
+                cli_defaults(),
+                EnvRunConfig::default(),
+                &file_config,
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("discovery.service_name is required")
+            );
+        }
+
+        #[test]
+        fn dynamic_discovery_keeps_explicit_peers_and_renders_effective_values() {
+            let file_config: RunFileConfig = toml::from_str(
+                r#"
+                [network]
+                listen = "127.0.0.1:9000"
+                peers = ["127.0.0.1:9001"]
+
+                [discovery]
+                mode = "bootstrap"
+                seeds = ["127.0.0.1:9100"]
+                refresh_interval = "15s"
+                "#,
+            )
+            .unwrap();
+
+            let effective = EffectiveRunConfig::resolve_with_env(
+                cli_defaults(),
+                EnvRunConfig::default(),
+                &file_config,
+            )
+            .unwrap();
+
+            assert_eq!(
+                effective.sync.as_ref().unwrap().peers,
+                vec!["127.0.0.1:9001"]
+            );
+            let rendered = effective.render_effective_toml();
+            assert!(rendered.contains("mode = \"bootstrap\""));
+            assert!(rendered.contains("seeds = [\"127.0.0.1:9100\"]"));
+            assert!(rendered.contains("refresh_interval = \"15s\""));
+        }
+
+        #[test]
         fn parses_observability_toml() {
             let cfg: RunFileConfig = toml::from_str(
                 r#"
@@ -1068,6 +1295,7 @@ mod tests {
                 sync: None,
                 observability: None,
                 management: Some(management),
+                discovery: nx_core::RuntimeDiscoveryConfig::default(),
                 log_level: "info".into(),
                 log_format: LogFormat::Text,
             };

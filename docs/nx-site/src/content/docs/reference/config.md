@@ -86,6 +86,13 @@ anti_entropy_interval = "30s"
 
 [discovery]
 mode = "static"
+# cluster_id = "default"
+# advertised_endpoint = "127.0.0.1:9000"
+# max_candidates = 1024
+# Bootstrap: seeds, refresh_interval, retry_initial, retry_max, stale_after, max_seeds
+# mDNS: instance_name, max_instances
+# DNS-SRV: service_name, retry_interval, max_refresh_interval
+# File: path, poll_interval, max_file_bytes
 ```
 
 All fields are optional. Unknown fields are rejected at validation time.
@@ -256,19 +263,61 @@ anti_entropy_interval = "60s"
 
 ## [discovery]
 
-Controls how peers are discovered.
+Controls how peers are discovered in `v0.1.5`, the current Numax version.
+Dynamic discovery is available alongside backward-compatible static peer lists.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `mode` | string | `static` | Discovery mode. Only `static` is supported today |
+| `mode` | string | `static` | `static`, `bootstrap`, `mdns`, `dns-srv`, or `file` |
+| `cluster_id` | string | `default` | Discovery routing scope; not an authorization boundary |
+| `advertised_endpoint` | string | derived from listener | Concrete endpoint published by bootstrap or mDNS |
+| `max_candidates` | integer | `1024` | Positive aggregate bound across all discovery sources; at most `4096` in bootstrap mode |
 
-In `static` mode, peers are explicitly listed in `[network].peers` or via `--peer` flags.
-Dynamic discovery (mDNS, DNS-SRV, SWIM) is on the roadmap.
+Provider-specific fields are accepted only for their selected mode:
+
+| Mode | Required fields | Optional fields and defaults |
+|---|---|---|
+| `static` | none | none |
+| `bootstrap` | `seeds` | `refresh_interval = "20s"`, `retry_initial = "500ms"`, `retry_max = "30s"`, `stale_after = "2m"`, `max_seeds = 32` |
+| `mdns` | `instance_name` | `max_instances = 1024` |
+| `dns-srv` | `service_name` | `retry_interval = "5s"`, `max_refresh_interval = "5m"` |
+| `file` | `path` | `poll_interval = "2s"`, `max_file_bytes = "1MiB"` |
+
+Explicit peers from `[network].peers`, `--peer`, `NX_PEER`, or `NX_PEERS`
+remain an additional static source when a dynamic mode is selected. They never
+become bootstrap seeds. Every non-static mode enables sync and therefore
+requires `[network].listen`, `--listen`, or `NX_LISTEN`.
+
+For compatibility, the effective candidate capacity is raised to at least the
+number of explicit peer entries. In bootstrap mode that effective value must
+also be at most `4096`: a larger explicit peer list is rejected, not silently
+truncated. The bootstrap upper bound does not apply to static, mDNS, DNS-SRV or
+file mode. `NX_DISCOVERY_MAX_CANDIDATES` overrides the TOML value; validation uses
+the resolved mode and capacity.
+
+Successful startup means local services are ready, not that discovery has
+found peers or CRDT state has converged. Candidate expiry stops new dialing but
+does not close admitted connections; periodic anti-entropy continues over those
+active connections. Recovery depends on retained operation and deduplication
+history, not merely on rediscovery. See the
+[discovery contract](/numax/design/discovery-contract/) for freshness, shutdown
+and mDNS resource limits.
 
 ```toml
 [discovery]
-mode = "static"
+mode = "bootstrap"
+cluster_id = "production"
+advertised_endpoint = "10.0.0.12:9000"
+seeds = ["10.0.0.10:9000", "10.0.0.11:9000"]
 ```
+
+### Advertised endpoint resolution rules
+
+The `advertised_endpoint` specifies the dialable address announced to peers through dynamic discovery providers (mDNS, bootstrap gossip, etc.):
+
+- **Explicit unicast listener**: When `[network].listen` specifies a concrete IP address (e.g., `192.168.1.50:9000`), `advertised_endpoint` defaults to that address and is optional.
+- **Wildcard listener (`0.0.0.0` or `[::]`)**: An explicit `advertised_endpoint` is **required** because wildcard addresses are not dialable by remote peers.
+- **Dynamic port binding (`:0`)**: If configured with port zero (e.g., `192.168.1.50:0`), Numax automatically resolves the port to the actual ephemeral port assigned by the OS upon binding.
 
 ---
 
@@ -297,6 +346,23 @@ They are useful for secrets (TLS paths), container environments, and CI.
 | `NX_MANAGEMENT_REQUEST_TIMEOUT_SECS` | integer | `[management].request_timeout_secs` | HTTP header-read and routed-request timeout in seconds |
 | `NX_LOG_LEVEL` | string | `[observability].log_level` | `trace`, `debug`, `info`, `warn`, `error` |
 | `NX_LOG_FORMAT` | string | `[observability].log_format` | `text` or `json` |
+| `NX_DISCOVERY_MODE` | string | `[discovery].mode` | `static`, `bootstrap`, `mdns`, `dns-srv`, or `file` |
+| `NX_DISCOVERY_CLUSTER_ID` | string | `[discovery].cluster_id` | Discovery routing scope |
+| `NX_DISCOVERY_ADVERTISED_ENDPOINT` | string | `[discovery].advertised_endpoint` | Endpoint to publish |
+| `NX_DISCOVERY_MAX_CANDIDATES` | integer | `[discovery].max_candidates` | Aggregate candidate bound |
+| `NX_DISCOVERY_SEEDS` | CSV | `[discovery].seeds` | Bootstrap seed endpoints |
+| `NX_DISCOVERY_REFRESH_INTERVAL` | duration | `[discovery].refresh_interval` | Bootstrap refresh interval |
+| `NX_DISCOVERY_RETRY_INITIAL` / `NX_DISCOVERY_RETRY_MAX` | duration | matching fields | Bootstrap retry bounds |
+| `NX_DISCOVERY_STALE_AFTER` | duration | `[discovery].stale_after` | Bootstrap candidate lease |
+| `NX_DISCOVERY_MAX_SEEDS` | integer | `[discovery].max_seeds` | Bootstrap seed bound |
+| `NX_DISCOVERY_INSTANCE_NAME` | string | `[discovery].instance_name` | mDNS instance name |
+| `NX_DISCOVERY_MAX_INSTANCES` | integer | `[discovery].max_instances` | mDNS instance bound |
+| `NX_DISCOVERY_SERVICE_NAME` | string | `[discovery].service_name` | Fully qualified DNS-SRV name |
+| `NX_DISCOVERY_RETRY_INTERVAL` | duration | `[discovery].retry_interval` | DNS retry interval |
+| `NX_DISCOVERY_MAX_REFRESH_INTERVAL` | duration | `[discovery].max_refresh_interval` | DNS refresh ceiling |
+| `NX_DISCOVERY_FILE` | path | `[discovery].path` | Watched peer file |
+| `NX_DISCOVERY_POLL_INTERVAL` | duration | `[discovery].poll_interval` | File polling interval |
+| `NX_DISCOVERY_MAX_FILE_BYTES` | byte size | `[discovery].max_file_bytes` | Peer-file size bound |
 
 `NX_PEER` and `NX_PEERS` are additive: if both are set, both peers are used.
 
@@ -365,5 +431,5 @@ nx run my_module.wasm --config node-b.toml --settle-for 5s
 
 ## Related
 
-- [CLI reference](/reference/cli/) - full flag and subcommand reference
-- [Host API](/reference/host-api/) - functions available to WASM modules
+- [CLI reference](/numax/reference/cli/) - full flag and subcommand reference
+- [Host API](/numax/reference/host-api/) - functions available to WASM modules

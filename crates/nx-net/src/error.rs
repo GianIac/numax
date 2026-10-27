@@ -3,6 +3,7 @@ use thiserror::Error;
 use crate::message::WireError;
 
 pub type NetResult<T> = Result<T, NetError>;
+pub type BootstrapResult<T> = Result<T, BootstrapError>;
 
 #[derive(Debug, Error)]
 pub enum NetError {
@@ -50,4 +51,45 @@ pub enum NetError {
 
     #[error("node ID mismatch: expected {expected}, got {got}")]
     NodeIdMismatch { expected: String, got: String },
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum NodeConfigError {
+    #[error("max_peers must not exceed {limit}")]
+    MaxPeersTooLarge { limit: usize },
+
+    #[error("event_channel_capacity must be in 1..={limit}")]
+    InvalidEventChannelCapacity { limit: usize },
+
+    #[error("socket_timeout must be positive and form a representable deadline")]
+    InvalidSocketTimeout,
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum BootstrapError {
+    #[error("invalid bootstrap configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("bootstrap query concurrency limit reached: {limit}")]
+    ConcurrencyLimitReached { limit: usize },
+
+    #[error("bootstrap request rejected: {reason}")]
+    Rejected { reason: String },
+
+    #[error("invalid bootstrap response: {0}")]
+    InvalidResponse(String),
+
+    #[error("bootstrap transport error: {0}")]
+    Transport(#[source] NetError),
+
+    #[error("invalid node configuration: {0}")]
+    NodeConfig(#[from] NodeConfigError),
+}
+
+impl From<NetError> for BootstrapError {
+    fn from(error: NetError) -> Self {
+        Self::Transport(error)
+    }
 }

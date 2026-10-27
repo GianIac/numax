@@ -17,21 +17,13 @@ When a WASM module imports `nx::my_function`, Wasmtime looks for `my_function` i
 
 For functions that exchange dynamic data, the usual path is:
 
-```
-guest: nx_sdk::text::upper(input)
-  │
-  ├── nx-sdk/src/ffi.rs
-  │   unsafe extern "C" { fn string_upper(ptr, len, out_ptr, out_cap) -> i32; }
-  │
-  ├── WASM linear memory
-  │
-  └── nx-core/src/host_api/text.rs
-      string_upper_impl(caller, ptr, len, out_ptr, out_cap) -> i32
-          reads input from guest memory
-          does host-side work
-          writes output into guest memory
-          returns byte count or error code
-```
+![A guest calls a byte-oriented host function through nx-sdk, WASM linear memory, and the nx-core Host API](/numax/diagrams/concepts/host-guest-call.svg)
+
+[Mermaid source for this diagram](/numax/diagrams/concepts/host-guest-call.mmd)
+
+The `string_upper` function built below follows this path: the SDK wrapper passes
+input and output buffer offsets through its FFI import, and the host function
+reads and writes the guest's linear memory before returning a byte count or error.
 
 Not every host function has this shape. `time_now()` and `time_monotonic()` return `u64`, legacy `host_log` returns `()`, and `abort` raises a Wasmtime trap. The byte-in/byte-out shape is the right default for APIs that pass strings, lists, or binary payloads.
 

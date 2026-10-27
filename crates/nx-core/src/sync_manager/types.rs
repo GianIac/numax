@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::Duration;
 
-use nx_net::Node;
+use nx_net::{Node, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
 use tokio::sync::{RwLock, watch};
@@ -129,7 +129,7 @@ impl SeenOps {
 
 pub(super) struct ReconnectLoopContext {
     pub(super) node: Arc<Node>,
-    pub(super) peers: Vec<String>,
+    pub(super) candidates_rx: watch::Receiver<Arc<Vec<String>>>,
     pub(super) max_peers: usize,
     pub(super) initial_delay: Duration,
     pub(super) max_delay: Duration,
@@ -141,7 +141,6 @@ pub(super) struct ReconnectLoopContext {
 
 pub(super) struct AntiEntropyLoopContext {
     pub(super) node: Arc<Node>,
-    pub(super) peers: Vec<String>,
     pub(super) interval: Duration,
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) metrics: Arc<RuntimeMetrics>,
@@ -226,7 +225,7 @@ pub(super) struct NodeEventContext {
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) node: Arc<Node>,
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
-    pub(super) peer_node_ids: Arc<RwLock<HashMap<String, NodeId>>>,
+    pub(super) active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
     pub(super) anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
     pub(super) peer_dead_after_failures: u32,
 }

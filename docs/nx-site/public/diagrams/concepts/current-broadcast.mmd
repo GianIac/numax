@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant Guest as Guest
+    participant Host as Host API
+    participant Store as Local store
+    participant Broadcast as Broadcast loop
+    participant Peers as Connected peers
+    Guest->>Host: CRDT update
+    Host->>Store: Persist updated CRDT state
+    Host->>Broadcast: Enqueue operation in bounded queue
+    Broadcast->>Broadcast: Drain and batch operations
+    Broadcast->>Store: Persist seen IDs and bounded op log
+    Broadcast->>Peers: PushOps via nx-net to each connected peer
+    Note over Broadcast,Peers: Direct broadcast now. K-fanout is planned

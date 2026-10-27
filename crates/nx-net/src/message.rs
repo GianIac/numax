@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -168,6 +168,88 @@ pub struct Message {
     pub kind: MessageKind,
 }
 
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,
+)]
+pub(crate) enum ProtocolWireError {
+    ProtocolMismatch { expected: u32, got: u32 },
+    OpRejected { reason: String },
+    RateLimited { retry_after_ms: Option<u64> },
+    NotAuthorized { reason: String },
+    Internal { reason: String },
+    BootstrapRejected { reason: String },
+}
+
+impl std::fmt::Display for ProtocolWireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BootstrapRejected { reason } => {
+                write!(formatter, "bootstrap request rejected: {reason}")
+            }
+            error => WireError::try_from(error.clone())
+                .map_err(|_| std::fmt::Error)?
+                .fmt(formatter),
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,
+)]
+pub(crate) enum WireMessageKind {
+    Hello {
+        node_id: NodeId,
+        #[serde(alias = "version")]
+        protocol_version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+    },
+    HelloAck {
+        node_id: NodeId,
+        #[serde(alias = "version")]
+        protocol_version: u32,
+        selected_format: SerializationFormat,
+    },
+    PushOps {
+        ops: Vec<Op>,
+    },
+    PushOpsAck {
+        received_count: u64,
+    },
+    PullSince {
+        since_op_id: Option<String>,
+    },
+    Ping,
+    Pong,
+    Error {
+        error: ProtocolWireError,
+    },
+    BootstrapHello {
+        node_id: NodeId,
+        protocol_version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        cluster_id: String,
+        advertised_endpoint: Option<String>,
+        max_results: u32,
+    },
+    BootstrapAck {
+        node_id: NodeId,
+        protocol_version: u32,
+        selected_format: SerializationFormat,
+        cluster_id: String,
+        candidates: Vec<String>,
+        candidate_ttl_ms: u64,
+    },
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,
+)]
+pub(crate) struct WireMessage {
+    pub(crate) kind: WireMessageKind,
+}
+
 impl Message {
     pub fn hello(node_id: NodeId) -> Self {
         Self::hello_with_formats(
@@ -256,24 +338,16 @@ impl Message {
 
     /// Serialize to bytes (length-prefixed format byte + payload).
     pub fn to_bytes_with_format(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
-        let payload = match format {
-            SerializationFormat::Json => serde_json::to_vec(self)?,
-            SerializationFormat::Bincode => wincode::config::serialize(
-                self,
-                wincode::config::Configuration::default().disable_preallocation_size_limit(),
-            )?,
-        };
-        let len = payload
-            .len()
-            .checked_add(1)
-            .and_then(|len| u32::try_from(len).ok())
-            .ok_or_else(|| NetError::InvalidMessage("message payload exceeds u32".to_string()))?;
-        let len = len.to_be_bytes();
-        let mut buf = Vec::with_capacity(4 + 1 + payload.len());
-        buf.extend_from_slice(&len);
-        buf.push(format.to_wire_byte());
-        buf.extend_from_slice(&payload);
-        Ok(buf)
+        encode_frame(
+            format,
+            || serde_json::to_vec(self).map_err(NetError::from),
+            || {
+                Ok(wincode::config::serialize(
+                    self,
+                    wincode::config::Configuration::default().disable_preallocation_size_limit(),
+                )?)
+            },
+        )
     }
 
     /// Deserialize from bytes without the length prefix.
@@ -284,19 +358,238 @@ impl Message {
 
     /// Deserialize from bytes without the length prefix, returning the detected format.
     pub fn from_bytes_with_format(bytes: &[u8]) -> NetResult<(SerializationFormat, Self)> {
-        let Some((&format_byte, payload)) = bytes.split_first() else {
-            return Err(NetError::InvalidMessage(
-                "message payload is missing serialization format byte".to_string(),
-            ));
-        };
-
-        let format = SerializationFormat::from_wire_byte(format_byte)?;
-        let msg = match format {
-            SerializationFormat::Json => serde_json::from_slice(payload)?,
-            SerializationFormat::Bincode => deserialize_binary(payload)?,
-        };
-        Ok((format, msg))
+        decode_frame(
+            bytes,
+            |payload| serde_json::from_slice(payload),
+            deserialize_binary_message,
+        )
     }
+}
+
+impl WireMessage {
+    pub(crate) fn bootstrap_hello(
+        node_id: NodeId,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        cluster_id: String,
+        advertised_endpoint: Option<String>,
+        max_results: u32,
+    ) -> Self {
+        Self {
+            kind: WireMessageKind::BootstrapHello {
+                node_id,
+                protocol_version: PROTOCOL_VERSION,
+                supported_formats,
+                preferred_format,
+                cluster_id,
+                advertised_endpoint,
+                max_results,
+            },
+        }
+    }
+
+    pub(crate) fn bootstrap_ack(
+        node_id: NodeId,
+        selected_format: SerializationFormat,
+        cluster_id: String,
+        candidates: Vec<String>,
+        candidate_ttl_ms: u64,
+    ) -> Self {
+        Self {
+            kind: WireMessageKind::BootstrapAck {
+                node_id,
+                protocol_version: PROTOCOL_VERSION,
+                selected_format,
+                cluster_id,
+                candidates,
+                candidate_ttl_ms,
+            },
+        }
+    }
+
+    pub(crate) fn wire_error(error: ProtocolWireError) -> Self {
+        Self {
+            kind: WireMessageKind::Error { error },
+        }
+    }
+
+    pub(crate) fn to_bytes_with_format(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
+        encode_frame(
+            format,
+            || serde_json::to_vec(self).map_err(NetError::from),
+            || {
+                Ok(wincode::config::serialize(
+                    self,
+                    wincode::config::Configuration::default().disable_preallocation_size_limit(),
+                )?)
+            },
+        )
+    }
+
+    pub(crate) fn from_bytes_with_format(bytes: &[u8]) -> NetResult<(SerializationFormat, Self)> {
+        decode_frame(
+            bytes,
+            |payload| serde_json::from_slice(payload),
+            deserialize_binary_wire_message,
+        )
+    }
+}
+
+impl From<WireError> for ProtocolWireError {
+    fn from(error: WireError) -> Self {
+        match error {
+            WireError::ProtocolMismatch { expected, got } => {
+                Self::ProtocolMismatch { expected, got }
+            }
+            WireError::OpRejected { reason } => Self::OpRejected { reason },
+            WireError::RateLimited { retry_after_ms } => Self::RateLimited { retry_after_ms },
+            WireError::NotAuthorized { reason } => Self::NotAuthorized { reason },
+            WireError::Internal { reason } => Self::Internal { reason },
+        }
+    }
+}
+
+impl TryFrom<ProtocolWireError> for WireError {
+    type Error = NetError;
+
+    fn try_from(error: ProtocolWireError) -> Result<Self, Self::Error> {
+        match error {
+            ProtocolWireError::ProtocolMismatch { expected, got } => {
+                Ok(Self::ProtocolMismatch { expected, got })
+            }
+            ProtocolWireError::OpRejected { reason } => Ok(Self::OpRejected { reason }),
+            ProtocolWireError::RateLimited { retry_after_ms } => {
+                Ok(Self::RateLimited { retry_after_ms })
+            }
+            ProtocolWireError::NotAuthorized { reason } => Ok(Self::NotAuthorized { reason }),
+            ProtocolWireError::Internal { reason } => Ok(Self::Internal { reason }),
+            ProtocolWireError::BootstrapRejected { .. } => Err(NetError::InvalidMessage(
+                "bootstrap wire errors are not public protocol messages".into(),
+            )),
+        }
+    }
+}
+
+impl From<Message> for WireMessage {
+    fn from(message: Message) -> Self {
+        let kind = match message.kind {
+            MessageKind::Hello {
+                node_id,
+                protocol_version,
+                supported_formats,
+                preferred_format,
+            } => WireMessageKind::Hello {
+                node_id,
+                protocol_version,
+                supported_formats,
+                preferred_format,
+            },
+            MessageKind::HelloAck {
+                node_id,
+                protocol_version,
+                selected_format,
+            } => WireMessageKind::HelloAck {
+                node_id,
+                protocol_version,
+                selected_format,
+            },
+            MessageKind::PushOps { ops } => WireMessageKind::PushOps { ops },
+            MessageKind::PushOpsAck { received_count } => {
+                WireMessageKind::PushOpsAck { received_count }
+            }
+            MessageKind::PullSince { since_op_id } => WireMessageKind::PullSince { since_op_id },
+            MessageKind::Ping => WireMessageKind::Ping,
+            MessageKind::Pong => WireMessageKind::Pong,
+            MessageKind::Error { error } => WireMessageKind::Error {
+                error: error.into(),
+            },
+        };
+        Self { kind }
+    }
+}
+
+impl TryFrom<WireMessage> for Message {
+    type Error = NetError;
+
+    fn try_from(message: WireMessage) -> Result<Self, Self::Error> {
+        let kind = match message.kind {
+            WireMessageKind::Hello {
+                node_id,
+                protocol_version,
+                supported_formats,
+                preferred_format,
+            } => MessageKind::Hello {
+                node_id,
+                protocol_version,
+                supported_formats,
+                preferred_format,
+            },
+            WireMessageKind::HelloAck {
+                node_id,
+                protocol_version,
+                selected_format,
+            } => MessageKind::HelloAck {
+                node_id,
+                protocol_version,
+                selected_format,
+            },
+            WireMessageKind::PushOps { ops } => MessageKind::PushOps { ops },
+            WireMessageKind::PushOpsAck { received_count } => {
+                MessageKind::PushOpsAck { received_count }
+            }
+            WireMessageKind::PullSince { since_op_id } => MessageKind::PullSince { since_op_id },
+            WireMessageKind::Ping => MessageKind::Ping,
+            WireMessageKind::Pong => MessageKind::Pong,
+            WireMessageKind::Error { error } => MessageKind::Error {
+                error: error.try_into()?,
+            },
+            WireMessageKind::BootstrapHello { .. } | WireMessageKind::BootstrapAck { .. } => {
+                return Err(NetError::InvalidMessage(
+                    "bootstrap wire messages are not public protocol messages".into(),
+                ));
+            }
+        };
+        Ok(Self { kind })
+    }
+}
+
+fn encode_frame(
+    format: SerializationFormat,
+    json: impl FnOnce() -> NetResult<Vec<u8>>,
+    binary: impl FnOnce() -> NetResult<Vec<u8>>,
+) -> NetResult<Vec<u8>> {
+    let payload = match format {
+        SerializationFormat::Json => json()?,
+        SerializationFormat::Bincode => binary()?,
+    };
+    let len = payload
+        .len()
+        .checked_add(1)
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| NetError::InvalidMessage("message payload exceeds u32".to_string()))?;
+    let mut buffer = Vec::with_capacity(4 + 1 + payload.len());
+    buffer.extend_from_slice(&len.to_be_bytes());
+    buffer.push(format.to_wire_byte());
+    buffer.extend_from_slice(&payload);
+    Ok(buffer)
+}
+
+fn decode_frame<T>(
+    bytes: &[u8],
+    json: impl FnOnce(&[u8]) -> Result<T, serde_json::Error>,
+    binary: impl FnOnce(&[u8]) -> Result<T, wincode::ReadError>,
+) -> NetResult<(SerializationFormat, T)> {
+    let Some((&format_byte, payload)) = bytes.split_first() else {
+        return Err(NetError::InvalidMessage(
+            "message payload is missing serialization format byte".to_string(),
+        ));
+    };
+    let format = SerializationFormat::from_wire_byte(format_byte)?;
+    let message = match format {
+        SerializationFormat::Json => json(payload)?,
+        SerializationFormat::Bincode => binary(payload)?,
+    };
+    Ok((format, message))
 }
 
 pub(crate) fn validate_payload_len(len: usize, limit: usize) -> NetResult<()> {
@@ -332,26 +625,36 @@ fn select_binary_preallocation_limit(declared_len: usize) -> BinaryPreallocation
     }
 }
 
-fn deserialize_binary(payload: &[u8]) -> Result<Message, wincode::ReadError> {
-    fn with_limit<const LIMIT: usize>(payload: &[u8]) -> Result<Message, wincode::ReadError> {
-        wincode::config::deserialize_exact(
-            payload,
-            wincode::config::Configuration::default().with_preallocation_size_limit::<LIMIT>(),
-        )
-    }
+macro_rules! binary_deserializer {
+    ($name:ident, $message:ty) => {
+        fn $name(payload: &[u8]) -> Result<$message, wincode::ReadError> {
+            macro_rules! with_limit {
+                ($limit:expr) => {
+                    wincode::config::deserialize_exact(
+                        payload,
+                        wincode::config::Configuration::default()
+                            .with_preallocation_size_limit::<$limit>(),
+                    )
+                };
+            }
 
-    match select_binary_preallocation_limit(payload.len()) {
-        BinaryPreallocationLimit::Limit4MiB => with_limit::<{ 4 * MIB }>(payload),
-        BinaryPreallocationLimit::Limit16MiB => with_limit::<{ 16 * MIB }>(payload),
-        BinaryPreallocationLimit::Limit64MiB => with_limit::<{ 64 * MIB }>(payload),
-        BinaryPreallocationLimit::Limit256MiB => with_limit::<{ 256 * MIB }>(payload),
-        BinaryPreallocationLimit::Limit1024MiB => with_limit::<{ 1024 * MIB }>(payload),
-        BinaryPreallocationLimit::Disabled => wincode::config::deserialize_exact(
-            payload,
-            wincode::config::Configuration::default().disable_preallocation_size_limit(),
-        ),
-    }
+            match select_binary_preallocation_limit(payload.len()) {
+                BinaryPreallocationLimit::Limit4MiB => with_limit!({ 4 * MIB }),
+                BinaryPreallocationLimit::Limit16MiB => with_limit!({ 16 * MIB }),
+                BinaryPreallocationLimit::Limit64MiB => with_limit!({ 64 * MIB }),
+                BinaryPreallocationLimit::Limit256MiB => with_limit!({ 256 * MIB }),
+                BinaryPreallocationLimit::Limit1024MiB => with_limit!({ 1024 * MIB }),
+                BinaryPreallocationLimit::Disabled => wincode::config::deserialize_exact(
+                    payload,
+                    wincode::config::Configuration::default().disable_preallocation_size_limit(),
+                ),
+            }
+        }
+    };
 }
+
+binary_deserializer!(deserialize_binary_message, Message);
+binary_deserializer!(deserialize_binary_wire_message, WireMessage);
 
 #[cfg(test)]
 mod tests {
@@ -386,7 +689,7 @@ mod tests {
         }
     }
 
-    fn protocol_v4_messages() -> Vec<Message> {
+    fn legacy_protocol_v5_messages() -> Vec<Message> {
         let origin = NodeId::new("node-a");
         let ops = vec![
             Op {
@@ -507,6 +810,53 @@ mod tests {
         ]
     }
 
+    fn bootstrap_wire_messages() -> Vec<WireMessage> {
+        vec![
+            WireMessage::wire_error(ProtocolWireError::BootstrapRejected {
+                reason: "wrong cluster".into(),
+            }),
+            WireMessage::bootstrap_hello(
+                NodeId::new("bootstrap-client"),
+                DEFAULT_SUPPORTED_FORMATS.to_vec(),
+                SerializationFormat::Bincode,
+                "cluster-a".into(),
+                Some("client.example:9000".into()),
+                32,
+            ),
+            WireMessage::bootstrap_ack(
+                NodeId::new("bootstrap-seed"),
+                SerializationFormat::Bincode,
+                "cluster-a".into(),
+                vec!["one.example:9000".into(), "two.example:9001".into()],
+                60_000,
+            ),
+        ]
+    }
+
+    fn protocol_v014_fixture_messages() -> Vec<Message> {
+        legacy_protocol_v5_messages()
+            .into_iter()
+            .map(|mut message| {
+                match &mut message.kind {
+                    MessageKind::Hello {
+                        protocol_version, ..
+                    }
+                    | MessageKind::HelloAck {
+                        protocol_version, ..
+                    } => *protocol_version = 4,
+                    MessageKind::Error {
+                        error: WireError::ProtocolMismatch { expected, got },
+                    } => {
+                        *expected = 4;
+                        *got = 3;
+                    }
+                    _ => {}
+                }
+                message
+            })
+            .collect()
+    }
+
     #[test]
     fn test_hello_message() {
         let node_id = NodeId::new("test-node");
@@ -552,6 +902,18 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v5_messages_roundtrip_in_json() {
+        for message in legacy_protocol_v5_messages() {
+            let bytes = message
+                .to_bytes_with_format(SerializationFormat::Json)
+                .unwrap();
+            let (format, parsed) = Message::from_bytes_with_format(&bytes[4..]).unwrap();
+            assert_eq!(format, SerializationFormat::Json);
+            assert_eq!(parsed, message);
+        }
+    }
+
+    #[test]
     fn test_message_roundtrip_bincode() {
         let node = NodeId::new("node-1");
         let op = Op::gcounter_increment(node, "counter:test", 5);
@@ -569,7 +931,41 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_binary_encoding_matches_bincode_golden_hashes() {
+    fn protocol_v5_binary_encoding_matches_bincode_golden_hashes() {
+        // The first thirteen fixtures are the complete public 0.1.4 message
+        // surface encoded with the intentional protocol-version value 5.
+        let expected_sha256 = [
+            "d3cdccc16446588fd57d15139604980cb441667ab5604bd95dbc95de9a222934",
+            "97cc49ef87c772c7eabb0e5e43fd9737460973e18c7e9ab2009dd5b0e6478ad1",
+            "1953b5c9bfa1929dbe636c27e4e6d504d585c2eba0eb4f61d5a955974b57c31d",
+            "7c16f5631b09eef6cfc2ecdfb0d5336adbaa187c45cf7b6c5e37c4b6dc98158d",
+            "88420266dfd64d604627234a8a6c75cf6477c6fd5505df0d17c59959ae9ce234",
+            "0dd60804260500069dbc38d3b7f3cc4c54ae6952e89b620a9c6d7378705e5b78",
+            "2594b6a92ebfb1c3312deb7d01c015fb95e9fbe9bd7bc6b527af07813ec7b910",
+            "7aa8ca4a02506da9133d8f889678b76f716ce45d02e22fdb7b70a15e56a0eff8",
+            "aa39a5af59f8c5ce2b32cb8b742ecd8879697b7219a19a82cbeea01e8211bedc",
+            "0239a8fac27cbe2066f549e3ef3bf654f34699e7338f328878dbdb5a956096ee",
+            "169f3c91969ead0a7a678f98088e54519e7c8679ed6d8a5ade85d7a00c718e50",
+            "678ff351757c2bbcba3d3aeb9aa6cef34c34dd07b122817509765742351ec3ab",
+            "574f81f9e34c4b5f8d195759d62c42983380a5a83ddd77cfebe5e7dd84425ae0",
+        ];
+        let messages = legacy_protocol_v5_messages();
+        assert_eq!(messages.len(), expected_sha256.len());
+
+        for (message, expected_hash) in messages.into_iter().zip(expected_sha256) {
+            let bytes = wincode::serialize(&message).unwrap();
+            let actual_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+            assert_eq!(actual_hash, expected_hash, "message: {message:?}");
+
+            let decoded: Message = wincode::deserialize_exact(&bytes).unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn public_codec_matches_frozen_v014_bincode_fixtures() {
+        // Copied from the v0.1.4 release test. Do not regenerate these hashes
+        // from the current implementation: they guard the legacy discriminants.
         let expected_sha256 = [
             "62cb7aa9f8be207d22c1b8e92bdf8096ddc4e1f1ed79a64b7e42047ae267df9a",
             "762558e92347d927b302e4a5a22de6a7f61feb74b25108d1adbe0037b93463f8",
@@ -585,16 +981,42 @@ mod tests {
             "678ff351757c2bbcba3d3aeb9aa6cef34c34dd07b122817509765742351ec3ab",
             "574f81f9e34c4b5f8d195759d62c42983380a5a83ddd77cfebe5e7dd84425ae0",
         ];
-        let messages = protocol_v4_messages();
-        assert_eq!(messages.len(), expected_sha256.len());
 
-        for (message, expected_hash) in messages.into_iter().zip(expected_sha256) {
+        for (message, expected_hash) in protocol_v014_fixture_messages()
+            .into_iter()
+            .zip(expected_sha256)
+        {
             let bytes = wincode::serialize(&message).unwrap();
             let actual_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
-            assert_eq!(actual_hash, expected_hash, "message: {message:?}");
+            assert_eq!(actual_hash, expected_hash, "v0.1.4 message: {message:?}");
+        }
+    }
 
-            let decoded: Message = wincode::deserialize_exact(&bytes).unwrap();
-            assert_eq!(decoded, message);
+    #[test]
+    fn private_wire_codec_matches_public_legacy_codec_in_both_formats() {
+        for message in legacy_protocol_v5_messages() {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let public = message.to_bytes_with_format(format).unwrap();
+                let private = WireMessage::from(message.clone())
+                    .to_bytes_with_format(format)
+                    .unwrap();
+                assert_eq!(private, public, "message: {message:?}, format: {format:?}");
+
+                let (_, decoded) = WireMessage::from_bytes_with_format(&private[4..]).unwrap();
+                assert_eq!(Message::try_from(decoded).unwrap(), message);
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_wire_messages_roundtrip_but_are_not_public_messages() {
+        for message in bootstrap_wire_messages() {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let bytes = message.to_bytes_with_format(format).unwrap();
+                let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
+                assert_eq!(decoded, message);
+                assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
+            }
         }
     }
 

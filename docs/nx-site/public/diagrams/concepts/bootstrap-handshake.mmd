@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant Client as Requesting node
+    participant Seed as Bootstrap seed
+    Client->>Seed: TCP connection (TLS if configured)
+    Client->>Seed: BootstrapHello
+    Seed->>Seed: Check protocol, formats, identity and cluster
+    Seed->>Seed: Validate advertisement and result limit
+    alt Rejected
+        Seed-->>Client: Error when possible, then close
+    else Accepted
+        Seed->>Seed: Lease valid advertisement if supplied
+        Seed-->>Client: BootstrapAck with candidate endpoints and TTL
+        Client->>Client: Validate seed identity and full response
+        Note over Client,Seed: Connection closes without peer admission
+        Client->>Client: Feed suggestions into normal reconnection
+    end

@@ -1,0 +1,12 @@
+flowchart TD
+    A[Static, bootstrap, mDNS, DNS-SRV, file, or manual input] --> B[Bounded endpoint candidates]
+    B --> C[Connect and verify identity]
+    C -->|Admitted| D[Membership view]
+    C -->|Rejected or unavailable| B
+    D --> E[Failure detection and reconnection]
+    J[Local CRDT call] --> G[Accepted operation and persisted CRDT state]
+    D --> F[K-fanout CRDT gossip]
+    G --> F
+    F --> H[Periodic anti-entropy]
+    H -->|History available| G
+    H -->|History unavailable| I[Explicit recovery failure or chosen state transfer]

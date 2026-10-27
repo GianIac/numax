@@ -1,0 +1,15 @@
+flowchart TD
+    cli[nx-cli - nx binary]
+    api[nx-api - management HTTP]
+    core[nx-core - runtime and orchestration]
+    store[nx-store - local sled store]
+    sync[nx-sync - CRDT logic and operation types]
+    net[nx-net - TCP and TLS]
+    sdk[nx-sdk - standalone WASM guest SDK]
+    cli --> api
+    cli --> core
+    api --> core
+    core --> store
+    core --> sync
+    core --> net
+    net --> sync

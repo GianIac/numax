@@ -1,6 +1,7 @@
 ---
 import config from 'virtual:starlight/user-config';
 
+import brandMark from '../assets/brand/numax-mark.png';
 import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
 import Search from '@astrojs/starlight/components/Search.astro';
 import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
@@ -31,6 +32,9 @@ const navLinks = topLevelLinks.map((link) => ({
 
 <div class="header sl-flex">
 	<div class="title-wrapper sl-flex">
+		<a class="brand-mark" href={`${basePath}/`} aria-label="Numax home">
+			<img src={brandMark.src} width="36" height="36" alt="" />
+		</a>
 		<SiteTitle />
 	</div>
 	<nav class="top-links sl-hidden lg:sl-flex print:hidden" aria-label="Primary">
@@ -57,10 +61,33 @@ const navLinks = topLevelLinks.map((link) => ({
 	}
 
 	.title-wrapper {
+		align-items: center;
+		gap: 0.5rem;
 		overflow: clip;
 		padding: 0.25rem;
 		margin: -0.25rem;
 		min-width: 0;
+	}
+
+	.brand-mark {
+		display: grid;
+		place-items: center;
+		flex: none;
+		width: 2.25rem;
+		height: 2.25rem;
+		border-radius: 0.5rem;
+	}
+
+	.brand-mark:hover,
+	.brand-mark:focus-visible {
+		background: color-mix(in srgb, var(--sl-color-accent) 12%, transparent);
+	}
+
+	.brand-mark img {
+		display: block;
+		width: 2rem;
+		height: 2rem;
+		object-fit: contain;
 	}
 
 	.top-links {

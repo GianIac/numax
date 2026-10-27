@@ -1,0 +1,11 @@
+stateDiagram-v2
+    [*] --> Candidate: endpoint observed
+    Candidate --> Connected: handshake and configured identity checks pass
+    Candidate --> Candidate: dial fails or retries
+    Connected --> Alive: membership admission
+    Alive --> Suspect: probe evidence
+    Suspect --> Alive: refutation or fresh evidence
+    Suspect --> Failed: suspicion policy expires
+    Alive --> Left: voluntary leave
+    Failed --> Alive: verified rejoin with newer incarnation
+    Left --> Alive: verified rejoin with newer incarnation

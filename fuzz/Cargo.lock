@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "nx-net"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "hex",
  "nx-sync",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "nx-sync"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",

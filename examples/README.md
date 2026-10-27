@@ -21,6 +21,7 @@ Examples that replicate state across Numax nodes using CRDTs and converge throug
 
 | Example | Description |
 | --- | --- |
+| [`discovery_lan`](discovery_lan/README.md) | Three mDNS-discovered daemons without `--peer`: SDK CRDT writes via authenticated local HTTP, offline operations and recovery; separate same-host test and three-device LAN procedure. |
 | [`distributed_ants`](distributed_ants/README.md) | Distributed Ant Colony Optimization swarm: a shared pheromone trail (PNCounter grid) emerges from many independent nodes. |
 | [`distributed_magnets`](distributed_magnets/README.md) | Distributed Magnetic Optimization Algorithm swarm: particles publish their position (LWW-Register) and pull toward whichever anchor or peer has the most mass. |
 | [`distributed_counter`](distributed_counter/README.md) | Grow-only distributed counter (GCounter). |
@@ -60,5 +61,6 @@ Examples that build guests in languages other than Rust.
 | --- | --- |
 | [`guest_c`](guest_c/README.md) | Minimal C guest compiled to WASM, with manual host imports and no libc. |
 | [`guest_cpp`](guest_cpp/README.md) | Minimal C++ guest compiled to WASM, using `import_name`/`export_name` instead of `extern "C"`. |
+| [`guest_python`](guest_python/README.md) | Minimal Python guest using embedded RustPython and the raw Numax host ABI. |
 | [`guest_tinygo`](guest_tinygo/README.md) | TinyGo guest using direct WASM imports for logging and local key/value storage. |
 | [`guest_zig`](guest_zig/README.md) | Freestanding Zig guest that calls the raw Numax logging ABI. |

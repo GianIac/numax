@@ -221,4 +221,4 @@ Use this page together with the runtime and user-facing storage docs:
 - [Crates overview](/numax/reference/crates/) - where `nx-store` fits in the dependency graph
 - [nx-core crate](/numax/reference/crates/nx-core/) - opens and shares the `Store`
 - [Host API](/numax/reference/host-api/) - `db_*` functions that call into the store through `nx-core`
-- [Configuration](/numax/reference/configuration/) - `[storage].datastore_path` that becomes the store path
+- [Configuration](/numax/reference/config/) - `[storage].datastore_path` that becomes the store path

@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant Guest as WASM guest code
+    participant SDK as nx-sdk wrapper and FFI import
+    participant Memory as WASM linear memory
+    participant Host as nx-core Host API
+    Guest->>SDK: Call byte-oriented wrapper
+    SDK->>Memory: Hold input and reserve output buffer
+    SDK->>Host: nx import with ptr, len, out_ptr, out_cap
+    Host->>Memory: Validate bounds and read input
+    Host->>Host: Perform host operation
+    Host->>Memory: Write output within capacity
+    Host-->>SDK: Return byte count or error code (i32)
+    SDK->>Memory: Read output on success
+    SDK-->>Guest: Return value or error

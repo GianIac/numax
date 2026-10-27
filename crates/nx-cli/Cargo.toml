@@ -1,6 +1,6 @@
 [package]
 name = "nx-cli"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license.workspace = true
 
@@ -13,8 +13,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 console-subscriber = { version = "0.5", optional = true }
-nx-core = { version = "0.1.4", path = "../nx-core" }
-nx-api = { version = "0.1.4", path = "../nx-api" }
+nx-core = { version = "0.1.5", path = "../nx-core" }
+nx-api = { version = "0.1.5", path = "../nx-api" }
 owo-colors = { version = "4", features = ["supports-colors"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
