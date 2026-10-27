@@ -1103,9 +1103,14 @@ impl SyncManager {
             debug!("event loop terminated");
         }));
 
+        let pacing = Arc::new(std::sync::Mutex::new(super::pacing::Pacer::new(
+            self.config.gossip_rate,
+            self.config.max_peers,
+        )));
         // Outbound loop: drain locally-produced ops into the network.
         self.broadcast_task = Some(spawn_broadcast_loop(
             BroadcastLoopContext {
+                pacing: Arc::clone(&pacing),
                 local_id: self.node_id.clone(),
                 membership: membership_snapshot.clone(),
                 node: Arc::clone(&node),
@@ -1120,6 +1125,7 @@ impl SyncManager {
 
         self.forward_task = Some(spawn_forward_loop(
             ForwardLoopContext {
+                pacing,
                 local_id: self.node_id.clone(),
                 membership: membership_snapshot.clone(),
                 node: Arc::clone(&node),

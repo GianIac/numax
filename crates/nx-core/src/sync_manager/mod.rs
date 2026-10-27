@@ -7,6 +7,7 @@ mod fixtures;
 mod manager;
 mod migration;
 mod neighbors;
+mod pacing;
 mod peer;
 mod replication;
 mod schema;

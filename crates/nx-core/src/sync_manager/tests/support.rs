@@ -52,6 +52,28 @@ impl crate::PeerDiscovery for UntouchedDiscovery {
 pub(super) fn invalid_sync_configs() -> Vec<(&'static str, SyncConfig)> {
     vec![
         (
+            "gossip_min_bytes_per_second",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                min_bytes_per_second: 0,
+                ..Default::default()
+            }),
+        ),
+        (
+            "gossip_max_bytes_per_second",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                min_bytes_per_second: 200,
+                max_bytes_per_second: 100,
+                ..Default::default()
+            }),
+        ),
+        (
+            "gossip_burst_bytes",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                burst_bytes: 0,
+                ..Default::default()
+            }),
+        ),
+        (
             "reconnect_initial_delay",
             SyncConfig::new().with_reconnect_backoff(Duration::MAX, Duration::from_secs(1)),
         ),
@@ -906,4 +928,87 @@ pub(super) async fn test_topology_reconnect(
         peer_health: Arc::clone(&manager.peer_health),
     });
     (candidates_tx, membership_tx)
+}
+
+/// A real TCP peer with independently delayed control service. Data events are
+/// drained, so RTT inflation is not confused with local data-writer blocking.
+pub(super) struct ControlledControlPeer {
+    pub(super) endpoint: String,
+    pub(super) delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    node: Arc<nx_net::Node>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl ControlledControlPeer {
+    pub(super) async fn start() -> Self {
+        let id = NodeId::new("controlled-peer");
+        let mut node = nx_net::Node::new(nx_net::NodeConfig::new(id.clone(), "127.0.0.1:0"));
+        let mut incoming = node.take_control_receiver().unwrap();
+        let mut events = node.take_event_receiver().unwrap();
+        let endpoint = node.start_listener().await.unwrap().to_string();
+        let owner = nx_net::MembershipRecord {
+            member: id.to_string(),
+            reporter: id.to_string(),
+            version: nx_net::MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state: nx_net::MembershipState::Alive,
+            endpoint: Some(endpoint.clone()),
+        };
+        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        let delay = Arc::clone(&delay_ms);
+        let task = tokio::spawn(async move {
+            let mut replies = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    event = incoming.recv() => {
+                        let Some(event) = event else { break; };
+                        if replies.len() >= 8 { continue; }
+                        let owner = owner.clone();
+                        let delay = delay.load(std::sync::atomic::Ordering::Relaxed);
+                        replies.spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            let ack = matches!(&event.request.kind, nx_net::ControlKind::Probe { target, version }
+                                if target == &owner.member && version == &owner.version);
+                            let _ = event.respond_to.send(nx_net::ControlReply {
+                                request_id: event.request.request_id, owner, ack, nack: false, records: vec![], next: None,
+                            });
+                        });
+                    }
+                    event = events.recv() => { if event.is_none() { break; } }
+                    Some(_) = replies.join_next(), if !replies.is_empty() => {}
+                }
+            }
+        });
+        Self {
+            endpoint,
+            delay_ms,
+            node: Arc::new(node),
+            task: Some(task),
+        }
+    }
+    pub(super) async fn shutdown(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.node.shutdown().await;
+    }
+}
+impl Drop for ControlledControlPeer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+pub(super) fn metric_value(metrics: &RuntimeMetrics, store: &NxStore, name: &str) -> u64 {
+    metrics
+        .render_for_test(store)
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("missing metric {name}"))
+        .parse()
+        .unwrap()
 }

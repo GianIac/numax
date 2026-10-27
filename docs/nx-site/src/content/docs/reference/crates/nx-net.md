@@ -18,6 +18,8 @@ It depends on `nx-sync` for `Op` and `NodeId` types. It does not depend on `nx-c
 |---|---|
 | TCP listener and inbound connection handling | `node.rs` - `Node::start_listener`, `handle_incoming` |
 | Outbound connections and handshake | `node.rs` - `Node::connect_to_peer` |
+| Encode-once, generation-bound History frames | `node.rs` - `Node::prepare_history_to_addr`, `Node::send_prepared_history`, `PreparedHistory`, `ConnectionGeneration` |
+| Correlated control timing excluding connection setup | `node.rs` - `Node::control_request_timed_tracked`, `ControlTiming`; existing request wrappers remain available |
 | Identity-guarded topology slot release | `node.rs` - `Node::disconnect_peer`; cancels the connection generation before event delivery |
 | Wire message framing (length-prefixed) | `node.rs` - `read_message`, `write_message` |
 | Serialization format negotiation | `node.rs` - `negotiate_serialization_format` |

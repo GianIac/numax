@@ -25,8 +25,8 @@ pub use message::{
 #[doc(hidden)]
 pub use node::read_wire_message_for_fuzzing;
 pub use node::{
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS, DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig,
-    NodeEvent,
+    ConnectionGeneration, ControlTiming, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS,
+    DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig, NodeEvent, PreparedHistory,
 };
 pub use peer::{
     ConnectionDirection, PeerConnectionInfo, PeerId, PeerIdentity, PeerIdentityVerification,

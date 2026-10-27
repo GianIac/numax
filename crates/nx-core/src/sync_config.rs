@@ -53,6 +53,43 @@ pub const DEFAULT_GOSSIP_FANOUT_CONSTANT: usize = 3;
 /// Upper bound on peers selected for one gossip batch.
 pub const DEFAULT_GOSSIP_MAX_FANOUT: usize = DEFAULT_MAX_PEERS;
 
+/// Per-peer gossip payload rate. Control and anti-entropy have separate budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GossipRateConfig {
+    pub min_bytes_per_second: u64,
+    pub max_bytes_per_second: u64,
+    pub burst_bytes: usize,
+}
+impl Default for GossipRateConfig {
+    fn default() -> Self {
+        Self {
+            min_bytes_per_second: 64 * 1024,
+            max_bytes_per_second: 4 * 1024 * 1024,
+            burst_bytes: 256 * 1024,
+        }
+    }
+}
+impl GossipRateConfig {
+    pub fn validate(&self) -> Result<(), SyncConfigError> {
+        if self.min_bytes_per_second == 0 {
+            return Err(SyncConfigError::Invalid(
+                "gossip_min_bytes_per_second must be positive".into(),
+            ));
+        }
+        if self.max_bytes_per_second < self.min_bytes_per_second {
+            return Err(SyncConfigError::Invalid(
+                "gossip_max_bytes_per_second must be at least gossip_min_bytes_per_second".into(),
+            ));
+        }
+        if self.burst_bytes == 0 {
+            return Err(SyncConfigError::Invalid(
+                "gossip_burst_bytes must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Sync configuration for the runtime.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -101,6 +138,8 @@ pub struct SyncConfig {
     /// Maximum peers selected for one gossip batch.
     pub gossip_max_fanout: usize,
 
+    pub gossip_rate: GossipRateConfig,
+
     /// Serialization format used for outgoing network messages.
     pub serialization_format: SerializationFormat,
 }
@@ -123,6 +162,7 @@ impl Default for SyncConfig {
             anti_entropy_interval: DEFAULT_ANTI_ENTROPY_INTERVAL,
             gossip_fanout_constant: DEFAULT_GOSSIP_FANOUT_CONSTANT,
             gossip_max_fanout: DEFAULT_GOSSIP_MAX_FANOUT,
+            gossip_rate: GossipRateConfig::default(),
             serialization_format: SerializationFormat::Bincode,
         }
     }
@@ -132,6 +172,7 @@ impl SyncConfig {
     /// Validate allocation bounds and timer deadlines before starting services.
     /// Zero retry delays and anti-entropy intervals retain their 1 ms normalization.
     pub fn validate(&self) -> Result<(), SyncConfigError> {
+        self.gossip_rate.validate()?;
         for (name, limit) in [
             ("queued_ops_limit", self.queued_ops_limit),
             ("max_peers", self.max_peers),
@@ -235,6 +276,11 @@ impl SyncConfig {
 
     pub fn with_anti_entropy_interval(mut self, interval: Duration) -> Self {
         self.anti_entropy_interval = interval;
+        self
+    }
+
+    pub fn with_gossip_rate(mut self, rate: GossipRateConfig) -> Self {
+        self.gossip_rate = rate;
         self
     }
 

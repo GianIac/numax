@@ -330,9 +330,16 @@ every node starting from the same address prefix. The
 the choice of c and its traffic cost. The formula alone does not establish
 connectivity or convergence.
 
-Load/RTT adaptation, jitter and topology repair remain planned. The membership
-state machine has an injectable clock and seeded scheduling for deterministic
-simulation; this is not evidence of cluster-wide data convergence. See the
+Local gossip and forwarding share an adaptive per-peer byte budget. It uses
+queue pressure, valid direct control round trips and local writer service time
+as distinct signals; connection/TLS setup and indirect replies do not become RTT
+samples. Congestion reduces the rate quickly, while healthy demand restores it
+gradually. Deferred attempts remain recoverable through anti-entropy within the
+retention contract. [The pacing contract](/numax/design/peer-discovery/#adaptive-rate-based-on-load-and-round-trip-observations)
+defines the limits and evidence. Jitter and full backpressure scheduling remain
+planned. The membership state machine has an injectable clock and seeded
+scheduling for deterministic simulation; these component checks do not establish
+cluster-wide data convergence. See the
 [peer-discovery design](/numax/design/peer-discovery/).
 
 ---

@@ -22,9 +22,17 @@ const RPC_BUDGET: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const SCHEDULING_SAMPLES_LIMIT: usize = 2048;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeTiming {
+    pub(crate) member: String,
+    pub(crate) version: MembershipVersion,
+    pub(crate) timing: nx_net::ControlTiming,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Snapshot {
     pub(crate) records: Vec<MembershipRecord>,
+    pub(crate) probe_timings: Vec<ProbeTiming>,
     pub(crate) health: u32,
     pub(crate) error: Option<String>,
     pub(crate) successful_probes: u64,
@@ -118,6 +126,7 @@ pub(crate) async fn start(
         store,
         incoming,
         records: BTreeMap::new(),
+        timings: BTreeMap::new(),
         sessions: BTreeMap::new(),
         serial: 0,
         now: Duration::ZERO,
@@ -183,6 +192,7 @@ struct Completion {
     endpoint: String,
     expected: Option<String>,
     mode: Job,
+    timing: Option<nx_net::ControlTiming>,
     result: nx_net::NetResult<(nx_sync::NodeId, ControlReply)>,
 }
 
@@ -211,6 +221,7 @@ struct Actor {
     store: Arc<Store>,
     incoming: mpsc::Receiver<ControlIncoming>,
     records: BTreeMap<String, MembershipRecord>,
+    timings: BTreeMap<String, ProbeTiming>,
     sessions: BTreeMap<String, (u64, u64)>,
     serial: u64,
     now: Duration,
@@ -359,6 +370,20 @@ impl Actor {
         let mut records: Vec<_> = self.records.values().cloned().collect();
         records.push(self.owner.clone());
         self.snapshot_tx.send_replace(Snapshot {
+            probe_timings: self
+                .timings
+                .values()
+                .filter(|sample| {
+                    self.records.get(&sample.member).is_some_and(|record| {
+                        record.version == sample.version
+                            && matches!(
+                                record.state,
+                                MembershipState::Alive | MembershipState::Suspect
+                            )
+                    })
+                })
+                .cloned()
+                .collect(),
             records,
             health: self.core.health(),
             error: None,
@@ -800,20 +825,24 @@ impl Actor {
         };
         self.jobs.spawn(async move {
             let (sent, received) = oneshot::channel();
-            let query = node.control_request_tracked(&endpoint, request, budget, Some(sent));
+            let query = node.control_request_timed_tracked(&endpoint, request, budget, Some(sent));
             tokio::pin!(query);
             let result = tokio::select! {
                 biased;
                 sent = received => {
                     if sent.is_ok() && let Job::Probe { attempt, route, .. } = &mode
                         && dispatch_tx.try_send(Dispatch { attempt: *attempt, route: route.clone() }).is_err() {
-                            return Completion { endpoint: endpoint.clone(), expected, mode, result: Err(nx_net::NetError::PeerLimitReached(64)) };
+                            return Completion { endpoint: endpoint.clone(), expected, mode, timing: None, result: Err(nx_net::NetError::PeerLimitReached(64)) };
                     }
                     query.await
                 }
                 result = &mut query => result,
             };
-            Completion { endpoint: endpoint.clone(), expected, mode, result }
+            let (result, timing) = match result {
+                Ok((peer, reply, timing)) => (Ok((peer, reply)), Some(timing)),
+                Err(error) => (Err(error), None),
+            };
+            Completion { endpoint: endpoint.clone(), expected, mode, timing, result }
         });
         Ok(true)
     }
@@ -871,6 +900,27 @@ impl Actor {
                 _ => Ok(vec![]),
             }
             .map_err(core_error)?;
+            let direct_success = target == route
+                && actions.iter().any(|action| {
+                    matches!(action, Action::Probe(probe::Action::Finished {
+                    attempt: completed, outcome: probe::Outcome::Success, ..
+                }) if completed == attempt)
+                });
+            if direct_success
+                && let (Ok((peer, reply)), Some(timing)) = (&result, completion.timing)
+                && reply.ack
+                && version(reply.owner.version) == target.version
+                && accepted_session == Some(target.session)
+            {
+                self.timings.insert(
+                    peer.to_string(),
+                    ProbeTiming {
+                        member: peer.to_string(),
+                        version: reply.owner.version,
+                        timing,
+                    },
+                );
+            }
             self.actions(actions).await?;
         }
         if let Job::Helper { event, target } = completion.mode {
@@ -1012,6 +1062,7 @@ mod tests {
                 store,
                 incoming,
                 records: BTreeMap::new(),
+                timings: BTreeMap::new(),
                 sessions: BTreeMap::new(),
                 serial: 0,
                 now: Duration::ZERO,
@@ -1033,6 +1084,124 @@ mod tests {
                 write_queue: VecDeque::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn only_current_successful_direct_probes_publish_round_trip_samples() {
+        for case in 0..8 {
+            let (_directory, mut actor) = actor(&[]);
+            for member in ["bob", "carol"] {
+                actor
+                    .accept_owner(member, owner(member, 1, 0))
+                    .await
+                    .unwrap();
+            }
+            let actions = actor.core.probe_next(Duration::ZERO, |_| 0).unwrap();
+            let (attempt, target) = actions
+                .into_iter()
+                .find_map(|action| match action {
+                    Action::Probe(probe::Action::Direct {
+                        attempt, target, ..
+                    }) => Some((attempt, target)),
+                    _ => None,
+                })
+                .unwrap();
+            actor
+                .core
+                .probe_dispatched(attempt, &target, Duration::ZERO)
+                .unwrap();
+            let mut route = target.clone();
+            if case == 5 {
+                let helper = if target.id == "bob" { "carol" } else { "bob" };
+                route = Peer {
+                    id: helper.into(),
+                    version: Version {
+                        epoch: 1,
+                        incarnation: 0,
+                    },
+                    session: actor.sessions[helper].1,
+                };
+            }
+            if case == 7 {
+                route.session += 1;
+            }
+            if case == 4 {
+                actor
+                    .core
+                    .probe_send_failed(attempt, Duration::ZERO)
+                    .unwrap();
+            }
+            let mut response_owner = owner(&route.id, 1, 0);
+            if case == 6 {
+                response_owner.version.incarnation += 1;
+            }
+            let timing = nx_net::ControlTiming {
+                started_at: Instant::now(),
+                observed_at: Instant::now(),
+                round_trip: Duration::from_millis(10),
+            };
+            let response = if case == 1 {
+                Err(nx_net::NetError::Timeout)
+            } else {
+                Ok((
+                    nx_sync::NodeId::new(if case == 2 { "stranger" } else { &route.id }),
+                    ControlReply {
+                        request_id: 1,
+                        owner: response_owner,
+                        ack: case != 3,
+                        nack: case == 3,
+                        records: vec![],
+                        next: None,
+                    },
+                ))
+            };
+            actor
+                .completed(Completion {
+                    endpoint: "127.0.0.1:9000".into(),
+                    expected: Some(route.id.clone()),
+                    mode: Job::Probe {
+                        attempt,
+                        target: target.clone(),
+                        route,
+                    },
+                    timing: Some(timing),
+                    result: response,
+                })
+                .await
+                .unwrap();
+            assert_eq!(actor.timings.len(), usize::from(case == 0), "case {case}");
+            if case == 0 {
+                let accepted = actor.timings[&target.id].timing.observed_at;
+                actor
+                    .completed(Completion {
+                        endpoint: "127.0.0.1:9000".into(),
+                        expected: Some(target.id.clone()),
+                        mode: Job::Probe {
+                            attempt,
+                            target: target.clone(),
+                            route: target.clone(),
+                        },
+                        timing: Some(nx_net::ControlTiming {
+                            observed_at: accepted + Duration::from_secs(1),
+                            ..timing
+                        }),
+                        result: Ok((
+                            nx_sync::NodeId::new(&target.id),
+                            ControlReply {
+                                request_id: 2,
+                                owner: owner(&target.id, 1, 0),
+                                ack: true,
+                                nack: false,
+                                records: vec![],
+                                next: None,
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(actor.timings[&target.id].timing.observed_at, accepted);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1112,6 +1281,7 @@ mod tests {
                             endpoint: "127.0.0.1:9999".into(),
                             expected: Some("bob".into()),
                             mode: Job::Exchange,
+                            timing: None,
                             result: Ok((
                                 nx_sync::NodeId::new("bob"),
                                 ControlReply {

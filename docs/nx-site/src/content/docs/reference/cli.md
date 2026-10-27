@@ -248,6 +248,9 @@ peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
 gossip_fanout_constant = 3
 gossip_max_fanout = 64
+gossip_min_bytes_per_second = 65536
+gossip_max_bytes_per_second = 4194304
+gossip_burst_bytes = "256KiB"
 
 [discovery]
 mode = "static"
@@ -431,6 +434,9 @@ peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
 gossip_fanout_constant = 3
 gossip_max_fanout = 64
+gossip_min_bytes_per_second = 65536
+gossip_max_bytes_per_second = 4194304
+gossip_burst_bytes = "256KiB"
 ```
 
 | Field | Type | Description |
@@ -447,6 +453,9 @@ gossip_max_fanout = 64
 | `anti_entropy_interval` | duration | Interval between anti-entropy repair cycles |
 | `gossip_fanout_constant` | nonnegative integer | Additive constant `c` in `ceil(log2(N)) + c`; default `3` |
 | `gossip_max_fanout` | positive integer | Maximum immediate-push recipients; default `64`, also limited by eligible active connections |
+| `gossip_min_bytes_per_second` | positive integer | Per-peer lower bound for adaptive gossip pacing; default `65536` |
+| `gossip_max_bytes_per_second` | positive integer | Per-peer upper/initial gossip byte rate; default `4194304`; must be at least the minimum |
+| `gossip_burst_bytes` | byte size | Positive burst credit; default `256KiB`; one larger legal frame can overdraw the bucket and must be repaid |
 
 `reconnect_initial_delay` and `reconnect_max_delay` must be provided together.
 `reconnect_initial_delay` must be less than or equal to `reconnect_max_delay`.

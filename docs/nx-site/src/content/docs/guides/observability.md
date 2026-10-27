@@ -66,7 +66,11 @@ The dashboard uses only metrics currently emitted by Numax:
 | ------------------------------------ | ------- | ------------------------------------------ |
 | `numax_ops_total`                    | counter | operations processed by the runtime        |
 | `numax_peers_connected`              | gauge   | currently connected peers                  |
-| `numax_sync_latency_ms`              | gauge   | last recorded sync latency in milliseconds |
+| `numax_sync_latency_ms`              | gauge   | last local gossip batch send duration in milliseconds; not RTT or remote durability |
+| `numax_gossip_rate_limited_total` | counter | fast gossip attempts deferred to durable repair |
+| `numax_gossip_admitted_bytes_total` | counter | framed application bytes admitted for send attempts, including failed/partial writes |
+| `numax_gossip_rate_bytes_per_second` | gauge | last per-peer pacing decision; not aggregate throughput; zero before any decision |
+| `numax_gossip_control_rtt_seconds` | gauge | last smoothed direct-control round trip used by pacing, excluding connect/TLS setup; omitted when unknown |
 | `numax_sync_errors_total`            | counter | sync-related errors                        |
 | `numax_observability_requests_total` | counter | observability endpoint requests            |
 | `numax_observability_errors_total`   | counter | observability endpoint errors              |

@@ -1494,10 +1494,30 @@ repair path within D3 retention. A three-node TCP test verifies multi-hop
 forwarding with both JSON and Bincode, and apply tests cover all six CRDT
 families plus duplicate suppression.
 
-Adaptive pacing based on load/RTT, jitter, calibrated retry budgets and the
-50-node loss/partition acceptance run are not yet implemented or validated. In particular, a send completion duration is not
-being treated as peer RTT. Do not infer convergence beyond the bounded D3
-history/retention contract from a successful gossip send.
+#### Adaptive rate based on load and round-trip observations
+
+`sync_manager/pacing.rs` implements a deterministic per-connection byte bucket
+shared by local gossip and remote forwarding. It consumes explicit monotonic
+time, queue occupancy, correlated direct-probe timing and local write feedback.
+There is no additional production task, retry queue, wire variant, persistence
+namespace or dependency. Production and component tests use the same policy.
+
+The signals have distinct meanings:
+
+- **Queue pressure** is the occupied operation queue, including the batch's first
+  dequeued item, relative to its actual capacity. At least half full is pressure;
+  either local or forwarding pressure remains latched for the decision window.
+  Pressure alone does not cause a slowdown that would worsen the backlog.
+- **Control round trip** starts immediately before writing the existing direct
+  control request and ends when its response frame is read and decoded. TCP/TLS
+  setup is excluded. Request ID, identity, accepted owner session, exact owner
+  version and a current successful direct probe must all match before publication.
+  Indirect responses, NACKs, timeouts, cancelled attempts and late duplicates do
+  not produce samples. This is application request/service/response latency on
+  the isolated control path, not TCP RTT, data replication latency or a durability ACK.
+- **Local write service time** includes waiting for the data writer and writing
+  the prepared frame. It is used as local congestion feedback and is never
+  substituted for a round-trip measurement.
 
 ### D8–D10 — Management, compatibility, and readiness
 
@@ -1530,7 +1550,7 @@ The following aspects remain open for the proposed capabilities:
   runtime probe/suspicion parameters and transport byte budgets.
 - Shared-stream versus separate-connection control isolation, supported by measurements.
 - Broader fanout calibration, topology-aware optimization beyond bounded rotation,
-  jitter and adaptive pacing based on load/RTT.
+  jitter and full backpressure/retry scheduling.
 - Manual candidate removal and API error semantics.
 - Membership wire compatibility, future metadata migrations and expanded state-transfer formats.
 

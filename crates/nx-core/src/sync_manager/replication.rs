@@ -22,6 +22,7 @@ use super::peer::{
 };
 use super::sequence::{REPLAY_BYTES, REPLAY_PAGE, SUMMARY_PAGE};
 use super::types::*;
+use crate::observability::RuntimeMetrics;
 use nx_sync::{HistoryMessage, NodeId};
 
 const MAX_RECONNECT_ATTEMPTS_PER_TURN: usize = 8;
@@ -561,12 +562,72 @@ pub(super) fn select_gossip_peers(
         .collect()
 }
 
+/// The mutex covers only pure pacing decisions, never encoding or I/O. Denial
+/// skips a fast-path attempt; durable history remains eligible for anti-entropy.
+async fn send_paced_history(
+    node: &nx_net::Node,
+    metrics: &RuntimeMetrics,
+    pacing: &std::sync::Mutex<super::pacing::Pacer>,
+    membership: &watch::Receiver<crate::membership::runtime::Snapshot>,
+    addr: &str,
+    message: HistoryMessage,
+    load: super::pacing::Load,
+) -> nx_net::NetResult<bool> {
+    let prepared = node.prepare_history_to_addr(addr, message).await?;
+    let sample = membership
+        .borrow()
+        .probe_timings
+        .iter()
+        .find(|sample| sample.member == prepared.peer_id().as_str())
+        .map(|sample| sample.timing);
+    let generation = prepared.generation();
+    let bytes = prepared.encoded_len();
+    let decision = pacing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit(
+            addr,
+            generation.clone(),
+            bytes,
+            StdInstant::now(),
+            load,
+            sample,
+        );
+    if !decision.allowed && decision.bytes_per_second == 0 {
+        return Err(NetError::PeerDisconnected(addr.to_owned()));
+    }
+    metrics.record_gossip_pacing(
+        decision.allowed,
+        bytes,
+        decision.bytes_per_second,
+        decision.round_trip,
+    );
+    if !decision.allowed {
+        return Ok(false);
+    }
+    let result = node.send_prepared_history(prepared).await;
+    pacing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sent(
+            addr,
+            &generation,
+            StdInstant::now(),
+            result.as_ref().ok().copied(),
+        );
+    result.map(|_| true)
+}
+
 async fn forward_batch(
     context: &ForwardLoopContext,
     forwarded_rx: &mut mpsc::Receiver<ForwardedOp>,
     first: ForwardedOp,
     pending: &mut Option<ForwardedOp>,
 ) {
+    let load = super::pacing::Load {
+        queued: forwarded_rx.len().saturating_add(1),
+        capacity: forwarded_rx.max_capacity(),
+    };
     let source_addr = first.source_addr;
     let mut entries = vec![first.entry];
     let byte_budget = context
@@ -633,17 +694,21 @@ async fn forward_batch(
     let mut sent = 0;
     let mut failed = 0;
     for peer in recipients {
-        match context
-            .node
-            .send_history_to_addr(
-                &peer,
-                HistoryMessage::Push {
-                    ops: entries.clone(),
-                },
-            )
-            .await
+        match send_paced_history(
+            &context.node,
+            &context.metrics,
+            &context.pacing,
+            &context.membership,
+            &peer,
+            HistoryMessage::Push {
+                ops: entries.clone(),
+            },
+            load,
+        )
+        .await
         {
-            Ok(()) => sent += 1,
+            Ok(true) => sent += 1,
+            Ok(false) => {}
             Err(error) => {
                 failed += 1;
                 debug!(%peer, %error, count, "forward send failed; durable history remains available for repair");
@@ -689,6 +754,10 @@ pub(super) async fn broadcast_batch(
     op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
     first: AcceptedLocalOp,
 ) {
+    let load = super::pacing::Load {
+        queued: op_rx.len().saturating_add(1),
+        capacity: op_rx.max_capacity(),
+    };
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
 
@@ -731,12 +800,19 @@ pub(super) async fn broadcast_batch(
     let mut sent = 0;
     let mut failed = 0;
     for peer in recipients {
-        match context
-            .node
-            .send_history_to_addr(&peer, HistoryMessage::Push { ops: batch.clone() })
-            .await
+        match send_paced_history(
+            &context.node,
+            &context.metrics,
+            &context.pacing,
+            &context.membership,
+            &peer,
+            HistoryMessage::Push { ops: batch.clone() },
+            load,
+        )
+        .await
         {
-            Ok(()) => sent += 1,
+            Ok(true) => sent += 1,
+            Ok(false) => {}
             Err(error) => {
                 failed += 1;
                 debug!(%peer, %error, count, "gossip send failed; durable history remains available for repair");

@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 mod e2e;
+mod rate;
 mod recovery;
 mod sequencing;
 mod support;
@@ -6092,6 +6093,9 @@ async fn peer_rotation_replaces_dead_peer_with_available_configured_peer() {
         "peer C should not be marked failed while peer slots are full"
     );
 
+    // Lose transport before graceful shutdown: a delivered owner-issued Left
+    // correctly stops reconnect instead of promising a Dead endpoint transition.
+    manager_b.node.as_ref().unwrap().shutdown().await;
     manager_b.shutdown().await.unwrap();
 
     wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Dead).await;

@@ -158,6 +158,7 @@ pub(super) struct AntiEntropyLoopContext {
 }
 
 pub(super) struct BroadcastLoopContext {
+    pub(super) pacing: Arc<std::sync::Mutex<super::pacing::Pacer>>,
     pub(super) local_id: NodeId,
     pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
     pub(super) node: Arc<Node>,
@@ -168,6 +169,7 @@ pub(super) struct BroadcastLoopContext {
 }
 
 pub(super) struct ForwardLoopContext {
+    pub(super) pacing: Arc<std::sync::Mutex<super::pacing::Pacer>>,
     pub(super) local_id: NodeId,
     pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
     pub(super) node: Arc<Node>,

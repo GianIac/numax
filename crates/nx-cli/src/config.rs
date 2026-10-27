@@ -83,6 +83,9 @@ pub(crate) struct LimitsFileConfig {
     pub(crate) anti_entropy_interval: Option<String>,
     pub(crate) gossip_fanout_constant: Option<usize>,
     pub(crate) gossip_max_fanout: Option<usize>,
+    pub(crate) gossip_min_bytes_per_second: Option<u64>,
+    pub(crate) gossip_max_bytes_per_second: Option<u64>,
+    pub(crate) gossip_burst_bytes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,9 +434,10 @@ impl EffectiveRunConfig {
                 "gossip_fanout_constant = {}\n",
                 sync.gossip_fanout_constant
             ));
+            out.push_str(&format!("gossip_max_fanout = {}\n", sync.gossip_max_fanout));
             out.push_str(&format!(
-                "gossip_max_fanout = {}\n\n",
-                sync.gossip_max_fanout
+                "gossip_min_bytes_per_second = {}\ngossip_max_bytes_per_second = {}\ngossip_burst_bytes = \"{}B\"\n\n",
+                sync.gossip_rate.min_bytes_per_second, sync.gossip_rate.max_bytes_per_second, sync.gossip_rate.burst_bytes
             ));
         } else {
             out.push_str("# Sync limits are inactive because sync is disabled.\n\n");
@@ -488,6 +492,9 @@ peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
 gossip_fanout_constant = 3
 gossip_max_fanout = 64
+gossip_min_bytes_per_second = 65536
+gossip_max_bytes_per_second = 4194304
+gossip_burst_bytes = "256KiB"
 
 [discovery]
 mode = "static"
@@ -1215,6 +1222,17 @@ pub(crate) fn validate_run_file_config(config: &RunFileConfig) -> Result<()> {
     }
 
     if let Some(limits) = &config.limits {
+        let mut rate = nx_core::GossipRateConfig::default();
+        if let Some(value) = limits.gossip_min_bytes_per_second {
+            rate.min_bytes_per_second = value;
+        }
+        if let Some(value) = limits.gossip_max_bytes_per_second {
+            rate.max_bytes_per_second = value;
+        }
+        if let Some(value) = &limits.gossip_burst_bytes {
+            rate.burst_bytes = parse_byte_size(value)?;
+        }
+        rate.validate()?;
         validate_optional_non_zero("limits.max_peers", limits.max_peers)?;
         validate_optional_non_zero("limits.queued_ops_limit", limits.queued_ops_limit)?;
         validate_optional_non_zero("limits.op_log_limit", limits.op_log_limit)?;
@@ -1546,6 +1564,18 @@ pub(crate) fn apply_limit_config(
         let interval = parse_duration(anti_entropy_interval).map_err(|e| anyhow::anyhow!("{e}"))?;
         sync = sync.with_anti_entropy_interval(interval);
     }
+    let mut rate = sync.gossip_rate;
+    if let Some(value) = limits.gossip_min_bytes_per_second {
+        rate.min_bytes_per_second = value;
+    }
+    if let Some(value) = limits.gossip_max_bytes_per_second {
+        rate.max_bytes_per_second = value;
+    }
+    if let Some(value) = &limits.gossip_burst_bytes {
+        rate.burst_bytes = parse_byte_size(value)?;
+    }
+    rate.validate()?;
+    sync = sync.with_gossip_rate(rate);
     if let Some(gossip_max_fanout) = limits.gossip_max_fanout {
         validate_non_zero("limits.gossip_max_fanout", gossip_max_fanout)?;
     }
@@ -1826,6 +1856,45 @@ mod tests {
             "[network]\nlisten = \"127.0.0.1:9000\"\n[discovery]\nmode = \"{mode}\"\nmax_candidates = {max_candidates}\n{fields}"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn gossip_rate_toml_validates_and_renders_effective_values() {
+        let file: RunFileConfig = toml::from_str(
+            r#"[network]
+            listen = "127.0.0.1:9000"
+            [limits]
+            gossip_min_bytes_per_second = 1024
+            gossip_max_bytes_per_second = 8192
+            gossip_burst_bytes = "4KiB"
+        "#,
+        )
+        .unwrap();
+        validate_run_file_config(&file).unwrap();
+        let sync = apply_limit_config(SyncConfig::new(), file.limits.as_ref()).unwrap();
+        assert_eq!(sync.gossip_rate.burst_bytes, 4096);
+        assert_eq!(sync.gossip_rate.min_bytes_per_second, 1024);
+        assert_eq!(sync.gossip_rate.max_bytes_per_second, 8192);
+        let effective = EffectiveRunConfig::resolve_with_env(
+            RunCliOptions::default(),
+            EnvRunConfig::default(),
+            &file,
+        )
+        .unwrap();
+        let rendered = effective.render_effective_toml();
+        assert!(rendered.contains("gossip_min_bytes_per_second = 1024"));
+        assert!(rendered.contains("gossip_max_bytes_per_second = 8192"));
+        assert!(rendered.contains("gossip_burst_bytes = \"4096B\""));
+        for limits in [
+            "gossip_min_bytes_per_second = 0",
+            "gossip_max_bytes_per_second = 1",
+            "gossip_burst_bytes = \"0B\"",
+            "gossip_burst_bytes = \"invalid\"",
+        ] {
+            let file: RunFileConfig = toml::from_str(&format!("[limits]\n{limits}")).unwrap();
+            assert!(validate_run_file_config(&file).is_err());
+            assert!(apply_limit_config(SyncConfig::new(), file.limits.as_ref()).is_err());
+        }
     }
 
     #[test]

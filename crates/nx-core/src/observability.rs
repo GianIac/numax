@@ -56,6 +56,7 @@ impl ObservabilityConfig {
 
 #[derive(Default)]
 pub struct RuntimeMetrics {
+    gossip_pacing: GossipPacingMetrics,
     ops_total: AtomicU64,
     peers_connected: AtomicUsize,
     sync_latency_ms: AtomicU64,
@@ -74,6 +75,21 @@ pub struct RuntimeMetrics {
     remote_op_batch_apply_duration: DurationHistogram,
     wasm_modules: Mutex<BTreeMap<String, WasmModuleMetrics>>,
     ready: AtomicBool,
+}
+
+#[derive(Default)]
+struct GossipPacingMetrics {
+    deferred: AtomicU64,
+    admitted_bytes: AtomicU64,
+    last_rate: AtomicU64,
+    last_rtt_ns: AtomicU64,
+}
+#[derive(Default)]
+struct GossipPacingSnapshot {
+    deferred: u64,
+    admitted_bytes: u64,
+    last_rate: u64,
+    last_rtt_ns: u64,
 }
 
 #[derive(Clone, Default)]
@@ -137,6 +153,26 @@ impl RuntimeMetrics {
 
     pub fn set_peers_connected(&self, count: usize) {
         self.peers_connected.store(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_gossip_pacing(
+        &self,
+        allowed: bool,
+        bytes: usize,
+        rate: u64,
+        rtt: Option<Duration>,
+    ) {
+        if allowed {
+            self.gossip_pacing
+                .admitted_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        } else {
+            self.gossip_pacing.deferred.fetch_add(1, Ordering::Relaxed);
+        }
+        self.gossip_pacing.last_rate.store(rate, Ordering::Relaxed);
+        self.gossip_pacing
+            .last_rtt_ns
+            .store(rtt.map_or(0, duration_ns), Ordering::Relaxed);
     }
 
     pub fn record_sync_latency(&self, duration: Duration) {
@@ -293,6 +329,12 @@ impl RuntimeMetrics {
             .clone();
 
         MetricsSnapshot {
+            gossip_pacing: GossipPacingSnapshot {
+                deferred: self.gossip_pacing.deferred.load(Ordering::Relaxed),
+                admitted_bytes: self.gossip_pacing.admitted_bytes.load(Ordering::Relaxed),
+                last_rate: self.gossip_pacing.last_rate.load(Ordering::Relaxed),
+                last_rtt_ns: self.gossip_pacing.last_rtt_ns.load(Ordering::Relaxed),
+            },
             ops_total: self.ops_total.load(Ordering::Relaxed),
             peers_connected: self.peers_connected.load(Ordering::Relaxed),
             sync_latency_ms: self.sync_latency_ms.load(Ordering::Relaxed),
@@ -330,6 +372,7 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 struct MetricsSnapshot {
+    gossip_pacing: GossipPacingSnapshot,
     ops_total: u64,
     peers_connected: usize,
     sync_latency_ms: u64,
@@ -537,6 +580,16 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
         snapshot.store_bytes
     );
 
+    rendered.push_str(&format!(
+        "# HELP numax_gossip_rate_limited_total Fast-path attempts deferred to durable repair\n# TYPE numax_gossip_rate_limited_total counter\nnumax_gossip_rate_limited_total {}\n\
+         # HELP numax_gossip_admitted_bytes_total Framed bytes admitted for gossip attempts\n# TYPE numax_gossip_admitted_bytes_total counter\nnumax_gossip_admitted_bytes_total {}\n\
+         # HELP numax_gossip_rate_bytes_per_second Last per-peer pacing decision, not a node total\n# TYPE numax_gossip_rate_bytes_per_second gauge\nnumax_gossip_rate_bytes_per_second {}\n",
+        snapshot.gossip_pacing.deferred, snapshot.gossip_pacing.admitted_bytes, snapshot.gossip_pacing.last_rate,
+    ));
+    if snapshot.gossip_pacing.last_rtt_ns > 0 {
+        rendered.push_str(&format!("# HELP numax_gossip_control_rtt_seconds Last control round-trip estimate used by pacing, excluding connection setup\n# TYPE numax_gossip_control_rtt_seconds gauge\nnumax_gossip_control_rtt_seconds {}\n", snapshot.gossip_pacing.last_rtt_ns as f64 / 1_000_000_000.0));
+    }
+
     render_duration_histogram(
         &mut rendered,
         "numax_remote_op_batch_apply_duration_seconds",
@@ -640,8 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn gossip_pacing_metrics_distinguish_unknown_rtt_and_count_attempts_without_peer_labels() {
+        let metrics = RuntimeMetrics::default();
+        let store = temp_store();
+        metrics.record_gossip_pacing(true, 100, 4096, None);
+        metrics.record_gossip_pacing(false, 200, 2048, None);
+        let rendered = metrics.render_for_test(&store);
+        assert!(rendered.contains("numax_gossip_admitted_bytes_total 100\n"));
+        assert!(rendered.contains("numax_gossip_rate_limited_total 1\n"));
+        assert!(!rendered.contains("numax_gossip_control_rtt_seconds"));
+        metrics.record_gossip_pacing(true, 50, 2048, Some(Duration::from_millis(10)));
+        assert!(
+            metrics
+                .render_for_test(&store)
+                .contains("numax_gossip_control_rtt_seconds 0.01\n")
+        );
+        metrics.record_gossip_pacing(false, 200, 1024, None);
+        assert!(
+            !metrics
+                .render_for_test(&store)
+                .contains("numax_gossip_control_rtt_seconds")
+        );
+    }
+
+    #[test]
     fn metrics_are_rendered_in_prometheus_format() {
         let snapshot = MetricsSnapshot {
+            gossip_pacing: GossipPacingSnapshot::default(),
             ops_total: 7,
             peers_connected: 2,
             sync_latency_ms: 15,

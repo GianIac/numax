@@ -43,12 +43,63 @@ type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
 
 /// Generation identity and cancellation shared by the reader and write snapshots.
 struct ConnectionInstance {
+    created_at: std::time::Instant,
     closed_tx: watch::Sender<bool>,
+}
+
+/// Opaque identity of one data connection. Retaining it does not retain its socket.
+#[derive(Clone)]
+pub struct ConnectionGeneration(Arc<ConnectionInstance>);
+
+impl PartialEq for ConnectionGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ConnectionGeneration {}
+impl ConnectionGeneration {
+    pub fn created_at(&self) -> std::time::Instant {
+        self.0.created_at
+    }
+    pub fn is_closed(&self) -> bool {
+        *self.0.closed_tx.borrow()
+    }
+}
+
+/// One encoded History frame tied to its writer generation, ready for rate admission.
+pub struct PreparedHistory {
+    owner: Weak<StdMutex<TaskRegistry>>,
+    addr: String,
+    peer_id: NodeId,
+    writer: Weak<Mutex<WriteHalf<NetStream>>>,
+    generation: ConnectionGeneration,
+    bytes: Vec<u8>,
+}
+impl PreparedHistory {
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn generation(&self) -> ConnectionGeneration {
+        self.generation.clone()
+    }
+    pub fn peer_id(&self) -> &NodeId {
+        &self.peer_id
+    }
+}
+
+/// Correlated control request/response time, excluding connect and TLS setup.
+/// Includes request writing, remote service and response decoding; not TCP RTT.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlTiming {
+    pub started_at: std::time::Instant,
+    pub round_trip: Duration,
+    pub observed_at: std::time::Instant,
 }
 
 impl ConnectionInstance {
     fn new() -> Self {
         Self {
+            created_at: std::time::Instant::now(),
             closed_tx: watch::channel(false).0,
         }
     }
@@ -478,6 +529,18 @@ impl Node {
         budget: Duration,
         dispatched: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> NetResult<(NodeId, crate::ControlReply)> {
+        self.control_request_timed_tracked(addr, request, budget, dispatched)
+            .await
+            .map(|(peer, reply, _)| (peer, reply))
+    }
+
+    pub async fn control_request_timed_tracked(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+        dispatched: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, crate::ControlReply, ControlTiming)> {
         let _slot = Arc::clone(&self.control.outgoing)
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(crate::MAX_CONTROL_REQUESTS))?;
@@ -516,6 +579,7 @@ impl Node {
                     request,
                 },
             };
+            let started = std::time::Instant::now();
             write_message(
                 &mut writer,
                 &hello,
@@ -529,6 +593,7 @@ impl Node {
                 budget,
             )
             .await?;
+            let observed_at = std::time::Instant::now();
             match response.kind {
                 WireMessageKind::ControlAck {
                     node_id,
@@ -554,7 +619,15 @@ impl Node {
                             "uncorrelated control response".into(),
                         ));
                     }
-                    Ok((node_id, reply))
+                    Ok((
+                        node_id,
+                        reply,
+                        ControlTiming {
+                            started_at: started,
+                            round_trip: observed_at.saturating_duration_since(started),
+                            observed_at,
+                        },
+                    ))
                 }
                 WireMessageKind::Error { error } => Err(NetError::Wire(error.try_into()?)),
                 _ => Err(NetError::InvalidMessage("expected ControlAck".into())),
@@ -894,6 +967,90 @@ impl Node {
             },
         )
         .await
+    }
+
+    /// Encode once using the active connection's negotiated codec. The size
+    /// includes framing, and an oversized frame is refused before rate charging.
+    pub async fn prepare_history_to_addr(
+        &self,
+        addr: &str,
+        message: nx_sync::HistoryMessage,
+    ) -> NetResult<PreparedHistory> {
+        let (writer, serialization_format, generation, peer_id) = {
+            let peers = self.peers.read().await;
+            let peer = peers
+                .get(addr)
+                .filter(|peer| peer.state == PeerState::Connected)
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            let writer = peer
+                .writer
+                .as_ref()
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            let peer_id = peer
+                .info
+                .node_id
+                .clone()
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            (
+                Arc::downgrade(writer),
+                peer.serialization_format,
+                ConnectionGeneration(Arc::clone(&peer.instance)),
+                peer_id,
+            )
+        };
+        let bytes = WireMessage {
+            kind: WireMessageKind::History { message },
+        }
+        .to_bytes_with_format(serialization_format)?;
+        validate_payload_len(bytes.len().saturating_sub(4), self.config.max_message_size)?;
+        Ok(PreparedHistory {
+            owner: Arc::downgrade(&self.tasks),
+            addr: addr.into(),
+            peer_id,
+            writer,
+            generation,
+            bytes,
+        })
+    }
+
+    /// Send only on the generation used for encoding and rate admission.
+    /// Duration is local writer/transport service time, never a round-trip sample.
+    pub async fn send_prepared_history(&self, prepared: PreparedHistory) -> NetResult<Duration> {
+        if !Weak::ptr_eq(&prepared.owner, &Arc::downgrade(&self.tasks)) {
+            return Err(NetError::InvalidMessage(
+                "prepared frame belongs to another node".into(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let PreparedHistory {
+            addr,
+            writer,
+            generation,
+            bytes,
+            ..
+        } = prepared;
+        if let Err(error) = self
+            .write_to_connection(&addr, writer, &generation.0, &bytes)
+            .await
+        {
+            if let Some((node_id, peers_connected)) =
+                self.mark_peer_failed(&addr, &generation.0).await
+            {
+                send_node_event(
+                    &self.event_tx,
+                    &self.shutdown_tx.subscribe(),
+                    "PeerDisconnected",
+                    NodeEvent::PeerDisconnected {
+                        node_id,
+                        addr,
+                        peers_connected,
+                    },
+                )
+                .await;
+            }
+            return Err(error);
+        }
+        Ok(started.elapsed())
     }
 
     /// Send ops to all connected peers.
@@ -2025,21 +2182,174 @@ mod tests {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
 
+    fn owner(member: &NodeId) -> crate::MembershipRecord {
+        crate::MembershipRecord {
+            member: member.to_string(),
+            reporter: member.to_string(),
+            version: crate::MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state: crate::MembershipState::Alive,
+            endpoint: None,
+        }
+    }
+    #[tokio::test]
+    async fn timed_control_excludes_tls_setup_and_rejects_uncorrelated_replies() {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let pki = TestPki::generate().unwrap();
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for corrupt in [false, true] {
+                let client_id = crate::tls::derive_protocol_node_id_from_cert(
+                    &CertificateDer::from_pem_slice(pki.node2_cert.as_bytes()).unwrap(),
+                )
+                .unwrap();
+                let server_id = crate::tls::derive_protocol_node_id_from_cert(
+                    &CertificateDer::from_pem_slice(pki.node1_cert.as_bytes()).unwrap(),
+                )
+                .unwrap();
+                let client = Node::new(
+                    NodeConfig::new(client_id.clone(), "127.0.0.1:0")
+                        .with_tls(pki.node2_config())
+                        .with_serialization_format(format),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("localhost:{}", listener.local_addr().unwrap().port());
+                let tls_delay = Duration::from_millis(50);
+                let service_delay = Duration::from_millis(15);
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    // Deliberate TLS service delay is the injected fault, not polling.
+                    tokio::time::sleep(tls_delay).await;
+                    let mut stream = pki.node1_config().accept_stream(tcp).await.unwrap();
+                    let (_, request) = read_wire_message_with_format(
+                        &mut stream,
+                        crate::MAX_CONTROL_FRAME,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                    let WireMessageKind::ControlHello { request, .. } = request.kind else {
+                        panic!("missing control request");
+                    };
+                    tokio::time::sleep(service_delay).await;
+                    write_message(
+                        &mut stream,
+                        &WireMessage {
+                            kind: WireMessageKind::ControlAck {
+                                node_id: server_id.clone(),
+                                protocol_version: PROTOCOL_VERSION,
+                                selected_format: format,
+                                reply: crate::ControlReply {
+                                    request_id: request.request_id + u64::from(corrupt),
+                                    owner: owner(&server_id),
+                                    ack: true,
+                                    nack: false,
+                                    records: vec![],
+                                    next: None,
+                                },
+                            },
+                        },
+                        format,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                };
+                let started = std::time::Instant::now();
+                let query = client.control_request_timed_tracked(
+                    &endpoint,
+                    crate::ControlRequest {
+                        request_id: 1,
+                        owner: owner(&client_id),
+                        updates: vec![],
+                        kind: crate::ControlKind::Exchange { after: None },
+                    },
+                    Duration::from_secs(2),
+                    None,
+                );
+                let (result, ()) = timeout(Duration::from_secs(5), async {
+                    tokio::join!(query, server)
+                })
+                .await
+                .unwrap();
+                if corrupt {
+                    assert!(matches!(result, Err(NetError::InvalidMessage(_))));
+                } else {
+                    let (_, _, timing) = result.unwrap();
+                    assert!(timing.round_trip >= service_delay);
+                    assert!(started.elapsed().saturating_sub(timing.round_trip) >= tls_delay);
+                    assert!(timing.observed_at >= started);
+                }
+                client.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_history_accounts_framing_and_cannot_cross_connections_or_nodes() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let client = Node::new(
+                NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_serialization_format(format)
+                    .with_max_message_size(1024),
+            );
+            let server = Node::new(
+                NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let address = server.start_listener().await.unwrap().to_string();
+            client.connect_to_peer(&address).await.unwrap();
+            let message = nx_sync::HistoryMessage::SummaryRequest { after_origin: None };
+            let prepared = client
+                .prepare_history_to_addr(&address, message.clone())
+                .await
+                .unwrap();
+            let encoded = WireMessage {
+                kind: WireMessageKind::History { message },
+            }
+            .to_bytes_with_format(format)
+            .unwrap();
+            assert_eq!(prepared.encoded_len(), encoded.len());
+            let generation = prepared.generation();
+            assert!(!generation.is_closed());
+            client
+                .disconnect_peer(&address, &NodeId::new("server"))
+                .await;
+            client.connect_to_peer(&address).await.unwrap();
+            assert!(generation.is_closed());
+            assert!(matches!(
+                client.send_prepared_history(prepared).await,
+                Err(NetError::PeerDisconnected(_))
+            ));
+            assert!(client.is_connected_addr(&address).await);
+            let newer = client
+                .prepare_history_to_addr(
+                    &address,
+                    nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+                )
+                .await
+                .unwrap();
+            assert!(generation != newer.generation());
+            assert!(matches!(
+                server.send_prepared_history(newer).await,
+                Err(NetError::InvalidMessage(_))
+            ));
+            let oversized = nx_sync::HistoryMessage::SummaryRequest {
+                after_origin: Some("x".repeat(4096)),
+            };
+            assert!(matches!(
+                client.prepare_history_to_addr(&address, oversized).await,
+                Err(NetError::MessageTooLarge { .. })
+            ));
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn control_rpc_meets_local_budget_while_maximum_data_frame_is_blocked() {
         use rustls::pki_types::{CertificateDer, pem::PemObject};
-        fn owner(member: &NodeId) -> crate::MembershipRecord {
-            crate::MembershipRecord {
-                member: member.to_string(),
-                reporter: member.to_string(),
-                version: crate::MembershipVersion {
-                    epoch: 1,
-                    incarnation: 0,
-                },
-                state: crate::MembershipState::Alive,
-                endpoint: None,
-            }
-        }
         let pki = TestPki::generate().unwrap();
         for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
             for secure in [false, true] {

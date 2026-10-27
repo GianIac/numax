@@ -1332,6 +1332,9 @@ mod tests {
                 anti_entropy_interval: Some("2s".into()),
                 gossip_fanout_constant: Some(2),
                 gossip_max_fanout: Some(6),
+                gossip_min_bytes_per_second: Some(1024),
+                gossip_max_bytes_per_second: Some(8192),
+                gossip_burst_bytes: Some("4KiB".into()),
             };
 
             let cfg = apply_limit_config(SyncConfig::new(), Some(&limits)).unwrap();
@@ -1347,6 +1350,9 @@ mod tests {
             assert_eq!(cfg.peer_dead_after_failures, 4);
             assert_eq!(cfg.anti_entropy_interval, Duration::from_secs(2));
             assert_eq!(cfg.gossip_fanout_constant, 2);
+            assert_eq!(cfg.gossip_rate.min_bytes_per_second, 1024);
+            assert_eq!(cfg.gossip_rate.max_bytes_per_second, 8192);
+            assert_eq!(cfg.gossip_rate.burst_bytes, 4096);
             assert_eq!(cfg.gossip_max_fanout, 6);
         }
 
@@ -1365,6 +1371,9 @@ mod tests {
                 anti_entropy_interval: None,
                 gossip_fanout_constant: None,
                 gossip_max_fanout: None,
+                gossip_min_bytes_per_second: None,
+                gossip_max_bytes_per_second: None,
+                gossip_burst_bytes: None,
             };
 
             assert!(apply_limit_config(SyncConfig::new(), Some(&limits)).is_err());
