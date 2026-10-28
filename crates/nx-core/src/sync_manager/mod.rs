@@ -1,6 +1,7 @@
 mod apply;
 mod baseline;
 mod candidates;
+pub(crate) mod delivery;
 pub(crate) use candidates::canonicalize_endpoint;
 #[cfg(test)]
 mod fixtures;

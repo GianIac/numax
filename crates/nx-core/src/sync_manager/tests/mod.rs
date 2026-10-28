@@ -9,6 +9,7 @@ use std::time::Instant as StdInstant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
+mod backpressure;
 mod e2e;
 mod rate;
 mod recovery;

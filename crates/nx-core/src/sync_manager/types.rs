@@ -5,7 +5,7 @@ use std::time::Duration;
 use nx_net::{Node, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, watch};
 
 use crate::observability::RuntimeMetrics;
 
@@ -149,6 +149,8 @@ pub(super) struct HistoryCursor {
 }
 
 pub(super) struct AntiEntropyLoopContext {
+    pub(super) jitter_seed: u64,
+    pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
     pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
     pub(super) request_timeout: Duration,
     pub(super) node: Arc<Node>,
@@ -158,6 +160,7 @@ pub(super) struct AntiEntropyLoopContext {
 }
 
 pub(super) struct BroadcastLoopContext {
+    pub(super) max_message_size: usize,
     pub(super) pacing: Arc<std::sync::Mutex<super::pacing::Pacer>>,
     pub(super) local_id: NodeId,
     pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
@@ -183,6 +186,14 @@ pub(super) struct ForwardLoopContext {
 pub(super) struct ForwardedOp {
     pub(super) source_addr: String,
     pub(super) entry: nx_sync::SequencedOp,
+}
+
+impl super::delivery::Item for ForwardedOp {
+    fn delivery_bytes(&self) -> Option<usize> {
+        super::delivery::entry_bytes(&self.entry.op, &self.entry.position)?
+            .checked_add(self.source_addr.len())?
+            .checked_add(std::mem::size_of::<Self>())
+    }
 }
 
 pub(super) struct RemoteOpApplyContext<'a> {
@@ -250,6 +261,7 @@ pub(super) type HistoryRequests = HashMap<String, HashMap<String, PendingHistory
 
 #[derive(Clone)]
 pub(super) struct NodeEventContext {
+    pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
     pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
     pub(super) history_requests: Arc<RwLock<HistoryRequests>>,
     pub(super) history_request_timeout: Duration,
@@ -267,7 +279,7 @@ pub(super) struct NodeEventContext {
     pub(super) store: Arc<NxStore>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) node: Arc<Node>,
-    pub(super) forward_tx: Option<mpsc::Sender<ForwardedOp>>,
+    pub(super) forward_tx: Option<super::delivery::Sender<ForwardedOp>>,
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
     pub(super) active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
     pub(super) anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,

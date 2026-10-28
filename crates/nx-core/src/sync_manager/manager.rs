@@ -7,7 +7,9 @@ use std::sync::{
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
-use tokio::sync::{RwLock, mpsc, watch};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -43,7 +45,7 @@ use super::types::*;
 pub struct SyncHandle {
     generation: u64,
     node_id: NodeId,
-    op_tx: mpsc::Sender<AcceptedLocalOp>,
+    op_tx: super::delivery::Sender<AcceptedLocalOp>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
@@ -78,6 +80,13 @@ pub(crate) struct AcceptedLocalOp {
     position: nx_sync::OpPosition,
 }
 
+impl super::delivery::Item for AcceptedLocalOp {
+    fn delivery_bytes(&self) -> Option<usize> {
+        super::delivery::entry_bytes(&self.op, &self.position)?
+            .checked_add(std::mem::size_of::<Self>())
+    }
+}
+
 impl AcceptedLocalOp {
     fn new(store: &NxStore, op: Op) -> anyhow::Result<Self> {
         let entry = super::storage::sequenced_op(store, &op)?
@@ -93,6 +102,10 @@ impl AcceptedLocalOp {
             op: self.op,
             position: self.position,
         }
+    }
+
+    pub(super) fn position(&self) -> nx_sync::OpPosition {
+        self.position
     }
 
     pub(crate) fn op(&self) -> &Op {
@@ -136,7 +149,7 @@ impl SyncHandle {
         &self.node_id
     }
 
-    pub(crate) fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
+    pub(crate) fn op_sender(&self) -> super::delivery::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
     }
 
@@ -753,10 +766,10 @@ pub struct SyncManager {
     fanout_cursor: Arc<AtomicUsize>,
 
     /// Channel to send Ops to broadcast.
-    op_tx: mpsc::Sender<AcceptedLocalOp>,
+    op_tx: super::delivery::Sender<AcceptedLocalOp>,
 
     /// Receiver drained by `start` into the broadcast task.
-    op_rx: Option<mpsc::Receiver<AcceptedLocalOp>>,
+    op_rx: Option<super::delivery::Receiver<AcceptedLocalOp>>,
 
     /// Shutdown signal shared with background tasks.
     shutdown_tx: watch::Sender<bool>,
@@ -827,7 +840,11 @@ impl SyncManager {
         ensure_sync_schema(&store)?;
         let generation = super::storage::initialize_sequence_origin(&store, &node_id)?;
 
-        let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
+        let (op_tx, op_rx) = super::delivery::channel(
+            config.queued_ops_limit.max(1),
+            super::delivery::QUEUE_BYTES,
+            Arc::clone(&metrics),
+        );
         let op_log_limit = normalize_op_log_limit(config.op_log_limit);
         let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
@@ -903,7 +920,7 @@ impl SyncManager {
 
     /// Return sender
     #[cfg(test)]
-    pub(crate) fn op_sender(&self) -> mpsc::Sender<AcceptedLocalOp> {
+    pub(crate) fn op_sender(&self) -> super::delivery::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
     }
 
@@ -1052,10 +1069,18 @@ impl SyncManager {
         self.membership = Some(membership);
         self.node = Some(Arc::clone(&node));
 
-        let (forward_tx, forward_rx) = mpsc::channel(self.config.queued_ops_limit.max(1));
+        let (forward_tx, forward_rx) = super::delivery::channel(
+            self.config.queued_ops_limit.max(1),
+            super::delivery::QUEUE_BYTES,
+            Arc::clone(&self.metrics),
+        );
 
         // Inbound loop: apply remote ops into the CRDT registries.
+        let repair_budget = Arc::new(std::sync::Mutex::new(super::delivery::RepairBudget::new(
+            std::time::Instant::now(),
+        )));
         let event_context = NodeEventContext {
+            repair_budget: Arc::clone(&repair_budget),
             history_cursors: Arc::clone(&self.history_cursors),
             history_requests: Arc::new(RwLock::new(HashMap::new())),
             history_request_timeout: self.config.socket_timeout,
@@ -1115,6 +1140,7 @@ impl SyncManager {
                 membership: membership_snapshot.clone(),
                 node: Arc::clone(&node),
                 metrics: Arc::clone(&self.metrics),
+                max_message_size: self.config.max_message_size,
                 fanout_constant: self.config.gossip_fanout_constant,
                 max_fanout: self.config.gossip_max_fanout,
                 fanout_cursor: Arc::clone(&self.fanout_cursor),
@@ -1155,6 +1181,8 @@ impl SyncManager {
         });
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            jitter_seed: super::delivery::seed(self.node_id.as_str()),
+            repair_budget,
             history_cursors: Arc::clone(&self.history_cursors),
             request_timeout: self.config.socket_timeout,
             node: Arc::clone(&node),

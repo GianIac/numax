@@ -969,6 +969,11 @@ impl Node {
         .await
     }
 
+    /// Configured bound on a history payload, excluding its length prefix.
+    pub fn max_message_size(&self) -> usize {
+        self.config.max_message_size
+    }
+
     /// Encode once using the active connection's negotiated codec. The size
     /// includes framing, and an oversized frame is refused before rate charging.
     pub async fn prepare_history_to_addr(
@@ -1016,6 +1021,17 @@ impl Node {
     /// Send only on the generation used for encoding and rate admission.
     /// Duration is local writer/transport service time, never a round-trip sample.
     pub async fn send_prepared_history(&self, prepared: PreparedHistory) -> NetResult<Duration> {
+        self.send_prepared_history_with_timeout(prepared, self.config.socket_timeout)
+            .await
+    }
+
+    /// Bound writer acquisition and frame transmission together. A timeout may
+    /// leave a partial frame, so the generation is closed before returning.
+    pub async fn send_prepared_history_with_timeout(
+        &self,
+        prepared: PreparedHistory,
+        budget: Duration,
+    ) -> NetResult<Duration> {
         if !Weak::ptr_eq(&prepared.owner, &Arc::downgrade(&self.tasks)) {
             return Err(NetError::InvalidMessage(
                 "prepared frame belongs to another node".into(),
@@ -1029,25 +1045,17 @@ impl Node {
             bytes,
             ..
         } = prepared;
-        if let Err(error) = self
-            .write_to_connection(&addr, writer, &generation.0, &bytes)
-            .await
-        {
-            if let Some((node_id, peers_connected)) =
-                self.mark_peer_failed(&addr, &generation.0).await
-            {
-                send_node_event(
-                    &self.event_tx,
-                    &self.shutdown_tx.subscribe(),
-                    "PeerDisconnected",
-                    NodeEvent::PeerDisconnected {
-                        node_id,
-                        addr,
-                        peers_connected,
-                    },
-                )
-                .await;
-            }
+        let result = timeout(
+            budget.min(self.config.socket_timeout),
+            self.write_to_connection(&addr, writer, &generation.0, &bytes),
+        )
+        .await
+        .unwrap_or(Err(NetError::Timeout));
+        if let Err(error) = result {
+            // The existing reader task owns connection removal and disconnect
+            // notification. Signal it without waiting on the event queue: this
+            // send may itself run inside that queue's consumer.
+            generation.0.closed_tx.send_replace(true);
             return Err(error);
         }
         Ok(started.elapsed())
@@ -2342,6 +2350,61 @@ mod tests {
                 client.prepare_history_to_addr(&address, oversized).await,
                 Err(NetError::MessageTooLarge { .. })
             ));
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_history_timeout_releases_peer_despite_event_backpressure() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let client = Node::new(
+                NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format),
+            );
+            let server = Node::new(
+                NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let address = server.start_listener().await.unwrap().to_string();
+            client.connect_to_peer(&address).await.unwrap();
+            // PeerConnected occupies the client's only event slot.
+            assert_eq!(client.event_tx.capacity(), 0);
+            let writer = Arc::clone(client.peers.read().await[&address].writer.as_ref().unwrap());
+            let held = writer.lock().await;
+            let prepared = client
+                .prepare_history_to_addr(
+                    &address,
+                    nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+                )
+                .await
+                .unwrap();
+            let generation = prepared.generation();
+            let sent = timeout(
+                Duration::from_secs(1),
+                client.send_prepared_history_with_timeout(prepared, Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(sent, Err(NetError::Timeout)));
+            assert!(generation.is_closed());
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if client.connected_peer_count().await == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                client.connection_slots.available_permits(),
+                DEFAULT_MAX_PEERS
+            );
+            drop(held);
+            drop(writer);
             client.shutdown().await;
             server.shutdown().await;
         }

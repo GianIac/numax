@@ -29,10 +29,11 @@ const MAX_RECONNECT_ATTEMPTS_PER_TURN: usize = 8;
 
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
-    mut op_rx: mpsc::Receiver<AcceptedLocalOp>,
+    mut op_rx: super::delivery::Receiver<AcceptedLocalOp>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut pending = None;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -41,11 +42,12 @@ pub(super) fn spawn_broadcast_loop(
                         drain_broadcast_queue(
                             &context,
                             &mut op_rx,
+                            pending.take(),
                         ).await;
                         break;
                     }
                 }
-                op = op_rx.recv() => {
+                op = async { match pending.take() { Some(op) => Some(op), None => op_rx.recv().await } } => {
                     let Some(first) = op else {
                         break;
                     };
@@ -53,6 +55,7 @@ pub(super) fn spawn_broadcast_loop(
                         &context,
                         &mut op_rx,
                         first,
+                        &mut pending,
                     ).await;
                 }
             }
@@ -63,7 +66,7 @@ pub(super) fn spawn_broadcast_loop(
 
 pub(super) fn spawn_forward_loop(
     context: ForwardLoopContext,
-    mut forwarded_rx: mpsc::Receiver<ForwardedOp>,
+    mut forwarded_rx: super::delivery::Receiver<ForwardedOp>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -209,6 +212,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         let mut state = Vec::new();
         let mut neighbors = super::neighbors::Neighbors::new(StdInstant::now());
         let mut victim_cursor = 0usize;
+        let mut jitter = super::delivery::Jitter::new(super::delivery::seed(local_id.as_str()));
 
         'reconnect: loop {
             if *shutdown_rx.borrow() {
@@ -358,6 +362,9 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                 }
             }
             let sleep_for = sleep_for.unwrap_or(initial_delay);
+            let sleep_for = sleep_for
+                .saturating_add(jitter.delay(sleep_for / 8))
+                .min(max_delay);
             let Some(deadline) = tokio::time::Instant::now().checked_add(sleep_for) else {
                 metrics.record_sync_error();
                 warn!("stopping reconnect loop: sleep deadline overflow");
@@ -383,6 +390,8 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
     let AntiEntropyLoopContext {
+        jitter_seed,
+        repair_budget,
         history_cursors,
         request_timeout,
         node,
@@ -393,13 +402,19 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
 
     Some(tokio::spawn(async move {
         let interval = normalize_anti_entropy_interval(interval);
+        let mut jitter = super::delivery::Jitter::new(jitter_seed);
+        let mut peer_cursor = 0usize;
         // Keep the cadence independent of discovery churn and skip missed ticks
         // rather than issuing bursts after a slow transport write. Recheck every
         // deadline: construction-time validation cannot guarantee future additions.
         let mut previous = tokio::time::Instant::now();
         loop {
+            // Jitter shortens the poll period: it must not extend the configured
+            // repair interval past an idle transport's read deadline.
+            let period =
+                interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
             let Some(deadline) =
-                checked_anti_entropy_deadline(previous, interval, tokio::time::Instant::now())
+                checked_anti_entropy_deadline(previous, period, tokio::time::Instant::now())
             else {
                 metrics.record_sync_error();
                 warn!("stopping anti-entropy loop: cadence deadline overflow");
@@ -414,8 +429,15 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
                 }
                 _ = async {
                     tokio::time::sleep_until(deadline).await;
-                    let peers = node.connected_peers().await;
-                    for (peer, _) in peers {
+                    let mut peers = node.connected_peers().await;
+                    history_cursors.write().await.retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
+                    if !peers.is_empty() {
+                        let len = peers.len();
+                        peers.rotate_left(peer_cursor % len);
+                        peer_cursor = peer_cursor.wrapping_add(1);
+                    }
+                    let mut turn = super::delivery::Turn::new();
+                    for (peer, _) in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
                         let after_origin = {
                             let mut cursors = history_cursors.write().await;
                             let cursor = cursors.entry(peer.clone()).or_default();
@@ -431,7 +453,7 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
                             cursor.request_deadline = Some(deadline);
                             cursor.after_origin.clone()
                         };
-                        if let Err(error) = node.send_history_to_addr(&peer, HistoryMessage::SummaryRequest { after_origin }).await {
+                        if let Err(error) = send_repair_history(&node, &repair_budget, &peer, HistoryMessage::SummaryRequest { after_origin }, Some(&mut turn)).await {
                             if let Some(cursor) = history_cursors.write().await.get_mut(&peer) {
                                 cursor.request_deadline = None;
                             }
@@ -564,6 +586,31 @@ pub(super) fn select_gossip_peers(
 
 /// The mutex covers only pure pacing decisions, never encoding or I/O. Denial
 /// skips a fast-path attempt; durable history remains eligible for anti-entropy.
+async fn send_repair_history(
+    node: &nx_net::Node,
+    budget: &std::sync::Mutex<super::delivery::RepairBudget>,
+    addr: &str,
+    message: HistoryMessage,
+    turn: Option<&mut super::delivery::Turn>,
+) -> nx_net::NetResult<()> {
+    let prepared = node.prepare_history_to_addr(addr, message).await?;
+    let bytes = prepared.encoded_len();
+    if turn.is_some_and(|turn| !turn.admit(bytes))
+        || !budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(bytes, StdInstant::now())
+    {
+        return Err(NetError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "recovery budget exhausted; periodic repair will retry",
+        )));
+    }
+    node.send_prepared_history_with_timeout(prepared, super::delivery::SEND_TIMEOUT)
+        .await
+        .map(|_| ())
+}
+
 async fn send_paced_history(
     node: &nx_net::Node,
     metrics: &RuntimeMetrics,
@@ -571,9 +618,13 @@ async fn send_paced_history(
     membership: &watch::Receiver<crate::membership::runtime::Snapshot>,
     addr: &str,
     message: HistoryMessage,
-    load: super::pacing::Load,
+    budget: (super::pacing::Load, &mut super::delivery::Turn),
 ) -> nx_net::NetResult<bool> {
     let prepared = node.prepare_history_to_addr(addr, message).await?;
+    if !budget.1.admit(prepared.encoded_len()) {
+        metrics.record_gossip_pacing(false, prepared.encoded_len(), 0, None);
+        return Ok(false);
+    }
     let sample = membership
         .borrow()
         .probe_timings
@@ -590,7 +641,7 @@ async fn send_paced_history(
             generation.clone(),
             bytes,
             StdInstant::now(),
-            load,
+            budget.0,
             sample,
         );
     if !decision.allowed && decision.bytes_per_second == 0 {
@@ -605,7 +656,9 @@ async fn send_paced_history(
     if !decision.allowed {
         return Ok(false);
     }
-    let result = node.send_prepared_history(prepared).await;
+    let result = node
+        .send_prepared_history_with_timeout(prepared, super::delivery::SEND_TIMEOUT)
+        .await;
     pacing
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -620,7 +673,7 @@ async fn send_paced_history(
 
 async fn forward_batch(
     context: &ForwardLoopContext,
-    forwarded_rx: &mut mpsc::Receiver<ForwardedOp>,
+    forwarded_rx: &mut super::delivery::Receiver<ForwardedOp>,
     first: ForwardedOp,
     pending: &mut Option<ForwardedOp>,
 ) {
@@ -634,27 +687,26 @@ async fn forward_batch(
         .max_message_size
         .min(REPLAY_BYTES)
         .saturating_sub(256);
-    let mut encoded_bytes = serde_json::to_vec(&entries)
-        .map(|encoded| encoded.len())
-        .unwrap_or(usize::MAX);
+    let mut encoded_bytes =
+        super::delivery::entry_bytes(&entries[0].op, &entries[0].position).unwrap_or(usize::MAX);
     if encoded_bytes > byte_budget {
         context.metrics.record_sync_error();
         warn!(%source_addr, byte_budget, "forwarded operation exceeds gossip byte budget; durable history remains available for repair");
         return;
     }
 
-    tokio::time::sleep(BROADCAST_COALESCE_DELAY).await;
-    while entries.len() < BROADCAST_BATCH_MAX {
+    let seed = super::delivery::seed(entries[0].op.id.as_str())
+        ^ super::delivery::seed(context.local_id.as_str());
+    tokio::time::sleep(
+        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+    )
+    .await;
+    for _ in 1..BROADCAST_BATCH_MAX {
         match forwarded_rx.try_recv() {
             Ok(forwarded) if forwarded.source_addr == source_addr => {
-                let item_size = match serde_json::to_vec(&forwarded.entry) {
-                    Ok(encoded) => encoded.len().saturating_add(1),
-                    Err(error) => {
-                        context.metrics.record_sync_error();
-                        warn!(%error, "failed to size forwarded operation");
-                        continue;
-                    }
-                };
+                let item_size =
+                    super::delivery::entry_bytes(&forwarded.entry.op, &forwarded.entry.position)
+                        .unwrap_or(usize::MAX);
                 if encoded_bytes.saturating_add(item_size) > byte_budget {
                     *pending = Some(forwarded);
                     break;
@@ -693,7 +745,8 @@ async fn forward_batch(
     let started = std::time::Instant::now();
     let mut sent = 0;
     let mut failed = 0;
-    for peer in recipients {
+    let mut turn = super::delivery::Turn::new();
+    for peer in recipients.into_iter().take(super::delivery::TURN_MESSAGES) {
         match send_paced_history(
             &context.node,
             &context.metrics,
@@ -703,7 +756,7 @@ async fn forward_batch(
             HistoryMessage::Push {
                 ops: entries.clone(),
             },
-            load,
+            (load, &mut turn),
         )
         .await
         {
@@ -751,23 +804,53 @@ fn enqueue_forwarded_ops(
 
 pub(super) async fn broadcast_batch(
     context: &BroadcastLoopContext,
-    op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
+    op_rx: &mut super::delivery::Receiver<AcceptedLocalOp>,
     first: AcceptedLocalOp,
+    pending: &mut Option<AcceptedLocalOp>,
 ) {
     let load = super::pacing::Load {
         queued: op_rx.len().saturating_add(1),
         capacity: op_rx.max_capacity(),
     };
+    let byte_budget = context
+        .max_message_size
+        .min(REPLAY_BYTES)
+        .saturating_sub(256);
+    let mut bytes =
+        super::delivery::entry_bytes(first.op(), &first.position()).unwrap_or(usize::MAX);
+    if bytes > byte_budget {
+        context.metrics.record_sync_error();
+        debug!("local gossip entry exceeds byte budget; durable repair retains accepted operation");
+        return;
+    }
+    let seed = super::delivery::seed(first.op().id.as_str())
+        ^ super::delivery::seed(context.local_id.as_str());
     let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
     batch.push(first);
 
     // Give producers a tiny window to fill the channel so sustained load is
     // sent in larger PushOps messages instead of many tiny network writes.
-    tokio::time::sleep(BROADCAST_COALESCE_DELAY).await;
+    tokio::time::sleep(
+        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+    )
+    .await;
 
-    while batch.len() < BROADCAST_BATCH_MAX {
+    for _ in 1..BROADCAST_BATCH_MAX {
         match op_rx.try_recv() {
-            Ok(op) => batch.push(op),
+            Ok(op) => {
+                let size =
+                    super::delivery::entry_bytes(op.op(), &op.position()).unwrap_or(usize::MAX);
+                if size > byte_budget {
+                    context.metrics.record_sync_error();
+                    continue;
+                }
+                if bytes.saturating_add(size) > byte_budget {
+                    *pending = Some(op);
+                    break;
+                }
+                bytes += size;
+                batch.push(op);
+            }
             Err(_) => break,
         }
     }
@@ -799,7 +882,8 @@ pub(super) async fn broadcast_batch(
     let started = std::time::Instant::now();
     let mut sent = 0;
     let mut failed = 0;
-    for peer in recipients {
+    let mut turn = super::delivery::Turn::new();
+    for peer in recipients.into_iter().take(super::delivery::TURN_MESSAGES) {
         match send_paced_history(
             &context.node,
             &context.metrics,
@@ -807,7 +891,7 @@ pub(super) async fn broadcast_batch(
             &context.membership,
             &peer,
             HistoryMessage::Push { ops: batch.clone() },
-            load,
+            (load, &mut turn),
         )
         .await
         {
@@ -837,10 +921,11 @@ pub(super) async fn broadcast_batch(
 
 pub(super) async fn drain_broadcast_queue(
     context: &BroadcastLoopContext,
-    op_rx: &mut mpsc::Receiver<AcceptedLocalOp>,
+    op_rx: &mut super::delivery::Receiver<AcceptedLocalOp>,
+    mut pending: Option<AcceptedLocalOp>,
 ) {
-    while let Ok(first) = op_rx.try_recv() {
-        broadcast_batch(context, op_rx, first).await;
+    while let Some(first) = pending.take().or_else(|| op_rx.try_recv().ok()) {
+        broadcast_batch(context, op_rx, first, &mut pending).await;
     }
 }
 
@@ -1088,26 +1173,27 @@ async fn request_history_or_baseline(
             },
         );
     }
-    if let Err(error) = context
-        .node
-        .send_history_to_addr(
-            addr,
-            if start == 0 {
-                HistoryMessage::BaselineRequest {
-                    request_id: request_id.clone(),
-                    origin: origin.clone(),
-                    version: super::baseline::VERSION,
-                }
-            } else {
-                HistoryMessage::Request {
-                    request_id: request_id.clone(),
-                    origin: origin.clone(),
-                    start,
-                    end,
-                }
-            },
-        )
-        .await
+    if let Err(error) = send_repair_history(
+        &context.node,
+        &context.repair_budget,
+        addr,
+        if start == 0 {
+            HistoryMessage::BaselineRequest {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                version: super::baseline::VERSION,
+            }
+        } else {
+            HistoryMessage::Request {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                start,
+                end,
+            }
+        },
+        None,
+    )
+    .await
     {
         complete_history_request(addr, &origin, &request_id, start, end, context).await;
         return Err(error.into());
@@ -1142,6 +1228,22 @@ async fn handle_history_message(
     message: HistoryMessage,
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
+    // Bound response construction, including baseline export, before storage work.
+    // Refusing a request leaves its requester to the existing bounded timeout and
+    // periodic retry path; it does not delete any operation or baseline.
+    if matches!(
+        &message,
+        HistoryMessage::SummaryRequest { .. }
+            | HistoryMessage::Request { .. }
+            | HistoryMessage::BaselineRequest { .. }
+    ) && !context
+        .repair_budget
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit_work(StdInstant::now())
+    {
+        anyhow::bail!("recovery work budget exhausted; periodic repair will retry");
+    }
     match message {
         HistoryMessage::Push { ops } => {
             anyhow::ensure!(
@@ -1196,10 +1298,14 @@ async fn handle_history_message(
         HistoryMessage::SummaryRequest { after_origin } => {
             let cursor = super::storage::summary_cursor(after_origin.as_deref())?;
             let (entries, _) = super::storage::summary_page(&context.store, cursor.as_deref())?;
-            context
-                .node
-                .send_history_to_addr(addr, HistoryMessage::Summary { entries })
-                .await?;
+            send_repair_history(
+                &context.node,
+                &context.repair_budget,
+                addr,
+                HistoryMessage::Summary { entries },
+                None,
+            )
+            .await?;
         }
         HistoryMessage::Summary { entries } => {
             anyhow::ensure!(
@@ -1257,11 +1363,27 @@ async fn handle_history_message(
                     }
                 }
                 retained.sort_by_key(|entry| entry.position.sequence);
+                let mut envelope = super::delivery::ByteCount::default();
+                serde_json::to_writer(
+                    &mut envelope,
+                    &HistoryMessage::Replay {
+                        request_id: request_id.clone(),
+                        origin: origin.clone(),
+                        start,
+                        end,
+                        ops: Vec::new(),
+                    },
+                )?;
+                let byte_budget = context
+                    .node
+                    .max_message_size()
+                    .saturating_sub(envelope.0.saturating_add(256))
+                    .min(REPLAY_BYTES);
                 let mut page = Vec::new();
                 let mut bytes = 2;
                 for (expected, entry) in (start..=end).zip(retained) {
                     let size = serde_json::to_vec(&entry)?.len() + 1;
-                    if entry.position.sequence != expected || bytes + size > REPLAY_BYTES {
+                    if entry.position.sequence != expected || bytes + size > byte_budget {
                         break;
                     }
                     bytes += size;
@@ -1287,7 +1409,8 @@ async fn handle_history_message(
                     }
                 }
             };
-            context.node.send_history_to_addr(addr, response).await?;
+            send_repair_history(&context.node, &context.repair_budget, addr, response, None)
+                .await?;
         }
         HistoryMessage::Replay {
             request_id,
@@ -1389,7 +1512,33 @@ async fn handle_history_message(
                     }
                 }
             };
-            context.node.send_history_to_addr(addr, response).await?;
+            let correlation = match &response {
+                HistoryMessage::Baseline {
+                    request_id, origin, ..
+                } => Some((request_id.clone(), origin.clone())),
+                _ => None,
+            };
+            match send_repair_history(&context.node, &context.repair_budget, addr, response, None)
+                .await
+            {
+                Err(NetError::MessageTooLarge { .. }) if correlation.is_some() => {
+                    if let Some((request_id, origin)) = correlation {
+                        send_repair_history(
+                            &context.node,
+                            &context.repair_budget,
+                            addr,
+                            HistoryMessage::BaselineUnavailable {
+                                request_id,
+                                origin,
+                                reason: nx_sync::BaselineFailure::BudgetExceeded,
+                            },
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+                other => other?,
+            }
         }
         HistoryMessage::Baseline {
             request_id,
@@ -1812,6 +1961,10 @@ mod tests {
     async fn anti_entropy_task_exits_without_panicking_on_deadline_overflow() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            jitter_seed: 1,
+            repair_budget: Arc::new(std::sync::Mutex::new(
+                super::super::delivery::RepairBudget::new(StdInstant::now()),
+            )),
             history_cursors: Arc::new(RwLock::new(HashMap::new())),
             request_timeout: Duration::from_secs(30),
             node: Arc::new(
@@ -1921,6 +2074,9 @@ mod tests {
         peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
     ) -> NodeEventContext {
         NodeEventContext {
+            repair_budget: Arc::new(std::sync::Mutex::new(
+                super::super::delivery::RepairBudget::new(StdInstant::now()),
+            )),
             history_cursors: Arc::new(RwLock::new(HashMap::new())),
             history_requests: Arc::new(RwLock::new(HashMap::new())),
             history_request_timeout: Duration::from_secs(30),
@@ -3116,6 +3272,10 @@ mod tests {
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            jitter_seed: 1,
+            repair_budget: Arc::new(std::sync::Mutex::new(
+                super::super::delivery::RepairBudget::new(StdInstant::now()),
+            )),
             history_cursors: Arc::clone(&cursors),
             request_timeout: Duration::from_secs(30),
             node: Arc::clone(&node),

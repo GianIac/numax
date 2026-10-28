@@ -221,6 +221,9 @@ pub(super) fn test_event_context(
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 ) -> NodeEventContext {
     NodeEventContext {
+        repair_budget: Arc::new(std::sync::Mutex::new(
+            crate::sync_manager::delivery::RepairBudget::new(StdInstant::now()),
+        )),
         history_cursors: Arc::new(RwLock::new(HashMap::new())),
         history_requests: Arc::new(RwLock::new(HashMap::new())),
         history_request_timeout: Duration::from_secs(30),
@@ -667,7 +670,9 @@ pub(super) async fn wait_for_peer_health(
     }
 }
 
-async fn reserve_local_op(handle: &SyncHandle) -> tokio::sync::mpsc::OwnedPermit<AcceptedLocalOp> {
+async fn reserve_local_op(
+    handle: &SyncHandle,
+) -> crate::sync_manager::delivery::OwnedPermit<AcceptedLocalOp> {
     handle.op_sender().reserve_owned().await.unwrap()
 }
 

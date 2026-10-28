@@ -206,7 +206,7 @@ while peer discovery remains deliberately separated from authentication and auth
 - [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
 - [x] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect ([contract and local TCP evidence](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts))
 - [x] Adaptive rate based on load/RTT
-- [ ] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
+- [x] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
 - [x] Periodic, byte-bounded and paginated anti-entropy complementing gossip
 
 **Runtime peer management**:
