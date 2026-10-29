@@ -79,6 +79,13 @@ guest.wasm
 
 The output is written to the `examples/guest_cpp` directory.
 
+### ABI smoke test
+
+After building `guest.wasm`, run:
+
+```bash
+node test.mjs
+
 ## Run
 
 From the repository root:
