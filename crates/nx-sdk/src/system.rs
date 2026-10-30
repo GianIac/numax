@@ -107,3 +107,152 @@ pub fn abort(message: &str) -> ! {
         core::hint::spin_loop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::NxError;
+
+    fn write_mock_payload(out: *mut u8, out_cap: u32, payload: &[u8]) -> i32 {
+        assert!(payload.len() <= out_cap as usize);
+        let out = unsafe { core::slice::from_raw_parts_mut(out, out_cap as usize) };
+        out[..payload.len()].copy_from_slice(payload);
+        payload.len() as i32
+    }
+
+    #[test]
+    fn read_dynamic_returns_none_on_not_found() {
+        assert_eq!(read_dynamic(|_, _| ERR_NOT_FOUND), Ok(None));
+    }
+
+    #[test]
+    fn read_dynamic_maps_internal_error() {
+        assert_eq!(read_dynamic(|_, _| ERR_INTERNAL), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn read_dynamic_maps_unknown_negative_codes() {
+        assert_eq!(read_dynamic(|_, _| -42), Err(NxError::UnknownCode(-42)));
+    }
+
+    #[test]
+    fn read_dynamic_truncates_to_reported_length() {
+        let got = read_dynamic(|out, cap| {
+            assert_eq!(cap, 64);
+            write_mock_payload(out, cap, b"hello")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn read_dynamic_retries_with_larger_buffer_after_buf_too_small() {
+        let mut calls = 0u32;
+        let got = read_dynamic(|out, cap| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(cap, 64);
+                ERR_BUF_TOO_SMALL
+            } else {
+                assert_eq!(cap, 128);
+                write_mock_payload(out, cap, b"expanded")
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, b"expanded");
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn read_dynamic_errors_when_buffer_cap_exceeds_max() {
+        let mut attempts = 0u32;
+        let mut last_cap = 0u32;
+        let err = read_dynamic(|_, cap| {
+            attempts += 1;
+            last_cap = cap;
+            ERR_BUF_TOO_SMALL
+        })
+        .unwrap_err();
+        assert_eq!(err, NxError::BufferTooSmall);
+        assert!(attempts > 1);
+        assert_eq!(last_cap as usize, MAX_SYSTEM_BUFFER);
+    }
+
+    /// Mirrors `host_capabilities` newline splitting (empty lines dropped).
+    fn decode_capability_list(bytes: &[u8]) -> Result<Vec<String>> {
+        let text = core::str::from_utf8(bytes).map_err(|_| NxError::Internal)?;
+        Ok(text
+            .split('\n')
+            .filter(|capability| !capability.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    #[test]
+    fn host_capabilities_decode_splits_non_empty_lines() {
+        let caps = decode_capability_list(b"net.sync\ndb.kv\nlog.emit").unwrap();
+        assert_eq!(
+            caps,
+            vec![
+                "net.sync".to_string(),
+                "db.kv".to_string(),
+                "log.emit".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_capabilities_decode_skips_blank_lines() {
+        let caps = decode_capability_list(b"net.sync\n\n\nlog.emit\n").unwrap();
+        assert_eq!(caps, vec!["net.sync".to_string(), "log.emit".to_string()]);
+    }
+
+    #[test]
+    fn host_capabilities_decode_rejects_invalid_utf8() {
+        assert_eq!(
+            decode_capability_list(&[0xff, 0xfe, 0xfd]),
+            Err(NxError::Internal)
+        );
+    }
+
+    /// Mirrors `module_id` UTF-8 decoding after a successful buffer read.
+    fn decode_module_id_bytes(bytes: Vec<u8>) -> Result<String> {
+        String::from_utf8(bytes).map_err(|_| NxError::Internal)
+    }
+
+    #[test]
+    fn module_id_decode_accepts_valid_utf8() {
+        assert_eq!(
+            decode_module_id_bytes(b"my-module".to_vec()),
+            Ok("my-module".to_string())
+        );
+    }
+
+    #[test]
+    fn module_id_decode_rejects_invalid_utf8() {
+        assert_eq!(
+            decode_module_id_bytes(vec![0xff, 0xfe]),
+            Err(NxError::Internal)
+        );
+    }
+
+    /// Mirrors `event_emit` return-code mapping.
+    fn map_event_emit_rc(rc: i32) -> Result<()> {
+        match rc {
+            0 => Ok(()),
+            ERR_INTERNAL => Err(NxError::Internal),
+            c if c < 0 => Err(NxError::UnknownCode(c)),
+            _ => Err(NxError::UnknownCode(rc)),
+        }
+    }
+
+    #[test]
+    fn event_emit_maps_success_and_errors() {
+        assert_eq!(map_event_emit_rc(0), Ok(()));
+        assert_eq!(map_event_emit_rc(ERR_INTERNAL), Err(NxError::Internal));
+        assert_eq!(map_event_emit_rc(-7), Err(NxError::UnknownCode(-7)));
+        assert_eq!(map_event_emit_rc(1), Err(NxError::UnknownCode(1)));
+    }
+}
