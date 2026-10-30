@@ -195,13 +195,26 @@ The async machinery lives entirely on the host side. When a host function needs 
 
 ## Writing a module: minimal example
 
-```rust
-// Cargo.toml
-// [lib]
-// crate-type = ["cdylib"]
-// [dependencies]
-// nx-sdk = { path = "../../crates/nx-sdk" }
+Create a library project with `cargo new --lib my_module`. In `Cargo.toml`,
+set the library output to `cdylib` and add the SDK dependency. Adjust the path
+to point to the `crates/nx-sdk` directory in your Numax checkout:
 
+```toml
+[package]
+name = "my_module"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nx-sdk = { path = "../../crates/nx-sdk" }
+```
+
+Put the guest code in `src/lib.rs`:
+
+```rust
 use nx_sdk::{db, nx_log};
 
 #[unsafe(no_mangle)]
@@ -210,7 +223,7 @@ pub extern "C" fn run() {
 
     match db::get("counter") {
         Ok(Some(bytes)) => {
-            let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0u8; 8]));
+            let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
             let next = n + 1;
             db::set("counter", &next.to_le_bytes()).unwrap();
             nx_log!("counter = {}", next);
@@ -224,9 +237,10 @@ pub extern "C" fn run() {
 }
 ```
 
-Build:
+Build and run from the project directory:
 
 ```bash
+rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
 nx run target/wasm32-unknown-unknown/release/my_module.wasm
 ```
