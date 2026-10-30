@@ -1,4 +1,5 @@
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -8,7 +9,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use nx_core::control::MAX_CONTROL_PAGE_SIZE;
-use nx_core::{ControlError, ModuleInfo, PeerInfo, SharedRuntimeControl};
+use nx_core::{
+    ControlError, ModuleInfo, PeerInfo, PeerObservation, PeerView, SharedRuntimeControl,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{error_response, payload_too_large_response};
@@ -30,6 +33,20 @@ struct ApiState {
 struct PageQuery {
     cursor: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerPageQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    view: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddPeerRequest {
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +106,15 @@ pub(crate) fn router(control: SharedRuntimeControl) -> Router {
             get(get_module).delete(delete_module),
         )
         .route("/api/v1/modules/{id}/runs", post(run_module))
-        .route("/api/v1/peers", get(list_peers))
+        .route(
+            "/api/v1/peers",
+            post(add_peer)
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::BodyLimitState(4096),
+                    crate::enforce_request_body_limit,
+                ))
+                .get(list_peers),
+        )
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/{key}", get(get_value))
         .route("/api/v1/health", get(health))
@@ -217,10 +242,153 @@ async fn run_module(
     }
 }
 
+async fn add_peer(
+    State(state): State<ApiState>,
+    body: Result<Json<AddPeerRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) if error.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            return error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "content type must be application/json",
+            );
+        }
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return payload_too_large_response();
+        }
+        Err(_) => return invalid_request(),
+    };
+    match state.control.add_peer(body.address).await {
+        Ok(peer) => (
+            if peer.created {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            },
+            Json(serde_json::json!({
+                "address": peer.address, "source": "manual", "created": peer.created,
+                "persisted": true, "status": "candidate_accepted",
+            })),
+        )
+            .into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+struct ObservationResponse {
+    cursor: String,
+    value: serde_json::Value,
+}
+
+impl Serialize for ObservationResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+fn observation_value(observation: PeerObservation) -> serde_json::Value {
+    use serde_json::json;
+    match observation {
+        PeerObservation::Candidate {
+            candidate,
+            reconnect,
+        } => json!({
+            "address": candidate.address, "sources": candidate.sources, "persisted": candidate.persisted,
+            "reconnect": reconnect.map(|state| match state {
+                nx_core::sync_manager::PeerHealthState::Healthy => "healthy",
+                nx_core::sync_manager::PeerHealthState::Suspect => "suspect",
+                nx_core::sync_manager::PeerHealthState::Dead => "dead",
+            }),
+        }),
+        PeerObservation::Connection(connection) => json!({
+            "transport_addr": connection.transport_addr, "dialed_endpoint": connection.dialed_endpoint,
+            "direction": match connection.direction { nx_core::ConnectionDirection::Inbound => "inbound", nx_core::ConnectionDirection::Outbound => "outbound" },
+            "node_id": connection.identity.node_id.to_string(),
+            "verification": match connection.identity.verification { nx_core::PeerIdentityVerification::CertificateBound => "certificate_bound", nx_core::PeerIdentityVerification::Unverified => "unverified" },
+        }),
+        PeerObservation::Membership {
+            record,
+            service_error,
+        } => json!({
+            "node_id": record.member, "epoch": record.version.epoch, "incarnation": record.version.incarnation,
+            "state": format!("{:?}", record.state).to_ascii_lowercase(), "endpoint": record.endpoint,
+            "reporter": record.reporter, "service_error": service_error,
+        }),
+        PeerObservation::Recovery {
+            progress,
+            in_flight,
+        } => json!({
+            "origin": progress.origin.to_string(), "contiguous_sequence": progress.contiguous_sequence,
+            "known_high_sequence": progress.known_high_sequence, "sparse_positions": progress.sparse_positions,
+            "missing_positions": progress.known_high_sequence.saturating_sub(progress.contiguous_sequence).saturating_sub(progress.sparse_positions as u64),
+            "source_unavailable": progress.source_unavailable,
+            "unavailable_evidence": progress.unavailable_evidence.map(|evidence| json!({"source": evidence.source, "start": evidence.start, "end": evidence.end, "request_id": evidence.request_id.to_string()})),
+            "baseline_required": progress.baseline_required, "baseline_missing": progress.baseline_missing,
+            "baseline_unconfirmed": progress.baseline_unconfirmed,
+            "recovery_failure": progress.recovery_failure.map(|failure| json!({"source": failure.source, "reason": failure.reason})),
+            "in_flight": in_flight,
+        }),
+    }
+}
+
 async fn list_peers(
     State(state): State<ApiState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<PeerPageQuery>, QueryRejection>,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    if let Some(view_name) = &query.view {
+        let view = match view_name.as_str() {
+            "candidates" => PeerView::Candidates,
+            "connections" => PeerView::Connections,
+            "membership" => PeerView::Membership,
+            "recovery" => PeerView::Recovery,
+            _ => return invalid_request(),
+        };
+        let limit = match page_size(query.limit) {
+            Ok(limit) => limit,
+            Err(_) => return invalid_request(),
+        };
+        let prefix = format!("{view_name}\0");
+        let cursor = match query.cursor.as_deref().map(decode_cursor).transpose() {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(cursor) => match cursor.strip_prefix(&prefix) {
+                    Some(key) if !key.is_empty() => Some(key.as_bytes().to_vec()),
+                    _ => return invalid_request(),
+                },
+                Err(_) => return invalid_request(),
+            },
+            Ok(None) => None,
+            Err(_) => return invalid_request(),
+        };
+        return match state.control.inspect_peers(view, cursor, limit).await {
+            Ok(page) => {
+                let next_cursor = page
+                    .next_cursor
+                    .map(|key| URL_SAFE_NO_PAD.encode([prefix.as_bytes(), &key].concat()));
+                let items = page
+                    .items
+                    .into_iter()
+                    .map(|item| ObservationResponse {
+                        cursor: URL_SAFE_NO_PAD.encode(format!("{prefix}{}", item.cursor_key())),
+                        value: observation_value(item),
+                    })
+                    .collect();
+                bounded_page(items, next_cursor, |item: &ObservationResponse| {
+                    item.cursor.clone()
+                })
+            }
+            Err(error) => control_error_response(error),
+        };
+    }
+    let query = Ok(Query(PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    }));
     let query = match parse_page_query(query, CursorKind::Peer) {
         Ok(query) => query,
         Err(_) => return invalid_request(),
@@ -497,6 +665,31 @@ fn is_module_id_bytes(id: &[u8]) -> bool {
 
 fn control_error_response(error: ControlError) -> Response {
     match error {
+        ControlError::InvalidPeer => invalid_request(),
+        ControlError::PeerCapacityExceeded => error_response(
+            StatusCode::CONFLICT,
+            "peer_capacity_exceeded",
+            "peer candidate capacity exceeded",
+        ),
+        ControlError::ServiceUnavailable => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "peer service unavailable",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+        ControlError::PeerAcceptanceUncertain(error) => {
+            tracing::error!(%error, "manual peer acceptance uncertain");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "peer_acceptance_uncertain",
+                "peer acceptance uncertain; retry the same address",
+            )
+        }
         ControlError::InvalidCursor | ControlError::InvalidLimit => invalid_request(),
         ControlError::ModuleNotFound => {
             error_response(StatusCode::NOT_FOUND, "not_found", "module not found")
@@ -572,6 +765,14 @@ mod tests {
 
     #[async_trait]
     impl RuntimeIntrospection for TestControl {
+        async fn inspect_peers(
+            &self,
+            _: PeerView,
+            _: Option<Vec<u8>>,
+            _: usize,
+        ) -> Result<ControlPage<PeerObservation>, ControlError> {
+            Err(ControlError::ServiceUnavailable)
+        }
         async fn list_modules(
             &self,
             cursor: Option<Vec<u8>>,
@@ -676,6 +877,9 @@ mod tests {
 
     #[async_trait]
     impl RuntimeManagement for TestControl {
+        async fn add_peer(&self, _: String) -> Result<nx_core::PeerRegistration, ControlError> {
+            Err(ControlError::ServiceUnavailable)
+        }
         async fn register_module(
             &self,
             bytes: Vec<u8>,
@@ -738,6 +942,204 @@ mod tests {
     async fn json(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_post_and_views_use_real_control_without_claiming_connection() {
+        use nx_core::runtime::{Runtime, RuntimeConfig};
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_with_discovery(
+            RuntimeConfig {
+                datastore_path: directory.path().into(),
+                sync: Some(nx_core::SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+                ..Default::default()
+            },
+            nx_core::RuntimeDiscoveryConfig {
+                max_candidates: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let control: SharedRuntimeControl = Arc::new(runtime.control_handle());
+        let app = router(control);
+        let request = |body: &'static str| {
+            call(
+                app.clone(),
+                Method::POST,
+                "/api/v1/peers",
+                Some("application/json"),
+                body,
+            )
+        };
+        assert_eq!(
+            request(r#"{"address":"127.0.0.1:1"}"#).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        runtime.start_sync().await.unwrap();
+        for body in [
+            r#"{"address":"0.0.0.0:9000"}"#,
+            r#"{"address":"a:0"}"#,
+            r#"{"address":"a:1","extra":true}"#,
+            "{}",
+        ] {
+            assert_eq!(request(body).await.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = request(r#"{"address":"127.0.0.1:1"}"#).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            json(response).await,
+            serde_json::json!({"address":"127.0.0.1:1","source":"manual","created":true,"persisted":true,"status":"candidate_accepted"})
+        );
+        let response = request(r#"{"address":"127.0.0.1:1"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["created"], false);
+        let response = request(r#"{"address":"127.0.0.1:2"}"#).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json(response).await["error"]["code"],
+            "peer_capacity_exceeded"
+        );
+        let old = call(
+            app.clone(),
+            Method::GET,
+            "/api/v1/peers",
+            None,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            json(old).await,
+            serde_json::json!({"items":[],"next_cursor":null})
+        );
+        let candidates = call(
+            app.clone(),
+            Method::GET,
+            "/api/v1/peers?view=candidates",
+            None,
+            Body::empty(),
+        )
+        .await;
+        let candidates = json(candidates).await;
+        assert_eq!(
+            candidates["items"][0]["sources"],
+            serde_json::json!(["manual"])
+        );
+        assert_eq!(candidates["items"][0]["persisted"], true);
+        for view in ["connections", "membership", "recovery"] {
+            let response = call(
+                app.clone(),
+                Method::GET,
+                &format!("/api/v1/peers?view={view}"),
+                None,
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            call(
+                app.clone(),
+                Method::GET,
+                "/api/v1/peers?view=unknown",
+                None,
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(app.clone(), Method::POST, "/api/v1/peers", None, "{}")
+                .await
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                Method::POST,
+                "/api/v1/peers",
+                Some("application/json"),
+                format!(r#"{{"address":"{}"}}"#, "x".repeat(4096))
+            )
+            .await
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        runtime.shutdown().await.unwrap();
+        assert_eq!(
+            request(r#"{"address":"127.0.0.1:1"}"#).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_pages_keep_cursors_in_the_original_view() {
+        use nx_core::runtime::{Runtime, RuntimeConfig};
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().into(),
+            sync: Some(nx_core::SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..Default::default()
+        })
+        .unwrap();
+        runtime.start_sync().await.unwrap();
+        let control: SharedRuntimeControl = Arc::new(runtime.control_handle());
+        let app = router(control);
+        for endpoint in ["127.0.0.1:1", "127.0.0.1:2"] {
+            let response = call(
+                app.clone(),
+                Method::POST,
+                "/api/v1/peers",
+                Some("application/json"),
+                format!(r#"{{"address":"{endpoint}"}}"#),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        let first = json(
+            call(
+                app.clone(),
+                Method::GET,
+                "/api/v1/peers?view=candidates&limit=1",
+                None,
+                Body::empty(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first["items"][0]["address"], "127.0.0.1:1");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let second = json(
+            call(
+                app.clone(),
+                Method::GET,
+                &format!("/api/v1/peers?view=candidates&limit=1&cursor={cursor}"),
+                None,
+                Body::empty(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["address"], "127.0.0.1:2");
+        assert!(second["next_cursor"].is_null());
+        for view in ["connections", "membership", "recovery"] {
+            assert_eq!(
+                call(
+                    app.clone(),
+                    Method::GET,
+                    &format!("/api/v1/peers?view={view}&cursor={cursor}"),
+                    None,
+                    Body::empty(),
+                )
+                .await
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

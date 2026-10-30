@@ -121,6 +121,30 @@ pub(super) fn metrics() -> Arc<RuntimeMetrics> {
     Arc::new(RuntimeMetrics::default())
 }
 
+pub(super) async fn manual_pair(
+    format: nx_net::SerializationFormat,
+) -> (
+    SyncManager,
+    SyncHandle,
+    Arc<NxStore>,
+    SyncManager,
+    SyncHandle,
+    Arc<NxStore>,
+    String,
+) {
+    let config = || {
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_serialization_format(format)
+            .with_anti_entropy_interval(Duration::from_millis(20))
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(40))
+    };
+    let (mut a, ha, sa) = started_manager_with_config(config()).await;
+    let (b, hb, sb) = started_manager_with_config(config()).await;
+    let endpoint = test_owner_record(&mut a).await.endpoint.unwrap();
+    (a, ha, sa, b, hb, sb, endpoint)
+}
+
 pub(super) fn free_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

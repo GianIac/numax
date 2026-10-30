@@ -516,6 +516,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_post_is_authenticated_and_sync_disabled_is_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let server = ManagementServer::start(
+            ManagementConfig::new("127.0.0.1:0", "test-token", false).unwrap(),
+            Arc::new(runtime.control_handle()),
+        )
+        .await
+        .unwrap();
+        let address = server.local_addr();
+        let body = r#"{"address":"127.0.0.1:1"}"#;
+        for (auth, status) in [
+            ("", "401"),
+            ("Authorization: Bearer wrong\r\n", "401"),
+            ("Authorization: Bearer test-token\r\n", "503"),
+        ] {
+            let response = raw_request(address, format!("POST /api/v1/peers HTTP/1.1\r\nHost: {address}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+        }
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn start_fails_when_the_port_is_already_in_use() {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = occupied.local_addr().unwrap();

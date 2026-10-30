@@ -9,7 +9,7 @@ use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -43,6 +43,12 @@ use super::types::*;
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    recovery_scan_limit: Arc<Semaphore>,
+    candidates: super::candidates::CandidateAccess,
+    membership_view:
+        Arc<std::sync::Mutex<Option<watch::Receiver<crate::membership::runtime::Snapshot>>>>,
+    peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+    history_requests: Arc<RwLock<HistoryRequests>>,
     generation: u64,
     node_id: NodeId,
     op_tx: super::delivery::Sender<AcceptedLocalOp>,
@@ -692,9 +698,105 @@ impl SyncHandle {
         });
         connections
     }
+
+    pub async fn add_peer(
+        &self,
+        address: String,
+    ) -> Result<crate::control::PeerRegistration, crate::control::ControlError> {
+        self.candidates.add(address).await
+    }
+
+    pub(crate) async fn inspect_peers(
+        &self,
+        view: crate::control::PeerView,
+    ) -> Result<Vec<crate::control::PeerObservation>, crate::control::ControlError> {
+        use crate::control::{ControlError, PeerObservation, PeerView};
+        match view {
+            PeerView::Candidates => {
+                let candidates = self.candidates.snapshot()?;
+                let health = self.peer_health.read().await;
+                Ok(candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let reconnect = health.get(&candidate.address).map(|health| health.state);
+                        PeerObservation::Candidate {
+                            candidate,
+                            reconnect,
+                        }
+                    })
+                    .collect())
+            }
+            PeerView::Connections => Ok(self
+                .active_connections()
+                .await
+                .into_iter()
+                .map(PeerObservation::Connection)
+                .collect()),
+            PeerView::Membership => {
+                let state = self
+                    .membership_view
+                    .lock()
+                    .map_err(|_| ControlError::Internal("membership view lock poisoned".into()))?;
+                let receiver = state.as_ref().ok_or(ControlError::ServiceUnavailable)?;
+                let snapshot = receiver.borrow().clone();
+                Ok(snapshot
+                    .records
+                    .into_iter()
+                    .map(|record| PeerObservation::Membership {
+                        record,
+                        service_error: snapshot.error.clone(),
+                    })
+                    .collect())
+            }
+            PeerView::Recovery => {
+                let store = Arc::clone(&self.store);
+                let progress = run_recovery_scan(&self.recovery_scan_limit, move || {
+                    super::storage::replication_progress(&store)
+                })
+                .await?;
+                let requests = self.history_requests.read().await;
+                Ok(progress
+                    .into_iter()
+                    .map(|progress| {
+                        let in_flight = requests.values().any(|origins| {
+                            origins
+                                .get(progress.origin.as_str())
+                                .is_some_and(|request| request.deadline > std::time::Instant::now())
+                        });
+                        PeerObservation::Recovery {
+                            progress,
+                            in_flight,
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+async fn run_recovery_scan(
+    limit: &Arc<Semaphore>,
+    read: impl FnOnce() -> anyhow::Result<Vec<super::ReplicationProgress>> + Send + 'static,
+) -> Result<Vec<super::ReplicationProgress>, crate::control::ControlError> {
+    use crate::control::ControlError;
+    let permit = Arc::clone(limit)
+        .try_acquire_owned()
+        .map_err(|_| ControlError::ServiceUnavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    })
+    .await
+    .map_err(|error| ControlError::Internal(error.to_string()))?
+    .map_err(|error| ControlError::Storage(error.to_string()))
 }
 
 pub struct SyncManager {
+    recovery_scan_limit: Arc<Semaphore>,
+    candidates: super::candidates::CandidateAccess,
+    membership_view:
+        Arc<std::sync::Mutex<Option<watch::Receiver<crate::membership::runtime::Snapshot>>>>,
+    history_requests: Arc<RwLock<HistoryRequests>>,
     history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
     generation: u64,
     /// NodeId.
@@ -877,6 +979,10 @@ impl SyncManager {
         let rgas = Arc::new(RwLock::new(rgas));
 
         Ok(Self {
+            recovery_scan_limit: Arc::new(Semaphore::new(1)),
+            candidates: super::candidates::CandidateAccess::with_metrics(Arc::clone(&metrics)),
+            membership_view: Arc::new(std::sync::Mutex::new(None)),
+            history_requests: Arc::new(RwLock::new(HashMap::new())),
             history_cursors: Arc::new(RwLock::new(HashMap::new())),
             generation,
             node_id,
@@ -927,6 +1033,11 @@ impl SyncManager {
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            recovery_scan_limit: Arc::clone(&self.recovery_scan_limit),
+            candidates: self.candidates.clone(),
+            membership_view: Arc::clone(&self.membership_view),
+            peer_health: Arc::clone(&self.peer_health),
+            history_requests: Arc::clone(&self.history_requests),
             generation: self.generation,
             node_id: self.node_id.clone(),
             op_tx: self.op_tx.clone(),
@@ -953,6 +1064,7 @@ impl SyncManager {
     /// are started, not that a peer is connected or replication has settled.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         self.config.validate()?;
+        self.candidates.check_startable()?;
         let listen_addr = match &self.config.listen_addr {
             Some(addr) => addr.clone(),
             None => {
@@ -994,9 +1106,11 @@ impl SyncManager {
 
         // Provider watches are acquired before binding so discovery startup is
         // atomic with respect to network resources. All later failures roll back.
-        let mut discovery_coordinator = DiscoveryCoordinator::start(
+        let mut discovery_coordinator = DiscoveryCoordinator::prepare_managed(
             self.discovery_providers.clone(),
             self.discovery_config.clone(),
+            Arc::clone(&self.store),
+            self.candidates.clone(),
         )
         .await?;
         let candidates_rx = discovery_coordinator.candidates();
@@ -1020,12 +1134,13 @@ impl SyncManager {
             }
         };
         let node = Arc::new(node);
-        let membership = match crate::membership::runtime::start(
+        let membership = match crate::membership::runtime::start_with_metrics(
             self.node_id.to_string(),
             advertised_endpoint.clone(),
             Arc::clone(&node),
             Arc::clone(&self.store),
             control_rx,
+            Arc::clone(&self.metrics),
         )
         .await
         {
@@ -1039,6 +1154,9 @@ impl SyncManager {
         if let Some(endpoint) = &advertised_endpoint
             && let Err(error) = node.announce_bootstrap_endpoint(endpoint.clone())
         {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             return Err(error.into());
@@ -1047,18 +1165,25 @@ impl SyncManager {
             .announce(advertised_endpoint.as_deref())
             .await
         {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             return Err(error.into());
         }
 
         let initial_candidates = Arc::clone(&candidates_rx.borrow());
+        self.metrics.refresh_recovery(Arc::clone(&self.store)).await;
         *self.peer_health.write().await = initial_candidates
             .iter()
             .map(|peer| (peer.clone(), PeerHealth::default()))
             .collect();
 
         let Some(op_rx) = self.op_rx.take() else {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             anyhow::bail!("sync manager is already started");
@@ -1066,13 +1191,32 @@ impl SyncManager {
 
         // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
         let membership_snapshot = membership.snapshot.clone();
+        let view = self
+            .membership_view
+            .lock()
+            .map(|mut view| *view = Some(membership_snapshot.clone()))
+            .map_err(|_| anyhow::anyhow!("membership view lock poisoned"));
+        let activated = view.and_then(|()| discovery_coordinator.activate().map_err(Into::into));
+        if let Err(error) = activated {
+            self.op_rx = Some(op_rx);
+            if let Ok(mut view) = self.membership_view.lock() {
+                *view = None;
+            }
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            return Err(error);
+        }
         self.membership = Some(membership);
         self.node = Some(Arc::clone(&node));
 
-        let (forward_tx, forward_rx) = super::delivery::channel(
+        let (forward_tx, forward_rx) = super::delivery::named_channel(
             self.config.queued_ops_limit.max(1),
             super::delivery::QUEUE_BYTES,
             Arc::clone(&self.metrics),
+            true,
         );
 
         // Inbound loop: apply remote ops into the CRDT registries.
@@ -1082,7 +1226,7 @@ impl SyncManager {
         let event_context = NodeEventContext {
             repair_budget: Arc::clone(&repair_budget),
             history_cursors: Arc::clone(&self.history_cursors),
-            history_requests: Arc::new(RwLock::new(HashMap::new())),
+            history_requests: Arc::clone(&self.history_requests),
             history_request_timeout: self.config.socket_timeout,
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
@@ -1181,6 +1325,7 @@ impl SyncManager {
         });
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            store: Arc::clone(&self.store),
             jitter_seed: super::delivery::seed(self.node_id.as_str()),
             repair_budget,
             history_cursors: Arc::clone(&self.history_cursors),
@@ -1295,6 +1440,7 @@ impl SyncManager {
 
     /// Gracefully stop sync tasks and close network connections.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.candidates.stop();
         let _ = self.shutdown_tx.send(true);
         let membership_error = if let Some(membership) = self.membership.take() {
             let snapshot = membership.snapshot.borrow().clone();
@@ -1361,7 +1507,7 @@ impl SyncManager {
 }
 
 async fn rollback_discovery(coordinator: &mut DiscoveryCoordinator) {
-    if let Err(error) = coordinator.shutdown().await {
+    if let Err(error) = coordinator.rollback().await {
         warn!(error = %error, "discovery rollback failed");
     }
 }

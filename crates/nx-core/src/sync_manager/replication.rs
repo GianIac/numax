@@ -116,6 +116,10 @@ pub(super) async fn try_connect_configured_peer(
 
     match context.node.connect_to_peer(peer_addr).await {
         Ok(()) => {
+            context
+                .metrics
+                .peers
+                .increment(crate::peer_metrics::Counter::DialConnected);
             mark_peer_success(context.peer_health, peer_addr).await;
             ConfiguredPeerConnectOutcome::Connected
         }
@@ -137,6 +141,13 @@ pub(super) async fn try_connect_configured_peer(
             .await;
 
             let outcome = connect_failure_outcome(&e);
+            context.metrics.peers.increment(match outcome {
+                ConfiguredPeerConnectOutcome::Fatal => crate::peer_metrics::Counter::DialFatal,
+                ConfiguredPeerConnectOutcome::RetryAfter(_) => {
+                    crate::peer_metrics::Counter::DialLimited
+                }
+                _ => crate::peer_metrics::Counter::DialFailed,
+            });
             match outcome {
                 ConfiguredPeerConnectOutcome::Fatal => {
                     debug!(
@@ -339,6 +350,9 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         sleep_for = Some(
                             sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
                         );
+                        metrics
+                            .peers
+                            .increment(crate::peer_metrics::Counter::RetryFailure);
                     }
                     ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
                         let Some(retry_after) = peer.record_retry_after(
@@ -351,6 +365,9 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         };
                         sleep_for =
                             Some(sleep_for.map_or(retry_after, |current| current.min(retry_after)));
+                        metrics
+                            .peers
+                            .increment(crate::peer_metrics::Counter::RetryLimited);
                     }
                     ConfiguredPeerConnectOutcome::Fatal => {
                         warn!(
@@ -390,6 +407,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
     let AntiEntropyLoopContext {
+        store,
         jitter_seed,
         repair_budget,
         history_cursors,
@@ -429,6 +447,7 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
                 }
                 _ = async {
                     tokio::time::sleep_until(deadline).await;
+                    metrics.refresh_recovery(Arc::clone(&store)).await;
                     let mut peers = node.connected_peers().await;
                     history_cursors.write().await.retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
                     if !peers.is_empty() {
@@ -737,7 +756,9 @@ async fn forward_batch(
         context.max_fanout,
         &context.fanout_cursor,
     );
+    context.metrics.peers.fanout(true, false, recipients.len());
     if recipients.is_empty() {
+        context.metrics.peers.fanout(true, true, 0);
         return;
     }
 
@@ -772,6 +793,7 @@ async fn forward_batch(
         context.metrics.record_broadcast_batch(count);
         context.metrics.record_sync_latency(started.elapsed());
     }
+    context.metrics.peers.fanout(true, true, sent + failed);
     if failed > 0 {
         context.metrics.record_sync_error();
         warn!(
@@ -875,7 +897,9 @@ pub(super) async fn broadcast_batch(
         context.max_fanout,
         &context.fanout_cursor,
     );
+    context.metrics.peers.fanout(false, false, recipients.len());
     if recipients.is_empty() {
+        context.metrics.peers.fanout(false, true, 0);
         return;
     }
 
@@ -908,6 +932,7 @@ pub(super) async fn broadcast_batch(
         context.metrics.record_sync_latency(started.elapsed());
         debug!(count, recipients = sent, failed, "gossip batch sent");
     }
+    context.metrics.peers.fanout(false, true, sent + failed);
     if failed > 0 {
         context.metrics.record_sync_error();
         warn!(
@@ -1027,6 +1052,10 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
                 _ => None,
             };
             if let Err(error) = handle_history_message(&addr, message, context).await {
+                context
+                    .metrics
+                    .peers
+                    .increment(crate::peer_metrics::Counter::RecoveryError);
                 context.metrics.record_sync_error();
                 if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>() {
                     // Decoder errors can contain supplied values; log only the bounded reason.
@@ -1041,6 +1070,10 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
                     .await
                     .insert(from, id);
             }
+            context
+                .metrics
+                .refresh_recovery(Arc::clone(&context.store))
+                .await;
         }
         NodeEvent::OpsReceived { from, .. } => {
             context.metrics.record_sync_error();
@@ -1197,6 +1230,12 @@ async fn request_history_or_baseline(
     {
         complete_history_request(addr, &origin, &request_id, start, end, context).await;
         return Err(error.into());
+    }
+    if start == 0 {
+        context
+            .metrics
+            .peers
+            .increment(crate::peer_metrics::Counter::BaselineRequested);
     }
     Ok(())
 }
@@ -1472,6 +1511,10 @@ async fn handle_history_message(
                     request_id,
                 },
             )?;
+            context
+                .metrics
+                .peers
+                .increment(crate::peer_metrics::Counter::HistoryUnavailable);
             warn!(%origin, start, end, "source cannot supply missing history; another source or state baseline is required");
             if let Err(error) = request_baseline(addr, origin, context).await {
                 context.metrics.record_sync_error();
@@ -1576,6 +1619,10 @@ async fn handle_history_message(
                 }
                 return Err(error.context("baseline import failed"));
             }
+            context
+                .metrics
+                .peers
+                .increment(crate::peer_metrics::Counter::BaselineAccepted);
         }
         HistoryMessage::BaselineUnavailable {
             request_id,
@@ -1602,6 +1649,10 @@ async fn handle_history_message(
                 return Ok(());
             }
             context.metrics.record_sync_error();
+            context
+                .metrics
+                .peers
+                .increment(crate::peer_metrics::Counter::BaselineRejected);
             warn!(%origin, ?reason, "gap unrecoverable from this source under the bounded baseline contract; other sources may still recover it");
         }
     }
@@ -1961,6 +2012,7 @@ mod tests {
     async fn anti_entropy_task_exits_without_panicking_on_deadline_overflow() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            store: temp_store(),
             jitter_seed: 1,
             repair_budget: Arc::new(std::sync::Mutex::new(
                 super::super::delivery::RepairBudget::new(StdInstant::now()),
@@ -3272,6 +3324,7 @@ mod tests {
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            store: temp_store(),
             jitter_seed: 1,
             repair_budget: Arc::new(std::sync::Mutex::new(
                 super::super::delivery::RepairBudget::new(StdInstant::now()),

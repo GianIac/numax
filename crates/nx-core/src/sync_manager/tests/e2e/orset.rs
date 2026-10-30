@@ -1,6 +1,31 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_orset_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        local_orset_add(&ha, "manual-o", "value").await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_orset(&b, "manual-o", &["value"]).await;
+        local_orset_remove(&hb, "manual-o", "value").await;
+        wait_for_orset(&a, "manual-o", &[]).await;
+        assert_eq!(
+            read_materialized_orset(&sa, "manual-o"),
+            read_materialized_orset(&sb, "manual-o")
+        );
+        assert_eq!(
+            read_durable_orset_state(&sa, "manual-o"),
+            read_durable_orset_state(&sb, "manual-o")
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_orset_adds_and_observed_remove_converge() {
     let key = "tags:item-1";
     let addr_a = free_addr();

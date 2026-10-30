@@ -217,6 +217,9 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
         }
+        if let Some(task) = &lifecycle.task {
+            task.running(PROVIDER, &self.inner.state)?;
+        }
         let endpoint = crate::sync_manager::canonicalize_endpoint(&announcement.endpoint)
             .map_err(|error| provider_error(error.to_string(), false))?;
         // Serialize publication with request_shutdown, not just its check.
@@ -243,6 +246,25 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
+        let result = self.rollback().await;
+        self.inner.announcement_tx.send_replace(None);
+        result
+    }
+
+    fn request_rollback(&self) {
+        let lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(shutdown) = &lifecycle.shutdown {
+            shutdown.send_replace(true);
+        }
+        self.inner.announcement_tx.send_replace(None);
+    }
+
+    async fn rollback(&self) -> Result<(), DiscoveryError> {
+        self.request_rollback();
         let task = {
             let lifecycle = self
                 .inner
@@ -251,12 +273,10 @@ impl PeerDiscovery for BootstrapGossipDiscovery {
                 .unwrap_or_else(|error| error.into_inner());
             lifecycle.task.clone()
         };
-        let result = match task {
+        match task {
             Some(task) => task.join().await,
             None => Ok(()),
-        };
-        self.inner.announcement_tx.send_replace(None);
-        result
+        }
     }
 }
 
@@ -271,45 +291,43 @@ struct BootstrapCleanup<C: SeedClient = BootstrapClient> {
 
 impl<C: SeedClient> BootstrapCleanup<C> {
     async fn withdraw(&self) -> Result<(), DiscoveryError> {
-        if self.announcement_tx.borrow().is_some() {
-            let announced_seeds = self
-                .announced_seeds
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let deadline = checked_deadline(
-                Instant::now(),
-                SHUTDOWN_WITHDRAWAL_BUDGET,
+        // Desired intent may already be cleared by startup rollback.
+        let announced_seeds = self
+            .announced_seeds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let deadline = checked_deadline(
+            Instant::now(),
+            SHUTDOWN_WITHDRAWAL_BUDGET,
+            PROVIDER,
+            "withdrawal",
+        )?;
+        for (index, seed) in announced_seeds.iter().enumerate() {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            let remaining_seeds = u32::try_from(announced_seeds.len() - index)
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let request = BootstrapRequest::new(self.cluster_id.clone(), 1);
+            let slot_deadline = checked_deadline(
+                now,
+                remaining / remaining_seeds,
                 PROVIDER,
-                "withdrawal",
+                "withdrawal slot",
             )?;
-            for (index, seed) in announced_seeds.iter().enumerate() {
-                let now = Instant::now();
-                let remaining = deadline.saturating_duration_since(now);
-                if remaining.is_zero() {
-                    break;
+            match tokio::time::timeout_at(slot_deadline, self.client.query(seed, request)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, %seed, "bootstrap announcement withdrawal failed");
                 }
-                let remaining_seeds = u32::try_from(announced_seeds.len() - index)
-                    .unwrap_or(u32::MAX)
-                    .max(1);
-                let request = BootstrapRequest::new(self.cluster_id.clone(), 1);
-                let slot_deadline = checked_deadline(
-                    now,
-                    remaining / remaining_seeds,
-                    PROVIDER,
-                    "withdrawal slot",
-                )?;
-                match tokio::time::timeout_at(slot_deadline, self.client.query(seed, request)).await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        tracing::debug!(%error, %seed, "bootstrap announcement withdrawal failed");
-                    }
-                    Err(_) => {
-                        tracing::debug!(%seed, "bootstrap announcement withdrawal timed out");
-                    }
+                Err(_) => {
+                    tracing::debug!(%seed, "bootstrap announcement withdrawal timed out");
                 }
             }
         }
@@ -699,6 +717,81 @@ mod tests {
     use super::*;
     use nx_net::{BootstrapServerConfig, Node, NodeConfig};
     use nx_sync::NodeId;
+
+    #[tokio::test]
+    async fn rollback_restarts_bootstrap_generation_but_shutdown_remains_terminal() {
+        let seed = Node::try_new_with_bootstrap_server(
+            NodeConfig::new(NodeId::new("rollback-seed"), "127.0.0.1:0"),
+            BootstrapServerConfig::new("default").unwrap(),
+        )
+        .unwrap();
+        let bound = seed.start_listener().await.unwrap().to_string();
+        seed.announce_bootstrap_endpoint(bound.clone()).unwrap();
+        let mut config = BootstrapGossipDiscoveryConfig::new(vec![bound.clone()]);
+        config.refresh_interval = Duration::from_millis(10);
+        config.max_candidates = 4;
+        let provider = BootstrapGossipDiscovery::new(
+            config,
+            BootstrapClientConfig::new(NodeId::new("rollback-client")),
+        )
+        .unwrap();
+        let advertised = "127.0.0.1:43111";
+        provider
+            .announce(&PeerAnnouncement {
+                endpoint: advertised.into(),
+            })
+            .await
+            .unwrap();
+        let mut changes = provider.watch().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let old = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        provider.rollback().await.unwrap();
+        assert!(provider.inner.announced_seeds.lock().unwrap().is_empty());
+        assert!(provider.inner.announcement_tx.borrow().is_none());
+        provider
+            .announce(&PeerAnnouncement {
+                endpoint: advertised.into(),
+            })
+            .await
+            .unwrap();
+        provider.rollback().await.unwrap();
+        assert!(provider.inner.announcement_tx.borrow().is_none());
+        let observer =
+            BootstrapClient::new(BootstrapClientConfig::new(NodeId::new("rollback-observer")))
+                .unwrap();
+        let after = observer
+            .query(&bound, BootstrapRequest::new("default", 4))
+            .await
+            .unwrap();
+        assert!(!after.endpoints.contains(&advertised.into()));
+        provider.watch().await.unwrap();
+        assert!(
+            !old.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        provider.shutdown().await.unwrap();
+        provider.rollback().await.unwrap();
+        assert!(provider.watch().await.is_err());
+        seed.shutdown().await;
+    }
 
     #[test]
     fn extreme_durations_are_rejected_before_starting() {

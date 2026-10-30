@@ -15,6 +15,8 @@ use super::state::{Action, Membership, Status, Update};
 use super::storage::MembershipStore;
 use super::suspicion::Timing;
 use super::{Error, Version};
+use crate::observability::RuntimeMetrics;
+use crate::peer_metrics::{Counter as Metric, Gauge};
 
 const TICK: Duration = Duration::from_millis(25);
 const CAPACITY: usize = 4096;
@@ -80,12 +82,32 @@ impl Drop for Handle {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn start(
     local: String,
     endpoint: Option<String>,
     node: Arc<Node>,
     store: Arc<Store>,
     incoming: mpsc::Receiver<ControlIncoming>,
+) -> anyhow::Result<Handle> {
+    start_with_metrics(
+        local,
+        endpoint,
+        node,
+        store,
+        incoming,
+        Arc::new(RuntimeMetrics::default()),
+    )
+    .await
+}
+
+pub(crate) async fn start_with_metrics(
+    local: String,
+    endpoint: Option<String>,
+    node: Arc<Node>,
+    store: Arc<Store>,
+    incoming: mpsc::Receiver<ControlIncoming>,
+    metrics: Arc<RuntimeMetrics>,
 ) -> anyhow::Result<Handle> {
     let persisted_store = Arc::clone(&store);
     let (core, actions) = tokio::task::spawn_blocking(move || {
@@ -120,6 +142,8 @@ pub(crate) async fn start(
     getrandom::fill(&mut seed)
         .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
     let actor = Actor {
+        local_declarations: BTreeMap::new(),
+        metrics,
         core,
         owner,
         node,
@@ -178,13 +202,17 @@ fn record(update: Update, endpoint: Option<String>, reporter: Option<String>) ->
         reporter: reporter.unwrap_or_else(|| update.member.clone()),
         member: update.member,
         version: wire_version(update.version),
-        state: match update.status {
-            Status::Alive => MembershipState::Alive,
-            Status::Suspect => MembershipState::Suspect,
-            Status::Dead => MembershipState::Dead,
-            Status::Left => MembershipState::Left,
-        },
+        state: wire_state(update.status),
         endpoint,
+    }
+}
+
+fn wire_state(status: Status) -> MembershipState {
+    match status {
+        Status::Alive => MembershipState::Alive,
+        Status::Suspect => MembershipState::Suspect,
+        Status::Dead => MembershipState::Dead,
+        Status::Left => MembershipState::Left,
     }
 }
 
@@ -210,11 +238,14 @@ enum Job {
 }
 
 struct Dispatch {
+    indirect: bool,
     attempt: u64,
     route: Peer,
 }
 
 struct Actor {
+    local_declarations: BTreeMap<String, Version>,
+    metrics: Arc<RuntimeMetrics>,
     core: Membership,
     owner: MembershipRecord,
     node: Arc<Node>,
@@ -302,6 +333,7 @@ impl Actor {
                 }
                 dispatched = self.dispatch_rx.recv() => {
                     if let Some(dispatched) = dispatched {
+                        self.metrics.peers.increment(if dispatched.indirect { Metric::ProbeIndirect } else { Metric::ProbeDirect });
                         self.advance();
                         let now = self.now;
                         let actions = self.core().probe_dispatched(dispatched.attempt, &dispatched.route, now).map_err(core_error)?;
@@ -324,6 +356,12 @@ impl Actor {
                     self.advance();
                     let now = self.now;
                     let actions = self.core().tick(now).map_err(core_error)?;
+                    for action in &actions {
+                        if let Action::PersistFloor { update, .. } = action
+                            && update.status == Status::Dead {
+                            self.local_declarations.insert(update.member.clone(), update.version);
+                        }
+                    }
                     self.actions(actions).await?;
                     let mut rng = self.rng;
                     let actions = self.core().probe_next(now, |upper| {
@@ -367,6 +405,16 @@ impl Actor {
     }
 
     fn publish_snapshot(&self) {
+        self.metrics
+            .peers
+            .set(Gauge::ControlIngress, self.incoming.len() as u64);
+        self.metrics
+            .peers
+            .set(Gauge::ControlCapacity, self.incoming.max_capacity() as u64);
+        self.metrics
+            .peers
+            .set(Gauge::MembershipWrites, self.write_queue.len() as u64);
+        self.metrics.peers.set(Gauge::MembershipWriteCapacity, 64);
         let mut records: Vec<_> = self.records.values().cloned().collect();
         records.push(self.owner.clone());
         self.snapshot_tx.send_replace(Snapshot {
@@ -480,6 +528,36 @@ impl Actor {
                     self.start_write()?;
                 }
                 Action::Publish(update) => {
+                    let previous = if update.member == self.owner.member {
+                        Some(&self.owner)
+                    } else {
+                        self.records.get(&update.member)
+                    };
+                    if previous.is_none_or(|record| {
+                        record.state != wire_state(update.status)
+                            || record.version != wire_version(update.version)
+                    }) {
+                        match update.status {
+                            Status::Alive
+                                if previous.is_some_and(|record| {
+                                    record.state == MembershipState::Suspect
+                                }) =>
+                            {
+                                self.metrics.peers.increment(Metric::Refuted)
+                            }
+                            Status::Dead => self.metrics.peers.increment(
+                                if self.local_declarations.remove(&update.member)
+                                    == Some(update.version)
+                                {
+                                    Metric::DeclaredDead
+                                } else {
+                                    Metric::LearnedDead
+                                },
+                            ),
+                            Status::Left => self.metrics.peers.increment(Metric::Left),
+                            _ => {}
+                        }
+                    }
                     if update.member == self.owner.member {
                         self.owner = record(update, self.owner.endpoint.clone(), None);
                     } else {
@@ -499,6 +577,12 @@ impl Actor {
                     }
                 }
                 Action::Suspicion { update, reporter } => {
+                    if self.records.get(&update.member).is_none_or(|record| {
+                        record.state != MembershipState::Suspect
+                            || record.version != wire_version(update.version)
+                    }) {
+                        self.metrics.peers.increment(Metric::Suspect);
+                    }
                     let endpoint = self
                         .records
                         .get(&update.member)
@@ -601,12 +685,16 @@ impl Actor {
                 }
                 Action::Probe(probe::Action::Finished { outcome, .. }) => match outcome {
                     probe::Outcome::Success => {
+                        self.metrics.peers.increment(Metric::ProbeSuccess);
                         self.successful_probes = self.successful_probes.saturating_add(1)
                     }
                     probe::Outcome::Failed => {
+                        self.metrics.peers.increment(Metric::ProbeFailed);
                         self.failed_probes = self.failed_probes.saturating_add(1)
                     }
-                    probe::Outcome::LocalDegradation => {}
+                    probe::Outcome::LocalDegradation => {
+                        self.metrics.peers.increment(Metric::ProbeDegraded)
+                    }
                 },
                 _ => {}
             }
@@ -831,7 +919,7 @@ impl Actor {
                 biased;
                 sent = received => {
                     if sent.is_ok() && let Job::Probe { attempt, route, .. } = &mode
-                        && dispatch_tx.try_send(Dispatch { attempt: *attempt, route: route.clone() }).is_err() {
+                        && dispatch_tx.try_send(Dispatch { indirect: matches!(&mode, Job::Probe { target, route, .. } if target != route), attempt: *attempt, route: route.clone() }).is_err() {
                             return Completion { endpoint: endpoint.clone(), expected, mode, timing: None, result: Err(nx_net::NetError::PeerLimitReached(64)) };
                     }
                     query.await
@@ -1056,6 +1144,8 @@ mod tests {
         (
             directory,
             Actor {
+                local_declarations: BTreeMap::new(),
+                metrics: Arc::new(RuntimeMetrics::default()),
                 core,
                 owner: owner("local", 2, 0),
                 node: Arc::new(node),

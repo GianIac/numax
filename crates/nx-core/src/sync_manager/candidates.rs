@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -9,10 +9,186 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
 
+use crate::control::{ControlError, PeerCandidate, PeerRegistration};
 use crate::discovery::{
     AbortOnDropTask, AnnouncementSupport, DiscoveryChange, DiscoveryError, DiscoveryProvider,
     DiscoveryRuntimeConfig, DiscoverySnapshot, DiscoveryWatch, PeerAnnouncement,
 };
+
+#[derive(Clone, Default)]
+pub(super) struct CandidateAccess(Arc<Mutex<AccessState>>);
+
+#[derive(Default)]
+struct AccessState {
+    metrics: Arc<crate::observability::RuntimeMetrics>,
+    generation: u64,
+    terminal: bool,
+    sender: Option<mpsc::Sender<CandidateCommand>>,
+    snapshot: Vec<PeerCandidate>,
+}
+
+impl CandidateAccess {
+    pub(super) fn with_metrics(metrics: Arc<crate::observability::RuntimeMetrics>) -> Self {
+        Self(Arc::new(Mutex::new(AccessState {
+            metrics,
+            ..Default::default()
+        })))
+    }
+
+    pub(super) async fn add(&self, address: String) -> Result<PeerRegistration, ControlError> {
+        if address.len() > 259 {
+            return Err(ControlError::InvalidPeer);
+        }
+        let endpoint = canonicalize_endpoint(&address).map_err(|_| ControlError::InvalidPeer)?;
+        if endpoint.len() > 259 {
+            return Err(ControlError::InvalidPeer);
+        }
+        let (reply, response) = oneshot::channel();
+        {
+            let state = self
+                .0
+                .lock()
+                .map_err(|_| ControlError::Internal("candidate access lock poisoned".into()))?;
+            if state.terminal {
+                return Err(ControlError::ServiceUnavailable);
+            }
+            let sender = state
+                .sender
+                .as_ref()
+                .ok_or(ControlError::ServiceUnavailable)?;
+            sender
+                .try_send(CandidateCommand::Manual {
+                    endpoint,
+                    reply: RegistrationReply {
+                        sender: Some(reply),
+                        started: false,
+                    },
+                })
+                .map_err(|_| ControlError::ServiceUnavailable)?;
+            state.metrics.peers.set(
+                crate::peer_metrics::Gauge::CandidateItems,
+                (sender.max_capacity() - sender.capacity()) as u64,
+            );
+        }
+        response.await.map_err(|_| {
+            ControlError::PeerAcceptanceUncertain(
+                "candidate coordinator closed before confirmation".into(),
+            )
+        })?
+    }
+
+    pub(super) fn snapshot(&self) -> Result<Vec<PeerCandidate>, ControlError> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| ControlError::Internal("candidate access lock poisoned".into()))?;
+        if state.terminal || state.sender.is_none() {
+            return Err(ControlError::ServiceUnavailable);
+        }
+        Ok(state.snapshot.clone())
+    }
+
+    pub(super) fn check_startable(&self) -> Result<(), ControlError> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| ControlError::Internal("candidate access lock poisoned".into()))?;
+        if state.terminal || state.sender.is_some() {
+            return Err(ControlError::ServiceUnavailable);
+        }
+        Ok(())
+    }
+
+    fn begin_generation(&self) -> Result<CandidateGeneration, DiscoveryError> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| configuration_error("coordinator", "candidate access lock poisoned"))?;
+        if state.terminal || state.sender.is_some() {
+            return Err(configuration_error(
+                "coordinator",
+                "candidate access unavailable",
+            ));
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| configuration_error("coordinator", "candidate generation exhausted"))?;
+        state.snapshot.clear();
+        Ok(CandidateGeneration {
+            access: self.clone(),
+            id: state.generation,
+        })
+    }
+
+    pub(super) fn stop(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.terminal = true;
+        state.sender = None;
+    }
+}
+
+#[derive(Clone)]
+struct CandidateGeneration {
+    access: CandidateAccess,
+    id: u64,
+}
+
+impl CandidateGeneration {
+    fn publish(&self, registry: &CandidateRegistry) {
+        let mut state = self
+            .access
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.generation != self.id || state.terminal {
+            return;
+        }
+        state.snapshot = registry
+            .order
+            .iter()
+            .filter_map(|address| {
+                let record = registry.records.get(address)?;
+                let mut sources: Vec<_> = record.sources.keys().cloned().collect();
+                sources.sort();
+                Some(PeerCandidate {
+                    address: address.clone(),
+                    persisted: record.sources.contains_key("manual"),
+                    sources,
+                })
+            })
+            .collect();
+        if let Some(sender) = &state.sender {
+            state.metrics.peers.set(
+                crate::peer_metrics::Gauge::CandidateItems,
+                (sender.max_capacity() - sender.capacity()) as u64,
+            );
+        }
+    }
+
+    fn deactivate(&self) {
+        let mut state = self
+            .access
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.generation != self.id {
+            return;
+        }
+        state.sender = None;
+        state.snapshot.clear();
+        state
+            .metrics
+            .peers
+            .set(crate::peer_metrics::Gauge::CandidateItems, 0);
+    }
+
+    fn running(&self) -> bool {
+        self.access.0.lock().is_ok_and(|state| {
+            state.generation == self.id && !state.terminal && state.sender.is_some()
+        })
+    }
+}
 
 const DISCOVERY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const DISCOVERY_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -382,6 +558,10 @@ impl CandidateRegistry {
 }
 
 enum CandidateCommand {
+    Manual {
+        endpoint: String,
+        reply: RegistrationReply,
+    },
     Snapshot {
         source_id: String,
         snapshot: DiscoverySnapshot,
@@ -411,7 +591,36 @@ enum CandidateCommand {
     },
 }
 
+struct RegistrationReply {
+    sender: Option<oneshot::Sender<Result<PeerRegistration, ControlError>>>,
+    started: bool,
+}
+
+impl RegistrationReply {
+    fn send(mut self, result: Result<PeerRegistration, ControlError>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for RegistrationReply {
+    fn drop(&mut self) {
+        let error = if self.started {
+            ControlError::PeerAcceptanceUncertain(
+                "candidate coordinator stopped before persistence confirmation".into(),
+            )
+        } else {
+            ControlError::ServiceUnavailable
+        };
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(error));
+        }
+    }
+}
+
 pub(super) struct DiscoveryCoordinator {
+    generation: CandidateGeneration,
     config: DiscoveryRuntimeConfig,
     providers: Vec<DiscoveryProvider>,
     candidates_rx: watch::Receiver<Arc<Vec<String>>>,
@@ -419,11 +628,23 @@ pub(super) struct DiscoveryCoordinator {
     shutdown_tx: watch::Sender<bool>,
     coordinator_task: Option<JoinHandle<()>>,
     provider_tasks: Vec<JoinHandle<()>>,
+    prepared: Option<PreparedCandidates>,
+    finished: bool,
+}
+
+struct PreparedCandidates {
+    watches: Vec<DiscoveryWatch>,
+    manual: Vec<String>,
+    store: Option<Arc<nx_store::Store>>,
+    commands: mpsc::Receiver<CandidateCommand>,
+    candidates: watch::Sender<Arc<Vec<String>>>,
 }
 
 impl Drop for DiscoveryCoordinator {
     fn drop(&mut self) {
-        self.request_shutdown();
+        if !self.finished {
+            self.request_rollback();
+        }
         for task in &self.provider_tasks {
             task.abort();
         }
@@ -434,13 +655,73 @@ impl Drop for DiscoveryCoordinator {
 }
 
 impl DiscoveryCoordinator {
+    #[cfg(test)]
     pub(super) async fn start(
         providers: Vec<DiscoveryProvider>,
         config: DiscoveryRuntimeConfig,
     ) -> Result<Self, DiscoveryError> {
-        validate_discovery_config(&providers, &config)?;
+        Self::start_inner(providers, config, None, CandidateAccess::default()).await
+    }
 
-        let mut registry = CandidateRegistry::new(config.max_candidates())?;
+    #[cfg(test)]
+    pub(super) async fn start_managed(
+        providers: Vec<DiscoveryProvider>,
+        config: DiscoveryRuntimeConfig,
+        store: Arc<nx_store::Store>,
+        access: CandidateAccess,
+    ) -> Result<Self, DiscoveryError> {
+        let mut coordinator = Self::prepare_managed(providers, config, store, access).await?;
+        if let Err(error) = coordinator.initialize(Vec::new()) {
+            let _ = coordinator.rollback().await;
+            return Err(error);
+        }
+        Ok(coordinator)
+    }
+
+    pub(super) async fn prepare_managed(
+        providers: Vec<DiscoveryProvider>,
+        config: DiscoveryRuntimeConfig,
+        store: Arc<nx_store::Store>,
+        access: CandidateAccess,
+    ) -> Result<Self, DiscoveryError> {
+        Self::prepare(providers, config, Some(store), access).await
+    }
+
+    #[cfg(test)]
+    async fn start_inner(
+        providers: Vec<DiscoveryProvider>,
+        config: DiscoveryRuntimeConfig,
+        store: Option<Arc<nx_store::Store>>,
+        access: CandidateAccess,
+    ) -> Result<Self, DiscoveryError> {
+        let mut coordinator = Self::prepare(providers, config, store, access).await?;
+        if let Err(error) = coordinator.initialize(Vec::new()) {
+            let _ = coordinator.rollback().await;
+            return Err(error);
+        }
+        Ok(coordinator)
+    }
+
+    async fn prepare(
+        providers: Vec<DiscoveryProvider>,
+        config: DiscoveryRuntimeConfig,
+        store: Option<Arc<nx_store::Store>>,
+        access: CandidateAccess,
+    ) -> Result<Self, DiscoveryError> {
+        validate_discovery_config(&providers, &config)?;
+        let generation = access.begin_generation()?;
+
+        let manual = if let Some(store) = &store {
+            let store = Arc::clone(store);
+            let cluster = config.cluster_id().to_owned();
+            let capacity = config.max_candidates();
+            tokio::task::spawn_blocking(move || super::manual::load(&store, &cluster, capacity))
+                .await
+                .map_err(|error| configuration_error("manual", error.to_string()))?
+                .map_err(|error| configuration_error("manual", error.to_string()))?
+        } else {
+            Vec::new()
+        };
         let mut initial_watches = Vec::with_capacity(providers.len());
         for source in &providers {
             let provider_watch =
@@ -457,67 +738,132 @@ impl DiscoveryCoordinator {
                         return Err(provider_timeout(source.source_id(), "watch"));
                     }
                 };
-            if let Err(error) = registry.replace_snapshot(
-                source.source_id(),
-                provider_watch.snapshot(),
-                source.candidate_ttl(),
-                StdInstant::now(),
-            ) {
+            if provider_watch.snapshot().peers().len() > config.max_candidates() {
                 rollback_providers(&providers).await;
-                return Err(error);
+                return Err(configuration_error(
+                    source.source_id(),
+                    "discovery snapshot exceeds candidate limit",
+                ));
             }
             initial_watches.push(provider_watch);
         }
 
-        let (candidates_tx, candidates_rx) = watch::channel(registry.endpoints());
+        let (candidates_tx, candidates_rx) = watch::channel(Arc::new(Vec::new()));
         let command_capacity = config.max_candidates().clamp(1, 4096);
         let (command_tx, command_rx) = mpsc::channel(command_capacity);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let coordinator_task = Some(tokio::spawn(run_candidate_registry(
-            registry,
-            candidates_tx,
-            command_rx,
-            shutdown_rx,
-        )));
-
-        let provider_tasks = providers
-            .iter()
-            .cloned()
-            .zip(initial_watches)
-            .map(|(source, provider_watch)| {
-                tokio::spawn(run_provider_watch(
-                    source,
-                    provider_watch,
-                    command_tx.clone(),
-                    shutdown_tx.subscribe(),
-                ))
-            })
-            .collect();
+        let (shutdown_tx, _) = watch::channel(false);
 
         Ok(Self {
+            generation,
             config,
             providers,
             candidates_rx,
             command_tx,
             shutdown_tx,
-            coordinator_task,
-            provider_tasks,
+            coordinator_task: None,
+            provider_tasks: Vec::new(),
+            finished: false,
+            prepared: Some(PreparedCandidates {
+                watches: initial_watches,
+                manual,
+                store,
+                commands: command_rx,
+                candidates: candidates_tx,
+            }),
         })
+    }
+
+    fn initialize(&mut self, local_endpoints: Vec<String>) -> Result<(), DiscoveryError> {
+        let Some(prepared) = self.prepared.take() else {
+            return Err(configuration_error("coordinator", "already initialized"));
+        };
+        let mut registry = CandidateRegistry::new(self.config.max_candidates())?;
+        registry.set_local_endpoints(local_endpoints);
+        for (source, provider_watch) in self.providers.iter().zip(&prepared.watches) {
+            registry.replace_snapshot(
+                source.source_id(),
+                provider_watch.snapshot(),
+                source.candidate_ttl(),
+                StdInstant::now(),
+            )?;
+        }
+        registry.replace_source("manual", &prepared.manual, None, StdInstant::now())?;
+        self.generation.publish(&registry);
+        prepared.candidates.send_replace(registry.endpoints());
+        self.candidates_rx.borrow_and_update();
+        self.coordinator_task = Some(tokio::spawn(run_candidate_registry(
+            registry,
+            prepared.manual.into_iter().collect(),
+            prepared.candidates,
+            prepared.commands,
+            self.shutdown_tx.subscribe(),
+            prepared
+                .store
+                .map(|store| (store, self.config.cluster_id().to_owned())),
+            self.generation.clone(),
+        )));
+        self.provider_tasks = self
+            .providers
+            .iter()
+            .cloned()
+            .zip(prepared.watches)
+            .map(|(source, watch)| {
+                tokio::spawn(run_provider_watch(
+                    source,
+                    watch,
+                    self.command_tx.clone(),
+                    self.shutdown_tx.subscribe(),
+                ))
+            })
+            .collect();
+        Ok(())
     }
 
     pub(super) fn candidates(&self) -> watch::Receiver<Arc<Vec<String>>> {
         self.candidates_rx.clone()
     }
 
+    pub(super) fn activate(&self) -> Result<(), ControlError> {
+        let mut state = self
+            .generation
+            .access
+            .0
+            .lock()
+            .map_err(|_| ControlError::Internal("candidate access lock poisoned".into()))?;
+        if state.terminal
+            || state.generation != self.generation.id
+            || *self.shutdown_tx.borrow()
+            || self.coordinator_task.is_none()
+            || self.command_tx.is_closed()
+        {
+            return Err(ControlError::ServiceUnavailable);
+        }
+        state.sender = Some(self.command_tx.clone());
+        state.metrics.peers.set(
+            crate::peer_metrics::Gauge::CandidateCapacity,
+            self.command_tx.max_capacity() as u64,
+        );
+        Ok(())
+    }
+
     pub(super) fn request_shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.generation.access.stop();
+        self.shutdown_tx.send_replace(true);
         for source in &self.providers {
             source.provider().request_shutdown();
         }
     }
 
+    fn request_rollback(&self) {
+        self.generation.deactivate();
+        self.shutdown_tx.send_replace(true);
+        for source in &self.providers {
+            source.provider().request_rollback();
+        }
+    }
+
     pub(super) async fn configure_local_endpoint(
-        &self,
+        &mut self,
         bound_addr: SocketAddr,
     ) -> Result<Option<String>, DiscoveryError> {
         let advertised =
@@ -530,6 +876,10 @@ impl DiscoveryCoordinator {
             && !local_endpoints.contains(endpoint)
         {
             local_endpoints.push(endpoint.clone());
+        }
+        if self.prepared.is_some() {
+            self.initialize(local_endpoints)?;
+            return Ok(advertised);
         }
         let (reply, response) = oneshot::channel();
         self.command_tx
@@ -576,22 +926,46 @@ impl DiscoveryCoordinator {
 
     pub(super) async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
-        for task in self.provider_tasks.drain(..) {
-            let _ = AbortOnDropTask::new(task).join().await;
-        }
-        if let Some(task) = self.coordinator_task.take() {
-            let _ = AbortOnDropTask::new(task).join().await;
-        }
+        self.finish(true).await
+    }
 
-        shutdown_providers(&self.providers).await
+    pub(super) async fn rollback(&mut self) -> Result<(), DiscoveryError> {
+        self.request_rollback();
+        self.finish(false).await
+    }
+
+    async fn finish(&mut self, terminal: bool) -> Result<(), DiscoveryError> {
+        self.finished = true;
+        let tasks: Vec<_> = self
+            .provider_tasks
+            .drain(..)
+            .chain(self.coordinator_task.take())
+            .map(AbortOnDropTask::new)
+            .collect();
+        let joined = tokio::time::timeout(DISCOVERY_OPERATION_TIMEOUT, async move {
+            for task in tasks {
+                task.join().await.map_err(|error| {
+                    configuration_error("coordinator", format!("candidate task failed: {error}"))
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| provider_timeout("coordinator", "candidate shutdown"))
+        .and_then(|result| result);
+        let providers = finish_providers(&self.providers, terminal).await;
+        joined.and(providers)
     }
 }
 
 async fn run_candidate_registry(
     mut registry: CandidateRegistry,
+    mut persisted_manual: HashSet<String>,
     candidates_tx: watch::Sender<Arc<Vec<String>>>,
     mut command_rx: mpsc::Receiver<CandidateCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
+    manual_store: Option<(Arc<nx_store::Store>, String)>,
+    generation: CandidateGeneration,
 ) {
     loop {
         let next_expiry = registry.next_expiry();
@@ -606,17 +980,43 @@ async fn run_candidate_registry(
                     break;
                 };
                 let command = match command {
+                    CandidateCommand::Manual { endpoint, mut reply } => {
+                        let before = registry.endpoints();
+                        let running = generation.running();
+                        let result = if !running {
+                            Err(ControlError::ServiceUnavailable)
+                        } else {
+                            reply.started = true;
+                            accept_manual(
+                                &mut registry,
+                                &mut persisted_manual,
+                                &endpoint,
+                                manual_store.as_ref(),
+                            ).await
+                        };
+                        if let Err(error) = &result {
+                            warn!(%error, "manual peer registration failed");
+                        }
+                        generation.publish(&registry);
+                        if registry.endpoints() != before {
+                            candidates_tx.send_replace(registry.endpoints());
+                        }
+                        reply.send(result);
+                        continue;
+                    }
                     CandidateCommand::SetLocalEndpoints { endpoints, reply } => {
                         let changed = registry.set_local_endpoints(endpoints);
                         if changed {
                             candidates_tx.send_replace(registry.endpoints());
                         }
+                        generation.publish(&registry);
                         let _ = reply.send(());
                         continue;
                     }
                     command => command,
                 };
                 let changed = apply_candidate_command(&mut registry, command);
+                generation.publish(&registry);
                 if changed {
                     candidates_tx.send_replace(registry.endpoints());
                 }
@@ -625,10 +1025,63 @@ async fn run_candidate_registry(
                 if registry.expire(StdInstant::now()) {
                     candidates_tx.send_replace(registry.endpoints());
                 }
+                generation.publish(&registry);
             }
         }
     }
+    generation.deactivate();
+    command_rx.close();
+    while let Ok(command) = command_rx.try_recv() {
+        if let CandidateCommand::Manual { reply, .. } = command {
+            reply.send(Err(ControlError::ServiceUnavailable));
+        }
+    }
     debug!("peer candidate coordinator terminated");
+}
+
+async fn accept_manual(
+    registry: &mut CandidateRegistry,
+    persisted_manual: &mut HashSet<String>,
+    endpoint: &str,
+    storage: Option<&(Arc<nx_store::Store>, String)>,
+) -> Result<PeerRegistration, ControlError> {
+    if registry.local_endpoints.contains(endpoint) {
+        return Err(ControlError::InvalidPeer);
+    }
+    if registry
+        .records
+        .get(endpoint)
+        .is_some_and(|record| record.sources.contains_key("manual"))
+    {
+        return Ok(PeerRegistration {
+            address: endpoint.to_owned(),
+            created: false,
+        });
+    }
+    if (!registry.records.contains_key(endpoint)
+        && registry.records.len() >= registry.max_candidates)
+        || (!persisted_manual.contains(endpoint)
+            && persisted_manual.len() >= registry.max_candidates)
+    {
+        return Err(ControlError::PeerCapacityExceeded);
+    }
+    let mut prepared = registry.clone();
+    prepared
+        .add("manual", endpoint.to_owned(), None, StdInstant::now())
+        .map_err(|error| ControlError::Internal(error.to_string()))?;
+    let (store, cluster) = storage.ok_or(ControlError::ServiceUnavailable)?;
+    let store = Arc::clone(store);
+    let cluster = cluster.clone();
+    let address = endpoint.to_owned();
+    tokio::task::spawn_blocking(move || super::manual::persist(&store, &cluster, &address))
+        .await
+        .map_err(|error| ControlError::PeerAcceptanceUncertain(error.to_string()))??;
+    persisted_manual.insert(endpoint.to_owned());
+    *registry = prepared;
+    Ok(PeerRegistration {
+        address: endpoint.to_owned(),
+        created: true,
+    })
 }
 
 fn apply_candidate_command(registry: &mut CandidateRegistry, command: CandidateCommand) -> bool {
@@ -682,7 +1135,7 @@ fn apply_candidate_command(registry: &mut CandidateRegistry, command: CandidateC
         CandidateCommand::SourceUnavailable { source_id, leased } => {
             registry.source_unavailable(&source_id, leased)
         }
-        CandidateCommand::SetLocalEndpoints { .. } => false,
+        CandidateCommand::SetLocalEndpoints { .. } | CandidateCommand::Manual { .. } => false,
     }
 }
 
@@ -840,6 +1293,12 @@ fn validate_discovery_config(
     }
     let mut source_ids = HashSet::new();
     for source in providers {
+        if source.source_id() == "manual" {
+            return Err(configuration_error(
+                "manual",
+                "reserved discovery source identifier",
+            ));
+        }
         validate_identifier("source_id", source.source_id())?;
         if !source_ids.insert(source.source_id()) {
             return Err(configuration_error(
@@ -1006,16 +1465,29 @@ fn provider_timeout(provider: &str, operation: &str) -> DiscoveryError {
     }
 }
 
-async fn shutdown_providers(providers: &[DiscoveryProvider]) -> Result<(), DiscoveryError> {
+async fn finish_providers(
+    providers: &[DiscoveryProvider],
+    terminal: bool,
+) -> Result<(), DiscoveryError> {
     let mut tasks = tokio::task::JoinSet::new();
     for source in providers {
-        source.provider().request_shutdown();
+        if terminal {
+            source.provider().request_shutdown();
+        } else {
+            source.provider().request_rollback();
+        }
         let source_id = source.source_id().to_string();
         let provider = Arc::clone(source.provider());
         tasks.spawn(async move {
-            tokio::time::timeout(DISCOVERY_OPERATION_TIMEOUT, provider.shutdown())
-                .await
-                .map_err(|_| provider_timeout(&source_id, "shutdown"))?
+            tokio::time::timeout(DISCOVERY_OPERATION_TIMEOUT, async {
+                if terminal {
+                    provider.shutdown().await
+                } else {
+                    provider.rollback().await
+                }
+            })
+            .await
+            .map_err(|_| provider_timeout(&source_id, "shutdown"))?
         });
     }
 
@@ -1039,7 +1511,7 @@ async fn shutdown_providers(providers: &[DiscoveryProvider]) -> Result<(), Disco
 }
 
 async fn rollback_providers(providers: &[DiscoveryProvider]) {
-    if let Err(error) = shutdown_providers(providers).await {
+    if let Err(error) = finish_providers(providers, false).await {
         warn!(error = %error, "discovery provider rollback failed");
     }
 }
@@ -1437,9 +1909,12 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_candidate_registry(
             registry,
+            HashSet::new(),
             candidates_tx,
             command_rx,
             shutdown_rx,
+            None,
+            CandidateAccess::default().begin_generation().unwrap(),
         ));
         tokio::time::timeout(Duration::from_secs(2), candidates_rx.changed())
             .await
@@ -1659,6 +2134,251 @@ mod tests {
         assert_eq!(&*registry.endpoints(), &["peer.example:9000"]);
         assert!(registry.remove("two", "peer.example:9000"));
         assert!(registry.endpoints().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_shutdown_budget_does_not_wait_for_a_stalled_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(nx_store::Store::open(directory.path()).unwrap());
+        let access = CandidateAccess::default();
+        let mut coordinator = DiscoveryCoordinator::start_managed(
+            vec![],
+            DiscoveryRuntimeConfig::default(),
+            Arc::clone(&store),
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        coordinator.activate().unwrap();
+        let (reached, checkpoint) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        store.pause_next_flush(reached, release);
+        let request = tokio::spawn({
+            let access = access.clone();
+            async move { access.add("127.0.0.1:1".into()).await }
+        });
+        tokio::task::spawn_blocking(move || {
+            checkpoint.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        let queued = tokio::spawn({
+            let access = access.clone();
+            async move { access.add("127.0.0.1:2".into()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(5));
+            while coordinator.command_tx.capacity() == coordinator.command_tx.max_capacity() {
+                tick.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        let stopped = tokio::time::timeout(
+            DISCOVERY_OPERATION_TIMEOUT + Duration::from_secs(1),
+            coordinator.shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(stopped, Err(DiscoveryError::Provider { message, .. })
+            if message.contains("candidate shutdown timed out"))
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ControlError::PeerAcceptanceUncertain(_))
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), queued)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ControlError::ServiceUnavailable),
+        );
+        assert_eq!(access.snapshot(), Err(ControlError::ServiceUnavailable));
+        resume.send(()).unwrap();
+        let persisted = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || super::super::manual::load(&store, "default", 1)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted, ["127.0.0.1:1"]);
+        assert!(coordinator.candidates().borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_rollback_does_not_make_access_terminal_or_invalidate_a_new_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(nx_store::Store::open(directory.path()).unwrap());
+        let access = CandidateAccess::default();
+        let mut old = DiscoveryCoordinator::start_managed(
+            vec![],
+            DiscoveryRuntimeConfig::default(),
+            Arc::clone(&store),
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        old.activate().unwrap();
+        let old_generation = old.generation.clone();
+        old.rollback().await.unwrap();
+        let mut current = DiscoveryCoordinator::start_managed(
+            vec![],
+            DiscoveryRuntimeConfig::default(),
+            store,
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        current.activate().unwrap();
+        access.add("127.0.0.1:1".into()).await.unwrap();
+        old_generation.publish(&CandidateRegistry::new(1).unwrap());
+        old_generation.deactivate();
+        drop(old);
+        assert_eq!(access.snapshot().unwrap()[0].address, "127.0.0.1:1");
+        current.shutdown().await.unwrap();
+        assert!(access.check_startable().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_flush_transaction_outlives_request_cancellation_and_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(nx_store::Store::open(directory.path()).unwrap());
+        let access = CandidateAccess::default();
+        let mut coordinator = DiscoveryCoordinator::start_managed(
+            vec![],
+            DiscoveryRuntimeConfig::default(),
+            Arc::clone(&store),
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        coordinator.activate().unwrap();
+        let (reached, checkpoint) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        store.pause_next_flush(reached, release);
+        let request = tokio::spawn({
+            let access = access.clone();
+            async move { access.add("127.0.0.1:1".into()).await }
+        });
+        tokio::task::spawn_blocking(move || {
+            checkpoint.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(coordinator.candidates().borrow().is_empty());
+        request.abort();
+        let _ = request.await;
+        coordinator.request_shutdown();
+        assert_eq!(
+            access.add("127.0.0.1:2".into()).await,
+            Err(ControlError::ServiceUnavailable)
+        );
+        resume.send(()).unwrap();
+        coordinator.shutdown().await.unwrap();
+        assert_eq!(
+            super::super::manual::load(&store, "default", 2).unwrap(),
+            ["127.0.0.1:1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_contribution_survives_source_withdrawal_and_watch_is_coherent() {
+        use crate::PeerDiscovery;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(nx_store::Store::open(directory.path()).unwrap());
+        let provider = Arc::new(MutableDiscovery::new(vec!["127.0.0.1:1".into()]));
+        let mut watch = provider.watch().await.unwrap();
+        let access = CandidateAccess::default();
+        let mut coordinator = DiscoveryCoordinator::start_managed(
+            vec![DiscoveryProvider::new("other", provider.clone())],
+            DiscoveryRuntimeConfig::default(),
+            store,
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        coordinator.activate().unwrap();
+        assert_eq!(watch.snapshot().peers(), ["127.0.0.1:1"]);
+        access.add("127.0.0.1:1".into()).await.unwrap();
+        provider.remove("127.0.0.1:1");
+        tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                let snapshot = access.snapshot().unwrap();
+                if snapshot.len() == 1 && snapshot[0].sources == ["manual"] {
+                    break;
+                }
+                tick.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            coordinator.candidates().borrow().as_ref(),
+            &vec!["127.0.0.1:1".to_owned()]
+        );
+        coordinator.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_capacity_includes_persisted_local_records_and_serializes_insertions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(nx_store::Store::open(directory.path()).unwrap());
+        super::super::manual::persist(&store, "default", "127.0.0.1:1").unwrap();
+        let access = CandidateAccess::default();
+        let mut coordinator = DiscoveryCoordinator::start_managed(
+            vec![],
+            DiscoveryRuntimeConfig::default().with_max_candidates(2),
+            Arc::clone(&store),
+            access.clone(),
+        )
+        .await
+        .unwrap();
+        coordinator
+            .configure_local_endpoint("127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+        coordinator.activate().unwrap();
+        assert!(access.snapshot().unwrap().is_empty());
+        let mut changes = coordinator.candidates();
+        let (a, b) = tokio::join!(
+            access.add("127.0.0.1:2".into()),
+            access.add("127.0.0.1:3".into()),
+        );
+        let accepted = match (a, b) {
+            (Ok(accepted), Err(ControlError::PeerCapacityExceeded))
+            | (Err(ControlError::PeerCapacityExceeded), Ok(accepted)) => accepted,
+            other => panic!("expected one accepted candidate and one capacity error: {other:?}"),
+        };
+        assert!(accepted.created);
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(
+            changes.borrow_and_update().as_ref(),
+            std::slice::from_ref(&accepted.address)
+        );
+        assert_eq!(access.snapshot().unwrap()[0].address, accepted.address);
+        assert_eq!(
+            access.add("127.0.0.1:1".into()).await,
+            Err(ControlError::InvalidPeer)
+        );
+        assert_eq!(
+            super::super::manual::load(&store, "default", 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        coordinator.shutdown().await.unwrap();
     }
 
     #[test]

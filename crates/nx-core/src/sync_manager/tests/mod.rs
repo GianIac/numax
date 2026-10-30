@@ -11,6 +11,7 @@ use tokio::time::{Duration, Instant, sleep};
 
 mod backpressure;
 mod e2e;
+mod manual;
 mod rate;
 mod recovery;
 mod sequencing;

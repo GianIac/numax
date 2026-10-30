@@ -61,6 +61,7 @@ async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
         assert_eq!(b.get_counter_value("paced-g").await, 0);
         // Resume the production anti-entropy task with its existing independent budget.
         b.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+            store: Arc::clone(&b.store),
             jitter_seed: 1,
             repair_budget: Arc::new(std::sync::Mutex::new(
                 crate::sync_manager::delivery::RepairBudget::new(StdInstant::now()),

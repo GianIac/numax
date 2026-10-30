@@ -621,6 +621,21 @@ pub trait PeerDiscovery: Send + Sync {
         self.request_shutdown();
         Ok(())
     }
+
+    /// Cancel an unsuccessful startup generation without authorizing overlap.
+    ///
+    /// Providers supporting retries must keep explicit shutdown terminal and
+    /// prevent a new generation until the old generation's cleanup completes.
+    /// The conservative default stops providers that do not support rollback.
+    fn request_rollback(&self) {
+        self.request_shutdown();
+    }
+
+    /// Wait for startup-generation cleanup. Repeated/cancelled waiters must not
+    /// cancel cleanup or make a failed cleanup safe to restart.
+    async fn rollback(&self) -> Result<(), DiscoveryError> {
+        self.shutdown().await
+    }
 }
 
 /// Backward-compatible discovery provider for explicitly configured peers.

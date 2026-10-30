@@ -56,6 +56,8 @@ impl ObservabilityConfig {
 
 #[derive(Default)]
 pub struct RuntimeMetrics {
+    pub(crate) peers: crate::peer_metrics::PeerMetrics,
+    recovery_sample: Mutex<Option<std::time::Instant>>,
     gossip_pacing: GossipPacingMetrics,
     ops_total: AtomicU64,
     peers_connected: AtomicUsize,
@@ -147,6 +149,60 @@ struct DurationHistogramSnapshot {
 }
 
 impl RuntimeMetrics {
+    pub(crate) async fn refresh_recovery(self: &Arc<Self>, store: Arc<NxStore>) {
+        {
+            let Ok(mut last) = self.recovery_sample.lock() else {
+                tracing::error!("recovery metrics sampling lock poisoned");
+                self.record_sync_error();
+                return;
+            };
+            if last.is_some_and(|last| last.elapsed() < Duration::from_secs(1)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let progress =
+            tokio::task::spawn_blocking(move || crate::sync_manager::storage_progress(&store))
+                .await;
+        match progress {
+            Ok(Ok(progress)) => {
+                use crate::peer_metrics::Gauge;
+                let mut pending = 0u64;
+                let mut unconfirmed = 0u64;
+                let mut failed = 0u64;
+                let mut complete = 0u64;
+                let mut gaps = 0u64;
+                for origin in progress {
+                    let missing = origin
+                        .known_high_sequence
+                        .saturating_sub(origin.contiguous_sequence)
+                        .saturating_sub(origin.sparse_positions as u64);
+                    gaps = gaps.saturating_add(missing);
+                    if missing > 0 || origin.baseline_missing {
+                        pending += 1;
+                    } else {
+                        complete += 1;
+                    }
+                    unconfirmed += u64::from(origin.baseline_unconfirmed);
+                    failed += u64::from(origin.recovery_failure.is_some());
+                }
+                for (gauge, value) in [
+                    (Gauge::PendingOrigins, pending),
+                    (Gauge::BaselineUnconfirmed, unconfirmed),
+                    (Gauge::FailedOrigins, failed),
+                    (Gauge::KnownCompleteOrigins, complete),
+                    (Gauge::GapPositions, gaps),
+                ] {
+                    self.peers.set(gauge, value);
+                }
+            }
+            result => {
+                self.record_sync_error();
+                tracing::error!(?result, "recovery metrics sampling failed");
+            }
+        }
+    }
+
     pub fn record_ops(&self, count: u64) {
         self.ops_total.fetch_add(count, Ordering::Relaxed);
     }
@@ -329,6 +385,11 @@ impl RuntimeMetrics {
             .clone();
 
         MetricsSnapshot {
+            peer_metrics: {
+                let mut rendered = String::new();
+                self.peers.render(&mut rendered);
+                rendered
+            },
             gossip_pacing: GossipPacingSnapshot {
                 deferred: self.gossip_pacing.deferred.load(Ordering::Relaxed),
                 admitted_bytes: self.gossip_pacing.admitted_bytes.load(Ordering::Relaxed),
@@ -372,6 +433,7 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 struct MetricsSnapshot {
+    peer_metrics: String,
     gossip_pacing: GossipPacingSnapshot,
     ops_total: u64,
     peers_connected: usize,
@@ -580,6 +642,7 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
         snapshot.store_bytes
     );
 
+    rendered.push_str(&snapshot.peer_metrics);
     rendered.push_str(&format!(
         "# HELP numax_gossip_rate_limited_total Fast-path attempts deferred to durable repair\n# TYPE numax_gossip_rate_limited_total counter\nnumax_gossip_rate_limited_total {}\n\
          # HELP numax_gossip_admitted_bytes_total Framed bytes admitted for gossip attempts\n# TYPE numax_gossip_admitted_bytes_total counter\nnumax_gossip_admitted_bytes_total {}\n\
@@ -719,6 +782,7 @@ mod tests {
     #[test]
     fn metrics_are_rendered_in_prometheus_format() {
         let snapshot = MetricsSnapshot {
+            peer_metrics: String::new(),
             gossip_pacing: GossipPacingSnapshot::default(),
             ops_total: 7,
             peers_connected: 2,

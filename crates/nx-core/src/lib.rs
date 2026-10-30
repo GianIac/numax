@@ -3,13 +3,15 @@ pub mod discovery;
 pub mod host_api;
 mod membership;
 pub mod observability;
+mod peer_metrics;
 pub mod runtime;
 pub mod sync_config;
 pub mod sync_manager;
 
 pub use control::{
-    ControlError, ControlPage, ModuleInfo, ModuleRegistration, PeerInfo, RuntimeControl,
-    RuntimeControlHandle, RuntimeIntrospection, RuntimeManagement, SharedRuntimeControl,
+    ControlError, ControlPage, ModuleInfo, ModuleRegistration, PeerCandidate, PeerInfo,
+    PeerObservation, PeerRegistration, PeerView, RuntimeControl, RuntimeControlHandle,
+    RuntimeIntrospection, RuntimeManagement, SharedRuntimeControl,
 };
 pub use discovery::{
     AnnouncementSupport, BootstrapDiscoverySettings, BootstrapGossipDiscovery,

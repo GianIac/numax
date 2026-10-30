@@ -149,6 +149,7 @@ pub(super) struct HistoryCursor {
 }
 
 pub(super) struct AntiEntropyLoopContext {
+    pub(super) store: Arc<NxStore>,
     pub(super) jitter_seed: u64,
     pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
     pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,

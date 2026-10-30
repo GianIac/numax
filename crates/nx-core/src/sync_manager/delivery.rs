@@ -39,26 +39,45 @@ pub(super) fn entry_bytes(op: &nx_sync::Op, position: &nx_sync::OpPosition) -> O
 }
 
 struct Queued<T> {
-    item: T,
+    item: Option<T>,
+    budget: Arc<Budget>,
+    size: usize,
     _bytes: OwnedSemaphorePermit,
 }
 
+impl<T> Drop for Queued<T> {
+    fn drop(&mut self) {
+        self.budget
+            .metrics
+            .peers
+            .queue_change(self.budget.forward, self.size, false);
+    }
+}
+
 struct Budget {
+    forward: bool,
     bytes: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
 }
 impl Budget {
-    fn admit<T: Item>(&self, item: T) -> Option<Queued<T>> {
+    fn admit<T: Item>(self: &Arc<Self>, item: T) -> Option<Queued<T>> {
         let permit = item
             .delivery_bytes()
             .and_then(|size| u32::try_from(size.max(1)).ok())
             .and_then(|size| Arc::clone(&self.bytes).try_acquire_many_owned(size).ok());
         match permit {
-            Some(permit) => Some(Queued {
-                item,
-                _bytes: permit,
-            }),
+            Some(permit) => {
+                let size = permit.num_permits();
+                self.metrics.peers.queue_change(self.forward, size, true);
+                Some(Queued {
+                    item: Some(item),
+                    budget: Arc::clone(self),
+                    size,
+                    _bytes: permit,
+                })
+            }
             None => {
+                self.metrics.peers.queue_reject(self.forward, 1);
                 self.metrics.record_sync_error();
                 tracing::debug!(
                     "delivery byte budget exhausted; durable repair retains accepted operation"
@@ -84,7 +103,7 @@ impl<T> Clone for Sender<T> {
 pub(crate) struct Receiver<T>(mpsc::Receiver<Queued<T>>);
 pub(crate) struct Permit<'a, T> {
     permit: mpsc::Permit<'a, Queued<T>>,
-    budget: &'a Budget,
+    budget: &'a Arc<Budget>,
 }
 pub(crate) struct OwnedPermit<T> {
     permit: mpsc::OwnedPermit<Queued<T>>,
@@ -96,11 +115,22 @@ pub(super) fn channel<T>(
     bytes: usize,
     metrics: Arc<RuntimeMetrics>,
 ) -> (Sender<T>, Receiver<T>) {
+    named_channel(slots, bytes, metrics, false)
+}
+
+pub(super) fn named_channel<T>(
+    slots: usize,
+    bytes: usize,
+    metrics: Arc<RuntimeMetrics>,
+    forward: bool,
+) -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = mpsc::channel(slots.max(1));
+    metrics.peers.queue_capacity(forward, slots.max(1), bytes);
     (
         Sender {
             tx,
             budget: Arc::new(Budget {
+                forward,
                 bytes: Arc::new(Semaphore::new(bytes)),
                 metrics,
             }),
@@ -110,14 +140,29 @@ pub(super) fn channel<T>(
 }
 impl<T: Item> Sender<T> {
     pub(crate) fn try_reserve(&self) -> Result<Permit<'_, T>, mpsc::error::TrySendError<()>> {
+        let permit = self.tx.try_reserve().inspect_err(|error| {
+            self.budget.metrics.peers.queue_reject(
+                self.budget.forward,
+                if matches!(error, mpsc::error::TrySendError::Closed(_)) {
+                    2
+                } else {
+                    0
+                },
+            );
+        })?;
         Ok(Permit {
-            permit: self.tx.try_reserve()?,
+            permit,
             budget: &self.budget,
         })
     }
     pub(crate) async fn reserve_owned(self) -> Result<OwnedPermit<T>, mpsc::error::SendError<()>> {
         Ok(OwnedPermit {
-            permit: self.tx.reserve_owned().await?,
+            permit: self.tx.reserve_owned().await.inspect_err(|_| {
+                self.budget
+                    .metrics
+                    .peers
+                    .queue_reject(self.budget.forward, 2);
+            })?,
             budget: self.budget,
         })
     }
@@ -150,10 +195,15 @@ impl<T: Item> OwnedPermit<T> {
 }
 impl<T> Receiver<T> {
     pub(crate) async fn recv(&mut self) -> Option<T> {
-        self.0.recv().await.map(|queued| queued.item)
+        self.0
+            .recv()
+            .await
+            .and_then(|mut queued| queued.item.take())
     }
     pub(crate) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
-        self.0.try_recv().map(|queued| queued.item)
+        self.0
+            .try_recv()
+            .map(|mut queued| queued.item.take().expect("queued item is consumed once"))
     }
     pub(crate) fn len(&self) -> usize {
         self.0.len()
@@ -285,6 +335,33 @@ mod tests {
         assert_eq!(tx.capacity(), 2);
         tx.try_send(Payload(10)).unwrap();
         assert_eq!(rx.recv().await.unwrap().0, 10);
+    }
+
+    #[tokio::test]
+    async fn queue_metrics_track_real_enqueue_receive_drop_and_rejection() {
+        let metrics = metrics();
+        let (tx, mut rx) = named_channel(1, 10, Arc::clone(&metrics), true);
+        tx.try_send(Payload(6)).unwrap();
+        let mut sample = String::new();
+        metrics.peers.render(&mut sample);
+        assert!(sample.contains("numax_queue_items{queue=\"forward\"} 1"));
+        assert!(sample.contains("numax_queue_bytes{queue=\"forward\"} 6"));
+        assert!(tx.try_send(Payload(1)).is_err());
+        assert_eq!(rx.recv().await.unwrap().0, 6);
+        tx.try_send(Payload(11)).unwrap();
+        assert_eq!(rx.len(), 0);
+        tx.try_send(Payload(8)).unwrap();
+        drop(rx);
+        assert!(tx.clone().reserve_owned().await.is_err());
+        let mut sample = String::new();
+        metrics.peers.render(&mut sample);
+        assert!(sample.contains("numax_queue_items{queue=\"forward\"} 0"));
+        assert!(sample.contains("numax_queue_bytes{queue=\"forward\"} 0"));
+        for reason in ["slots", "bytes", "closed"] {
+            assert!(sample.contains(&format!(
+                "numax_queue_rejections_total{{queue=\"forward\",reason=\"{reason}\"}} 1"
+            )));
+        }
     }
 
     #[test]

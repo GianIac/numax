@@ -6,6 +6,7 @@ pub(crate) use candidates::canonicalize_endpoint;
 #[cfg(test)]
 mod fixtures;
 mod manager;
+mod manual;
 mod migration;
 mod neighbors;
 mod pacing;
@@ -14,6 +15,11 @@ mod replication;
 mod schema;
 mod sequence;
 mod storage;
+pub(crate) fn storage_progress(
+    store: &nx_store::Store,
+) -> anyhow::Result<Vec<ReplicationProgress>> {
+    storage::replication_progress(store)
+}
 pub use sequence::{RecoveryFailure, ReplicationProgress, UnavailableHistory};
 mod types;
 

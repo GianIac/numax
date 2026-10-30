@@ -33,6 +33,55 @@ pub struct PeerInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRegistration {
+    pub address: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCandidate {
+    pub address: String,
+    pub sources: Vec<String>,
+    pub persisted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerView {
+    Candidates,
+    Connections,
+    Membership,
+    Recovery,
+}
+
+#[derive(Debug, Clone)]
+pub enum PeerObservation {
+    Candidate {
+        candidate: PeerCandidate,
+        reconnect: Option<crate::sync_manager::PeerHealthState>,
+    },
+    Connection(crate::PeerConnectionInfo),
+    Membership {
+        record: nx_net::MembershipRecord,
+        service_error: Option<String>,
+    },
+    Recovery {
+        progress: crate::sync_manager::ReplicationProgress,
+        in_flight: bool,
+    },
+}
+
+impl PeerObservation {
+    pub fn cursor_key(&self) -> &str {
+        match self {
+            Self::Candidate { candidate, .. } => &candidate.address,
+            Self::Connection(connection) => &connection.transport_addr,
+            Self::Membership { record, .. } => &record.member,
+            Self::Recovery { progress, .. } => progress.origin.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPage<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<Vec<u8>>,
@@ -40,6 +89,10 @@ pub struct ControlPage<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
+    InvalidPeer,
+    PeerCapacityExceeded,
+    ServiceUnavailable,
+    PeerAcceptanceUncertain(String),
     InvalidCursor,
     InvalidLimit,
     ModuleNotFound,
@@ -53,6 +106,12 @@ pub enum ControlError {
 impl fmt::Display for ControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPeer => formatter.write_str("invalid peer endpoint"),
+            Self::PeerCapacityExceeded => formatter.write_str("peer candidate capacity exceeded"),
+            Self::ServiceUnavailable => formatter.write_str("peer service unavailable"),
+            Self::PeerAcceptanceUncertain(error) => {
+                write!(formatter, "peer acceptance uncertain: {error}")
+            }
             Self::InvalidCursor => formatter.write_str("invalid cursor"),
             Self::InvalidLimit => write!(
                 formatter,
@@ -75,6 +134,13 @@ impl Error for ControlError {}
 /// Collection methods require a limit between 1 and [`MAX_CONTROL_PAGE_SIZE`].
 #[async_trait]
 pub trait RuntimeIntrospection: Send + Sync {
+    async fn inspect_peers(
+        &self,
+        view: PeerView,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<ControlPage<PeerObservation>, ControlError>;
+
     async fn list_modules(
         &self,
         cursor: Option<Vec<u8>>,
@@ -105,6 +171,8 @@ pub trait RuntimeIntrospection: Send + Sync {
 
 #[async_trait]
 pub trait RuntimeManagement: Send + Sync {
+    async fn add_peer(&self, address: String) -> Result<PeerRegistration, ControlError>;
+
     async fn register_module(&self, bytes: Vec<u8>) -> Result<ModuleRegistration, ControlError>;
 
     async fn delete_module(&self, id: String) -> Result<(), ControlError>;
@@ -147,6 +215,40 @@ impl RuntimeControlHandle {
 
 #[async_trait]
 impl RuntimeIntrospection for RuntimeControlHandle {
+    async fn inspect_peers(
+        &self,
+        view: PeerView,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<ControlPage<PeerObservation>, ControlError> {
+        validate_page_limit(limit)?;
+        let cursor = cursor
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| ControlError::InvalidCursor)?;
+        let handle = self
+            .sync_handle
+            .as_ref()
+            .ok_or(ControlError::ServiceUnavailable)?;
+        let mut items = handle.inspect_peers(view).await?;
+        items.sort_by(|left, right| left.cursor_key().cmp(right.cursor_key()));
+        items.retain(|item| {
+            cursor
+                .as_ref()
+                .is_none_or(|cursor| item.cursor_key() > cursor.as_str())
+        });
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| item.cursor_key().as_bytes().to_vec())
+        } else {
+            None
+        };
+        Ok(ControlPage { items, next_cursor })
+    }
+
     async fn list_modules(
         &self,
         cursor: Option<Vec<u8>>,
@@ -252,6 +354,14 @@ impl RuntimeIntrospection for RuntimeControlHandle {
 
 #[async_trait]
 impl RuntimeManagement for RuntimeControlHandle {
+    async fn add_peer(&self, address: String) -> Result<PeerRegistration, ControlError> {
+        self.sync_handle
+            .as_ref()
+            .ok_or(ControlError::ServiceUnavailable)?
+            .add_peer(address)
+            .await
+    }
+
     async fn register_module(&self, bytes: Vec<u8>) -> Result<ModuleRegistration, ControlError> {
         self.executor
             .validate_module(&bytes)

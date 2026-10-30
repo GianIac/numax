@@ -201,6 +201,22 @@ impl PeerDiscovery for DnsSrvDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
+        self.rollback().await
+    }
+
+    fn request_rollback(&self) {
+        let lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(shutdown) = &lifecycle.shutdown {
+            shutdown.send_replace(true);
+        }
+    }
+
+    async fn rollback(&self) -> Result<(), DiscoveryError> {
+        self.request_rollback();
         let task = {
             let lifecycle = self
                 .inner
@@ -475,6 +491,43 @@ mod tests {
     use hickory_resolver::proto::rr::Name;
 
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_restarts_dns_generation_but_shutdown_remains_terminal() {
+        let provider = DnsSrvDiscovery::with_resolver(
+            DnsSrvDiscoveryConfig::new("_numax._tcp.example."),
+            Arc::new(PendingResolver),
+        );
+        provider.watch().await.unwrap();
+        let old = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        provider.request_rollback();
+        provider.rollback().await.unwrap();
+        let (first, second) = tokio::join!(provider.watch(), provider.watch());
+        assert!(first.unwrap().snapshot().peers().is_empty());
+        second.unwrap();
+        assert!(
+            !old.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        provider.shutdown().await.unwrap();
+        provider.rollback().await.unwrap();
+        assert!(provider.watch().await.is_err());
+    }
 
     #[test]
     fn extreme_durations_are_rejected_before_resolver_construction() {

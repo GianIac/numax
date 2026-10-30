@@ -251,6 +251,7 @@ async fn exhausted_repair_budget_defers_then_recovers_without_losing_history() {
     );
     assert!(!budget.lock().unwrap().admit(1, StdInstant::now()));
     b.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
+        store: Arc::clone(&b.store),
         jitter_seed: 42,
         repair_budget: budget,
         history_cursors: Arc::clone(&b.history_cursors),

@@ -1,6 +1,41 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_gcounter_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        local_increment(&ha, "manual-g", 3).await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_counter(&b, "manual-g", 3).await;
+        local_increment(&hb, "manual-g", 2).await;
+        wait_for_counter(&a, "manual-g", 5).await;
+        assert_eq!(
+            read_materialized(&sa, "manual-g"),
+            read_materialized(&sb, "manual-g")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &read_durable_gcounter_state(&sa, "manual-g")
+                    .to_json()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &read_durable_gcounter_state(&sb, "manual-g")
+                    .to_json()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_push_ops_materializes_on_peer() {
     let key = "visits";
     let addr_a = free_addr();
