@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 520" width="600" height="520" role="img" aria-labelledby="title desc">
+<title id="title">Certificate-bound protocol identity</title><desc id="desc">The protocol NodeId is derived from SHA-256 of the certificate public key SPKI, truncated to sixteen bytes and encoded as lowercase hexadecimal.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#59677d"/></marker></defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#202c40}.node{fill:#f3f1ff;stroke:#8271bd;stroke-width:1.5}.good{fill:#eaf8f2;stroke:#368565}.warn{fill:#fff3e8;stroke:#b47a3b}.muted{fill:#f1f3f7;stroke:#8692a4}.edge{fill:none;stroke:#59677d;stroke-width:1.6;marker-end:url(#arrow)}.label{font-size:14px;paint-order:stroke;stroke:white;stroke-width:6px;stroke-linejoin:round}.sub{font-size:14px;fill:#47566d}</style>
+<rect width="600" height="520" rx="12" fill="white"/>
+<text x="300.0" y="30" text-anchor="middle" font-size="20" font-weight="600">Certificate-bound protocol identity</text>
+<path class="edge" d="M300.0,125 L300.0,165"/>
+<path class="edge" d="M300.0,225 L300.0,265"/>
+<path class="edge" d="M300.0,325 L300.0,365"/>
+<path class="edge" d="M300.0,425 L300.0,465"/>
+<rect class="node " x="110" y="65" width="380" height="60" rx="9"/>
+<text x="300.0" y="85.0" text-anchor="middle" font-size="16" font-weight="600">Peer certificate</text>
+<text class="sub" x="300.0" y="106.0" text-anchor="middle">DER encoding</text>
+<rect class="node " x="110" y="165" width="380" height="60" rx="9"/>
+<text x="300.0" y="185.0" text-anchor="middle" font-size="16" font-weight="600">Extract public-key SPKI</text>
+<text class="sub" x="300.0" y="206.0" text-anchor="middle">Hash its DER bytes with SHA-256</text>
+<rect class="node " x="110" y="265" width="380" height="60" rx="9"/>
+<text x="300.0" y="285.0" text-anchor="middle" font-size="16" font-weight="600">Take first 16 hash bytes</text>
+<text class="sub" x="300.0" y="306.0" text-anchor="middle">128-bit identity</text>
+<rect class="node good" x="110" y="365" width="380" height="60" rx="9"/>
+<text x="300.0" y="385.0" text-anchor="middle" font-size="16" font-weight="600">Encode lowercase hexadecimal</text>
+<text class="sub" x="300.0" y="406.0" text-anchor="middle">32-character protocol NodeId</text>
+<rect class="node muted" x="65" y="465" width="470" height="38" rx="9"/>
+<text x="300.0" y="489.0" text-anchor="middle" font-size="16" font-weight="600">Compare with claimed NodeId during admission</text>
+</svg>

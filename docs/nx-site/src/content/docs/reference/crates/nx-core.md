@@ -107,6 +107,20 @@ The CLI also shuts the runtime down if an earlier step fails.
 | `wait_until_shutdown()` | Blocks until an OS shutdown signal regardless of whether sync is enabled; used by daemon processes |
 | `shutdown_with_timeout(dur)` | Stops sync manager, flushes sled store, shuts down observability server. Bounded by `dur` (default 30s) |
 
+### Runtime peer control
+
+| API | Result |
+| --- | --- |
+| `RuntimeManagement::add_peer(address)` | `PeerRegistration { address, created }` after manual-candidate persistence and publication. |
+| `SyncHandle::add_peer(address)` | The same candidate-registration path for embedded callers. |
+| `RuntimeIntrospection::inspect_peers(view, cursor, limit)` | `ControlPage<PeerObservation>` for candidates, connections, membership or recovery. |
+
+`PeerView` selects the observation family. `PeerAcceptanceUncertain` indicates
+that persistence may have completed without confirmation; retry the same
+canonical endpoint after resolving the underlying failure. A successful
+registration does not establish a remote identity or data readiness. See the
+[management contract](/numax/guides/management-api/#add-a-persistent-peer-candidate).
+
 ### Module compilation cache
 
 Modules are compiled once and cached in a `Mutex<HashMap<[u8; 32], Module>>`, keyed by
@@ -179,6 +193,10 @@ Peers alone do not enable sync - a node must also listen.
 | `reconnect_max_delay` | 30s |
 | `peer_dead_after_failures` | 3 |
 | `anti_entropy_interval` | 30s |
+| `gossip_fanout_constant` / `gossip_max_fanout` | 3 / 64 |
+| `gossip_rate.min_bytes_per_second` | 65,536 |
+| `gossip_rate.max_bytes_per_second` | 4,194,304 |
+| `gossip_rate.burst_bytes` | 256 KiB |
 | `serialization_format` | `Bincode` |
 
 ---
@@ -191,8 +209,9 @@ from guest modules and the network layer in `nx-net`.
 The default constructor wraps configured peers in `StaticDiscovery` and remains
 backward-compatible. Integrations can use `SyncManager::try_new_with_discovery`
 with named `DiscoveryProvider` values and `DiscoveryRuntimeConfig`. The manager
-keeps one bounded candidate snapshot shared by initial connection, reconnect and
-anti-entropy, while `SyncHandle::active_connections()` exposes transport and
+keeps one bounded candidate snapshot for initial connection and reconnect.
+Anti-entropy instead uses all active data connections, including inbound peers
+and peers no longer in discovery, while `SyncHandle::active_connections()` exposes transport and
 identity-verification details separately.
 
 ### Peer discovery API
@@ -302,7 +321,7 @@ schema evolution in `schema.rs` and `migration.rs`.
 - Peer broadcast queue (bounded by `queued_ops_limit`)
 
 **What it does not own:**
-- TCP connections and TLS (delegated to `nx-net::SyncNode`)
+- TCP connections and TLS (delegated to `nx-net::Node`)
 - CRDT data structures and merge logic (delegated to `nx-sync`)
 - Sled store (shared `Arc<NxStore>` from the `Runtime`)
 
@@ -312,7 +331,9 @@ schema evolution in `schema.rs` and `migration.rs`.
 broadcast endpoint owned by `SyncManager`. Its public submission method owns the
 reserve, persistence and enqueue sequence; direct Rust callers cannot access the
 queue or a persist-only mutation primitive. Host API functions use the same
-ordering internally so a full or closed queue rejects the call before storage.
+ordering internally: exhausted item slots or a closed queue reject the call
+before storage. Byte admission follows persistence; a rejected delivery attempt
+leaves the accepted operation recoverable through retained history or baseline.
 
 ```rust
 let handle = state.sync_handle.as_ref().ok_or(ERR_SYNC_DISABLED)?;
@@ -325,7 +346,7 @@ batches and disseminates accepted operations. It has no datastore,
 deduplication registry or op-log access; a failed send leaves the flushed replay
 record available for recovery.
 
-The [D1 local acceptance contract](/numax/design/peer-discovery/#d1--local-acceptance-and-durability)
+The [local acceptance contract](/numax/design/peer-discovery/#local-acceptance-and-durability)
 defines the persistence, result, retry and failure semantics of local CRDT
 mutations.
 
@@ -337,7 +358,7 @@ metadata: contiguous sequence, known-high sequence, sparse count,
 request ID), and `baseline_required`. A known maximum can reveal a gap;
 it does not advance the contiguous prefix. A missing replay source does not
 exclude recovery from another source. Legacy baseline requirements persist
-independently of new sequenced receipts. See [D2](/numax/design/peer-discovery/#d2--identity-missing-history-and-duplicates).
+independently of new sequenced receipts. See [receipt coverage](/numax/design/peer-discovery/#operation-identity-and-receipt-coverage).
 Unavailable evidence survives restart and is removed once its specific interval
 is covered, even if a different gap remains.
 

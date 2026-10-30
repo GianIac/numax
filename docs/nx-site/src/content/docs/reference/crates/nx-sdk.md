@@ -107,7 +107,7 @@ they do not retry after an error.
 
 ![Local CRDT write outcomes and guest retry boundary](/numax/diagrams/peer-discovery/local-crdt-outcomes.svg)
 
-The [D1 retry contract](/numax/design/peer-discovery/#retry-contract) defines the
+The [retry contract](/numax/design/peer-discovery/#retry-contract) defines the
 acceptance and recovery boundary. The existing API has no caller-provided
 idempotency token or lookup for a lost request. Reading the current CRDT value
 may help an application reconcile its state, but it cannot prove whether one

@@ -230,20 +230,28 @@ for most single-machine multi-node setups.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `max_peers` | integer | `64` | Maximum number of simultaneously connected peers |
-| `queued_ops_limit` | integer | `10000` | Maximum ops queued for broadcast before backpressure |
+| `queued_ops_limit` | integer | `10000` | Item capacity of each local/forwarding delivery queue |
 | `op_log_limit` | integer | `10000` | Maximum ops kept in the local op-log for anti-entropy |
 | `seen_ops_limit` | integer | `100000` | Maximum op IDs tracked for deduplication |
 | `max_message_size` | string | `16MiB` | Maximum sync message size. Accepts `KiB`, `MiB` or plain bytes |
 | `socket_timeout_secs` | integer | `30` | Socket read/write timeout in seconds. Must be > 0 |
 | `reconnect_initial_delay` | duration | `500ms` | Initial backoff before reconnecting to a lost peer |
 | `reconnect_max_delay` | duration | `30s` | Maximum backoff ceiling for reconnect attempts |
-| `peer_dead_after_failures` | integer | `3` | Consecutive failures before a peer is marked dead |
+| `peer_dead_after_failures` | integer | `3` | Consecutive dial failures before endpoint reconnect health becomes dead; separate from SWIM membership |
 | `anti_entropy_interval` | duration | `30s` | Interval between anti-entropy repair cycles |
+| `gossip_fanout_constant` | integer | `3` | Additive term in `ceil(log2(N)) + c`; zero is allowed |
+| `gossip_max_fanout` | integer | `64` | Maximum selected recipients per data batch |
+| `gossip_min_bytes_per_second` | integer | `65536` | Per-peer adaptive gossip rate floor |
+| `gossip_max_bytes_per_second` | integer | `4194304` | Per-peer adaptive gossip rate ceiling, at least the floor |
+| `gossip_burst_bytes` | string | `256KiB` | Per-peer byte-bucket burst allowance |
 
 `reconnect_initial_delay` and `reconnect_max_delay` must be provided together
 and `reconnect_initial_delay` must be ≤ `reconnect_max_delay`.
 
-All integer fields must be > 0.
+Limits must be positive except `gossip_fanout_constant`, which may be zero.
+These gossip controls are TOML settings, without dedicated CLI or environment
+overrides. Internal queue-byte and recovery ceilings are listed in
+[resource budgets](/numax/design/peer-discovery/#resource-budgets).
 
 ```toml
 [limits]
@@ -263,8 +271,8 @@ anti_entropy_interval = "60s"
 
 ## [discovery]
 
-Controls how peers are discovered in `v0.1.5`, the current Numax version.
-Dynamic discovery is available alongside backward-compatible static peer lists.
+Controls endpoint discovery. Static peer lists can contribute alongside a
+dynamic provider; persisted runtime additions form a separate manual source.
 
 | Field | Type | Default | Description |
 |---|---|---|---|

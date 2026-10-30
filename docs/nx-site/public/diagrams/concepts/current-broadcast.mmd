@@ -16,4 +16,4 @@ sequenceDiagram
     Broadcast->>Peers: History::Push via nx-net
     Peers->>Peers: Persist new operations before forwarding
     Note over Broadcast,Peers: Forwarding excludes sender, duplicates do not forward
-    Note over Broadcast,Peers: Topology repair remains open, anti-entropy repairs gaps
+    Note over Broadcast,Peers: Rotating neighbors reconnect; anti-entropy repairs gaps

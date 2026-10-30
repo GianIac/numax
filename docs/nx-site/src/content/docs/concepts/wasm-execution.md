@@ -89,11 +89,11 @@ WASM linear memory is a flat array of bytes. The module and the host share acces
 
 Most host functions follow the same ABI convention:
 
-```
-input:   (ptr: u32, len: u32)  ->  host reads len bytes from linear memory at offset ptr
-output:  (out_ptr: u32, out_cap: u32)  ->  host writes result into linear memory at out_ptr, up to out_cap bytes
-return:  i32  ->  byte count/status on success, negative error code on failure
-```
+| ABI component | Host behavior |
+| --- | --- |
+| Input `(ptr: u32, len: u32)` | Read `len` bytes from the guest's linear memory at `ptr`. |
+| Output `(out_ptr: u32, out_cap: u32)` | Write at most `out_cap` result bytes at `out_ptr`. |
+| Return `i32` | Byte count or status on success; negative error code on failure. |
 
 There are a few special cases: `time_now` and `time_monotonic` return `u64` directly,
 legacy `host_log` returns `()`, and `abort` traps instead of returning normally.

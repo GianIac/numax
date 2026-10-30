@@ -1,0 +1,10 @@
+flowchart TB
+    accTitle: PNCounter state merge
+    accDescr: Merge takes maxima for each positive and negative origin slot, then subtracts total negative counts from total positive counts.
+    A["Node A<br/>P[A] = 10; N[A] = 3; value = 7"]
+    B["Node B<br/>P[B] = 5; N[B] = 8; value = -3"]
+    Merge["Merge each origin slot by maximum<br/>P = {A:10, B:5}; N = {A:3, B:8}"]
+    Value["Visible value: 15 - 11 = 4"]
+    A --> Merge
+    B --> Merge
+    Merge --> Value

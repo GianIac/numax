@@ -1,0 +1,12 @@
+flowchart TB
+    accTitle: Node transport lifecycle
+    accDescr: Construct and validate without binding, take event receivers, start listener, then handle data and control work. Shutdown is explicit and owned.
+    Build["Construct and validate Node<br/>Optional bootstrap service"]
+    Receivers["Take event and control receivers<br/>Before starting consumers"]
+    Listen["Bind and start listener<br/>Returns actual socket address"]
+    Data["Data connections<br/>Inbound and outbound admission"]
+    Control["One-shot control / bootstrap<br/>Separate from active data peers"]
+    Build --> Receivers
+    Receivers --> Listen
+    Listen -->|"Running"| Data
+    Listen -->|"Running"| Control

@@ -465,9 +465,8 @@ membership identities and active data-peer identities, deduplicated by `NodeId`.
 Only active connections are recipients. They rotate in a deterministic order
 hashed by local identity and address; remote forwarding excludes the immediate
 sender. These TOML settings do not create or repair connections and have no
-dedicated CLI flags or environment overrides. The default `c = 3` is based on
-the [bounded calibration](/numax/design/peer-discovery/#fanout-calibration),
-not a universal delivery or latency guarantee.
+dedicated CLI flags or environment overrides. The default is `c = 3`; see the
+[fanout policy](/numax/design/peer-discovery/#fanout) for estimation and bounds.
 
 ### [discovery]
 

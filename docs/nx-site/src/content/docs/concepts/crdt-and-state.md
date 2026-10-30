@@ -133,14 +133,7 @@ let total: u64 = gcounter::value("counter:visits")?;
 
 **How it works:** two GCounters internally. One tracks increments (`P`), one tracks decrements (`N`). The visible value is `P - N`. Merge handles each GCounter independently.
 
-```
-Node A local slots: P[A]=10, N[A]=3  ->  value = 7
-Node B local slots: P[B]=5,  N[B]=8  ->  value = -3
-After merge:
-  P slots = { A: 10, B: 5  } -> sum P = 15
-  N slots = { A: 3,  B: 8  } -> sum N = 11
-  value = 15 - 11 = 4
-```
+![PNCounter merge preserves positive and negative per-origin slots and yields visible value 4.](/numax/diagrams/reference/pncounter-merge.svg)
 
 Overflow is handled with `saturating_add` and the final `i64` value is clamped to `[i64::MIN, i64::MAX]`.
 
@@ -248,16 +241,7 @@ let all_tags: Vec<String> = orset::elements("tags:item-1")?;
 
 Deletes are tombstones: the element id is added to a deleted-ids set. The element stays in the data structure (so parent links remain valid) but is invisible in `values()`. Children of deleted elements remain visible.
 
-```
-insert "a" at head -> id="op-1"
-insert "b" after "op-1" -> id="op-2"
-insert "c" after "op-2" -> id="op-3"
-values: ["a", "b", "c"]
-
-delete "op-2"
-values: ["a", "c"]
-ordered_ids (including tombstones): ["op-1", "op-2", "op-3"]
-```
+![Deleting the middle RGA element preserves its identity and the parent link to its visible child.](/numax/diagrams/reference/rga-tombstone.svg)
 
 ```rust
 use nx_sdk::crdt::rga;

@@ -1,0 +1,10 @@
+flowchart TB
+    accTitle: RGA deletion preserves parent links
+    accDescr: The deleted op-2 element remains as a tombstone. Its op-3 child stays reachable and visible.
+    A["a / op-1<br/>Head element"]
+    B["b / op-2<br/>Deleted: tombstone"]
+    C["c / op-3<br/>Child of op-2"]
+    Order["Internal order: op-1, op-2, op-3<br/>Visible values after delete: a, c"]
+    A --> B
+    B --> C
+    B -->|"Retain identity and links"| Order

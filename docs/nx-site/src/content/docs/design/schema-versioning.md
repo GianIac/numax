@@ -27,15 +27,47 @@ __nx/schema/<table-name>
 
 Its value is an eight-byte header:
 
-```text
-[magic: 4 bytes][schema version: u16 BE][table id: u16 BE]
-```
+![The eight-byte NXDB header contains magic, a big-endian schema version and a big-endian table ID.](/numax/diagrams/reference/schema-header.svg)
 
 The magic value is `NXDB`. Versions and table identifiers use big-endian
 encoding.
 
 The table identifier prevents valid metadata for one namespace from being
 accepted for another. Each table owns its schema version independently.
+
+## Manual candidate metadata
+
+The coordinator owns an additive version-1 namespace, independent of sync tables
+and membership. It consumes no CRDT operation or sequence number:
+
+| Key | Value |
+| --- | --- |
+| `__nx/discovery/manual/schema` | Eight bytes: `NXMP`, version `u16 BE` = 1, reserved `u16 BE` = 0 |
+| `__nx/discovery/manual/cluster` | Validated discovery cluster identifier |
+| `__nx/discovery/manual/peer/<canonical-endpoint>` | Empty value |
+
+Endpoints use the existing coordinator canonicalizer and at most 259 bytes.
+Loading uses pages of 64 records/32 KiB, records up to 512 bytes and at most
+`max_candidates` manual endpoints. Unknown keys, unsupported headers, invalid
+or noncanonical endpoints, nonempty peer values, partial namespaces and scope
+mismatches fail explicitly. Missing namespace means an empty manual source.
+Changing capacity must still accommodate the union with configured sources.
+
+The coordinator prepares the entire candidate mutation before storage. An
+exclusive write lease covers the atomic header/scope/endpoint batch and its
+flush. Only then is the prepared state published and the request confirmed.
+No live candidate is published on write/flush failure. An uncertain flush or
+crash can leave the complete record; a fresh start validates and confirms a
+covering flush before publishing survivors. A retry of the canonical address
+is idempotent. Cancellation of an HTTP waiter is not transaction cancellation.
+
+The namespace stores only candidates, never identity verification, membership,
+timers, sockets or replica readiness. It supplements configuration without
+changing CLI > NX_* > TOML > default precedence. No removal or TTL is provided.
+No historical manual format exists, so no migration is introduced. Future
+formats require an explicit migration. Existing sync schemas, wire protocol,
+`nx migrate` and historical fixture bytes are unchanged. This additive namespace
+alone is not a downgrade fence.
 
 ## Membership metadata
 
@@ -91,7 +123,7 @@ The next successful start confirms a new covering flush before publication.
 Losing the datastore or restoring an older backup does not guarantee a newer
 epoch and is outside this recovery contract.
 
-For the moment no historical membership format or upgrade migration is supported. Future
+No earlier membership format is supported. Future
 versions require an explicit migration path; this adapter rejects them without
 mutation. `nx migrate` still governs sync tables, not this separate namespace.
 Historical CRDT fixtures and current sync-table versions are unchanged. Older
@@ -197,14 +229,14 @@ receipt frontiers. Old operations are excluded from sequenced replay; incoming
 legacy replay is rejected even after its UUIDs have left the seen cache.
 A connected new peer therefore cannot infer historical convergence from a
 successful handshake or complete coverage of new operations. Recovery of that
-baseline uses the implemented, bounded D3 state-transfer contract. A source
+baseline uses the [bounded state-transfer contract](../peer-discovery/#bounded-state-transfer). A source
 with incomplete coverage, an oversized payload or an incompatible receiver cut
 may refuse recovery explicitly; no unrestricted lossless recovery is promised.
 
 A downgrade cannot safely write this store: the old writer would bypass sequence
 tracking. There is no reverse migration. Restoring an offline pre-upgrade backup
 is a separate operator action and does not preserve writes accepted since that
-backup. Mixed protocol-5/protocol-8 replication is also rejected; plan deployment
+backup. Mixed protocol-5/protocol-9 replication is also rejected; plan deployment
 for that communication interruption rather than assuming a rolling upgrade
 continues replication across the version boundary.
 
@@ -212,51 +244,10 @@ continues replication across the version boundary.
 
 ### Compatibility verification
 
-Historical fixtures are immutable logical-store records produced by their
-release encoders. They include source tags, pinned commits and reproduction
-instructions; current encoders must not regenerate them to fit a migration.
-
-| Fixture | Contents |
-| --- | --- |
-| `sync_manager/fixtures/v0_1_0/` | Unversioned sync records and operation payloads |
-| `sync_manager/fixtures/v0_1_5/` | Six CRDT families, tombstones, seen IDs, UUID-only replay, schema-1 headers and an application key |
-
-Verification reconstructs disposable stores and checks the following boundaries:
-
-- Payload bytes and unrelated application records survive migration unchanged.
-- Record checkpoints resume after reopen, including partially converted receipts.
-- Storage rejection or corrupted input does not advance the failed record's checkpoint.
-- Final schema headers and checkpoint removal remain atomic across process termination.
-- Legacy replay remains rejected after real seen-ID and op-log eviction.
-- A new sequence frontier does not establish receipt of a historical baseline.
-- Baseline installation preserves full internal state, receipt coverage and legacy
-  provenance across restart, delayed duplicates and flush failure.
-- Recovery refusal remains specific to the requested source and current coverage;
-  an alternate source can still complete recovery.
-
-Focused verification entry points:
-
-```sh
-cargo test -p nx-core baseline_
-cargo test -p nx-core v015
-cargo test -p nx-core sequence_v1_migration
-cargo test -p nx-core migrates_fixture_generated_by_v0_1_0
-cargo test -p nx-net
-```
-
-For real-process compatibility, build `examples/distributed_counter` for
-`wasm32-unknown-unknown`, build `nx-cli` from the pinned v0.1.5 sources, set
-`NUMAX_PREVIOUS_NX_BIN` to that release binary, then run:
-
-```sh
-cargo test -p nx-cli --test multiprocess_smoke \
-  different_protocol_versions_reject_connection_without_exchanging_ops \
-  -- --exact --ignored
-```
-
-These tests require local TCP sockets; the process-crash test also requires
-permission to spawn and terminate its child process. They never operate on an
-operator's datastore.
+Historical fixtures are immutable release-generated records. Their original
+encoders, source tags and payload bytes are preserved; migration does not
+regenerate them using the current format. Reproduction procedures are in the
+[contributor validation notes](https://github.com/GianIac/numax/blob/v0.1.6/docs/development/peer-discovery-validation.md#storage-compatibility-verification).
 
 ## Startup validation
 

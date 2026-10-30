@@ -423,12 +423,7 @@ serialization format tag, followed by either JSON or bincode encoded message
 data. Bincode is the default production format; JSON is selected with
 `--debug-protocol` for inspectability.
 
-```
-┌──────────────┬──────────────┬─────────────────────────────┐
-│ Length (4B)  │ Format (1B)  │ JSON or bincode payload      │
-│ big-endian   │              │                             │
-└──────────────┴──────────────┴─────────────────────────────┘
-```
+![Peer framing consists of a four-byte payload length, a one-byte format tag and the encoded message.](/numax/diagrams/reference/wire-frame.svg)
 
 **Implemented message types:**
 
@@ -436,33 +431,35 @@ data. Bincode is the default production format; JSON is selected with
 |---------|-----------|-------------|
 | `Hello` | Client → Server | Initial handshake with NodeId, protocol version, supported formats and preferred format |
 | `HelloAck` | Server → Client | Handshake confirmation with selected serialization format |
-| `PushOps` | Bidirectional | Sends a batch of CRDT operations |
-| `PushOpsAck` | Bidirectional | Confirms reception of operations |
-| `PullSince` | Client → Server | Requests operations after a given OpId |
-| `Ping` | Bidirectional | Keepalive |
-| `Pong` | Bidirectional | Response to Ping |
-| `Error` | Bidirectional | Structured rejection or failure |
-| `BootstrapHello` | Client → Seed | One-shot authenticated bootstrap request, cluster and optional endpoint advertisement |
-| `BootstrapAck` | Seed → Client | Seed identity, cluster, negotiated format and bounded endpoint suggestions with a lease |
+| `PushOps` / `PullSince` | Bidirectional | Legacy public codec helpers; the development sync path uses sequenced history instead |
+| `PushOpsAck` | Bidirectional | Legacy acknowledgement variant; the current sync path does not use it to confirm receipt or durability |
+| `Ping` / `Pong` | Bidirectional | Transport keepalive; not a correlated membership probe |
+| `History` | Bidirectional | Sequenced pushes, summaries, replay and bounded baseline recovery |
+| `ControlHello` / `ControlAck` | One-shot RPC | Independent membership exchange and correlated direct/indirect probing |
+| `BootstrapHello` / `BootstrapAck` | One-shot RPC | Bounded endpoint discovery; candidates require a separate admission handshake |
 
-**Protocol versioning:** version number (`PROTOCOL_VERSION = 5`) exchanged during the handshake. Version mismatches are rejected during handshake to avoid mixed-version wire ambiguity. Version `4` belongs to Numax `v0.1.4` and is not wire-compatible with `v0.1.5`.
+**Protocol versioning:** the development checkout uses `PROTOCOL_VERSION = 9`;
+the v0.1.5 wire contract was version `5`. Peers exchange the version during
+handshake and reject mismatches before admission or CRDT exchange. See
+[wire versioning](/numax/design/wire-versioning/) for the compatibility policy.
 
-**Current status:**
+**Current development implementation:**
 
-- TCP + TLS 1.3 + mTLS channel *(Implemented)*;
-- handshake, push/pull, anti-entropy pull requests and keepalive *(Implemented)*;
-- peer connection limit, queued-op limit, message-size limit and socket read/write timeouts *(Implemented)*;
-- automatic reconnect with exponential backoff, peer health tracking and peer rotation *(Prototype)*;
-- periodic anti-entropy after missed pushes/reconnects *(Prototype)*;
-- bounded OpId deduplication and persisted dedup metadata *(Prototype)*;
-- static, bootstrap, mDNS, DNS-SRV and file discovery through CLI, environment and TOML configuration *(Implemented)*;
-- peer-to-peer gossip with K-fanout: architecture defined, SWIM membership and K-fanout dissemination remain future work *(Prototype)*.
+- TCP, optional TLS/mTLS, identity checks and serialization negotiation;
+- bounded connections, queues, frames, byte budgets and socket deadlines;
+- static, bootstrap, mDNS, DNS-SRV and file discovery;
+- SWIM/Lifeguard membership with independent control traffic;
+- K-fanout dissemination, rotating neighbors and recovery contacts;
+- load/RTT adaptation, jitter and bounded retry work;
+- persisted operation identity, sequenced replay and bounded baseline recovery;
+- runtime manual peer registration and separate candidate, membership,
+  connection and recovery introspection.
 
 ### 5.5 Channel security *(Implemented)*
 
-Numax assumes a hostile network: the transport can be observed, altered or redirected. Communications between nodes happen by default over encrypted and authenticated channels.
+Numax assumes a hostile network: the transport can be observed, altered or redirected. Encrypted and authenticated communication requires TLS/mTLS configuration; plaintext transport is also supported.
 
-**Guaranteed today:**
+**With TLS/mTLS configured:**
 
 - **Confidentiality** - TLS 1.3 encrypts all traffic between nodes.
 - **Integrity** - TLS 1.3 protects against payload tampering.
@@ -925,7 +922,7 @@ Numax is not AI. It is one of the things that AI can, comfortably, run on top of
 
 `v0.1.5` is the current stable release, building on the first stable `v0.1.0` line. We recognize its limits explicitly:
 
-- **Network resilience is still prototype-grade.** `v0.1.5` combines automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup with static, bootstrap, mDNS, DNS-SRV and file discovery. SWIM membership and K-fanout gossip remain future work. Local startup readiness is not peer or CRDT convergence. Recovery depends on retained operation and deduplication history, not merely on rediscovery; unrestricted lossless recovery is not guaranteed.
+- **Network resilience is still prototype-grade.** `v0.1.5` combines automatic reconnect, peer health tracking, peer rotation, anti-entropy and bounded dedup with static, bootstrap, mDNS, DNS-SRV and file discovery. SWIM membership and K-fanout gossip are implemented in the v0.1.6 development branch, whose release acceptance targets remain under validation. Local startup readiness is not peer or CRDT convergence. Recovery depends on retained operation and deduplication history, not merely on rediscovery; unrestricted lossless recovery is not guaranteed.
 - **Deduplication is bounded.** Recent duplicate remote operations are prevented across restart, but this is not an infinite causal history. Stronger guarantees would require a fuller durable op-log/causal metadata strategy.
 - **TLS/mTLS is implemented, but not yet hardened for all scenarios.** It is solid enough for controlled scenarios (dev, lab, defined deployments); the full hardening (rotation, advanced pinning, extreme hostile scenarios) continues.
 - **Observability is operational but intentionally small.** Structured logs, Prometheus-compatible metrics, health checks, a ready-made Prometheus/Grafana stack, a Grafana dashboard and PromQL examples are available. Deeper tracing and richer built-in dashboards remain future work.
@@ -971,32 +968,22 @@ In closing, I love software and I love numax.
 
 ## Appendix A - Repository structure
 
-```
-numax/
-├── Cargo.toml              # Workspace manifest
-├── crates/
-│   ├── nx-core/            # WASM Runtime + Host API + SyncManager
-│   ├── nx-api/             # Authenticated Management API and HTTP lifecycle
-│   ├── nx-store/           # Local datastore (sled)
-│   ├── nx-sync/            # Pure CRDT data structures and operations
-│   ├── nx-net/             # Networking, protocol, TLS/mTLS
-│   ├── nx-sdk/             # SDK for WASM guests
-│   └── nx-cli/             # CLI
-├── examples/
-│   ├── distributed_counter/
-│   ├── distributed_inventory/
-│   ├── distributed_status/
-│   ├── distributed_tags/
-│   ├── distributed_settings/
-│   ├── distributed_comments/
-│   └── vote_tally_tls/
-├── docs/
-│   ├── nx-site/src/content/docs/reference/host-api.md
-│   ├── nx-site/src/content/docs/whitepaper/index.md
-│   ├── nx-site/src/content/docs/roadmap/index.md
-│   └── nx-site/            # Starlight documentation site
-└── LICENSE
-```
+| Path | Contents |
+| --- | --- |
+| `Cargo.toml` | Rust workspace manifest. |
+| `crates/nx-core/` | WASM runtime, host API, discovery, membership and replication. |
+| `crates/nx-api/` | Authenticated Management API and HTTP lifecycle. |
+| `crates/nx-store/` | Local sled datastore. |
+| `crates/nx-sync/` | CRDT structures and operation types. |
+| `crates/nx-net/` | Peer transport, framing and TLS/mTLS. |
+| `crates/nx-sdk/` | WASM guest SDK. |
+| `crates/nx-cli/` | CLI, configuration and service composition. |
+| `examples/` | Guest modules and distributed examples for counters, inventory, registers, sets, maps and sequences. |
+| `fuzz/` | Fuzz targets with a separate Cargo lockfile. |
+| `docs/nx-site/` | Starlight documentation site, reference and roadmap. |
+| `docs/api/openapi.yaml` | Management API contract. |
+| `docs/development/` | Contributor validation procedures and recorded experiments. |
+| `LICENSE` | Project license. |
 
 ---
 

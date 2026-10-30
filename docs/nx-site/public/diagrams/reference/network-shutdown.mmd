@@ -1,0 +1,13 @@
+flowchart TB
+    accTitle: Network shutdown uses one grace period
+    accDescr: Shutdown closes admissions and bootstrap state, allows all owned network tasks a single total three-second grace, then aborts remaining tasks and clears peers.
+    Stop["Serialize shutdown and close task registry"]
+    Signal["Signal stop and close admission slots<br/>Clear bootstrap advertisement and cache"]
+    Grace["Join owned network tasks<br/>One total 3 s grace period"]
+    Abort["Abort and join remaining tasks<br/>After shared deadline"]
+    Clear["Clear peers and release resources<br/>Writers and remaining connection permits"]
+    Stop --> Signal
+    Signal --> Grace
+    Grace -->|"If tasks remain"| Abort
+    Abort --> Clear
+    Grace -->|"All tasks finished"| Clear

@@ -79,24 +79,21 @@ establish that a listen address can be bound or a peer reached.
 
 ### Node lifecycle
 
-```
-Node::try_new(config)?          validate before constructing; no socket binding yet
-Node::try_new_with_bootstrap_server(config, bootstrap)?
-                               validate and enable the one-shot bootstrap service
-  └── take_event_receiver()     take the event channel before starting
-  └── start_listener()          bind TCP, spawn listener task, returns bound SocketAddr
-  └── connect_to_peer(addr)     dial, TLS, handshake, register, spawn read loop
-  └── connection_info(addr)     transport, direction and verified/claimed identity
-  └── announce_bootstrap_endpoint(addr)  publish the local bootstrap suggestion
-  └── withdraw_bootstrap_endpoint()      remove that suggestion
-      ...running...
-  └── broadcast_history(message)        send sequenced history to all connected peers
-  └── send_history_to_addr(addr, message)
-  └── broadcast_ops(ops)        legacy unsequenced codec; not accepted by the sync manager
-  └── send_ops_to_addr(addr, ops)
-  └── send_pull_since_to_addr(addr, since_op_id)
-  └── shutdown()                sends true on shutdown_tx, waits for tasks (3s grace), drops peers
-```
+![Node construction, receiver ownership and listener startup precede independent data and one-shot control work.](/numax/diagrams/reference/network-lifecycle.svg)
+
+| Method | Responsibility |
+| --- | --- |
+| `try_new(config)` | Validate without binding sockets. |
+| `try_new_with_bootstrap_server(config, bootstrap)` | Also configure the optional one-shot bootstrap service. |
+| `take_event_receiver()` / `take_control_receiver()` | Transfer ownership of data events / control requests to consumers. |
+| `start_listener()` | Bind TCP, own the listener task and return its actual socket address. |
+| `connect_to_peer(addr)` | Dial, apply TLS/handshake policy and admit a data connection. |
+| `connection_info(addr)` | Inspect transport direction, identity and verification. |
+| `announce_bootstrap_endpoint(addr)` / `withdraw_bootstrap_endpoint()` | Manage the local bootstrap advertisement. |
+| `broadcast_history(message)` / `send_history_to_addr(addr, message)` | Send sequenced history over data connections. |
+| `prepare_history_to_addr()` / `send_prepared_history_with_timeout()` | Encode for the negotiated connection generation, then send within a writer budget. |
+| `broadcast_ops()` / `send_ops_to_addr()` / `send_pull_since_to_addr()` | Legacy unsequenced codec helpers; rejected by the current sync path. |
+| `shutdown()` | Stop admissions, retire owned tasks and close connections. |
 
 ### NodeEvent
 
@@ -119,21 +116,28 @@ of the `Node` so the sync manager owns it.
 
 ## Connection flow
 
-### Outbound (dialer)
+### Data connection admission
 
-```
-connect_to_peer(addr)
-  1. reject a duplicate attempt for the same endpoint and acquire the bounded outbound-attempt slot
-  2. acquire connection semaphore slot (PeerLimitReached if full)
-  3. TCP connect with socket_timeout and retain the actual transport address
-  4. TLS handshake (if configured)
-  5. capture peer_cert DER bytes
-  6. send Hello { node_id, protocol_version, supported_formats, preferred_format }
-  7. receive HelloAck { node_id, protocol_version, selected_format }
-  8. validate protocol version == PROTOCOL_VERSION (7) and reject the local NodeId
-  9. if TLS and not insecure: derive NodeId from peer cert, verify == claimed node_id
-  10. if allowlist configured: verify peer_node_id in allowed_peers
-  11. insert PeerConnection and its `PeerConnectionInfo` into the peers map
+![A dialer and listener exchange Hello and HelloAck before admitting the data connection.](/numax/diagrams/concepts/peer-handshake.svg)
+
+The dialer rejects duplicate endpoint attempts and acquires bounded attempt and
+connection slots before opening TCP/TLS. Both sides validate protocol version,
+serialization format and peer identity before admitting a data connection.
+TLS certificate binding and the allowlist apply when configured; a plaintext
+handshake does not authenticate the claimed identity.
+
+### Inbound routing
+
+The listener applies the socket deadline, optional TLS and a bounded first-frame
+read, then routes the request by its opening message:
+
+| Opening message | Processing | Result |
+| --- | --- | --- |
+| `Hello` | Validate version, negotiate format, verify identity and acquire data admission capacity. | `HelloAck`, active peer registration and a data read loop. |
+| `BootstrapHello` | Validate identity, bootstrap service, cluster and request bounds. | `BootstrapAck`, then close; no active data peer registration. |
+| `ControlHello` | Validate version, identity and control owner; use independent bounded control capacity. | Correlated `ControlAck`, then close; no active data peer registration. |
+
+`PeerConnectionInfo` into the peers map
   12. emit PeerConnected event and spawn the read loop
 ```
 
@@ -160,9 +164,7 @@ facts only and do not change the wire format.
 
 Every message is framed as:
 
-```
-[4 bytes BE length][1 byte format][payload bytes]
-```
+![A four-byte big-endian length precedes the format tag and encoded message.](/numax/diagrams/reference/wire-frame.svg)
 
 - Length is the total of `format byte + payload`, encoded as big-endian `u32`.
 - Format byte: `0x01` = JSON, `0x02` = bincode.
@@ -171,7 +173,7 @@ Every message is framed as:
   bootstrap-only variants remain private so the exhaustive public enums retain
   their 0.1.4 source-compatible shape.
 
-`PROTOCOL_VERSION = 7`. Version mismatch during a recognized handshake causes a structured
+`PROTOCOL_VERSION = 9`. Version mismatch during a recognized handshake causes a structured
 `WireError::ProtocolMismatch` and immediate disconnect.
 
 ### Protocol message variants
@@ -187,9 +189,10 @@ Every message is framed as:
 | `Error` | both | Structured wire error: `ProtocolMismatch`, `OpRejected`, `RateLimited`, `NotAuthorized`, `Internal` |
 | `BootstrapHello` *(private wire variant)* | client -> seed | One-shot identity, format, cluster, optional endpoint advertisement and result limit |
 | `BootstrapAck` *(private wire variant)* | seed -> client | Seed identity, format, cluster, bounded candidates and lease |
-| `History` *(private wire variant)* | both | Sequenced pushes, summary requests/replies and bounded range recovery |
+| `History` *(private wire variant)* | both | Sequenced pushes, summaries, bounded range and baseline recovery |
+| `ControlHello` / `ControlAck` *(private wire variants)* | one-shot RPC | Membership exchange and correlated probing with independent control budgets |
 
-The protocol-7 private `History` variant carries `HistoryMessage` exchanges.
+The private `History` variant carries `HistoryMessage` exchanges.
 Range requests and responses carry a required `request_id`; replies from an
 expired or superseded attempt cannot complete a current request.
 Use `Node::broadcast_history` / `send_history_to_addr`; received messages become
@@ -239,12 +242,11 @@ exponential backoff.
 
 When a bincode node connects to a JSON-only debug node:
 
-```
-dialer sends: supported_formats = [Bincode, Json], preferred = Bincode
-listener picks: first format in dialer's list that listener supports
-result: Json (because listener only supports Json)
-HelloAck selected_format = Json
-```
+| Stage | Value |
+| --- | --- |
+| Dialer advertises | `[Bincode, Json]`, preferred `Bincode` |
+| Listener supports | `Json` |
+| Negotiated format in `HelloAck` | `Json`, the first common format in the dialer's list |
 
 A `--debug-protocol` node (JSON only) always negotiates JSON with any peer.
 A standard node advertises both and prefers bincode.
@@ -301,13 +303,7 @@ pub struct TlsConfig {
 After TLS handshake, the node verifies the claimed NodeId in `Hello`/`HelloAck` against
 the identity derived from the peer's X.509 certificate:
 
-```
-derive_protocol_node_id_from_cert(peer_cert_der)
-  -> SHA-256 of SubjectPublicKeyInfo bytes
-  -> first 16 hash bytes
-  -> 32 lowercase hex chars
-  -> NodeId(hex_prefix)
-```
+![Derive the protocol NodeId from certificate SPKI using SHA-256, 16-byte truncation and lowercase hexadecimal.](/numax/diagrams/reference/certificate-identity.svg)
 
 If the claimed NodeId does not match the cert-derived one, the connection is rejected with
 `NetError::TlsError("node_id mismatch ...")`.
@@ -343,18 +339,12 @@ The permit is dropped when the `PeerConnection` is removed from the peers map (o
 
 ## Cooperative shutdown
 
-Shutdown uses a `tokio::sync::watch` channel. `shutdown_tx` is a `watch::Sender<bool>`.
-All background tasks subscribe with `shutdown_tx.subscribe()` and select on `shutdown_rx.changed()`.
+Shutdown serializes callers, closes admissions and signals owned tasks through
+a `tokio::sync::watch` channel. All network tasks share one total three-second
+grace period; the deadline is not renewed for each task. Remaining tasks are
+aborted and joined before peer writers are released.
 
-```
-Node::shutdown()
-  1. shutdown_tx.send(true)
-  2. collect all JoinHandles from tasks Vec
-  3. for each task: timeout(3s, task).await
-     - if task does not finish in 3s: task.abort()
-  4. peers.clear() -> drops all PeerConnection -> drops all semaphore permits
-  5. clear the bootstrap advertisement and leased requester cache
-```
+![Network tasks share a single three-second grace period before residual tasks are aborted and joined.](/numax/diagrams/reference/network-shutdown.svg)
 
 Read loops check the shutdown signal on every iteration via `tokio::select!`.
 Listener loop checks it between accept calls.

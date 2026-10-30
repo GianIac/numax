@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 630" width="600" height="630" role="img" aria-labelledby="title desc">
+<title id="title">Network shutdown uses one grace period</title><desc id="desc">Shutdown closes admissions and bootstrap state, allows all owned network tasks a single total three-second grace, then aborts remaining tasks and clears peers.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#59677d"/></marker></defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#202c40}.node{fill:#f3f1ff;stroke:#8271bd;stroke-width:1.5}.good{fill:#eaf8f2;stroke:#368565}.warn{fill:#fff3e8;stroke:#b47a3b}.muted{fill:#f1f3f7;stroke:#8692a4}.edge{fill:none;stroke:#59677d;stroke-width:1.6;marker-end:url(#arrow)}.label{font-size:14px;paint-order:stroke;stroke:white;stroke-width:6px;stroke-linejoin:round}.sub{font-size:14px;fill:#47566d}</style>
+<rect width="600" height="630" rx="12" fill="white"/>
+<text x="300.0" y="30" text-anchor="middle" font-size="20" font-weight="600">Network shutdown uses one grace period</text>
+<path class="edge" d="M300.0,130 L300.0,170"/>
+<path class="edge" d="M300.0,245 L300.0,290"/>
+<path class="edge" d="M300.0,365 L300.0,410"/>
+<text class="label" x="300.0" y="379.5" text-anchor="middle">If tasks remain</text>
+<path class="edge" d="M300.0,475 L300.0,520"/>
+<path class="edge" d="M100,327.5 L45,327.5 L45,552.5 L100,552.5"/>
+<text class="label" x="34" y="440" text-anchor="middle" transform="rotate(-90 34 440)">All tasks finished</text>
+<rect class="node " x="100" y="65" width="400" height="65" rx="9"/>
+<text x="300.0" y="102.5" text-anchor="middle" font-size="16" font-weight="600">Serialize shutdown and close task registry</text>
+<rect class="node " x="100" y="170" width="400" height="75" rx="9"/>
+<text x="300.0" y="197.5" text-anchor="middle" font-size="16" font-weight="600">Signal stop and close admission slots</text>
+<text class="sub" x="300.0" y="218.5" text-anchor="middle">Clear bootstrap advertisement and cache</text>
+<rect class="node " x="100" y="290" width="400" height="75" rx="9"/>
+<text x="300.0" y="317.5" text-anchor="middle" font-size="16" font-weight="600">Join owned network tasks</text>
+<text class="sub" x="300.0" y="338.5" text-anchor="middle">One total 3 s grace period</text>
+<rect class="node warn" x="100" y="410" width="400" height="65" rx="9"/>
+<text x="300.0" y="432.5" text-anchor="middle" font-size="16" font-weight="600">Abort and join remaining tasks</text>
+<text class="sub" x="300.0" y="453.5" text-anchor="middle">After shared deadline</text>
+<rect class="node good" x="100" y="520" width="400" height="65" rx="9"/>
+<text x="300.0" y="542.5" text-anchor="middle" font-size="16" font-weight="600">Clear peers and release resources</text>
+<text class="sub" x="300.0" y="563.5" text-anchor="middle">Writers and remaining connection permits</text>
+</svg>

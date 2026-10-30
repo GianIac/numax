@@ -10,24 +10,20 @@ independent from the Numax release version.
 
 The current value is defined in `crates/nx-net/src/message.rs`.
 
-The v0.1.6 development checkout uses `9`. Version `5`, shipped by v0.1.5,
-introduced the one-shot bootstrap handshake described below. The development
-protocol `6` introduced sequenced replication and bounded history exchange;
-version `7` added required attempt identifiers to range requests, replay pages,
-and unavailable-range responses. Version `8` adds bounded, versioned full CRDT
-baseline recovery. Version `9` adds isolated membership control RPCs.
-Exact version matching rejects earlier development protocols
-and v0.1.5 before peer registration or CRDT exchange.
+The v0.1.6 development runtime uses **protocol 9**. The released v0.1.5 runtime
+uses protocol 5. Exact version matching rejects incompatible peers before
+registration or CRDT exchange.
 
-Protocol 8 retains the private `History` variant after the existing private
-bootstrap variants. Its messages carry sequenced operations, paginated
-per-origin summaries, replay interval requests and pages, unavailable-range
-responses, and baseline requests/results. The UUID `Op`, existing public `MessageKind` discriminants, and frozen
-v0.1.4/v0.1.5 codec fixtures are preserved. A history summary advertises known
-existence; it is neither a contiguous receipt frontier nor a durability ACK.
-Range responses must match the pending source connection, origin, request ID,
-unexpired deadline and requested interval. Retried requests receive fresh IDs;
-late responses cannot complete or mark unavailable a later attempt.
+Protocol 9 includes bootstrap, sequenced history exchange, bounded baseline
+transfer and isolated membership control RPCs. The UUID `Op` and existing public
+`MessageKind` discriminants retain their frozen codec fixtures; that byte
+stability does not provide cross-version network compatibility.
+
+History messages carry pushes, summaries, correlated range requests/replay,
+unavailable ranges and baseline requests/results. A summary advertises known
+existence, not contiguous receipt or storage durability. Range responses must
+match the pending source, origin, request ID, unexpired deadline and interval.
+Retried requests use fresh IDs; late responses cannot complete a newer attempt.
 
 ## Compatibility policy
 
@@ -152,26 +148,15 @@ the legacy public `MessageKind` layout and adds a private
 exchange is an alternative one-shot handshake on the normal peer listener; it
 does not turn into a replication connection.
 
-```text
-client -> seed: BootstrapHello {
-  node_id,
-  protocol_version: 5,
-  supported_formats,
-  preferred_format,
-  cluster_id,
-  advertised_endpoint?,
-  max_results
-}
+![One-shot bootstrap exchange, with validation before endpoint suggestions](/numax/diagrams/concepts/bootstrap-handshake.svg)
 
-seed -> client: BootstrapAck {
-  node_id,
-  protocol_version: 5,
-  selected_format,
-  cluster_id,
-  candidates,
-  candidate_ttl_ms
-}
-```
+| Message | Required fields |
+| --- | --- |
+| `BootstrapHello` | `node_id`, `protocol_version`, supported/preferred formats, `cluster_id`, optional advertised endpoint and `max_results`. |
+| `BootstrapAck` | `node_id`, `protocol_version`, selected format, `cluster_id`, candidates and `candidate_ttl_ms`. |
+
+This exchange was introduced in protocol 5. Current peers send protocol 9 and
+still require an exact version match.
 
 The seed validates the exact protocol version, negotiates JSON or Bincode,
 authenticates the requester's claimed `NodeId` through the same TLS certificate
@@ -232,13 +217,9 @@ Frozen protocol-7 history frames and older public codec fixtures remain
 compatibility references. They describe their encoded layouts and do not grant
 mixed-version admission.
 
-The real-process entry point is
-`different_protocol_versions_reject_connection_without_exchanging_ops` in
-`crates/nx-cli/tests/multiprocess_smoke.rs`. CI builds the previous binary from
-`refs/tags/v0.1.5` and checks its peeled commit against
-`471a2281d0ffc8b7a3c20550320854812b8af726`. A mutable branch name does not identify
-that release artifact. Reproducible commands and prerequisites are listed under
-[Schema Versioning](/numax/design/schema-versioning/#compatibility-verification).
+Compatibility checks use frozen codec/store fixtures and a pinned v0.1.5 binary.
+The [validation notes](https://github.com/GianIac/numax/blob/v0.1.6/docs/development/peer-discovery-validation.md#storage-compatibility-verification)
+contain reproduction procedures and prerequisites.
 
 Exact matching interrupts replication between old and upgraded nodes during
 deployment. Persisted-data migration does not translate wire traffic or provide
@@ -246,7 +227,7 @@ mixed-version rolling replication. The
 [schema migration contract](/numax/design/schema-versioning/#upgrade-historical-state-and-downgrade-contract)
 defines offline upgrade, downgrade protection and the historical baseline boundary.
 Future baseline-format or membership additions follow the same versioning rules;
-protocol 8 does not reserve compatibility for arbitrary snapshots.
+the bounded baseline format does not reserve compatibility for arbitrary snapshots.
 
 ## Protocol 8 bounded baseline recovery
 
@@ -271,7 +252,7 @@ and flush the captured cut before responding. The receiver validates version,
 digest, structure, budgets and a cut dominating its applied history and internal
 state before atomic installation. The 1 MiB encoded payload, record/key limits,
 RGA validation and refusal cases are specified in the
-[D3 recovery contract](/numax/design/peer-discovery/#selected-bounded-recovery-contract).
+[D3 recovery contract](/numax/design/peer-discovery/#bounded-state-transfer).
 This is a limited recovery subset, not a general snapshot or backup protocol.
 
 Baseline attempts share the existing bounded per-peer/origin request map and

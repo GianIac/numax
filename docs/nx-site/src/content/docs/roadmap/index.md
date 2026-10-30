@@ -179,17 +179,13 @@ while peer discovery remains deliberately separated from authentication and auth
 
 **Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
 
-**Design doc as a public RFC**:
-- [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, approved design directions and remaining specifications
-- [x] Documented failure scenarios in the RFC
-
 **Replication correctness prerequisites**:
 - [x] Atomic local operation persistence: create `OpId` before persistence and commit CRDT state, materialized value, seen-operation metadata and replay record in one batch.
 - [x] Flush-confirmed local acceptance: return success only after a flush covering the batch; define uncertain outcomes, retry semantics and the bounded process-crash model.
 - [x] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics ([current contract](/numax/design/peer-discovery/#acknowledgement-semantics))
 - [x] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
-- [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([contract and evidence](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
-- [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#wireschema-evolution-and-historical-data-verification))
+- [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([compatibility contract](/numax/design/peer-discovery/#compatibility-and-limits))
+- [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#compatibility-and-limits))
 - [x] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
 - [x] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 
@@ -202,18 +198,21 @@ while peer discovery remains deliberately separated from authentication and auth
 - [x] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
 
 **Adaptive K-fanout gossip**:
-- [x] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits ([bounded calibration, c = 3](/numax/design/peer-discovery/#fanout-calibration))
+- [x] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits ([fanout policy, c = 3](/numax/design/peer-discovery/#fanout))
 - [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
-- [x] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect ([contract and local TCP evidence](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts))
+- [x] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect ([topology contract](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts))
 - [x] Adaptive rate based on load/RTT
 - [x] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
 - [x] Periodic, byte-bounded and paginated anti-entropy complementing gossip
 
 **Runtime peer management**:
-- [ ] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
-- [ ] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
-- [ ] Document whether runtime-added peers persist across node restarts
-- [ ] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
+- [x] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
+- [x] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
+- [x] Document whether runtime-added peers persist across node restarts
+- [x] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
+
+[Runtime-management contract](/numax/guides/management-api/#add-a-persistent-peer-candidate).
+Release-scale loss, partition and detector criteria remain separate below.
 
 **Determinism for tests**:
 - [ ] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering

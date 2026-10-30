@@ -60,7 +60,7 @@ The Numax dashboard is provisioned automatically from
 
 ## Metrics
 
-The dashboard uses only metrics currently emitted by Numax:
+The runtime exposes the following metrics:
 
 | Metric                               | Type    | Meaning                                    |
 | ------------------------------------ | ------- | ------------------------------------------ |
@@ -97,6 +97,53 @@ This keeps the identity stable without exposing local paths.
 Numax bounds the registry to 128 labels and aggregates additional modules under `module="overflow"`.
 
 Execution duration is wall-clock time and can include asynchronous host-call waits; it is not raw CPU time. Linear-memory metrics describe the guest memory exported as `memory`, not individual `malloc` and `free` operations inside the guest allocator.
+
+## Peer management metrics
+
+Peer metric labels use fixed enumerations. Endpoints and arbitrary node,
+operation or CRDT-key identities are available through authenticated peer
+views rather than metric labels.
+
+| Metric | Type / unit | Meaning and bounded labels |
+| --- | --- | --- |
+| `numax_membership_probe_attempts_total{route}` | counter / RPCs | Actual dispatched probe requests, `direct` or `indirect`; an indirect dispatch goes to a helper |
+| `numax_membership_probe_results_total{outcome}` | counter / completed logical probes | `success`, `failed`, `local_degradation`; local degradation is not proof of peer failure |
+| `numax_membership_transitions_total{transition}` | counter / transitions | `suspect`, `refuted`, `declared_dead` (local detector after terminal persistence), `learned_dead` (other terminal publication), `left`; duplicate snapshot publication is not counted |
+| `numax_queue_items{queue}` | gauge / items | Volatile queues `local`, `forward`, `candidates`, `control_ingress`, `membership_writes` |
+| `numax_queue_capacity_items{queue}` | gauge / slots | Corresponding configured capacity |
+| `numax_queue_bytes{queue}` | gauge / bytes | Occupied byte permits in `local` / `forward` delivery queues |
+| `numax_queue_capacity_bytes{queue}` | gauge / bytes | Corresponding byte budget, not wire bytes or retained durable history |
+| `numax_queue_rejections_total{queue,reason}` | counter / rejected enqueues | `local` / `forward`, reasons `slots`, `bytes`, `closed`; dropping these attempts does not delete accepted durable operations |
+| `numax_peer_dial_attempts_total{outcome}` | counter / attempts | Actual data dials: `connected`, `failed`, `fatal`, `rate_limited`; already-connected and local full-slot skips are excluded |
+| `numax_peer_retries_scheduled_total{reason}` | counter / retry schedules | Backoff actually scheduled for `failure` / `rate_limited`; not every loop turn or successful connection |
+| `numax_gossip_fanout{path,stage}` | histogram / recipients | `local` / `forward`, `selected` / `attempted`; attempted counts non-deferred send calls, including errors, not remote receipts or ACKs |
+| `numax_recovery_origins{state}` | gauge / known origins | `pending`, `baseline_unconfirmed`, `source_rejected`, `no_known_gap`; these categories may overlap |
+| `numax_recovery_gap_positions` | gauge / operation positions | Sum of known high minus contiguous coverage minus sparse receipts, excluding unknown origins and baseline contents |
+| `numax_recovery_events_total{event}` | counter / events | Correlated `history_unavailable`, sent `baseline_requested`, successfully imported `baseline_accepted`, current `baseline_rejected` from a source, or history-handler `error` |
+
+Counters accumulate for the process lifetime. Queue item/byte gauges cover
+entries until dequeue or drop, excluding batches in progress and empty reserved
+slots. Control, candidate and persistence queues are sampled at owner turns;
+the active persistence worker is outside its queue.
+
+Recovery gauges refresh at most once per second from event/repair loops and can
+lag by the repair cadence and storage service time. Zero-valued series before a
+component starts do not establish an active subsystem. Recovery states can
+overlap, and zero known gaps does not prove global convergence.
+
+Fanout buckets are `0, 1, 2, 4, 8, 16, 32, +Inf`, with `_sum` and `_count`.
+Pacing admission and attempted fanout describe local delivery work, not remote
+receipt or durability.
+
+| Observation | Next check |
+| --- | --- |
+| Dial failures grow without connections | Inspect `?view=candidates`, endpoint health, handshake and TLS errors. |
+| Queue rejections or pacing deferrals grow | Compare occupied capacity and writer/RTT metrics; inspect whether anti-entropy is repairing the backlog. |
+| Known gap positions remain nonzero | Inspect `?view=recovery` for missing ranges, in-flight requests and baseline requirements. |
+| Recovery reports `source_rejected` | Read the source-specific failure; another source may still supply the required history or baseline. |
+
+The [peer observation views](../management-api/#independent-observation-views)
+provide detailed state. Gauges and views are independent local observations.
 
 ## Useful PromQL
 

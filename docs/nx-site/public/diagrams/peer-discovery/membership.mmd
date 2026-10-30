@@ -1,6 +1,6 @@
 stateDiagram-v2
     direction TB
-    accTitle: Proposed membership state machine
+    accTitle: Membership state and epoch ordering
     accDescr: Admission establishes Alive. Suspicion and matching failure evidence advance state. Only a newer owner announcement refutes suspicion or death; leave closes the epoch and requires a newer epoch to rejoin.
     [*] --> Candidate: endpoint or relayed claim
     Candidate --> Alive: normal admission + fresh owner Alive
