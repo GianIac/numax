@@ -4,6 +4,7 @@ pub mod host_api;
 mod membership;
 pub mod observability;
 mod peer_metrics;
+mod peer_io;
 pub mod runtime;
 pub mod sync_config;
 pub mod sync_manager;

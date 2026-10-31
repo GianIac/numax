@@ -293,7 +293,7 @@ async fn admitted_owner_endpoint_becomes_a_data_neighbor_without_discovery() {
         local_id: a.node_id.clone(),
         membership: a.membership.as_ref().unwrap().snapshot.clone(),
         rotation_interval: Duration::from_millis(100),
-        node: Arc::clone(a.node.as_ref().unwrap()),
+        node: (a.node.as_ref().unwrap()).clone(),
         candidates_rx,
         max_peers: 1,
         initial_delay: Duration::from_millis(10),

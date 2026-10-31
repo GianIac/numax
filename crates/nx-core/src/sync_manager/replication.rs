@@ -221,7 +221,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         let max_delay = max_delay.max(initial_delay);
         let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
         let mut state = Vec::new();
-        let mut neighbors = super::neighbors::Neighbors::new(StdInstant::now());
+        let mut neighbors = super::neighbors::Neighbors::new(node.now());
         let mut victim_cursor = 0usize;
         let mut jitter = super::delivery::Jitter::new(super::delivery::seed(local_id.as_str()));
 
@@ -229,7 +229,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
             if *shutdown_rx.borrow() {
                 break;
             }
-            let mut rotation_due = neighbors.rotate(StdInstant::now(), rotation_interval);
+            let mut rotation_due = neighbors.rotate(node.now(), rotation_interval);
             let discovery = Arc::clone(&candidates_rx.borrow_and_update());
             let records = membership.borrow().records.clone();
             let was_suppressed = neighbors.recovery_suppressed();
@@ -240,7 +240,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     "withdrawal budget exhausted; membership-only data recovery disabled until restart; live discovery remains usable"
                 );
             }
-            reconcile_reconnect_candidates(&mut state, &candidates, initial_delay, &peer_health)
+            reconcile_reconnect_candidates(&mut state, &candidates, initial_delay, &peer_health, node.now())
                 .await;
             neighbors.advance();
             let connected = node.connected_peers().await;
@@ -265,7 +265,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
             }
             let mut attempts = 0usize;
             let mut sleep_for: Option<Duration> = None;
-            let now = StdInstant::now();
+            let now = node.now();
             let connect_context = ConfiguredPeerConnectContext {
                 node: node.as_ref(),
                 max_peers,
@@ -285,7 +285,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     || node.is_connected_addr(peer_addr).await
                 {
                     mark_peer_success(&peer_health, peer_addr).await;
-                    peer.reset(initial_delay, StdInstant::now());
+                    peer.reset(initial_delay, node.now());
                     continue;
                 }
 
@@ -332,16 +332,16 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                 match outcome {
                     ConfiguredPeerConnectOutcome::Connected => {
                         info!(peer = %peer_addr, "reconnected configured peer");
-                        peer.reset(initial_delay, StdInstant::now());
+                        peer.reset(initial_delay, node.now());
                     }
                     ConfiguredPeerConnectOutcome::AlreadyConnected => {
-                        peer.reset(initial_delay, StdInstant::now());
+                        peer.reset(initial_delay, node.now());
                     }
                     ConfiguredPeerConnectOutcome::SlotLimitReached => {
                         break;
                     }
                     ConfiguredPeerConnectOutcome::Failed => {
-                        let Some(attempt_delay) = peer.record_failure(max_delay, StdInstant::now())
+                        let Some(attempt_delay) = peer.record_failure(max_delay, node.now())
                         else {
                             metrics.record_sync_error();
                             warn!(peer = %peer.addr, "stopping reconnect: backoff deadline overflow");
@@ -357,7 +357,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                     ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
                         let Some(retry_after) = peer.record_retry_after(
                             bounded_retry_after(delay, max_delay),
-                            StdInstant::now(),
+                            node.now(),
                         ) else {
                             metrics.record_sync_error();
                             warn!(peer = %peer.addr, "stopping reconnect: retry-after deadline overflow");
@@ -382,7 +382,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
             let sleep_for = sleep_for
                 .saturating_add(jitter.delay(sleep_for / 8))
                 .min(max_delay);
-            let Some(deadline) = tokio::time::Instant::now().checked_add(sleep_for) else {
+            let Some(deadline) = node.now().checked_add(sleep_for) else {
                 metrics.record_sync_error();
                 warn!("stopping reconnect loop: sleep deadline overflow");
                 break;
@@ -398,7 +398,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
                         break;
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => {}
+                _ = node.sleep_until(deadline) => {}
             }
         }
         debug!("reconnect loop terminated");
@@ -406,80 +406,26 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 }
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
-    let AntiEntropyLoopContext {
-        store,
-        jitter_seed,
-        repair_budget,
-        history_cursors,
-        request_timeout,
-        node,
-        interval,
-        mut shutdown_rx,
-        metrics,
-    } = context;
-
     Some(tokio::spawn(async move {
-        let interval = normalize_anti_entropy_interval(interval);
-        let mut jitter = super::delivery::Jitter::new(jitter_seed);
+        let mut shutdown_rx = context.shutdown_rx.clone();
+        let interval = normalize_anti_entropy_interval(context.interval);
+        let mut jitter = super::delivery::Jitter::new(context.jitter_seed);
         let mut peer_cursor = 0usize;
-        // Keep the cadence independent of discovery churn and skip missed ticks
-        // rather than issuing bursts after a slow transport write. Recheck every
-        // deadline: construction-time validation cannot guarantee future additions.
-        let mut previous = tokio::time::Instant::now();
+        let mut previous = context.node.now();
         loop {
-            // Jitter shortens the poll period: it must not extend the configured
-            // repair interval past an idle transport's read deadline.
-            let period =
-                interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
-            let Some(deadline) =
-                checked_anti_entropy_deadline(previous, period, tokio::time::Instant::now())
-            else {
-                metrics.record_sync_error();
+            let period = interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
+            let Some(deadline) = checked_anti_entropy_deadline(previous, period, context.node.now()) else {
+                context.metrics.record_sync_error();
                 warn!("stopping anti-entropy loop: cadence deadline overflow");
                 break;
             };
             previous = deadline;
             tokio::select! {
                 biased;
-                _ = wait_for_shutdown(&mut shutdown_rx) => {
-                    debug!("anti-entropy loop shutdown requested");
-                    break;
-                }
+                _ = wait_for_shutdown(&mut shutdown_rx) => break,
                 _ = async {
-                    tokio::time::sleep_until(deadline).await;
-                    metrics.refresh_recovery(Arc::clone(&store)).await;
-                    let mut peers = node.connected_peers().await;
-                    history_cursors.write().await.retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
-                    if !peers.is_empty() {
-                        let len = peers.len();
-                        peers.rotate_left(peer_cursor % len);
-                        peer_cursor = peer_cursor.wrapping_add(1);
-                    }
-                    let mut turn = super::delivery::Turn::new();
-                    for (peer, _) in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
-                        let after_origin = {
-                            let mut cursors = history_cursors.write().await;
-                            let cursor = cursors.entry(peer.clone()).or_default();
-                            let now = StdInstant::now();
-                            if cursor.request_deadline.is_some_and(|deadline| deadline > now) {
-                                continue;
-                            }
-                            let Some(deadline) = now.checked_add(request_timeout) else {
-                                metrics.record_sync_error();
-                                warn!("stopping anti-entropy loop: request deadline overflow");
-                                return;
-                            };
-                            cursor.request_deadline = Some(deadline);
-                            cursor.after_origin.clone()
-                        };
-                        if let Err(error) = send_repair_history(&node, &repair_budget, &peer, HistoryMessage::SummaryRequest { after_origin }, Some(&mut turn)).await {
-                            if let Some(cursor) = history_cursors.write().await.get_mut(&peer) {
-                                cursor.request_deadline = None;
-                            }
-                            metrics.record_sync_error();
-                            debug!(%peer, %error, "history summary request failed");
-                        }
-                    }
+                    context.node.sleep_until(deadline).await;
+                    anti_entropy_turn(&context, &mut peer_cursor).await
                 } => {}
             }
         }
@@ -487,11 +433,45 @@ pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option
     }))
 }
 
+/// One bounded protocol turn; both adapters execute this function.
+pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cursor: &mut usize) {
+    context.metrics.refresh_recovery(Arc::clone(&context.store)).await;
+    let mut peers = context.node.connected_peers().await;
+    peers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+    context.history_cursors.write().await.retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
+    if !peers.is_empty() {
+        let len = peers.len();
+        peers.rotate_left(*peer_cursor % len);
+        *peer_cursor = peer_cursor.wrapping_add(1);
+    }
+    let mut turn = super::delivery::Turn::new();
+    for (peer, _) in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
+        let after_origin = {
+            let mut cursors = context.history_cursors.write().await;
+            let cursor = cursors.entry(peer.clone()).or_default();
+            let now = context.node.now();
+            if cursor.request_deadline.is_some_and(|deadline| deadline > now) { continue; }
+            let Some(deadline) = now.checked_add(context.request_timeout) else {
+                context.metrics.record_sync_error();
+                warn!("skipping anti-entropy turn: request deadline overflow");
+                return;
+            };
+            cursor.request_deadline = Some(deadline);
+            cursor.after_origin.clone()
+        };
+        if let Err(error) = send_repair_history(&context.node, &context.repair_budget, &peer, HistoryMessage::SummaryRequest { after_origin }, Some(&mut turn)).await {
+            if let Some(cursor) = context.history_cursors.write().await.get_mut(&peer) { cursor.request_deadline = None; }
+            context.metrics.record_sync_error();
+            debug!(%peer, %error, "history summary request failed");
+        }
+    }
+}
+
 fn checked_anti_entropy_deadline(
-    previous: tokio::time::Instant,
+    previous: StdInstant,
     interval: Duration,
-    now: tokio::time::Instant,
-) -> Option<tokio::time::Instant> {
+    now: StdInstant,
+) -> Option<StdInstant> {
     let interval = normalize_anti_entropy_interval(interval);
     let next = previous.checked_add(interval)?;
     if next > now {
@@ -511,13 +491,14 @@ async fn reconcile_reconnect_candidates(
     candidates: &[String],
     initial_delay: Duration,
     peer_health: &Arc<RwLock<std::collections::HashMap<String, super::peer::PeerHealth>>>,
+    now: StdInstant,
 ) {
     let retained = candidates.iter().collect::<HashSet<_>>();
     let mut existing = state
         .drain(..)
         .map(|peer| (peer.addr.clone(), peer))
         .collect::<HashMap<_, _>>();
-    let now = StdInstant::now();
+    
     state.extend(candidates.iter().map(|addr| {
         existing
             .remove(addr)
@@ -606,19 +587,19 @@ pub(super) fn select_gossip_peers(
 /// The mutex covers only pure pacing decisions, never encoding or I/O. Denial
 /// skips a fast-path attempt; durable history remains eligible for anti-entropy.
 async fn send_repair_history(
-    node: &nx_net::Node,
+    node: &Arc<dyn crate::peer_io::PeerIo>,
     budget: &std::sync::Mutex<super::delivery::RepairBudget>,
     addr: &str,
     message: HistoryMessage,
     turn: Option<&mut super::delivery::Turn>,
 ) -> nx_net::NetResult<()> {
-    let prepared = node.prepare_history_to_addr(addr, message).await?;
+    let prepared = node.clone().prepare_history_to_addr(addr, message).await?;
     let bytes = prepared.encoded_len();
     if turn.is_some_and(|turn| !turn.admit(bytes))
         || !budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .admit(bytes, StdInstant::now())
+            .admit(bytes, node.now())
     {
         return Err(NetError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -631,7 +612,7 @@ async fn send_repair_history(
 }
 
 async fn send_paced_history(
-    node: &nx_net::Node,
+    node: &Arc<dyn crate::peer_io::PeerIo>,
     metrics: &RuntimeMetrics,
     pacing: &std::sync::Mutex<super::pacing::Pacer>,
     membership: &watch::Receiver<crate::membership::runtime::Snapshot>,
@@ -639,7 +620,7 @@ async fn send_paced_history(
     message: HistoryMessage,
     budget: (super::pacing::Load, &mut super::delivery::Turn),
 ) -> nx_net::NetResult<bool> {
-    let prepared = node.prepare_history_to_addr(addr, message).await?;
+    let prepared = node.clone().prepare_history_to_addr(addr, message).await?;
     if !budget.1.admit(prepared.encoded_len()) {
         metrics.record_gossip_pacing(false, prepared.encoded_len(), 0, None);
         return Ok(false);
@@ -659,7 +640,7 @@ async fn send_paced_history(
             addr,
             generation.clone(),
             bytes,
-            StdInstant::now(),
+            node.now(),
             budget.0,
             sample,
         );
@@ -684,7 +665,7 @@ async fn send_paced_history(
         .sent(
             addr,
             &generation,
-            StdInstant::now(),
+            node.now(),
             result.as_ref().ok().copied(),
         );
     result.map(|_| true)
@@ -716,8 +697,8 @@ async fn forward_batch(
 
     let seed = super::delivery::seed(entries[0].op.id.as_str())
         ^ super::delivery::seed(context.local_id.as_str());
-    tokio::time::sleep(
-        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+    context.node.sleep_until(context.node.now() +
+        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2))
     )
     .await;
     for _ in 1..BROADCAST_BATCH_MAX {
@@ -763,7 +744,7 @@ async fn forward_batch(
     }
 
     let count = entries.len();
-    let started = std::time::Instant::now();
+    let started = context.node.now();
     let mut sent = 0;
     let mut failed = 0;
     let mut turn = super::delivery::Turn::new();
@@ -791,7 +772,7 @@ async fn forward_batch(
     }
     if sent > 0 {
         context.metrics.record_broadcast_batch(count);
-        context.metrics.record_sync_latency(started.elapsed());
+        context.metrics.record_sync_latency(context.node.now().saturating_duration_since(started));
     }
     context.metrics.peers.fanout(true, true, sent + failed);
     if failed > 0 {
@@ -852,8 +833,8 @@ pub(super) async fn broadcast_batch(
 
     // Give producers a tiny window to fill the channel so sustained load is
     // sent in larger PushOps messages instead of many tiny network writes.
-    tokio::time::sleep(
-        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+    context.node.sleep_until(context.node.now() +
+        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2))
     )
     .await;
 
@@ -903,7 +884,7 @@ pub(super) async fn broadcast_batch(
         return;
     }
 
-    let started = std::time::Instant::now();
+    let started = context.node.now();
     let mut sent = 0;
     let mut failed = 0;
     let mut turn = super::delivery::Turn::new();
@@ -929,7 +910,7 @@ pub(super) async fn broadcast_batch(
     }
     if sent > 0 {
         context.metrics.record_broadcast_batch(count);
-        context.metrics.record_sync_latency(started.elapsed());
+        context.metrics.record_sync_latency(context.node.now().saturating_duration_since(started));
         debug!(count, recipients = sent, failed, "gossip batch sent");
     }
     context.metrics.peers.fanout(false, true, sent + failed);
@@ -1177,7 +1158,7 @@ async fn request_history_or_baseline(
     end: u64,
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
-    let request_id = nx_sync::OpId::generate();
+    let request_id = context.node.request_id();
     let baseline_revision = if start == 0 {
         Some(super::storage::recovery_revision(&context.store, &origin)?)
     } else {
@@ -1186,7 +1167,7 @@ async fn request_history_or_baseline(
     {
         let mut requests = context.history_requests.write().await;
         let pending = requests.entry(addr.to_owned()).or_default();
-        let now = StdInstant::now();
+        let now = context.node.now();
         pending.retain(|_, request| request.deadline > now);
         if pending.contains_key(origin.as_str()) || pending.len() >= SUMMARY_PAGE {
             debug!(%addr, %origin, "deferring history range: request pending or peer budget full");
@@ -1252,7 +1233,7 @@ async fn complete_history_request(
     if let Some(pending) = requests.get_mut(addr)
         && let Some(request) = pending.get(origin.as_str())
         && request.request_id == *request_id
-        && request.deadline > StdInstant::now()
+        && request.deadline > context.node.now()
         && request.start == start
         && end >= start
         && end <= request.end
@@ -1279,7 +1260,7 @@ async fn handle_history_message(
         .repair_budget
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .admit_work(StdInstant::now())
+        .admit_work(context.node.now())
     {
         anyhow::bail!("recovery work budget exhausted; periodic repair will retry");
     }
@@ -1991,7 +1972,7 @@ mod tests {
 
     #[test]
     fn anti_entropy_deadlines_are_checked_and_skip_missed_ticks_without_bursts() {
-        let now = tokio::time::Instant::now();
+        let now = StdInstant::now();
         let interval = Duration::from_millis(10);
         assert_eq!(checked_anti_entropy_deadline(now, Duration::MAX, now), None);
         assert_eq!(
@@ -2075,7 +2056,7 @@ mod tests {
             PeerHealth::default(),
         )])));
 
-        reconcile_reconnect_candidates(&mut state, &[], Duration::from_millis(10), &peer_health)
+        reconcile_reconnect_candidates(&mut state, &[], Duration::from_millis(10), &peer_health, now)
             .await;
 
         assert!(state.is_empty());
@@ -2108,6 +2089,7 @@ mod tests {
             &["two.example:9000".into(), "one.example:9000".into()],
             Duration::from_millis(10),
             &peer_health,
+            now,
         )
         .await;
 
@@ -3331,7 +3313,7 @@ mod tests {
             )),
             history_cursors: Arc::clone(&cursors),
             request_timeout: Duration::from_secs(30),
-            node: Arc::clone(&node),
+            node: node.clone(),
             interval: Duration::from_millis(1),
             shutdown_rx,
             metrics: metrics(),

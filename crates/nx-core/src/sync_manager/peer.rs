@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use nx_net::Node;
+use crate::peer_io::PeerIo;
 use tokio::sync::RwLock;
 
 use crate::observability::RuntimeMetrics;
@@ -88,7 +88,7 @@ impl PeerReconnectState {
 }
 
 pub(super) struct ConfiguredPeerConnectContext<'a> {
-    pub(super) node: &'a Node,
+    pub(super) node: &'a dyn PeerIo,
     pub(super) max_peers: usize,
     pub(super) peer_dead_after_failures: u32,
     pub(super) metrics: &'a Arc<RuntimeMetrics>,

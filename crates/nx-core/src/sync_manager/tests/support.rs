@@ -946,7 +946,7 @@ pub(super) async fn test_topology_reconnect(
         local_id: manager.node_id.clone(),
         membership,
         rotation_interval,
-        node: Arc::clone(manager.node.as_ref().unwrap()),
+        node: (manager.node.as_ref().unwrap()).clone(),
         candidates_rx,
         max_peers: manager.config.max_peers,
         initial_delay: Duration::from_millis(10),

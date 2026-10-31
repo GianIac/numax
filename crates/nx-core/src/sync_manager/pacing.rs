@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::GossipRateConfig;
-use nx_net::{ConnectionGeneration, ControlTiming};
+use nx_net::ControlTiming;
+use crate::peer_io::Generation as ConnectionGeneration;
 
 const WINDOW: Duration = Duration::from_secs(1);
 pub(super) const SAMPLE_TTL: Duration = Duration::from_secs(10);

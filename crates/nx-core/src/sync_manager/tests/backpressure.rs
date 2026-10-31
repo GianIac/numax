@@ -203,7 +203,7 @@ async fn local_batch_splits_at_wire_budget_without_anti_entropy() {
             ))),
             local_id: a.node_id.clone(),
             membership: snapshot,
-            node: Arc::clone(a.node.as_ref().unwrap()),
+            node: (a.node.as_ref().unwrap()).clone(),
             metrics: Arc::clone(&a.metrics),
             fanout_constant: a.config.gossip_fanout_constant,
             max_fanout: a.config.gossip_max_fanout,
@@ -258,7 +258,7 @@ async fn exhausted_repair_budget_defers_then_recovers_without_losing_history() {
         // Retry deadlines are short, while the TCP idle timeout stays at its
         // production default: the deliberately exhausted allowance lasts 1 s.
         request_timeout: Duration::from_millis(200),
-        node: Arc::clone(b.node.as_ref().unwrap()),
+        node: (b.node.as_ref().unwrap()).clone(),
         interval: b.config.anti_entropy_interval,
         shutdown_rx: b.shutdown_tx.subscribe(),
         metrics: Arc::clone(&b.metrics),

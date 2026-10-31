@@ -68,7 +68,7 @@ async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
             )),
             history_cursors: Arc::clone(&b.history_cursors),
             request_timeout: b.config.socket_timeout,
-            node: Arc::clone(b.node.as_ref().unwrap()),
+            node: (b.node.as_ref().unwrap()).clone(),
             interval: Duration::from_millis(10),
             shutdown_rx: b.shutdown_tx.subscribe(),
             metrics: Arc::clone(&b.metrics),

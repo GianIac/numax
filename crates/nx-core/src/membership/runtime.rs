@@ -86,7 +86,7 @@ impl Drop for Handle {
 pub(crate) async fn start(
     local: String,
     endpoint: Option<String>,
-    node: Arc<Node>,
+    node: Arc<dyn crate::peer_io::PeerIo>,
     store: Arc<Store>,
     incoming: mpsc::Receiver<ControlIncoming>,
 ) -> anyhow::Result<Handle> {
@@ -104,7 +104,7 @@ pub(crate) async fn start(
 pub(crate) async fn start_with_metrics(
     local: String,
     endpoint: Option<String>,
-    node: Arc<Node>,
+    node: Arc<dyn crate::peer_io::PeerIo>,
     store: Arc<Store>,
     incoming: mpsc::Receiver<ControlIncoming>,
     metrics: Arc<RuntimeMetrics>,
@@ -141,6 +141,8 @@ pub(crate) async fn start_with_metrics(
     let mut seed = [0u8; 8];
     getrandom::fill(&mut seed)
         .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
+    let rng = crate::peer_io::random::Random::stream(u64::from_le_bytes(seed), core.local_id(), "probes");
+    let last = node.now();
     let actor = Actor {
         local_declarations: BTreeMap::new(),
         metrics,
@@ -154,14 +156,14 @@ pub(crate) async fn start_with_metrics(
         sessions: BTreeMap::new(),
         serial: 0,
         now: Duration::ZERO,
-        last: Instant::now(),
+        last,
         jobs: JoinSet::new(),
         pending: BTreeMap::new(),
         cursor: 0,
         snapshot_tx,
         dispatch_tx,
         dispatch_rx,
-        rng: u64::from_le_bytes(seed),
+        rng,
         next_exchange: Duration::ZERO,
         hints: BTreeMap::new(),
         pages: BTreeMap::new(),
@@ -248,7 +250,7 @@ struct Actor {
     metrics: Arc<RuntimeMetrics>,
     core: Membership,
     owner: MembershipRecord,
-    node: Arc<Node>,
+    node: Arc<dyn crate::peer_io::PeerIo>,
     store: Arc<Store>,
     incoming: mpsc::Receiver<ControlIncoming>,
     records: BTreeMap<String, MembershipRecord>,
@@ -263,7 +265,7 @@ struct Actor {
     snapshot_tx: watch::Sender<Snapshot>,
     dispatch_tx: mpsc::Sender<Dispatch>,
     dispatch_rx: mpsc::Receiver<Dispatch>,
-    rng: u64,
+    rng: crate::peer_io::random::Random,
     next_exchange: Duration,
     hints: BTreeMap<String, String>,
     pages: BTreeMap<String, Option<String>>,
@@ -302,8 +304,8 @@ impl Actor {
     }
 
     async fn run_inner(&mut self, stopped: &mut oneshot::Receiver<()>) -> anyhow::Result<()> {
-        let mut ticker = tokio::time::interval(TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_tick = self.node.now();
+        let timer = self.node.clone();
         self.publish_snapshot();
         loop {
             tokio::select! {
@@ -350,30 +352,12 @@ impl Actor {
                     self.pending.remove(&completed.endpoint);
                     self.completed(completed).await?;
                 }
-                _tick = ticker.tick() => {
+                _ = timer.sleep_until(next_tick) => {
                     #[cfg(test)]
-                    self.record_tick_lateness(Instant::now().saturating_duration_since(_tick.into_std()));
+                    self.record_tick_lateness(self.node.now().saturating_duration_since(next_tick));
+                    next_tick = self.node.now().checked_add(TICK).ok_or_else(|| core_error(Error::Overflow))?;
                     self.advance();
-                    let now = self.now;
-                    let actions = self.core().tick(now).map_err(core_error)?;
-                    for action in &actions {
-                        if let Action::PersistFloor { update, .. } = action
-                            && update.status == Status::Dead {
-                            self.local_declarations.insert(update.member.clone(), update.version);
-                        }
-                    }
-                    self.actions(actions).await?;
-                    let mut rng = self.rng;
-                    let actions = self.core().probe_next(now, |upper| {
-                        rng = rng.wrapping_add(0x9e3779b97f4a7c15);
-                        let mut value = rng;
-                        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-                        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-                        ((value ^ (value >> 31)) % upper as u64) as usize
-                    });
-                    self.rng = rng;
-                    if let Ok(actions) = actions { self.actions(actions).await?; }
-                    self.exchange_next().await?;
+                    self.tick().await?;
                 }
                 event = self.incoming.recv() => {
                     let Some(event) = event else { anyhow::bail!("membership ingress closed"); };
@@ -385,9 +369,26 @@ impl Actor {
         }
     }
 
+    async fn tick(&mut self) -> anyhow::Result<()> {
+                    let now = self.now;
+                    let actions = self.core().tick(now).map_err(core_error)?;
+                    for action in &actions {
+                        if let Action::PersistFloor { update, .. } = action
+                            && update.status == Status::Dead {
+                            self.local_declarations.insert(update.member.clone(), update.version);
+                        }
+                    }
+                    self.actions(actions).await?;
+                    let actions = self.core.probe_next(now, |upper| self.rng.choose(upper));
+                    if let Ok(actions) = actions { self.actions(actions).await?; }
+                    self.exchange_next().await?;
+        Ok(())
+    }
+
     fn advance(&mut self) {
-        let elapsed = self.last.elapsed();
-        self.last = Instant::now();
+        let observed = self.node.now();
+        let elapsed = observed.saturating_duration_since(self.last);
+        self.last = observed;
         if elapsed > TICK * 4 {
             self.core().local_degradation();
         } else {
@@ -1163,7 +1164,7 @@ mod tests {
                 snapshot_tx,
                 dispatch_tx,
                 dispatch_rx,
-                rng: 1,
+                rng: crate::peer_io::random::Random::new(1),
                 next_exchange: Duration::ZERO,
                 hints: BTreeMap::new(),
                 pages: BTreeMap::new(),
