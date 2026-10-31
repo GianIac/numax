@@ -43,6 +43,8 @@ use super::types::*;
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    clock: Arc<dyn crate::peer_io::clock::Clock>,
+    ids: Arc<dyn crate::peer_io::random::IdSource>,
     recovery_scan_limit: Arc<Semaphore>,
     candidates: super::candidates::CandidateAccess,
     membership_view:
@@ -145,6 +147,27 @@ impl PartialEq<AcceptedLocalOp> for Op {
 }
 
 impl SyncHandle {
+    fn local_op(&self, kind: OpKind) -> Op {
+        Op {
+            id: self.ids.next(),
+            origin: self.node_id.clone(),
+            kind,
+        }
+    }
+
+    pub(crate) fn rga_insert_op(&self, key: &str, parent: Option<String>, value: Vec<u8>) -> Op {
+        let id = self.ids.next();
+        Op {
+            kind: OpKind::RgaInsert {
+                key: key.into(),
+                id: id.as_str().into(),
+                parent,
+                value,
+            },
+            id,
+            origin: self.node_id.clone(),
+        }
+    }
     /// Bounded, durable per-origin coverage; known maxima do not imply contiguous receipt.
     pub fn replication_progress(&self) -> anyhow::Result<Vec<super::ReplicationProgress>> {
         super::storage::replication_progress(&self.store)
@@ -188,7 +211,10 @@ impl SyncHandle {
         key: &str,
         delta: u64,
     ) -> anyhow::Result<AcceptedLocalOp> {
-        let op = Op::gcounter_increment(self.node_id.clone(), key, delta);
+        let op = self.local_op(OpKind::GCounterIncrement {
+            key: key.into(),
+            increment: delta,
+        });
         let op_id = op.id.as_str().to_string();
 
         // Match the remote apply lock order so local and remote updates cannot race.
@@ -254,12 +280,14 @@ impl SyncHandle {
         direction: PNCounterDirection,
     ) -> anyhow::Result<AcceptedLocalOp> {
         let op = match direction {
-            PNCounterDirection::Increment => {
-                Op::pncounter_increment(self.node_id.clone(), key, delta)
-            }
-            PNCounterDirection::Decrement => {
-                Op::pncounter_decrement(self.node_id.clone(), key, delta)
-            }
+            PNCounterDirection::Increment => self.local_op(OpKind::PNCounterIncrement {
+                key: key.into(),
+                increment: delta,
+            }),
+            PNCounterDirection::Decrement => self.local_op(OpKind::PNCounterDecrement {
+                key: key.into(),
+                decrement: delta,
+            }),
         };
         let op_id = op.id.as_str().to_string();
 
@@ -318,7 +346,11 @@ impl SyncHandle {
         let timestamp_ms = registers.get(key).map_or(observed_timestamp_ms, |current| {
             observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
         });
-        let op = Op::lww_register_set(self.node_id.clone(), key, value.clone(), timestamp_ms);
+        let op = self.local_op(OpKind::LwwRegisterSet {
+            key: key.into(),
+            value: value.clone(),
+            timestamp_ms,
+        });
         let op_id = op.id.as_str().to_string();
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate LwwRegister operation id");
@@ -393,16 +425,17 @@ impl SyncHandle {
             observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
         });
         let op = match &change {
-            LwwMapChange::Set(value) => Op::lww_map_set(
-                self.node_id.clone(),
-                key,
-                field,
-                value.clone(),
+            LwwMapChange::Set(value) => self.local_op(OpKind::LwwMapSet {
+                key: key.into(),
+                field: field.into(),
+                value: value.clone(),
                 timestamp_ms,
-            ),
-            LwwMapChange::Remove => {
-                Op::lww_map_remove(self.node_id.clone(), key, field, timestamp_ms)
-            }
+            }),
+            LwwMapChange::Remove => self.local_op(OpKind::LwwMapRemove {
+                key: key.into(),
+                field: field.into(),
+                timestamp_ms,
+            }),
         };
         let op_id = op.id.as_str().to_string();
         if seen.ids.contains(&op_id) {
@@ -449,7 +482,16 @@ impl SyncHandle {
         key: &str,
         element: &str,
     ) -> anyhow::Result<AcceptedLocalOp> {
-        let op = Op::orset_add_with_op_id_tag(self.node_id.clone(), key, element);
+        let id = self.ids.next();
+        let op = Op {
+            kind: OpKind::ORSetAdd {
+                key: key.into(),
+                element: element.into(),
+                tag: id.as_str().into(),
+            },
+            id,
+            origin: self.node_id.clone(),
+        };
         let op_id = op.id.as_str().to_string();
 
         // Match the remote apply lock order so observed tags and replay agree.
@@ -511,7 +553,11 @@ impl SyncHandle {
             return Ok(None);
         }
 
-        let op = Op::orset_remove(self.node_id.clone(), key, element, observed_tags.clone());
+        let op = self.local_op(OpKind::ORSetRemove {
+            key: key.into(),
+            element: element.into(),
+            observed_tags: observed_tags.clone(),
+        });
         let op_id = op.id.as_str().to_string();
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate ORSet operation id");
@@ -597,7 +643,10 @@ impl SyncHandle {
     }
 
     pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<AcceptedLocalOp> {
-        let op = Op::rga_delete(self.node_id.clone(), key, id);
+        let op = self.local_op(OpKind::RgaDelete {
+            key: key.into(),
+            id: id.into(),
+        });
         let op_id = op.id.as_str().to_string();
 
         let mut seen = self.seen_ops.write().await;
@@ -761,7 +810,7 @@ impl SyncHandle {
                         let in_flight = requests.values().any(|origins| {
                             origins
                                 .get(progress.origin.as_str())
-                                .is_some_and(|request| request.deadline > std::time::Instant::now())
+                                .is_some_and(|request| request.deadline > self.clock.now())
                         });
                         PeerObservation::Recovery {
                             progress,
@@ -792,6 +841,8 @@ async fn run_recovery_scan(
 }
 
 pub struct SyncManager {
+    clock: Arc<dyn crate::peer_io::clock::Clock>,
+    ids: Arc<dyn crate::peer_io::random::IdSource>,
     recovery_scan_limit: Arc<Semaphore>,
     candidates: super::candidates::CandidateAccess,
     membership_view:
@@ -979,6 +1030,8 @@ impl SyncManager {
         let rgas = Arc::new(RwLock::new(rgas));
 
         Ok(Self {
+            clock: Arc::new(crate::peer_io::clock::SystemClock),
+            ids: Arc::new(crate::peer_io::random::UuidIds),
             recovery_scan_limit: Arc::new(Semaphore::new(1)),
             candidates: super::candidates::CandidateAccess::with_metrics(Arc::clone(&metrics)),
             membership_view: Arc::new(std::sync::Mutex::new(None)),
@@ -1033,6 +1086,8 @@ impl SyncManager {
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            clock: Arc::clone(&self.clock),
+            ids: Arc::clone(&self.ids),
             recovery_scan_limit: Arc::clone(&self.recovery_scan_limit),
             candidates: self.candidates.clone(),
             membership_view: Arc::clone(&self.membership_view),
@@ -1137,7 +1192,7 @@ impl SyncManager {
         let membership = match crate::membership::runtime::start_with_metrics(
             self.node_id.to_string(),
             advertised_endpoint.clone(),
-            Arc::clone(&node),
+            node.clone(),
             Arc::clone(&self.store),
             control_rx,
             Arc::clone(&self.metrics),
@@ -1221,7 +1276,7 @@ impl SyncManager {
 
         // Inbound loop: apply remote ops into the CRDT registries.
         let repair_budget = Arc::new(std::sync::Mutex::new(super::delivery::RepairBudget::new(
-            std::time::Instant::now(),
+            self.clock.now(),
         )));
         let event_context = NodeEventContext {
             repair_budget: Arc::clone(&repair_budget),
@@ -1241,7 +1296,7 @@ impl SyncManager {
             op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
-            node: (&node).clone(),
+            node: node.clone(),
             forward_tx: Some(forward_tx),
             peer_health: Arc::clone(&self.peer_health),
             active_connections: Arc::clone(&self.active_connections),
@@ -1282,7 +1337,7 @@ impl SyncManager {
                 pacing: Arc::clone(&pacing),
                 local_id: self.node_id.clone(),
                 membership: membership_snapshot.clone(),
-                node: (&node).clone(),
+                node: node.clone(),
                 metrics: Arc::clone(&self.metrics),
                 max_message_size: self.config.max_message_size,
                 fanout_constant: self.config.gossip_fanout_constant,
@@ -1298,7 +1353,7 @@ impl SyncManager {
                 pacing,
                 local_id: self.node_id.clone(),
                 membership: membership_snapshot.clone(),
-                node: (&node).clone(),
+                node: node.clone(),
                 metrics: Arc::clone(&self.metrics),
                 fanout_constant: self.config.gossip_fanout_constant,
                 max_fanout: self.config.gossip_max_fanout,
@@ -1313,7 +1368,7 @@ impl SyncManager {
             local_id: self.node_id.clone(),
             membership: membership_snapshot,
             rotation_interval: super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
-            node: (&node).clone(),
+            node: node.clone(),
             candidates_rx,
             max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
@@ -1330,7 +1385,7 @@ impl SyncManager {
             repair_budget,
             history_cursors: Arc::clone(&self.history_cursors),
             request_timeout: self.config.socket_timeout,
-            node: (&node).clone(),
+            node: node.clone(),
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
@@ -1358,7 +1413,7 @@ impl SyncManager {
         let peer_dead_after_failures =
             normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
         let connect_context = ConfiguredPeerConnectContext {
-            node,
+            node: node.as_ref(),
             max_peers: self.config.max_peers,
             peer_dead_after_failures,
             metrics: &self.metrics,
@@ -1483,7 +1538,7 @@ impl SyncManager {
         }
 
         if let Some(node) = self.node.as_ref() {
-            node.shutdown().await;
+            crate::peer_io::PeerIo::shutdown(node.as_ref()).await;
         }
         self.metrics.set_peers_connected(0);
 

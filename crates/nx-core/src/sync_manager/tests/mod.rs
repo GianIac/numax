@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 mod backpressure;
+mod determinism;
 mod e2e;
 mod manual;
 mod rate;

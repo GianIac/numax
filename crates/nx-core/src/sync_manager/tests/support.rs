@@ -503,24 +503,40 @@ pub(super) async fn wait_for_counter(manager: &SyncManager, key: &str, expected:
 }
 
 pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
-    use std::io::{Read, Seek};
-    use std::process::{Command, Stdio};
-
     const CHILD_TEST: &str = "NUMAX_ISOLATED_SYNC_TEST";
     assert_eq!(std::thread::current().name(), Some(test_name));
     if std::env::var_os(CHILD_TEST).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
         return false;
     }
+    isolated_test_output(
+        test_name,
+        CHILD_TEST,
+        test_name,
+        std::time::Duration::from_secs(60),
+    );
+    true
+}
+
+pub(super) fn isolated_test_output(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+) -> Vec<u8> {
+    use std::io::{Read, Seek};
+    use std::process::{Command, Stdio};
+
+    assert_eq!(std::thread::current().name(), Some(test_name));
 
     let mut output = tempfile::tempfile().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture"])
-        .env(CHILD_TEST, test_name)
+        .env(marker, value)
         .stdout(Stdio::from(output.try_clone().unwrap()))
         .stderr(Stdio::from(output.try_clone().unwrap()))
         .spawn()
         .unwrap();
-    let deadline = StdInstant::now() + std::time::Duration::from_secs(60);
+    let deadline = StdInstant::now() + lifetime;
     let result = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -535,13 +551,13 @@ pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    if result.as_ref().is_ok_and(|status| status.success()) {
-        return true;
-    }
     let cleanup = result.is_err().then(|| (child.kill(), child.wait()));
     output.rewind().unwrap();
     let mut bytes = Vec::new();
     output.take(64 * 1024).read_to_end(&mut bytes).unwrap();
+    if result.as_ref().is_ok_and(|status| status.success()) {
+        return bytes;
+    }
     let diagnostics = String::from_utf8_lossy(&bytes);
     panic!("isolated test {test_name} failed: {result:?}; cleanup={cleanup:?}\n{diagnostics}");
 }
@@ -784,12 +800,7 @@ pub(super) async fn local_rga_insert_after(
     value: &[u8],
 ) -> String {
     let permit = reserve_local_op(handle).await;
-    let op = Op::rga_insert_with_op_id(
-        handle.node_id().clone(),
-        key,
-        parent.map(ToOwned::to_owned),
-        value.to_vec(),
-    );
+    let op = handle.rga_insert_op(key, parent.map(ToOwned::to_owned), value.to_vec());
     let id = op.id.as_str().to_string();
     let op = handle.insert_rga(op).await.unwrap();
     permit.send(op);

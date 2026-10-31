@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 fuzzing = []
+test-utils = []
 
 [dependencies]
 nx-sync = { version = "0.1.5", path = "../nx-sync" }

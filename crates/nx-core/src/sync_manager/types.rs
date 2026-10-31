@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::Duration;
 
-use nx_net::PeerConnectionInfo;
 use crate::peer_io::PeerIo;
+use nx_net::PeerConnectionInfo;
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
 use tokio::sync::{RwLock, watch};

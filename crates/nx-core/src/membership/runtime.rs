@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 
 use nx_net::{
     ControlIncoming, ControlKind, ControlReply, ControlRequest, MembershipRecord, MembershipState,
-    MembershipVersion, Node,
+    MembershipVersion,
 };
 use nx_store::Store;
+use std::future::Future;
+#[cfg(test)]
+use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -17,12 +20,89 @@ use super::suspicion::Timing;
 use super::{Error, Version};
 use crate::observability::RuntimeMetrics;
 use crate::peer_metrics::{Counter as Metric, Gauge};
+#[cfg(test)]
+use nx_net::Node;
 
 const TICK: Duration = Duration::from_millis(25);
 const CAPACITY: usize = 4096;
 const RPC_BUDGET: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const SCHEDULING_SAMPLES_LIMIT: usize = 2048;
+#[cfg(test)]
+pub(crate) mod simulation;
+
+// The coordinator owns effects; only their executor differs in deterministic tests.
+struct Jobs<T: Send + 'static> {
+    tasks: JoinSet<T>,
+    #[cfg(test)]
+    deferred: Option<VecDeque<Pin<Box<dyn Future<Output = T> + Send>>>>,
+    #[cfg(test)]
+    active: usize,
+}
+impl<T: Send + 'static> Jobs<T> {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            #[cfg(test)]
+            deferred: None,
+            #[cfg(test)]
+            active: 0,
+        }
+    }
+    fn spawn(&mut self, future: impl Future<Output = T> + Send + 'static) {
+        #[cfg(test)]
+        if let Some(deferred) = &mut self.deferred {
+            self.active += 1;
+            deferred.push_back(Box::pin(future));
+            return;
+        }
+        self.tasks.spawn(future);
+    }
+    fn spawn_blocking(&mut self, work: impl FnOnce() -> T + Send + 'static) {
+        #[cfg(test)]
+        if let Some(deferred) = &mut self.deferred {
+            self.active += 1;
+            deferred.push_back(Box::pin(async move { work() }));
+            return;
+        }
+        self.tasks.spawn_blocking(work);
+    }
+    fn len(&self) -> usize {
+        #[cfg(test)]
+        if self.deferred.is_some() {
+            return self.active;
+        }
+        self.tasks.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    async fn join_next(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+    fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+    #[cfg(test)]
+    fn manual(&mut self) {
+        self.deferred = Some(VecDeque::new());
+    }
+    #[cfg(test)]
+    fn take(&mut self) -> Vec<Pin<Box<dyn Future<Output = T> + Send>>> {
+        self.deferred
+            .as_mut()
+            .expect("deterministic executor")
+            .drain(..)
+            .collect()
+    }
+    #[cfg(test)]
+    fn finished(&mut self) {
+        self.active = self
+            .active
+            .checked_sub(1)
+            .expect("untracked effect completion");
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeTiming {
@@ -110,20 +190,46 @@ pub(crate) async fn start_with_metrics(
     metrics: Arc<RuntimeMetrics>,
 ) -> anyhow::Result<Handle> {
     let persisted_store = Arc::clone(&store);
-    let (core, actions) = tokio::task::spawn_blocking(move || {
-        let timing = Timing {
-            interval: Duration::from_secs(2),
-            direct: RPC_BUDGET,
-            suspicion_min: Duration::from_secs(5),
-            suspicion_max: Duration::from_secs(15),
-            confirmations: 3,
-            health_max: 8,
-        };
-        let mut core = Membership::new(local, CAPACITY, timing, 1, 3).map_err(core_error)?;
-        let actions = MembershipStore::new(&persisted_store).start(&mut core)?;
-        Ok::<_, anyhow::Error>((core, actions))
+    let (core, owner) =
+        tokio::task::spawn_blocking(move || initialize(local, endpoint, &persisted_store))
+            .await??;
+    let (stop, stopped) = oneshot::channel();
+    let mut seed = [0u8; 8];
+    getrandom::fill(&mut seed)
+        .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
+    let actor = Actor::new(
+        core,
+        owner,
+        node,
+        store,
+        incoming,
+        metrics,
+        u64::from_le_bytes(seed),
+    );
+    let snapshot = actor.snapshot_tx.subscribe();
+    let task = tokio::spawn(actor.run(stopped));
+    Ok(Handle {
+        stop: Some(stop),
+        task: Some(task),
+        snapshot,
     })
-    .await??;
+}
+
+fn initialize(
+    local: String,
+    endpoint: Option<String>,
+    store: &Store,
+) -> anyhow::Result<(Membership, MembershipRecord)> {
+    let timing = Timing {
+        interval: Duration::from_secs(2),
+        direct: RPC_BUDGET,
+        suspicion_min: Duration::from_secs(5),
+        suspicion_max: Duration::from_secs(15),
+        confirmations: 3,
+        health_max: 8,
+    };
+    let mut core = Membership::new(local, CAPACITY, timing, 1, 3).map_err(core_error)?;
+    let actions = MembershipStore::new(store).start(&mut core)?;
     let initial = actions
         .into_iter()
         .find_map(|action| {
@@ -134,52 +240,55 @@ pub(crate) async fn start_with_metrics(
             }
         })
         .ok_or_else(|| anyhow::anyhow!("membership startup did not publish a durable identity"))?;
-    let owner = record(initial, endpoint, None);
-    let (stop, stopped) = oneshot::channel();
-    let (snapshot_tx, snapshot) = watch::channel(Snapshot::default());
-    let (dispatch_tx, dispatch_rx) = mpsc::channel(64);
-    let mut seed = [0u8; 8];
-    getrandom::fill(&mut seed)
-        .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
-    let rng = crate::peer_io::random::Random::stream(u64::from_le_bytes(seed), core.local_id(), "probes");
-    let last = node.now();
-    let actor = Actor {
-        local_declarations: BTreeMap::new(),
-        metrics,
-        core,
-        owner,
-        node,
-        store,
-        incoming,
-        records: BTreeMap::new(),
-        timings: BTreeMap::new(),
-        sessions: BTreeMap::new(),
-        serial: 0,
-        now: Duration::ZERO,
-        last,
-        jobs: JoinSet::new(),
-        pending: BTreeMap::new(),
-        cursor: 0,
-        snapshot_tx,
-        dispatch_tx,
-        dispatch_rx,
-        rng,
-        next_exchange: Duration::ZERO,
-        hints: BTreeMap::new(),
-        pages: BTreeMap::new(),
-        successful_probes: 0,
-        failed_probes: 0,
-        #[cfg(test)]
-        tick_lateness_micros: VecDeque::new(),
-        writes: JoinSet::new(),
-        write_queue: VecDeque::new(),
-    };
-    let task = tokio::spawn(actor.run(stopped));
-    Ok(Handle {
-        stop: Some(stop),
-        task: Some(task),
-        snapshot,
-    })
+    Ok((core, record(initial, endpoint, None)))
+}
+
+impl Actor {
+    fn new(
+        core: Membership,
+        owner: MembershipRecord,
+        node: Arc<dyn crate::peer_io::PeerIo>,
+        store: Arc<Store>,
+        incoming: mpsc::Receiver<ControlIncoming>,
+        metrics: Arc<RuntimeMetrics>,
+        seed: u64,
+    ) -> Self {
+        let rng = crate::peer_io::random::Random::stream(seed, core.local_id(), "probes");
+        let last = node.now();
+        let (snapshot_tx, _) = watch::channel(Snapshot::default());
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(64);
+        Self {
+            local_declarations: BTreeMap::new(),
+            metrics,
+            core,
+            owner,
+            node,
+            store,
+            incoming,
+            records: BTreeMap::new(),
+            timings: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            serial: 0,
+            now: Duration::ZERO,
+            last,
+            jobs: Jobs::new(),
+            pending: BTreeMap::new(),
+            cursor: 0,
+            snapshot_tx,
+            dispatch_tx,
+            dispatch_rx,
+            rng,
+            next_exchange: Duration::ZERO,
+            hints: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            successful_probes: 0,
+            failed_probes: 0,
+            #[cfg(test)]
+            tick_lateness_micros: VecDeque::new(),
+            writes: Jobs::new(),
+            write_queue: VecDeque::new(),
+        }
+    }
 }
 
 fn core_error(error: Error) -> anyhow::Error {
@@ -218,7 +327,7 @@ fn wire_state(status: Status) -> MembershipState {
     }
 }
 
-struct Completion {
+pub(crate) struct Completion {
     endpoint: String,
     expected: Option<String>,
     mode: Job,
@@ -239,7 +348,7 @@ enum Job {
     },
 }
 
-struct Dispatch {
+pub(crate) struct Dispatch {
     indirect: bool,
     attempt: u64,
     route: Peer,
@@ -259,7 +368,7 @@ struct Actor {
     serial: u64,
     now: Duration,
     last: Instant,
-    jobs: JoinSet<Completion>,
+    jobs: Jobs<Completion>,
     pending: BTreeMap<String, ()>,
     cursor: usize,
     snapshot_tx: watch::Sender<Snapshot>,
@@ -273,8 +382,17 @@ struct Actor {
     failed_probes: u64,
     #[cfg(test)]
     tick_lateness_micros: VecDeque<u64>,
-    writes: JoinSet<(u64, Result<(), super::storage::StorageError>)>,
+    writes: Jobs<(u64, Result<(), super::storage::StorageError>)>,
     write_queue: VecDeque<Action>,
+}
+
+pub(crate) struct Written((u64, Result<(), super::storage::StorageError>));
+pub(crate) enum Observation {
+    Dispatch(Dispatch),
+    Written(Written),
+    Completed(Box<Completion>),
+    Tick(Instant),
+    Incoming(Box<ControlIncoming>),
 }
 
 impl Actor {
@@ -335,53 +453,79 @@ impl Actor {
                 }
                 dispatched = self.dispatch_rx.recv() => {
                     if let Some(dispatched) = dispatched {
-                        self.metrics.peers.increment(if dispatched.indirect { Metric::ProbeIndirect } else { Metric::ProbeDirect });
-                        self.advance();
-                        let now = self.now;
-                        let actions = self.core().probe_dispatched(dispatched.attempt, &dispatched.route, now).map_err(core_error)?;
-                        self.actions(actions).await?;
+                        self.observe(Observation::Dispatch(dispatched)).await?;
                     }
                 }
                 written = self.writes.join_next(), if !self.writes.is_empty() => {
-                    self.advance();
-                    self.written(written.ok_or_else(|| anyhow::anyhow!("membership write missing"))??).await?;
+                    self.observe(Observation::Written(Written(written.ok_or_else(|| anyhow::anyhow!("membership write missing"))??))).await?;
                 }
                 result = self.jobs.join_next(), if !self.jobs.is_empty() => {
-                    self.advance();
                     let completed = result.ok_or_else(|| anyhow::anyhow!("membership job missing"))??;
-                    self.pending.remove(&completed.endpoint);
-                    self.completed(completed).await?;
+                    self.observe(Observation::Completed(Box::new(completed))).await?;
                 }
                 _ = timer.sleep_until(next_tick) => {
-                    #[cfg(test)]
-                    self.record_tick_lateness(self.node.now().saturating_duration_since(next_tick));
+                    let due = next_tick;
                     next_tick = self.node.now().checked_add(TICK).ok_or_else(|| core_error(Error::Overflow))?;
-                    self.advance();
-                    self.tick().await?;
+                    self.observe(Observation::Tick(due)).await?;
                 }
                 event = self.incoming.recv() => {
                     let Some(event) = event else { anyhow::bail!("membership ingress closed"); };
-                    self.advance();
-                    self.receive(event).await?;
+                    self.observe(Observation::Incoming(Box::new(event))).await?;
                 }
+
             }
             self.publish_snapshot();
         }
     }
 
+    async fn observe(&mut self, event: Observation) -> anyhow::Result<()> {
+        self.advance();
+        match event {
+            Observation::Dispatch(dispatched) => {
+                self.metrics.peers.increment(if dispatched.indirect {
+                    Metric::ProbeIndirect
+                } else {
+                    Metric::ProbeDirect
+                });
+                let actions = self
+                    .core
+                    .probe_dispatched(dispatched.attempt, &dispatched.route, self.now)
+                    .map_err(core_error)?;
+                self.actions(actions).await?;
+            }
+            Observation::Written(written) => self.written(written.0).await?,
+            Observation::Completed(completed) => {
+                self.pending.remove(&completed.endpoint);
+                self.completed(*completed).await?;
+            }
+            Observation::Tick(_due) => {
+                #[cfg(test)]
+                self.record_tick_lateness(self.node.now().saturating_duration_since(_due));
+                self.tick().await?;
+            }
+            Observation::Incoming(event) => self.receive(*event).await?,
+        }
+        self.publish_snapshot();
+        Ok(())
+    }
+
     async fn tick(&mut self) -> anyhow::Result<()> {
-                    let now = self.now;
-                    let actions = self.core().tick(now).map_err(core_error)?;
-                    for action in &actions {
-                        if let Action::PersistFloor { update, .. } = action
-                            && update.status == Status::Dead {
-                            self.local_declarations.insert(update.member.clone(), update.version);
-                        }
-                    }
-                    self.actions(actions).await?;
-                    let actions = self.core.probe_next(now, |upper| self.rng.choose(upper));
-                    if let Ok(actions) = actions { self.actions(actions).await?; }
-                    self.exchange_next().await?;
+        let now = self.now;
+        let actions = self.core().tick(now).map_err(core_error)?;
+        for action in &actions {
+            if let Action::PersistFloor { update, .. } = action
+                && update.status == Status::Dead
+            {
+                self.local_declarations
+                    .insert(update.member.clone(), update.version);
+            }
+        }
+        self.actions(actions).await?;
+        let actions = self.core.probe_next(now, |upper| self.rng.choose(upper));
+        if let Ok(actions) = actions {
+            self.actions(actions).await?;
+        }
+        self.exchange_next().await?;
         Ok(())
     }
 
@@ -418,6 +562,7 @@ impl Actor {
         self.metrics.peers.set(Gauge::MembershipWriteCapacity, 64);
         let mut records: Vec<_> = self.records.values().cloned().collect();
         records.push(self.owner.clone());
+        records.sort_by(|a, b| a.member.cmp(&b.member));
         self.snapshot_tx.send_replace(Snapshot {
             probe_timings: self
                 .timings
@@ -1158,7 +1303,7 @@ mod tests {
                 serial: 0,
                 now: Duration::ZERO,
                 last: Instant::now(),
-                jobs: JoinSet::new(),
+                jobs: Jobs::new(),
                 pending: BTreeMap::new(),
                 cursor: 0,
                 snapshot_tx,
@@ -1171,7 +1316,7 @@ mod tests {
                 successful_probes: 0,
                 failed_probes: 0,
                 tick_lateness_micros: VecDeque::new(),
-                writes: JoinSet::new(),
+                writes: Jobs::new(),
                 write_queue: VecDeque::new(),
             },
         )
@@ -1477,7 +1622,7 @@ mod tests {
             let handle = start(
                 member.into(),
                 Some(endpoint.clone()),
-                Arc::clone(&node),
+                node.clone(),
                 Arc::clone(&store),
                 incoming,
             )
@@ -1635,7 +1780,7 @@ mod tests {
                 start(
                     "bob".into(),
                     Some(bob.endpoint.clone()),
-                    Arc::clone(&bob.node),
+                    bob.node.clone(),
                     Arc::clone(&bob.store),
                     incoming,
                 )

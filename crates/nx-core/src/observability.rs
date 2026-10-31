@@ -166,40 +166,44 @@ impl RuntimeMetrics {
                 .await;
         match progress {
             Ok(Ok(progress)) => {
-                use crate::peer_metrics::Gauge;
-                let mut pending = 0u64;
-                let mut unconfirmed = 0u64;
-                let mut failed = 0u64;
-                let mut complete = 0u64;
-                let mut gaps = 0u64;
-                for origin in progress {
-                    let missing = origin
-                        .known_high_sequence
-                        .saturating_sub(origin.contiguous_sequence)
-                        .saturating_sub(origin.sparse_positions as u64);
-                    gaps = gaps.saturating_add(missing);
-                    if missing > 0 || origin.baseline_missing {
-                        pending += 1;
-                    } else {
-                        complete += 1;
-                    }
-                    unconfirmed += u64::from(origin.baseline_unconfirmed);
-                    failed += u64::from(origin.recovery_failure.is_some());
-                }
-                for (gauge, value) in [
-                    (Gauge::PendingOrigins, pending),
-                    (Gauge::BaselineUnconfirmed, unconfirmed),
-                    (Gauge::FailedOrigins, failed),
-                    (Gauge::KnownCompleteOrigins, complete),
-                    (Gauge::GapPositions, gaps),
-                ] {
-                    self.peers.set(gauge, value);
-                }
+                self.observe_recovery(progress);
             }
             result => {
                 self.record_sync_error();
                 tracing::error!(?result, "recovery metrics sampling failed");
             }
+        }
+    }
+
+    pub(crate) fn observe_recovery(&self, progress: Vec<crate::sync_manager::ReplicationProgress>) {
+        use crate::peer_metrics::Gauge;
+        let mut pending = 0u64;
+        let mut unconfirmed = 0u64;
+        let mut failed = 0u64;
+        let mut complete = 0u64;
+        let mut gaps = 0u64;
+        for origin in progress {
+            let missing = origin
+                .known_high_sequence
+                .saturating_sub(origin.contiguous_sequence)
+                .saturating_sub(origin.sparse_positions as u64);
+            gaps = gaps.saturating_add(missing);
+            if missing > 0 || origin.baseline_missing {
+                pending += 1;
+            } else {
+                complete += 1;
+            }
+            unconfirmed += u64::from(origin.baseline_unconfirmed);
+            failed += u64::from(origin.recovery_failure.is_some());
+        }
+        for (gauge, value) in [
+            (Gauge::PendingOrigins, pending),
+            (Gauge::BaselineUnconfirmed, unconfirmed),
+            (Gauge::FailedOrigins, failed),
+            (Gauge::KnownCompleteOrigins, complete),
+            (Gauge::GapPositions, gaps),
+        ] {
+            self.peers.set(gauge, value);
         }
     }
 

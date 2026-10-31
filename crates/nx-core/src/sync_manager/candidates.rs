@@ -6,7 +6,6 @@ use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
 
 use crate::control::{ControlError, PeerCandidate, PeerRegistration};
@@ -800,7 +799,10 @@ impl DiscoveryCoordinator {
             prepared
                 .store
                 .map(|store| (store, self.config.cluster_id().to_owned())),
-            self.generation.clone(),
+            CandidateExecution {
+                generation: self.generation.clone(),
+                clock: Arc::new(crate::peer_io::clock::SystemClock),
+            },
         )));
         self.provider_tasks = self
             .providers
@@ -958,6 +960,11 @@ impl DiscoveryCoordinator {
     }
 }
 
+struct CandidateExecution {
+    generation: CandidateGeneration,
+    clock: Arc<dyn crate::peer_io::clock::Clock>,
+}
+
 async fn run_candidate_registry(
     mut registry: CandidateRegistry,
     mut persisted_manual: HashSet<String>,
@@ -965,11 +972,14 @@ async fn run_candidate_registry(
     mut command_rx: mpsc::Receiver<CandidateCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
     manual_store: Option<(Arc<nx_store::Store>, String)>,
-    generation: CandidateGeneration,
+    execution: CandidateExecution,
 ) {
+    let generation = execution.generation;
     loop {
         let next_expiry = registry.next_expiry();
+        let clock = execution.clock.clone();
         tokio::select! {
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     break;
@@ -992,6 +1002,7 @@ async fn run_candidate_registry(
                                 &mut persisted_manual,
                                 &endpoint,
                                 manual_store.as_ref(),
+                                clock.now(),
                             ).await
                         };
                         if let Err(error) = &result {
@@ -1015,14 +1026,14 @@ async fn run_candidate_registry(
                     }
                     command => command,
                 };
-                let changed = apply_candidate_command(&mut registry, command);
+                let changed = apply_candidate_command(&mut registry, command, clock.now());
                 generation.publish(&registry);
                 if changed {
                     candidates_tx.send_replace(registry.endpoints());
                 }
             }
-            _ = wait_for_expiry(next_expiry) => {
-                if registry.expire(StdInstant::now()) {
+            _ = wait_for_expiry(next_expiry, clock.as_ref()) => {
+                if registry.expire(clock.now()) {
                     candidates_tx.send_replace(registry.endpoints());
                 }
                 generation.publish(&registry);
@@ -1044,6 +1055,7 @@ async fn accept_manual(
     persisted_manual: &mut HashSet<String>,
     endpoint: &str,
     storage: Option<&(Arc<nx_store::Store>, String)>,
+    now: StdInstant,
 ) -> Result<PeerRegistration, ControlError> {
     if registry.local_endpoints.contains(endpoint) {
         return Err(ControlError::InvalidPeer);
@@ -1067,7 +1079,7 @@ async fn accept_manual(
     }
     let mut prepared = registry.clone();
     prepared
-        .add("manual", endpoint.to_owned(), None, StdInstant::now())
+        .add("manual", endpoint.to_owned(), None, now)
         .map_err(|error| ControlError::Internal(error.to_string()))?;
     let (store, cluster) = storage.ok_or(ControlError::ServiceUnavailable)?;
     let store = Arc::clone(store);
@@ -1084,8 +1096,11 @@ async fn accept_manual(
     })
 }
 
-fn apply_candidate_command(registry: &mut CandidateRegistry, command: CandidateCommand) -> bool {
-    let now = StdInstant::now();
+fn apply_candidate_command(
+    registry: &mut CandidateRegistry,
+    command: CandidateCommand,
+    now: StdInstant,
+) -> bool {
     match command {
         CandidateCommand::Snapshot {
             source_id,
@@ -1264,9 +1279,9 @@ async fn wait_for_retry(delay: Duration, shutdown_rx: &mut watch::Receiver<bool>
     }
 }
 
-async fn wait_for_expiry(deadline: Option<StdInstant>) {
+async fn wait_for_expiry(deadline: Option<StdInstant>, clock: &dyn crate::peer_io::clock::Clock) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(TokioInstant::from_std(deadline)).await,
+        Some(deadline) => clock.sleep_until(deadline).await,
         None => pending::<()>().await,
     }
 }
@@ -1914,7 +1929,10 @@ mod tests {
             command_rx,
             shutdown_rx,
             None,
-            CandidateAccess::default().begin_generation().unwrap(),
+            CandidateExecution {
+                generation: CandidateAccess::default().begin_generation().unwrap(),
+                clock: Arc::new(crate::peer_io::clock::SystemClock),
+            },
         ));
         tokio::time::timeout(Duration::from_secs(2), candidates_rx.changed())
             .await
@@ -2134,6 +2152,72 @@ mod tests {
         assert_eq!(&*registry.endpoints(), &["peer.example:9000"]);
         assert!(registry.remove("two", "peer.example:9000"));
         assert!(registry.endpoints().is_empty());
+    }
+
+    #[test]
+    fn shared_candidate_driver_uses_observation_time_and_stable_order() {
+        use crate::peer_io::clock::Clock as _;
+        use crate::peer_io::simulation::{Clock, Tasks};
+        let clock = Clock::new();
+        let now = clock.now();
+        let access = CandidateAccess::with_metrics(Arc::new(
+            crate::observability::RuntimeMetrics::default(),
+        ));
+        let generation = access.begin_generation().unwrap();
+        let (candidates_tx, candidates_rx) = watch::channel(Arc::new(Vec::new()));
+        let (commands, command_rx) = mpsc::channel(8);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut tasks = Tasks::new();
+        let c = clock.clone();
+        tasks.spawn(run_candidate_registry(
+            CandidateRegistry::new(2).unwrap(),
+            HashSet::new(),
+            candidates_tx,
+            command_rx,
+            shutdown_rx,
+            None,
+            CandidateExecution {
+                generation,
+                clock: c,
+            },
+        ));
+        assert!(tasks.poll_ready().is_empty());
+        let snapshot =
+            DiscoverySnapshot::observed(1, vec![("b:1".into(), now), ("a:1".into(), now)]);
+        commands
+            .try_send(CandidateCommand::Snapshot {
+                source_id: "first".into(),
+                snapshot: snapshot.clone(),
+                ttl: Some(Duration::from_millis(10)),
+            })
+            .unwrap();
+        tasks.poll_ready();
+        assert_eq!(&**candidates_rx.borrow(), &["b:1", "a:1"]);
+        let expiry = clock.next_deadline().unwrap();
+        clock.advance_to(now + Duration::from_millis(5));
+        commands
+            .try_send(CandidateCommand::Snapshot {
+                source_id: "first".into(),
+                snapshot,
+                ttl: Some(Duration::from_millis(10)),
+            })
+            .unwrap();
+        tasks.poll_ready();
+        assert_eq!(
+            clock.next_deadline(),
+            Some(expiry),
+            "cached observation renewed lease"
+        );
+        clock.advance_to(expiry - Duration::from_nanos(1));
+        tasks.poll_ready();
+        assert_eq!(candidates_rx.borrow().len(), 2);
+        clock.advance_to(expiry);
+        tasks.poll_ready();
+        assert!(candidates_rx.borrow().is_empty());
+        shutdown.send_replace(true);
+        assert_eq!(tasks.poll_ready().len(), 1);
+        assert!(tasks.is_empty());
+        assert!(clock.next_deadline().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

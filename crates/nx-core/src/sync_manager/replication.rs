@@ -29,71 +29,85 @@ const MAX_RECONNECT_ATTEMPTS_PER_TURN: usize = 8;
 
 pub(super) fn spawn_broadcast_loop(
     context: BroadcastLoopContext,
+    op_rx: super::delivery::Receiver<AcceptedLocalOp>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(broadcast_loop(context, op_rx, shutdown_rx))
+}
+
+pub(super) async fn broadcast_loop(
+    context: BroadcastLoopContext,
     mut op_rx: super::delivery::Receiver<AcceptedLocalOp>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut pending = None;
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!("broadcast loop shutdown requested");
-                        drain_broadcast_queue(
-                            &context,
-                            &mut op_rx,
-                            pending.take(),
-                        ).await;
-                        break;
-                    }
-                }
-                op = async { match pending.take() { Some(op) => Some(op), None => op_rx.recv().await } } => {
-                    let Some(first) = op else {
-                        break;
-                    };
-                    broadcast_batch(
+) {
+    let mut pending = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    debug!("broadcast loop shutdown requested");
+                    drain_broadcast_queue(
                         &context,
                         &mut op_rx,
-                        first,
-                        &mut pending,
+                        pending.take(),
                     ).await;
+                    break;
                 }
             }
+            op = async { match pending.take() { Some(op) => Some(op), None => op_rx.recv().await } } => {
+                let Some(first) = op else {
+                    break;
+                };
+                broadcast_batch(
+                    &context,
+                    &mut op_rx,
+                    first,
+                    &mut pending,
+                ).await;
+            }
         }
-        debug!("broadcast loop terminated");
-    })
+    }
+    debug!("broadcast loop terminated");
 }
 
 pub(super) fn spawn_forward_loop(
     context: ForwardLoopContext,
+    forwarded_rx: super::delivery::Receiver<ForwardedOp>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(forward_loop(context, forwarded_rx, shutdown_rx))
+}
+
+pub(super) async fn forward_loop(
+    context: ForwardLoopContext,
     mut forwarded_rx: super::delivery::Receiver<ForwardedOp>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut pending = None;
-        loop {
-            let first = tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        debug!("forward loop shutdown requested; durable history remains available for repair");
-                        break;
-                    }
-                    continue;
+) {
+    let mut pending = None;
+    loop {
+        let first = tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    debug!("forward loop shutdown requested; durable history remains available for repair");
+                    break;
                 }
-                forwarded = async {
-                    match pending.take() {
-                        Some(forwarded) => Some(forwarded),
-                        None => forwarded_rx.recv().await,
-                    }
-                } => forwarded,
-            };
-            let Some(first) = first else {
-                break;
-            };
-            forward_batch(&context, &mut forwarded_rx, first, &mut pending).await;
-        }
-        debug!("forward loop terminated");
-    })
+                continue;
+            }
+            forwarded = async {
+                match pending.take() {
+                    Some(forwarded) => Some(forwarded),
+                    None => forwarded_rx.recv().await,
+                }
+            } => forwarded,
+        };
+        let Some(first) = first else {
+            break;
+        };
+        forward_batch(&context, &mut forwarded_rx, first, &mut pending).await;
+    }
+    debug!("forward loop terminated");
 }
 
 pub(super) async fn try_connect_configured_peer(
@@ -201,6 +215,10 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
 }
 
 pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<JoinHandle<()>> {
+    Some(tokio::spawn(reconnect_loop(context)))
+}
+
+pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
     let ReconnectLoopContext {
         local_id,
         membership,
@@ -216,229 +234,240 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
         peer_health,
     } = context;
 
-    Some(tokio::spawn(async move {
-        let initial_delay = normalize_reconnect_delay(initial_delay);
-        let max_delay = max_delay.max(initial_delay);
-        let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
-        let mut state = Vec::new();
-        let mut neighbors = super::neighbors::Neighbors::new(node.now());
-        let mut victim_cursor = 0usize;
-        let mut jitter = super::delivery::Jitter::new(super::delivery::seed(local_id.as_str()));
+    let initial_delay = normalize_reconnect_delay(initial_delay);
+    let max_delay = max_delay.max(initial_delay);
+    let peer_dead_after_failures = normalize_peer_dead_after_failures(peer_dead_after_failures);
+    let mut state = Vec::new();
+    let mut neighbors = super::neighbors::Neighbors::new(node.now());
+    let mut victim_cursor = 0usize;
+    let mut jitter = super::delivery::Jitter::new(super::delivery::seed(local_id.as_str()));
 
-        'reconnect: loop {
-            if *shutdown_rx.borrow() {
-                break;
-            }
-            let mut rotation_due = neighbors.rotate(node.now(), rotation_interval);
-            let discovery = Arc::clone(&candidates_rx.borrow_and_update());
-            let records = membership.borrow().records.clone();
-            let was_suppressed = neighbors.recovery_suppressed();
-            let candidates = neighbors.candidates(&discovery, &records, local_id.as_str());
-            if !was_suppressed && neighbors.recovery_suppressed() {
-                metrics.record_sync_error();
-                warn!(
-                    "withdrawal budget exhausted; membership-only data recovery disabled until restart; live discovery remains usable"
-                );
-            }
-            reconcile_reconnect_candidates(&mut state, &candidates, initial_delay, &peer_health, node.now())
-                .await;
-            neighbors.advance();
-            let connected = node.connected_peers().await;
-            let connected_ids: HashSet<_> = connected.iter().map(|(_, id)| id.as_str()).collect();
-            let mut connected_endpoints: HashSet<_> =
-                connected.iter().map(|(addr, _)| addr.clone()).collect();
-            let candidate_set: HashSet<_> = candidates.iter().map(String::as_str).collect();
-            let mut replaceable_ids = HashSet::new();
-            for record in &records {
-                if let Some(endpoint) = record
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| super::canonicalize_endpoint(endpoint).ok())
-                {
-                    if connected_ids.contains(record.member.as_str()) {
-                        connected_endpoints.insert(endpoint.clone());
-                    }
-                    if candidate_set.contains(endpoint.as_str()) {
-                        replaceable_ids.insert(record.member.as_str());
-                    }
+    'reconnect: loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let mut rotation_due = neighbors.rotate(node.now(), rotation_interval);
+        let discovery = Arc::clone(&candidates_rx.borrow_and_update());
+        let records = membership.borrow().records.clone();
+        let was_suppressed = neighbors.recovery_suppressed();
+        let candidates = neighbors.candidates(&discovery, &records, local_id.as_str());
+        if !was_suppressed && neighbors.recovery_suppressed() {
+            metrics.record_sync_error();
+            warn!(
+                "withdrawal budget exhausted; membership-only data recovery disabled until restart; live discovery remains usable"
+            );
+        }
+        reconcile_reconnect_candidates(
+            &mut state,
+            &candidates,
+            initial_delay,
+            &peer_health,
+            node.now(),
+        )
+        .await;
+        neighbors.advance();
+        let connected = node.connected_peers().await;
+        let connected_ids: HashSet<_> = connected.iter().map(|(_, id)| id.as_str()).collect();
+        let mut connected_endpoints: HashSet<_> =
+            connected.iter().map(|(addr, _)| addr.clone()).collect();
+        let candidate_set: HashSet<_> = candidates.iter().map(String::as_str).collect();
+        let mut replaceable_ids = HashSet::new();
+        for record in &records {
+            if let Some(endpoint) = record
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| super::canonicalize_endpoint(endpoint).ok())
+            {
+                if connected_ids.contains(record.member.as_str()) {
+                    connected_endpoints.insert(endpoint.clone());
                 }
-            }
-            let mut attempts = 0usize;
-            let mut sleep_for: Option<Duration> = None;
-            let now = node.now();
-            let connect_context = ConfiguredPeerConnectContext {
-                node: node.as_ref(),
-                max_peers,
-                peer_dead_after_failures,
-                metrics: &metrics,
-                peer_health: &peer_health,
-            };
-
-            for peer in state.iter_mut() {
-                let peer_addr = peer.addr.as_str();
-
-                if peer.stopped {
-                    continue;
+                if candidate_set.contains(endpoint.as_str()) {
+                    replaceable_ids.insert(record.member.as_str());
                 }
-
-                if connected_endpoints.contains(peer_addr)
-                    || node.is_connected_addr(peer_addr).await
-                {
-                    mark_peer_success(&peer_health, peer_addr).await;
-                    peer.reset(initial_delay, node.now());
-                    continue;
-                }
-
-                if let Some(wait) = peer.next_attempt_at.checked_duration_since(now)
-                    && !wait.is_zero()
-                {
-                    sleep_for = Some(sleep_for.map_or(wait, |current| current.min(wait)));
-                    continue;
-                }
-
-                // Bound dialing work per turn. Advancing the first candidate on
-                // every turn prevents a slow prefix or full slots from starving bridges.
-                if attempts == MAX_RECONNECT_ATTEMPTS_PER_TURN {
-                    break;
-                }
-                attempts += 1;
-                if node.connected_peer_count().await >= max_peers {
-                    let replaceable: Vec<_> = connected
-                        .iter()
-                        .filter(|(addr, id)| {
-                            candidate_set.contains(addr.as_str())
-                                || replaceable_ids.contains(id.as_str())
-                        })
-                        .collect();
-                    if !replaceable.is_empty() && rotation_due {
-                        rotation_due = false;
-                        let (addr, id) = replaceable[victim_cursor % replaceable.len()];
-                        victim_cursor = victim_cursor.wrapping_add(1);
-                        tokio::select! {
-                            biased;
-                            _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
-                            _ = node.disconnect_peer(addr, id) => {},
-                        }
-                    }
-                }
-
-                // The task owns the dial future: shutdown drops an in-flight
-                // handshake instead of waiting for every candidate's timeout.
-                let outcome = tokio::select! {
-                    biased;
-                    _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
-                    outcome = try_connect_configured_peer(&connect_context, peer_addr) => outcome,
-                };
-                match outcome {
-                    ConfiguredPeerConnectOutcome::Connected => {
-                        info!(peer = %peer_addr, "reconnected configured peer");
-                        peer.reset(initial_delay, node.now());
-                    }
-                    ConfiguredPeerConnectOutcome::AlreadyConnected => {
-                        peer.reset(initial_delay, node.now());
-                    }
-                    ConfiguredPeerConnectOutcome::SlotLimitReached => {
-                        break;
-                    }
-                    ConfiguredPeerConnectOutcome::Failed => {
-                        let Some(attempt_delay) = peer.record_failure(max_delay, node.now())
-                        else {
-                            metrics.record_sync_error();
-                            warn!(peer = %peer.addr, "stopping reconnect: backoff deadline overflow");
-                            continue;
-                        };
-                        sleep_for = Some(
-                            sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)),
-                        );
-                        metrics
-                            .peers
-                            .increment(crate::peer_metrics::Counter::RetryFailure);
-                    }
-                    ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
-                        let Some(retry_after) = peer.record_retry_after(
-                            bounded_retry_after(delay, max_delay),
-                            node.now(),
-                        ) else {
-                            metrics.record_sync_error();
-                            warn!(peer = %peer.addr, "stopping reconnect: retry-after deadline overflow");
-                            continue;
-                        };
-                        sleep_for =
-                            Some(sleep_for.map_or(retry_after, |current| current.min(retry_after)));
-                        metrics
-                            .peers
-                            .increment(crate::peer_metrics::Counter::RetryLimited);
-                    }
-                    ConfiguredPeerConnectOutcome::Fatal => {
-                        warn!(
-                            peer = %peer_addr,
-                            "stopping automatic reconnect for configured peer after fatal wire error"
-                        );
-                        peer.stop();
-                    }
-                }
-            }
-            let sleep_for = sleep_for.unwrap_or(initial_delay);
-            let sleep_for = sleep_for
-                .saturating_add(jitter.delay(sleep_for / 8))
-                .min(max_delay);
-            let Some(deadline) = node.now().checked_add(sleep_for) else {
-                metrics.record_sync_error();
-                warn!("stopping reconnect loop: sleep deadline overflow");
-                break;
-            };
-
-            tokio::select! {
-                _ = wait_for_shutdown(&mut shutdown_rx) => {
-                    debug!("reconnect loop shutdown requested");
-                    break;
-                }
-                changed = candidates_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-                _ = node.sleep_until(deadline) => {}
             }
         }
-        debug!("reconnect loop terminated");
-    }))
+        let mut attempts = 0usize;
+        let mut sleep_for: Option<Duration> = None;
+        let now = node.now();
+        let connect_context = ConfiguredPeerConnectContext {
+            node: node.as_ref(),
+            max_peers,
+            peer_dead_after_failures,
+            metrics: &metrics,
+            peer_health: &peer_health,
+        };
+
+        for peer in state.iter_mut() {
+            let peer_addr = peer.addr.as_str();
+
+            if peer.stopped {
+                continue;
+            }
+
+            if connected_endpoints.contains(peer_addr) || node.is_connected_addr(peer_addr).await {
+                mark_peer_success(&peer_health, peer_addr).await;
+                peer.reset(initial_delay, node.now());
+                continue;
+            }
+
+            if let Some(wait) = peer.next_attempt_at.checked_duration_since(now)
+                && !wait.is_zero()
+            {
+                sleep_for = Some(sleep_for.map_or(wait, |current| current.min(wait)));
+                continue;
+            }
+
+            // Bound dialing work per turn. Advancing the first candidate on
+            // every turn prevents a slow prefix or full slots from starving bridges.
+            if attempts == MAX_RECONNECT_ATTEMPTS_PER_TURN {
+                break;
+            }
+            attempts += 1;
+            if node.connected_peer_count().await >= max_peers {
+                let replaceable: Vec<_> = connected
+                    .iter()
+                    .filter(|(addr, id)| {
+                        candidate_set.contains(addr.as_str())
+                            || replaceable_ids.contains(id.as_str())
+                    })
+                    .collect();
+                if !replaceable.is_empty() && rotation_due {
+                    rotation_due = false;
+                    let (addr, id) = replaceable[victim_cursor % replaceable.len()];
+                    victim_cursor = victim_cursor.wrapping_add(1);
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
+                        _ = node.disconnect_peer(addr, id) => {},
+                    }
+                }
+            }
+
+            // The task owns the dial future: shutdown drops an in-flight
+            // handshake instead of waiting for every candidate's timeout.
+            let outcome = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
+                outcome = try_connect_configured_peer(&connect_context, peer_addr) => outcome,
+            };
+            match outcome {
+                ConfiguredPeerConnectOutcome::Connected => {
+                    info!(peer = %peer_addr, "reconnected configured peer");
+                    peer.reset(initial_delay, node.now());
+                }
+                ConfiguredPeerConnectOutcome::AlreadyConnected => {
+                    peer.reset(initial_delay, node.now());
+                }
+                ConfiguredPeerConnectOutcome::SlotLimitReached => {
+                    break;
+                }
+                ConfiguredPeerConnectOutcome::Failed => {
+                    let Some(attempt_delay) = peer.record_failure(max_delay, node.now()) else {
+                        metrics.record_sync_error();
+                        warn!(peer = %peer.addr, "stopping reconnect: backoff deadline overflow");
+                        continue;
+                    };
+                    sleep_for =
+                        Some(sleep_for.map_or(attempt_delay, |current| current.min(attempt_delay)));
+                    metrics
+                        .peers
+                        .increment(crate::peer_metrics::Counter::RetryFailure);
+                }
+                ConfiguredPeerConnectOutcome::RetryAfter(delay) => {
+                    let Some(retry_after) =
+                        peer.record_retry_after(bounded_retry_after(delay, max_delay), node.now())
+                    else {
+                        metrics.record_sync_error();
+                        warn!(peer = %peer.addr, "stopping reconnect: retry-after deadline overflow");
+                        continue;
+                    };
+                    sleep_for =
+                        Some(sleep_for.map_or(retry_after, |current| current.min(retry_after)));
+                    metrics
+                        .peers
+                        .increment(crate::peer_metrics::Counter::RetryLimited);
+                }
+                ConfiguredPeerConnectOutcome::Fatal => {
+                    warn!(
+                        peer = %peer_addr,
+                        "stopping automatic reconnect for configured peer after fatal wire error"
+                    );
+                    peer.stop();
+                }
+            }
+        }
+        let sleep_for = sleep_for.unwrap_or(initial_delay);
+        let sleep_for = sleep_for
+            .saturating_add(jitter.delay(sleep_for / 8))
+            .min(max_delay);
+        let Some(deadline) = node.now().checked_add(sleep_for) else {
+            metrics.record_sync_error();
+            warn!("stopping reconnect loop: sleep deadline overflow");
+            break;
+        };
+
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                debug!("reconnect loop shutdown requested");
+                break;
+            }
+            changed = candidates_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = node.sleep_until(deadline) => {}
+        }
+    }
+    debug!("reconnect loop terminated");
 }
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
-    Some(tokio::spawn(async move {
-        let mut shutdown_rx = context.shutdown_rx.clone();
-        let interval = normalize_anti_entropy_interval(context.interval);
-        let mut jitter = super::delivery::Jitter::new(context.jitter_seed);
-        let mut peer_cursor = 0usize;
-        let mut previous = context.node.now();
-        loop {
-            let period = interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
-            let Some(deadline) = checked_anti_entropy_deadline(previous, period, context.node.now()) else {
-                context.metrics.record_sync_error();
-                warn!("stopping anti-entropy loop: cadence deadline overflow");
-                break;
-            };
-            previous = deadline;
-            tokio::select! {
-                biased;
-                _ = wait_for_shutdown(&mut shutdown_rx) => break,
-                _ = async {
-                    context.node.sleep_until(deadline).await;
-                    anti_entropy_turn(&context, &mut peer_cursor).await
-                } => {}
-            }
+    Some(tokio::spawn(anti_entropy_loop(context)))
+}
+
+pub(super) async fn anti_entropy_loop(context: AntiEntropyLoopContext) {
+    let mut shutdown_rx = context.shutdown_rx.clone();
+    let interval = normalize_anti_entropy_interval(context.interval);
+    let mut jitter = super::delivery::Jitter::new(context.jitter_seed);
+    let mut peer_cursor = 0usize;
+    let mut previous = context.node.now();
+    loop {
+        let period =
+            interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
+        let Some(deadline) = checked_anti_entropy_deadline(previous, period, context.node.now())
+        else {
+            context.metrics.record_sync_error();
+            warn!("stopping anti-entropy loop: cadence deadline overflow");
+            break;
+        };
+        previous = deadline;
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => break,
+            _ = async {
+                context.node.sleep_until(deadline).await;
+                anti_entropy_turn(&context, &mut peer_cursor).await
+            } => {}
         }
-        debug!("anti-entropy loop terminated");
-    }))
+    }
+    debug!("anti-entropy loop terminated");
 }
 
 /// One bounded protocol turn; both adapters execute this function.
 pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cursor: &mut usize) {
-    context.metrics.refresh_recovery(Arc::clone(&context.store)).await;
+    context
+        .node
+        .refresh_recovery(&context.metrics, Arc::clone(&context.store))
+        .await;
     let mut peers = context.node.connected_peers().await;
     peers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
-    context.history_cursors.write().await.retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
+    context
+        .history_cursors
+        .write()
+        .await
+        .retain(|addr, _| peers.iter().any(|(peer, _)| peer == addr));
     if !peers.is_empty() {
         let len = peers.len();
         peers.rotate_left(*peer_cursor % len);
@@ -450,7 +479,12 @@ pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cur
             let mut cursors = context.history_cursors.write().await;
             let cursor = cursors.entry(peer.clone()).or_default();
             let now = context.node.now();
-            if cursor.request_deadline.is_some_and(|deadline| deadline > now) { continue; }
+            if cursor
+                .request_deadline
+                .is_some_and(|deadline| deadline > now)
+            {
+                continue;
+            }
             let Some(deadline) = now.checked_add(context.request_timeout) else {
                 context.metrics.record_sync_error();
                 warn!("skipping anti-entropy turn: request deadline overflow");
@@ -459,8 +493,18 @@ pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cur
             cursor.request_deadline = Some(deadline);
             cursor.after_origin.clone()
         };
-        if let Err(error) = send_repair_history(&context.node, &context.repair_budget, &peer, HistoryMessage::SummaryRequest { after_origin }, Some(&mut turn)).await {
-            if let Some(cursor) = context.history_cursors.write().await.get_mut(&peer) { cursor.request_deadline = None; }
+        if let Err(error) = send_repair_history(
+            &context.node,
+            &context.repair_budget,
+            &peer,
+            HistoryMessage::SummaryRequest { after_origin },
+            Some(&mut turn),
+        )
+        .await
+        {
+            if let Some(cursor) = context.history_cursors.write().await.get_mut(&peer) {
+                cursor.request_deadline = None;
+            }
             context.metrics.record_sync_error();
             debug!(%peer, %error, "history summary request failed");
         }
@@ -498,7 +542,7 @@ async fn reconcile_reconnect_candidates(
         .drain(..)
         .map(|peer| (peer.addr.clone(), peer))
         .collect::<HashMap<_, _>>();
-    
+
     state.extend(candidates.iter().map(|addr| {
         existing
             .remove(addr)
@@ -662,12 +706,7 @@ async fn send_paced_history(
     pacing
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sent(
-            addr,
-            &generation,
-            node.now(),
-            result.as_ref().ok().copied(),
-        );
+        .sent(addr, &generation, node.now(), result.as_ref().ok().copied());
     result.map(|_| true)
 }
 
@@ -697,10 +736,14 @@ async fn forward_batch(
 
     let seed = super::delivery::seed(entries[0].op.id.as_str())
         ^ super::delivery::seed(context.local_id.as_str());
-    context.node.sleep_until(context.node.now() +
-        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2))
-    )
-    .await;
+    context
+        .node
+        .sleep_until(
+            context.node.now()
+                + super::delivery::Jitter::new(seed)
+                    .delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+        )
+        .await;
     for _ in 1..BROADCAST_BATCH_MAX {
         match forwarded_rx.try_recv() {
             Ok(forwarded) if forwarded.source_addr == source_addr => {
@@ -772,7 +815,9 @@ async fn forward_batch(
     }
     if sent > 0 {
         context.metrics.record_broadcast_batch(count);
-        context.metrics.record_sync_latency(context.node.now().saturating_duration_since(started));
+        context
+            .metrics
+            .record_sync_latency(context.node.now().saturating_duration_since(started));
     }
     context.metrics.peers.fanout(true, true, sent + failed);
     if failed > 0 {
@@ -833,10 +878,14 @@ pub(super) async fn broadcast_batch(
 
     // Give producers a tiny window to fill the channel so sustained load is
     // sent in larger PushOps messages instead of many tiny network writes.
-    context.node.sleep_until(context.node.now() +
-        super::delivery::Jitter::new(seed).delay(BROADCAST_COALESCE_DELAY.saturating_mul(2))
-    )
-    .await;
+    context
+        .node
+        .sleep_until(
+            context.node.now()
+                + super::delivery::Jitter::new(seed)
+                    .delay(BROADCAST_COALESCE_DELAY.saturating_mul(2)),
+        )
+        .await;
 
     for _ in 1..BROADCAST_BATCH_MAX {
         match op_rx.try_recv() {
@@ -910,7 +959,9 @@ pub(super) async fn broadcast_batch(
     }
     if sent > 0 {
         context.metrics.record_broadcast_batch(count);
-        context.metrics.record_sync_latency(context.node.now().saturating_duration_since(started));
+        context
+            .metrics
+            .record_sync_latency(context.node.now().saturating_duration_since(started));
         debug!(count, recipients = sent, failed, "gossip batch sent");
     }
     context.metrics.peers.fanout(false, true, sent + failed);
@@ -1052,8 +1103,8 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
                     .insert(from, id);
             }
             context
-                .metrics
-                .refresh_recovery(Arc::clone(&context.store))
+                .node
+                .refresh_recovery(&context.metrics, Arc::clone(&context.store))
                 .await;
         }
         NodeEvent::OpsReceived { from, .. } => {
@@ -2056,8 +2107,14 @@ mod tests {
             PeerHealth::default(),
         )])));
 
-        reconcile_reconnect_candidates(&mut state, &[], Duration::from_millis(10), &peer_health, now)
-            .await;
+        reconcile_reconnect_candidates(
+            &mut state,
+            &[],
+            Duration::from_millis(10),
+            &peer_health,
+            now,
+        )
+        .await;
 
         assert!(state.is_empty());
         assert!(peer_health.read().await.is_empty());

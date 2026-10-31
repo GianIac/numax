@@ -8,6 +8,8 @@ production module:
 - End-to-end convergence tests live in `e2e/`, with one file per CRDT family.
 - Shared setup, operation, persistence, and convergence helpers live in
   `support.rs`.
+- Deterministic multi-family replay lives in `determinism.rs`; it drives the
+  same production loops and membership actor through the internal test ports.
 
 The E2E files must exercise behavior through the sync manager and its handle.
 They must not contain family-independent setup or duplicate helpers from
@@ -45,3 +47,25 @@ even if synchronous storage work delays the async polling loop. The runtime
 stays current-thread, other tests remain parallel, and bulk budget tests are
 neither skipped nor reduced. This isolates independent tests; it is not a
 latency guarantee under arbitrary storage contention in production.
+
+## Deterministic replay
+
+The replay uses versioned seeded IDs/random streams, a wake-driven virtual
+clock and real sled/codec paths. It compares ten runs per codec and report
+hashes in three independent processes. Child execution is bounded, timed-out
+processes are killed and reaped, and diagnostic reads are capped at 64 KiB.
+
+The repeated replay itself runs in an isolated process to avoid sled's global
+lock delaying unrelated real-time tests. Its 180-second total lifetime covers
+ten runs per codec and three child comparisons; each comparison child retains
+the existing 60-second limit. Neither lifetime changes the three-second
+virtual scenario or the configured recovery deadlines.
+
+Advance virtual time only after current work quiesces; never use arbitrary
+Tokio yields or sleeps to make a trace pass. Keep deadline, delivery,
+task-allocation and candidate order stable. Storage errors remain real errors;
+an injected failed flush fences writes until the store is reopened.
+
+This fixture starts from a three-node chain but lets the production reconnect
+policy choose later neighbors. It is not a fixed sparse-topology certificate
+or a substitute for the roadmap's 50-node, partition and detector scenarios.

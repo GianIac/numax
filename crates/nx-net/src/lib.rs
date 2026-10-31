@@ -4,6 +4,9 @@ mod error;
 mod message;
 mod node;
 mod peer;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod testing;
 mod tls;
 
 pub use bootstrap::{

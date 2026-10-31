@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nx_sync::{Op, OpKind};
+use nx_sync::OpKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
@@ -1143,12 +1143,7 @@ async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsert
         }
     };
 
-    let op = Op::rga_insert_with_op_id(
-        handle.node_id().clone(),
-        key.clone(),
-        parent.clone(),
-        value.clone(),
-    );
+    let op = handle.rga_insert_op(&key, parent.clone(), value.clone());
     let element_id = match &op.kind {
         OpKind::RgaInsert { id, .. } => id.clone(),
         _ => {

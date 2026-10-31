@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use nx_net::{ControlReply, ControlRequest, ControlTiming, NetResult, Node, PeerConnectionInfo};
 use nx_sync::{HistoryMessage, NodeId, OpId};
 use tokio::sync::oneshot;
+pub(crate) mod clock;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Generation {
@@ -42,11 +43,19 @@ pub(crate) trait Prepared: Send + Sync {
 struct TcpFrame(Arc<Node>, nx_net::PreparedHistory);
 #[async_trait]
 impl Prepared for TcpFrame {
-    fn encoded_len(&self) -> usize { self.1.encoded_len() }
-    fn generation(&self) -> Generation { Generation::Tcp(self.1.generation()) }
-    fn peer_id(&self) -> &NodeId { self.1.peer_id() }
+    fn encoded_len(&self) -> usize {
+        self.1.encoded_len()
+    }
+    fn generation(&self) -> Generation {
+        Generation::Tcp(self.1.generation())
+    }
+    fn peer_id(&self) -> &NodeId {
+        self.1.peer_id()
+    }
     async fn send(self: Box<Self>, budget: Duration) -> NetResult<Duration> {
-        self.0.send_prepared_history_with_timeout(self.1, budget).await
+        self.0
+            .send_prepared_history_with_timeout(self.1, budget)
+            .await
     }
 }
 
@@ -60,44 +69,109 @@ pub(crate) trait PeerIo: Send + Sync {
     async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo>;
     async fn connect_to_peer(&self, addr: &str) -> NetResult<()>;
     async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool;
-    async fn prepare_history_to_addr(self: Arc<Self>, addr: &str, message: HistoryMessage) -> NetResult<Box<dyn Prepared>>;
-    async fn control_request_timed_tracked(&self, addr: &str, request: ControlRequest, budget: Duration, dispatched: Option<oneshot::Sender<()>>) -> NetResult<(NodeId, ControlReply, ControlTiming)>;
+    async fn prepare_history_to_addr(
+        self: Arc<Self>,
+        addr: &str,
+        message: HistoryMessage,
+    ) -> NetResult<Box<dyn Prepared>>;
+    async fn control_request_timed_tracked(
+        &self,
+        addr: &str,
+        request: ControlRequest,
+        budget: Duration,
+        dispatched: Option<oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, ControlReply, ControlTiming)>;
     async fn shutdown(&self);
-    async fn connected_peer_count(&self) -> usize { self.connected_peers().await.len() }
+    async fn refresh_recovery(
+        &self,
+        metrics: &Arc<crate::observability::RuntimeMetrics>,
+        store: Arc<nx_store::Store>,
+    ) {
+        metrics.refresh_recovery(store).await;
+    }
+    async fn connected_peer_count(&self) -> usize {
+        self.connected_peers().await.len()
+    }
     async fn is_connected_addr(&self, addr: &str) -> bool {
-        self.connected_peers().await.iter().any(|(peer, _)| peer == addr)
+        self.connected_peers()
+            .await
+            .iter()
+            .any(|(peer, _)| peer == addr)
     }
-    async fn control_request(&self, addr: &str, request: ControlRequest, budget: Duration) -> NetResult<(NodeId, ControlReply)> {
-        self.control_request_timed_tracked(addr, request, budget, None).await.map(|(id, reply, _)| (id, reply))
+    async fn control_request(
+        &self,
+        addr: &str,
+        request: ControlRequest,
+        budget: Duration,
+    ) -> NetResult<(NodeId, ControlReply)> {
+        self.control_request_timed_tracked(addr, request, budget, None)
+            .await
+            .map(|(id, reply, _)| (id, reply))
     }
-    async fn send_prepared_history_with_timeout(&self, prepared: Box<dyn Prepared>, budget: Duration) -> NetResult<Duration> {
+    async fn send_prepared_history_with_timeout(
+        &self,
+        prepared: Box<dyn Prepared>,
+        budget: Duration,
+    ) -> NetResult<Duration> {
         prepared.send(budget).await
     }
 }
 
 #[async_trait]
 impl PeerIo for Node {
-    fn now(&self) -> Instant { Instant::now() }
-    async fn sleep_until(&self, deadline: Instant) { tokio::time::sleep_until(deadline.into()).await; }
-    fn request_id(&self) -> OpId { OpId::generate() }
-    fn max_message_size(&self) -> usize { Node::max_message_size(self) }
+    fn now(&self) -> Instant {
+        clock::Clock::now(&clock::SystemClock)
+    }
+    async fn sleep_until(&self, deadline: Instant) {
+        clock::Clock::sleep_until(&clock::SystemClock, deadline).await;
+    }
+    fn request_id(&self) -> OpId {
+        OpId::generate()
+    }
+    fn max_message_size(&self) -> usize {
+        Node::max_message_size(self)
+    }
     async fn connected_peers(&self) -> Vec<(String, NodeId)> {
         let mut peers = Node::connected_peers(self).await;
         // HashMap traversal must not select the first repair/rotation recipient.
         peers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
         peers
     }
-    async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo> { Node::connection_info(self, addr).await }
-    async fn connect_to_peer(&self, addr: &str) -> NetResult<()> { Node::connect_to_peer(self, addr).await }
-    async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool { Node::disconnect_peer(self, addr, expected).await }
-    async fn prepare_history_to_addr(self: Arc<Self>, addr: &str, message: HistoryMessage) -> NetResult<Box<dyn Prepared>> {
+    async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo> {
+        Node::connection_info(self, addr).await
+    }
+    async fn connect_to_peer(&self, addr: &str) -> NetResult<()> {
+        Node::connect_to_peer(self, addr).await
+    }
+    async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool {
+        Node::disconnect_peer(self, addr, expected).await
+    }
+    async fn prepare_history_to_addr(
+        self: Arc<Self>,
+        addr: &str,
+        message: HistoryMessage,
+    ) -> NetResult<Box<dyn Prepared>> {
         let prepared = Node::prepare_history_to_addr(&self, addr, message).await?;
         Ok(Box::new(TcpFrame(self, prepared)))
     }
-    async fn control_request_timed_tracked(&self, addr: &str, request: ControlRequest, budget: Duration, dispatched: Option<oneshot::Sender<()>>) -> NetResult<(NodeId, ControlReply, ControlTiming)> {
+    async fn control_request_timed_tracked(
+        &self,
+        addr: &str,
+        request: ControlRequest,
+        budget: Duration,
+        dispatched: Option<oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, ControlReply, ControlTiming)> {
         Node::control_request_timed_tracked(self, addr, request, budget, dispatched).await
     }
-    async fn shutdown(&self) { Node::shutdown(self).await; }
+    async fn shutdown(&self) {
+        Node::shutdown(self).await;
+    }
+    async fn connected_peer_count(&self) -> usize {
+        Node::connected_peer_count(self).await
+    }
+    async fn is_connected_addr(&self, addr: &str) -> bool {
+        Node::is_connected_addr(self, addr).await
+    }
 }
 
 #[cfg(test)]

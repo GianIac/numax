@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::GossipRateConfig;
-use nx_net::ControlTiming;
 use crate::peer_io::Generation as ConnectionGeneration;
+use nx_net::ControlTiming;
 
 const WINDOW: Duration = Duration::from_secs(1);
 pub(super) const SAMPLE_TTL: Duration = Duration::from_secs(10);
@@ -338,6 +338,8 @@ mod tests {
             .await
             .unwrap()
             .generation();
+        let ga = ConnectionGeneration::Tcp(ga);
+        let gb = ConnectionGeneration::Tcp(gb);
         let now = Instant::now();
         let mut pacer = Pacer::new(config(), 2);
         assert!(
@@ -365,6 +367,7 @@ mod tests {
             .await
             .unwrap()
             .generation();
+        let new = ConnectionGeneration::Tcp(new);
         assert!(ga != new);
         assert!(
             pacer
