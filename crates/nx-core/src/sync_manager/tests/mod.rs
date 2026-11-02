@@ -5683,7 +5683,21 @@ async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
         )
         .await
         .unwrap();
-    wait_for_counter(&target, "received", 7).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        let complete = target.get_counter_value("received").await == 7
+            && target.anti_entropy_watermarks.read().await.get(&source_id)
+                == Some(&newer.id.as_str().to_string());
+        assert!(
+            Instant::now() < deadline,
+            "received state and watermark did not complete"
+        );
+        if complete {
+            break;
+        }
+        poll.tick().await;
+    }
     assert_eq!(target.get_counter_value("missing").await, 0);
     assert_eq!(
         target.anti_entropy_watermarks.read().await.get(&source_id),

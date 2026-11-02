@@ -21,6 +21,181 @@ async fn real_control_data_partition_bincode() {
     real_control_data_partition(SerializationFormat::Bincode).await;
 }
 
+#[tokio::test]
+async fn history_summary_storage_wait_does_not_stall_control() {
+    use std::future::Future;
+
+    let (mut manager, _, store) =
+        started_manager_with_config(SyncConfig::new().with_listen_addr("127.0.0.1:0")).await;
+    let owner = test_owner_record(&mut manager).await;
+    let context = test_event_context(
+        Arc::clone(&manager.counters),
+        Arc::clone(&manager.seen_ops),
+        Arc::clone(&manager.op_log),
+        Arc::clone(&store),
+        Arc::clone(&manager.metrics),
+        Arc::clone(&manager.peer_health),
+    );
+    let cursors = Arc::clone(&context.history_cursors);
+    let request_deadline = StdInstant::now() + Duration::from_secs(30);
+    {
+        let mut cursors = cursors.write().await;
+        let cursor = cursors.entry("unused".into()).or_default();
+        cursor.after_origin = Some("previous-page".into());
+        cursor.request_deadline = Some(request_deadline);
+    }
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let lease = store.acquire_write_lease().unwrap();
+        held_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let control_progress = probe_rx.recv_timeout(Duration::from_secs(2));
+        drop(lease);
+        control_progress
+    });
+    held_rx.await.unwrap();
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+    let processing = tokio::spawn(async move {
+        let mut polled_tx = Some(polled_tx);
+        let handler = handle_node_event(
+            NodeEvent::HistoryReceived {
+                from: NodeId::new("summary-source"),
+                addr: "unused".into(),
+                message: nx_sync::HistoryMessage::Summary {
+                    entries: vec![nx_sync::HistorySummary {
+                        baseline_required: false,
+                        origin: NodeId::new("empty-origin"),
+                        high_sequence: 0,
+                    }],
+                },
+            },
+            &context,
+        );
+        let mut handler = std::pin::pin!(handler);
+        entered_tx.send(()).unwrap();
+        std::future::poll_fn(|cx| {
+            let result = handler.as_mut().poll(cx);
+            if let Some(polled_tx) = polled_tx.take() {
+                polled_tx.send(()).unwrap();
+            }
+            result
+        })
+        .await;
+    });
+    polled_rx.await.unwrap();
+    let during_storage = {
+        let cursors = cursors.read().await;
+        let cursor = &cursors["unused"];
+        (cursor.after_origin.clone(), cursor.request_deadline)
+    };
+    let requester = Node::new(NodeConfig::new(NodeId::new("probe-source"), "127.0.0.1:0"));
+    let probe = requester
+        .control_request(
+            owner.endpoint.as_ref().unwrap(),
+            nx_net::ControlRequest {
+                request_id: 1,
+                owner: nx_net::MembershipRecord {
+                    member: "probe-source".into(),
+                    reporter: "probe-source".into(),
+                    endpoint: None,
+                    state: MembershipState::Alive,
+                    version: nx_net::MembershipVersion {
+                        epoch: 1,
+                        incarnation: 0,
+                    },
+                },
+                updates: vec![],
+                kind: nx_net::ControlKind::Probe {
+                    target: owner.member,
+                    version: owner.version,
+                },
+            },
+            Duration::from_millis(500),
+        )
+        .await;
+    let acknowledged = probe.as_ref().is_ok_and(|(_, reply)| reply.ack);
+    let delivered = probe_tx.send(acknowledged);
+    processing.await.unwrap();
+    let progress = holder.join().unwrap();
+    let after_storage = {
+        let cursors = cursors.read().await;
+        let cursor = &cursors["unused"];
+        (cursor.after_origin.clone(), cursor.request_deadline)
+    };
+    requester.shutdown().await;
+    traced_shutdown(&mut manager).await;
+    assert!(acknowledged, "{probe:?}");
+    assert_eq!(
+        progress,
+        Ok(true),
+        "control did not progress while the storage lease was held"
+    );
+    assert!(delivered.is_ok(), "{delivered:?}");
+    assert_eq!(
+        during_storage,
+        (Some("previous-page".into()), Some(request_deadline)),
+        "summary request was released before storage processing completed"
+    );
+    assert_eq!(after_storage, (None, None));
+}
+
+#[tokio::test]
+async fn history_summary_storage_failure_releases_request_and_reports_error() {
+    let store = temp_store();
+    let context = test_event_context(
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(SeenOps::new(1024))),
+        Arc::new(RwLock::new(Vec::new())),
+        Arc::clone(&store),
+        metrics(),
+        Arc::new(RwLock::new(HashMap::new())),
+    );
+    context
+        .history_cursors
+        .write()
+        .await
+        .entry("source".into())
+        .or_default()
+        .request_deadline = Some(StdInstant::now() + Duration::from_secs(30));
+    store.inject_disk_full_on_writes(true);
+    handle_node_event(
+        NodeEvent::HistoryReceived {
+            from: NodeId::new("source"),
+            addr: "source".into(),
+            message: nx_sync::HistoryMessage::Summary {
+                entries: vec![nx_sync::HistorySummary {
+                    baseline_required: false,
+                    origin: NodeId::new("origin"),
+                    high_sequence: 1,
+                }],
+            },
+        },
+        &context,
+    )
+    .await;
+    store.inject_disk_full_on_writes(false);
+    assert!(
+        context.history_cursors.read().await["source"]
+            .request_deadline
+            .is_none()
+    );
+    assert!(context.history_requests.read().await.is_empty());
+    assert!(
+        store
+            .get(b"__nx/crdt/sequence/origin/origin")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        context
+            .metrics
+            .render_for_test(&store)
+            .contains("numax_sync_errors_total 1")
+    );
+}
+
 async fn wait_mutual_state(a: &SyncManager, b: &SyncManager, expected: MembershipState) {
     let admission_started = StdInstant::now();
     let admission = tokio::time::timeout(Duration::from_secs(30), async {
@@ -214,8 +389,8 @@ async fn real_control_data_partition(format: SerializationFormat) {
                 > 0
         );
     }
-    a.shutdown().await.unwrap();
-    b.shutdown().await.unwrap();
+    traced_shutdown(&mut a).await;
+    traced_shutdown(&mut b).await;
 }
 
 #[tokio::test]
@@ -501,14 +676,8 @@ async fn two_full_pairs_reconnect_after_mutual_dead_data_partition() {
         );
     }
     result.unwrap();
-    for (index, manager) in [&mut a, &mut b, &mut c, &mut d].into_iter().enumerate() {
-        let started = StdInstant::now();
-        let result = manager.shutdown().await;
-        assert!(
-            result.is_ok(),
-            "node {index} shutdown failed after {:?}: {result:?}",
-            started.elapsed(),
-        );
+    for manager in [&mut a, &mut b, &mut c, &mut d] {
+        traced_shutdown(manager).await;
     }
 }
 

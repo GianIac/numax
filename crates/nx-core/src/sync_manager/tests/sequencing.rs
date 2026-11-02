@@ -1,6 +1,76 @@
 use super::*;
 use nx_sync::{HistorySummary, OpPosition, SequencedOp};
 
+#[test]
+fn unchanged_history_summary_does_not_require_a_storage_write() {
+    let store = temp_store();
+    let summary = HistorySummary {
+        baseline_required: false,
+        origin: NodeId::new("summary-origin"),
+        high_sequence: 7,
+    };
+    let missing = record_summary(&store, &summary).unwrap();
+    assert_eq!(missing, Some((1, 7)));
+    let keys = [
+        b"__nx/crdt/sequence/origin/summary-origin".as_slice(),
+        b"__nx/crdt/sequence/usage".as_slice(),
+    ];
+    let before = keys.map(|key| store.get(key).unwrap());
+    store.inject_disk_full_on_writes(true);
+    let repeated = record_summary(&store, &summary);
+    store.inject_disk_full_on_writes(false);
+    assert_eq!(before, keys.map(|key| store.get(key).unwrap()));
+    assert_eq!(
+        repeated.unwrap_or_else(|error| panic!("unchanged summary attempted a write: {error:#}")),
+        missing,
+    );
+}
+
+#[test]
+fn history_summary_changes_preserve_validation_and_recovery_metadata() {
+    let store = temp_store();
+    let mut summary = HistorySummary {
+        baseline_required: false,
+        origin: NodeId::new("summary-origin"),
+        high_sequence: 7,
+    };
+    record_summary(&store, &summary).unwrap();
+    let revision = recovery_revision(&store, &summary.origin).unwrap();
+    assert!(
+        record_recovery_failure(
+            &store,
+            &summary.origin,
+            "source",
+            nx_sync::BaselineFailure::CoverageConflict,
+            &revision,
+        )
+        .unwrap()
+    );
+    let before = replication_progress(&store).unwrap();
+    store.inject_disk_full_on_writes(true);
+    let unchanged = record_summary(&store, &summary);
+    summary.high_sequence = 6;
+    let stale = record_summary(&store, &summary);
+    summary.high_sequence = 8;
+    let changed = record_summary(&store, &summary);
+    store.inject_disk_full_on_writes(false);
+    assert_eq!(unchanged.unwrap(), Some((1, 7)));
+    assert_eq!(stale.unwrap(), Some((1, 7)));
+    assert!(changed.is_err());
+    assert_eq!(replication_progress(&store).unwrap(), before);
+    assert_eq!(record_summary(&store, &summary).unwrap(), Some((1, 8)));
+    assert!(
+        replication_progress(&store).unwrap()[0]
+            .recovery_failure
+            .is_none()
+    );
+    summary.baseline_required = true;
+    record_summary(&store, &summary).unwrap();
+    assert!(needs_baseline(&store, summary.origin.as_str()).unwrap());
+    summary.origin = NodeId::new("");
+    assert!(record_summary(&store, &summary).is_err());
+}
+
 fn transport_replay(entry: SequencedOp) -> nx_sync::HistoryMessage {
     nx_sync::HistoryMessage::Replay {
         request_id: nx_sync::OpId::new("\0".repeat(128)),

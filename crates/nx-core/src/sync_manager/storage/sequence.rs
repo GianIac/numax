@@ -473,11 +473,15 @@ pub(in crate::sync_manager) fn record_summary(
     progress.baseline_required |= summary.baseline_required;
     let missing = progress.missing_page();
     let sets = tracker_sets(store, BTreeMap::from([(origin.to_owned(), progress)]))?;
-    let refs = sets
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect::<Vec<_>>();
-    lease.apply_batch(&refs, &[])?;
+    let mut refs = Vec::new();
+    for (key, value) in &sets {
+        if store.get(key)?.as_deref() != Some(value.as_slice()) {
+            refs.push((key.as_slice(), value.as_slice()));
+        }
+    }
+    if !refs.is_empty() {
+        lease.apply_batch(&refs, &[])?;
+    }
     Ok(missing)
 }
 

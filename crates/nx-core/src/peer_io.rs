@@ -32,6 +32,25 @@ impl Generation {
     }
 }
 
+pub(crate) enum StorageExecutor {
+    Blocking,
+    #[cfg(test)]
+    Deterministic,
+}
+
+impl StorageExecutor {
+    pub(crate) async fn execute<T: Send + 'static>(
+        self,
+        work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        match self {
+            Self::Blocking => tokio::task::spawn_blocking(work).await?,
+            #[cfg(test)]
+            Self::Deterministic => work(),
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait Prepared: Send + Sync {
     fn encoded_len(&self) -> usize;
@@ -61,6 +80,9 @@ impl Prepared for TcpFrame {
 
 #[async_trait]
 pub(crate) trait PeerIo: Send + Sync {
+    fn storage_executor(&self) -> StorageExecutor {
+        StorageExecutor::Blocking
+    }
     fn now(&self) -> Instant;
     async fn sleep_until(&self, deadline: Instant);
     fn request_id(&self) -> OpId;

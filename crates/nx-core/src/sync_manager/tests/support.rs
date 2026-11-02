@@ -39,6 +39,10 @@ pub(super) async fn wait_for_store_file_release(
 }
 
 pub(super) fn log_sync_phase(phase: &str, elapsed: Duration, managers: &[&SyncManager]) {
+    crate::membership::runtime::shutdown_trace(
+        "manager.phase",
+        format_args!("name={phase} elapsed_us={}", elapsed.as_micros()),
+    );
     eprintln!(
         "SYNC_PHASE phase={phase} pid={} elapsed_ms={}",
         std::process::id(),
@@ -67,6 +71,15 @@ pub(super) fn log_sync_phase(phase: &str, elapsed: Duration, managers: &[&SyncMa
                 .map(|task| task.is_finished()),
             manager.op_log.try_read().is_ok(),
         );
+        eprintln!(
+            "SYNC_PHASE node={index} id={} partition_values={:?} coverage={:?}",
+            manager.node_id,
+            manager.counters.try_read().map(|counters| {
+                ["partition-left", "partition-right"]
+                    .map(|key| counters.get(key).map(GCounter::value))
+            }),
+            manager.handle().replication_progress(),
+        );
         if let Some(snapshot) = snapshot {
             eprintln!(
                 "SYNC_PHASE node={index} records={} probes_ok={} probes_failed={} \
@@ -80,6 +93,23 @@ pub(super) fn log_sync_phase(phase: &str, elapsed: Duration, managers: &[&SyncMa
             );
         }
     }
+}
+
+pub(super) async fn traced_shutdown(manager: &mut SyncManager) {
+    let started = StdInstant::now();
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        log_sync_phase("shutdown-start", Duration::ZERO, &[manager]);
+    }
+    let result = manager.shutdown().await;
+    if result.is_err() || std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        log_sync_phase("shutdown-result", started.elapsed(), &[manager]);
+    }
+    assert!(
+        result.is_ok(),
+        "node {} shutdown failed after {:?}: {result:?}",
+        manager.node_id,
+        started.elapsed(),
+    );
 }
 
 pub(super) fn remote_apply_context(manager: &SyncManager) -> RemoteOpApplyContext<'_> {
@@ -621,6 +651,11 @@ pub(super) fn isolated_test_output(
         .stderr(Stdio::from(output.try_clone().unwrap()))
         .spawn()
         .unwrap();
+    crate::membership::runtime::shutdown_trace(
+        "child.started",
+        format_args!("name={test_name} child_pid={}", child.id()),
+    );
+    crate::membership::runtime::dump_shutdown_trace();
     let deadline = StdInstant::now() + lifetime;
     let result = loop {
         match child.try_wait() {
@@ -639,8 +674,25 @@ pub(super) fn isolated_test_output(
     let cleanup = result.is_err().then(|| (child.kill(), child.wait()));
     output.rewind().unwrap();
     let mut bytes = Vec::new();
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        let length = output.metadata().unwrap().len();
+        output
+            .seek(std::io::SeekFrom::Start(length.saturating_sub(64 * 1024)))
+            .unwrap();
+    }
     output.take(64 * 1024).read_to_end(&mut bytes).unwrap();
     let directory_cleanup = directory.close();
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        crate::membership::runtime::shutdown_trace(
+            "child.finished",
+            format_args!(
+                "name={test_name} child_pid={} result={result:?}",
+                child.id()
+            ),
+        );
+        crate::membership::runtime::dump_shutdown_trace();
+        eprintln!("{}", String::from_utf8_lossy(&bytes));
+    }
     if result.as_ref().is_ok_and(|status| status.success()) && directory_cleanup.is_ok() {
         return bytes;
     }

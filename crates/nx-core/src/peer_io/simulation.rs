@@ -597,6 +597,9 @@ impl Prepared for Frame {
 }
 #[async_trait]
 impl PeerIo for Endpoint {
+    fn storage_executor(&self) -> StorageExecutor {
+        StorageExecutor::Deterministic
+    }
     fn now(&self) -> Instant {
         self.network.clock.now()
     }

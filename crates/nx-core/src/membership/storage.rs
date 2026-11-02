@@ -183,9 +183,23 @@ impl<'store> MembershipStore<'store> {
     ) -> Result<(), StorageError> {
         #[cfg(test)]
         let started = std::time::Instant::now();
+        #[cfg(test)]
+        let trace = |phase| {
+            super::runtime::shutdown_trace(
+                phase,
+                format_args!(
+                    "node={local_id} member={} version={:?} status={:?}",
+                    update.member, update.version, update.status
+                ),
+            )
+        };
+        #[cfg(test)]
+        trace("storage.lease_wait");
         let lease = self.store.acquire_write_lease()?;
         #[cfg(test)]
         let leased = std::time::Instant::now();
+        #[cfg(test)]
+        trace("storage.leased");
         if lease.store().get(SCHEMA_KEY)?.as_deref() != Some(HEADER) {
             return Err(Error::InvalidMetadata.into());
         }
@@ -206,10 +220,16 @@ impl<'store> MembershipStore<'store> {
         let value = floor.encode()?;
         #[cfg(test)]
         let read = std::time::Instant::now();
+        #[cfg(test)]
+        trace("storage.batch_start");
         lease.apply_batch(&[(&key, &value)], &[])?;
         #[cfg(test)]
         let batched = std::time::Instant::now();
+        #[cfg(test)]
+        trace("storage.flush_start");
         lease.flush()?;
+        #[cfg(test)]
+        trace("storage.flush_done");
         #[cfg(test)]
         if started.elapsed() > std::time::Duration::from_secs(1) {
             eprintln!(

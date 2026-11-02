@@ -31,6 +31,46 @@ const SCHEDULING_SAMPLES_LIMIT: usize = 2048;
 #[cfg(test)]
 pub(crate) mod simulation;
 
+#[cfg(test)]
+static SHUTDOWN_TRACE: std::sync::Mutex<(VecDeque<String>, usize)> =
+    std::sync::Mutex::new((VecDeque::new(), 0));
+
+#[cfg(test)]
+pub(crate) fn shutdown_trace(phase: &str, details: std::fmt::Arguments<'_>) {
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_none() {
+        return;
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let message = format!(
+        "SHUTDOWN_TRACE pid={} at_us={} task={:?} phase={phase} {details}\n",
+        std::process::id(),
+        START.get_or_init(Instant::now).elapsed().as_micros(),
+        tokio::task::try_id(),
+    );
+    let mut trace = SHUTDOWN_TRACE.lock().expect("shutdown trace lock");
+    if trace.0.len() == 4096 {
+        trace.0.pop_front();
+        trace.1 += 1;
+    }
+    trace.0.push_back(message);
+}
+
+#[cfg(test)]
+pub(crate) fn dump_shutdown_trace() {
+    let (events, dropped) = {
+        let mut trace = SHUTDOWN_TRACE.lock().expect("shutdown trace lock");
+        (std::mem::take(&mut trace.0), std::mem::take(&mut trace.1))
+    };
+    if events.is_empty() {
+        return;
+    }
+    let mut message = format!("SHUTDOWN_TRACE_DUMP dropped={dropped}\n");
+    for event in events {
+        message.push_str(&event);
+    }
+    eprint!("{message}");
+}
+
 // The coordinator owns effects; only their executor differs in deterministic tests.
 struct Jobs<T: Send + 'static> {
     tasks: JoinSet<T>,
@@ -141,6 +181,15 @@ impl Handle {
 
     async fn shutdown_with_budget(mut self, budget: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + budget;
+        #[cfg(test)]
+        shutdown_trace(
+            "handle.request",
+            format_args!(
+                "actor={:?} budget_us={}",
+                self.task.as_ref().map(JoinHandle::id),
+                budget.as_micros()
+            ),
+        );
         let (completed, mut completion) = oneshot::channel();
         if let Some(stop) = self.stop.take()
             && stop
@@ -153,12 +202,16 @@ impl Handle {
             tracing::debug!("membership task stopped before receiving the shutdown request");
         }
         if let Some(task) = self.task.as_mut() {
+            #[cfg(test)]
+            let actor = task.id();
             let timed_out = match tokio::time::timeout_at(deadline, &mut *task).await {
                 Ok(result) => {
                     result??;
                     false
                 }
                 Err(_) => {
+                    #[cfg(test)]
+                    shutdown_trace("handle.timeout", format_args!("actor={}", task.id()));
                     task.abort();
                     match task.await {
                         Ok(result) => result?,
@@ -169,6 +222,11 @@ impl Handle {
                 }
             };
             let completed = completion.try_recv();
+            #[cfg(test)]
+            shutdown_trace(
+                "handle.result",
+                format_args!("actor={actor} timed_out={timed_out} completed={completed:?}"),
+            );
             let lateness = completed
                 .as_ref()
                 .map(|at| at.saturating_duration_since(deadline));
@@ -192,6 +250,8 @@ impl Drop for Handle {
         if let Some(task) = &self.task {
             task.abort();
         }
+        #[cfg(test)]
+        dump_shutdown_trace();
     }
 }
 
@@ -470,16 +530,29 @@ impl Actor {
                     let stopped_at = tokio::time::Instant::now();
                     #[cfg(test)]
                     let queued = self.write_queue.len() + self.writes.len();
+                    #[cfg(test)]
+                    shutdown_trace(
+                        "actor.stop",
+                        format_args!("node={} remaining_us={} queued={queued} jobs={}", self.owner.member,
+                            shutdown.deadline.saturating_duration_since(stopped_at).as_micros(), self.jobs.len()),
+                    );
                     let actions = self.core().leave().map_err(core_error)?;
                     self.actions(actions).await?;
+                    #[cfg(test)]
+                    shutdown_trace("actor.leave_queued", format_args!("node={}", self.owner.member));
                     while let Some(result) = self.writes.join_next().await {
                         self.written(result?).await?;
                     }
                     #[cfg(test)]
                     let writes_done = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    shutdown_trace("actor.writes_done", format_args!("node={}", self.owner.member));
                     self.jobs.abort_all();
                     while self.jobs.join_next().await.is_some() {}
                     let completed_at = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    shutdown_trace("actor.confirm", format_args!("node={} late_us={}", self.owner.member,
+                        completed_at.saturating_duration_since(shutdown.deadline).as_micros()));
                     if shutdown.completed.send(completed_at).is_err() {
                         tracing::debug!("membership shutdown completion observer dropped");
                     }
@@ -1020,7 +1093,26 @@ impl Actor {
                 .ok_or_else(|| core_error(Error::NotReady))?;
             #[cfg(test)]
             let queued_at = Instant::now();
+            #[cfg(test)]
+            shutdown_trace(
+                "write.queued",
+                format_args!(
+                    "node={local} token={token} member={} version={:?} status={:?}",
+                    update.member, update.version, update.status
+                ),
+            );
             self.writes.spawn_blocking(move || {
+                #[cfg(test)]
+                shutdown_trace(
+                    "write.started",
+                    format_args!(
+                        "node={local} token={token} member={} version={:?} status={:?} queue_us={}",
+                        update.member,
+                        update.version,
+                        update.status,
+                        queued_at.elapsed().as_micros()
+                    ),
+                );
                 #[cfg(test)]
                 if queued_at.elapsed() > Duration::from_secs(1) {
                     eprintln!(
@@ -1028,10 +1120,13 @@ impl Actor {
                         queued_at.elapsed().as_millis()
                     );
                 }
-                (
-                    token,
-                    MembershipStore::new(&store).persist_update(&local, epoch, &update),
-                )
+                let result = MembershipStore::new(&store).persist_update(&local, epoch, &update);
+                #[cfg(test)]
+                shutdown_trace(
+                    "write.finished",
+                    format_args!("node={local} token={token} ok={}", result.is_ok()),
+                );
+                (token, result)
             });
             break;
         }
@@ -1042,6 +1137,15 @@ impl Actor {
         &mut self,
         (token, result): (u64, Result<(), super::storage::StorageError>),
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        shutdown_trace(
+            "write.observed",
+            format_args!(
+                "node={} token={token} ok={}",
+                self.owner.member,
+                result.is_ok()
+            ),
+        );
         if let Err(error) = result {
             let _ = self.core.confirm_floor(token, false);
             self.core.fence();
@@ -1049,6 +1153,14 @@ impl Actor {
         }
         let actions = self.core.confirm_floor(token, true).map_err(core_error)?;
         self.actions(actions).await?;
+        #[cfg(test)]
+        shutdown_trace(
+            "write.published",
+            format_args!(
+                "node={} token={token} state={:?}",
+                self.owner.member, self.owner.state
+            ),
+        );
         self.start_write()?;
         Ok(())
     }
@@ -2462,6 +2574,107 @@ mod tests {
         guest_runtime.shutdown().await.unwrap();
         alice.stop().await;
         bob.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_confirms_own_left_only_after_flush() {
+        let mut alice = Running::new("shutdown-flush", nx_net::SerializationFormat::Json).await;
+        alice.owner("shutdown-flush").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(handle.shutdown());
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let premature_completion = stopping.is_finished();
+        let premature_left = snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-flush" && record.state == MembershipState::Left
+        });
+        let flushed_while_paused = alice.store.completed_flushes();
+        resume_tx.send(()).unwrap();
+        stopping.await.unwrap().unwrap();
+        assert!(!premature_completion);
+        assert!(!premature_left);
+        assert_eq!(flushed_while_paused, before);
+        assert_eq!(alice.store.completed_flushes(), before + 1);
+        let key = [super::super::schema::FLOOR_PREFIX, b"shutdown-flush"].concat();
+        let floor = super::super::schema::Floor::decode(
+            "shutdown-flush",
+            &alice.store.get(&key).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor.status, Status::Left);
+        assert_eq!(floor.closed_epoch, Some(floor.version.epoch));
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_own_late_flush_cannot_publish_after_timeout() {
+        let mut alice = Running::new("shutdown-late", nx_net::SerializationFormat::Bincode).await;
+        alice.owner("shutdown-late").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(handle.shutdown());
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = stopping.await.unwrap();
+        let flushed_while_paused = alice.store.completed_flushes();
+        resume_tx.send(()).unwrap();
+        let store = Arc::clone(&alice.store);
+        tokio::task::spawn_blocking(move || store.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown budget exhausted")
+        );
+        assert_eq!(flushed_while_paused, before);
+        assert_eq!(alice.store.completed_flushes(), before + 2);
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-late" && record.state == MembershipState::Left
+        }));
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_propagates_own_flush_failure_without_left() {
+        let mut alice = Running::new("shutdown-failure", nx_net::SerializationFormat::Json).await;
+        alice.owner("shutdown-failure").await;
+        let before = alice.store.completed_flushes();
+        alice.store.inject_disk_full_on_flush(true);
+        let handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let result = handle.shutdown().await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("membership storage")
+        );
+        assert_eq!(alice.store.completed_flushes(), before);
+        assert!(snapshot.borrow().error.is_some());
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-failure" && record.state == MembershipState::Left
+        }));
+        assert!(matches!(
+            alice.store.flush(),
+            Err(nx_store::StoreError::DurabilityUncertain)
+        ));
+        alice.node.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

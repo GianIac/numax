@@ -1380,9 +1380,14 @@ async fn handle_history_message(
                     origin: nx_sync::NodeId::new(origin),
                     high_sequence,
                 };
-                if let Some((start, end)) =
-                    super::storage::record_summary(&context.store, &summary)?
-                {
+                let store = Arc::clone(&context.store);
+                let tracked = summary.clone();
+                let missing = context
+                    .node
+                    .storage_executor()
+                    .execute(move || super::storage::record_summary(&store, &tracked))
+                    .await?;
+                if let Some((start, end)) = missing {
                     request_history_range(addr, summary.origin, start, end, context).await?;
                 }
             }
@@ -1392,8 +1397,16 @@ async fn handle_history_message(
             enqueue_forwarded_ops(addr, accepted, context);
         }
         HistoryMessage::SummaryRequest { after_origin } => {
-            let cursor = super::storage::summary_cursor(after_origin.as_deref())?;
-            let (entries, _) = super::storage::summary_page(&context.store, cursor.as_deref())?;
+            let store = Arc::clone(&context.store);
+            let entries = context
+                .node
+                .storage_executor()
+                .execute(move || -> anyhow::Result<_> {
+                    let cursor = super::storage::summary_cursor(after_origin.as_deref())?;
+                    let (entries, _) = super::storage::summary_page(&store, cursor.as_deref())?;
+                    Ok(entries)
+                })
+                .await?;
             send_repair_history(
                 &context.node,
                 &context.repair_budget,
@@ -1419,22 +1432,37 @@ async fn handle_history_message(
             } else {
                 None
             };
+            let result = async {
+                for entry in entries {
+                    let store = Arc::clone(&context.store);
+                    let origin = entry.origin.clone();
+                    let (missing, baseline) = context
+                        .node
+                        .storage_executor()
+                        .execute(move || -> anyhow::Result<_> {
+                            let missing = super::storage::record_summary(&store, &entry)?;
+                            let baseline =
+                                super::storage::needs_baseline(&store, entry.origin.as_str())?
+                                    || store.exists(super::storage::BASELINE_UNCONFIRMED)?;
+                            Ok((missing, baseline))
+                        })
+                        .await?;
+                    if baseline {
+                        request_baseline(addr, origin, context).await?;
+                    } else if let Some((start, end)) = missing {
+                        request_history_range(addr, origin, start, end, context).await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             {
                 let mut cursors = context.history_cursors.write().await;
                 let cursor = cursors.entry(addr.to_owned()).or_default();
                 cursor.after_origin = next;
                 cursor.request_deadline = None;
             }
-            for entry in entries {
-                let missing = super::storage::record_summary(&context.store, &entry)?;
-                if super::storage::needs_baseline(&context.store, entry.origin.as_str())?
-                    || context.store.exists(super::storage::BASELINE_UNCONFIRMED)?
-                {
-                    request_baseline(addr, entry.origin, context).await?;
-                } else if let Some((start, end)) = missing {
-                    request_history_range(addr, entry.origin, start, end, context).await?;
-                }
-            }
+            result?;
         }
         HistoryMessage::Request {
             request_id,
