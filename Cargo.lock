@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "nx-api"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "nx-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "nx-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "nx-net"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "hex",
  "nx-sync",
@@ -2227,11 +2227,11 @@ dependencies = [
 
 [[package]]
 name = "nx-sdk"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "nx-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "sled",
  "tempfile",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "nx-sync"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "proptest",
  "serde",

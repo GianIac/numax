@@ -1,6 +1,6 @@
 [package]
 name = "discovery_lan"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 publish = false
 
@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 increment = []
 
 [dependencies]
-nx-sdk = { version = "0.1.5", path = "../../crates/nx-sdk" }
+nx-sdk = { version = "0.1.6", path = "../../crates/nx-sdk" }
 
 [profile.release]
 lto = true

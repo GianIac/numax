@@ -23,6 +23,33 @@ async fn real_control_data_partition_bincode() {
 
 #[tokio::test]
 async fn history_summary_storage_wait_does_not_stall_control() {
+    history_storage_wait_does_not_stall_control(StorageWaitCase::Summary).await;
+}
+
+#[tokio::test]
+async fn history_unavailable_storage_wait_does_not_stall_control() {
+    history_storage_wait_does_not_stall_control(StorageWaitCase::Unavailable).await;
+}
+
+#[tokio::test]
+async fn baseline_unavailable_storage_wait_does_not_stall_control() {
+    history_storage_wait_does_not_stall_control(StorageWaitCase::BaselineUnavailable).await;
+}
+
+#[tokio::test]
+async fn remote_push_storage_wait_does_not_stall_control() {
+    history_storage_wait_does_not_stall_control(StorageWaitCase::Push).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StorageWaitCase {
+    Summary,
+    Unavailable,
+    BaselineUnavailable,
+    Push,
+}
+
+async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
     use std::future::Future;
 
     let (mut manager, _, store) =
@@ -38,6 +65,71 @@ async fn history_summary_storage_wait_does_not_stall_control() {
     );
     let cursors = Arc::clone(&context.history_cursors);
     let request_deadline = StdInstant::now() + Duration::from_secs(30);
+    let origin = NodeId::new("storage-wait-origin");
+    let request_id = nx_sync::OpId::generate();
+    if !matches!(case, StorageWaitCase::Summary) {
+        record_summary(
+            &store,
+            &nx_sync::HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+    }
+    if matches!(
+        case,
+        StorageWaitCase::Unavailable | StorageWaitCase::BaselineUnavailable
+    ) {
+        let baseline = matches!(case, StorageWaitCase::BaselineUnavailable);
+        context
+            .history_requests
+            .write()
+            .await
+            .entry("unused".into())
+            .or_default()
+            .insert(
+                origin.to_string(),
+                PendingHistoryRequest {
+                    request_id: request_id.clone(),
+                    start: u64::from(!baseline),
+                    end: u64::from(!baseline),
+                    baseline_revision: baseline
+                        .then(|| recovery_revision(&store, &origin).unwrap()),
+                    deadline: request_deadline,
+                },
+            );
+    }
+    let message = match case {
+        StorageWaitCase::Summary => nx_sync::HistoryMessage::Summary {
+            entries: vec![nx_sync::HistorySummary {
+                baseline_required: false,
+                origin: origin.clone(),
+                high_sequence: 0,
+            }],
+        },
+        StorageWaitCase::Unavailable => nx_sync::HistoryMessage::Unavailable {
+            request_id,
+            origin: origin.clone(),
+            start: 1,
+            end: 1,
+        },
+        StorageWaitCase::BaselineUnavailable => nx_sync::HistoryMessage::BaselineUnavailable {
+            request_id,
+            origin: origin.clone(),
+            reason: nx_sync::BaselineFailure::BudgetExceeded,
+        },
+        StorageWaitCase::Push => nx_sync::HistoryMessage::Push {
+            ops: vec![nx_sync::SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "storage-wait", 7),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            }],
+        },
+    };
     {
         let mut cursors = cursors.write().await;
         let cursor = cursors.entry("unused".into()).or_default();
@@ -47,8 +139,9 @@ async fn history_summary_storage_wait_does_not_stall_control() {
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let held_store = Arc::clone(&store);
     let holder = std::thread::spawn(move || {
-        let lease = store.acquire_write_lease().unwrap();
+        let lease = held_store.acquire_write_lease().unwrap();
         held_tx.send(()).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let control_progress = probe_rx.recv_timeout(Duration::from_secs(2));
@@ -63,13 +156,7 @@ async fn history_summary_storage_wait_does_not_stall_control() {
             NodeEvent::HistoryReceived {
                 from: NodeId::new("summary-source"),
                 addr: "unused".into(),
-                message: nx_sync::HistoryMessage::Summary {
-                    entries: vec![nx_sync::HistorySummary {
-                        baseline_required: false,
-                        origin: NodeId::new("empty-origin"),
-                        high_sequence: 0,
-                    }],
-                },
+                message,
             },
             &context,
         );
@@ -126,11 +213,41 @@ async fn history_summary_storage_wait_does_not_stall_control() {
     };
     requester.shutdown().await;
     traced_shutdown(&mut manager).await;
+    let receipts = replication_progress(&store).unwrap();
+    let receipt = receipts
+        .iter()
+        .find(|receipt| receipt.origin == origin)
+        .unwrap();
+    match case {
+        StorageWaitCase::Summary => {
+            assert_eq!(after_storage, (None, None));
+        }
+        StorageWaitCase::Unavailable => {
+            assert!(receipt.source_unavailable);
+            assert_eq!(receipt.contiguous_sequence, 0);
+        }
+        StorageWaitCase::BaselineUnavailable => {
+            assert_eq!(
+                receipt.recovery_failure.as_ref().unwrap().reason,
+                nx_sync::BaselineFailure::BudgetExceeded
+            );
+            assert_eq!(receipt.contiguous_sequence, 0);
+        }
+        StorageWaitCase::Push => {
+            assert_eq!(receipt.contiguous_sequence, 1);
+            assert_eq!(read_materialized(&store, "storage-wait"), 7);
+            assert_eq!(
+                read_durable_gcounter_state(&store, "storage-wait").value(),
+                7
+            );
+            assert_eq!(manager.get_counter_value("storage-wait").await, 7);
+        }
+    }
     assert!(acknowledged, "{probe:?}");
     assert_eq!(
         progress,
         Ok(true),
-        "control did not progress while the storage lease was held"
+        "{case:?}: control did not progress while the storage lease was held"
     );
     assert!(delivered.is_ok(), "{delivered:?}");
     assert_eq!(
@@ -138,7 +255,6 @@ async fn history_summary_storage_wait_does_not_stall_control() {
         (Some("previous-page".into()), Some(request_deadline)),
         "summary request was released before storage processing completed"
     );
-    assert_eq!(after_storage, (None, None));
 }
 
 #[tokio::test]
