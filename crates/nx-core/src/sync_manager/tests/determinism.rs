@@ -467,58 +467,88 @@ async fn scenario(seed: u64, format: nx_net::SerializationFormat) -> serde_json:
 }
 
 #[tokio::test]
-async fn deterministic_six_family_replay() {
-    let test_name = std::thread::current().name().unwrap().to_owned();
-    if std::env::var_os("NUMAX_DETERMINISM_ISOLATED").is_none() {
-        // sled's process-global lock must not delay unrelated real-time tests.
-        // This lifetime covers all repeated runs, not their virtual deadline.
-        isolated_test_output(
-            &test_name,
-            "NUMAX_DETERMINISM_ISOLATED",
-            "1",
-            Duration::from_secs(180),
-        );
-        return;
-    }
-    let child = std::env::var_os("NUMAX_DETERMINISM_CHILD").is_some();
-    let mut markers = Vec::new();
-    for format in [
-        nx_net::SerializationFormat::Json,
-        nx_net::SerializationFormat::Bincode,
-    ] {
-        let expected = scenario(42, format).await;
-        if !child {
-            for _ in 1..10 {
-                assert_eq!(scenario(42, format).await, expected);
-            }
-            let alternate = scenario(7, format).await;
-            assert_ne!(
-                alternate["network_trace"], expected["network_trace"],
-                "seed did not change decisions"
-            );
-        }
+async fn deterministic_six_family_replay_json() {
+    repeated_codec_replay(nx_net::SerializationFormat::Json).await;
+}
 
-        let hash = blake3::hash(&serde_json::to_vec(&expected).unwrap());
-        let marker = format!("DETERMINISM {format:?} {hash}");
-        println!("{marker}");
-        markers.push(marker);
-    }
-    if !child {
-        for _ in 0..3 {
-            let output = isolated_test_output(
-                &test_name,
-                "NUMAX_DETERMINISM_CHILD",
-                "1",
-                Duration::from_secs(60),
-            );
-            for marker in &markers {
-                assert!(
-                    String::from_utf8_lossy(&output).contains(marker),
-                    "cross-process trace mismatch"
+#[tokio::test]
+async fn deterministic_six_family_replay_bincode() {
+    repeated_codec_replay(nx_net::SerializationFormat::Bincode).await;
+}
+
+fn replay_digest(output: &[u8], format: nx_net::SerializationFormat) -> blake3::Hash {
+    let output = std::str::from_utf8(output).unwrap();
+    let prefix = format!("DETERMINISM {format:?} ");
+    let mut digests = output.lines().filter_map(|line| line.strip_prefix(&prefix));
+    let hash = blake3::Hash::from_hex(digests.next().expect("replay digest missing")).unwrap();
+    assert!(digests.next().is_none(), "multiple replay digests");
+    hash
+}
+
+async fn repeated_codec_replay(format: nx_net::SerializationFormat) {
+    const STAGE: &str = "NUMAX_DETERMINISM_STAGE";
+    let test_name = std::thread::current().name().unwrap().to_owned();
+    let stage = std::env::var_os(STAGE);
+    let repeat = match stage.as_deref() {
+        None => {
+            let started = StdInstant::now();
+            let lifetime = Duration::from_secs(180);
+            let output = isolated_test_output(&test_name, STAGE, "repeat", lifetime);
+            let expected = replay_digest(&output, format);
+            for index in 0..3 {
+                let remaining = lifetime
+                    .checked_sub(started.elapsed())
+                    .filter(|remaining| !remaining.is_zero())
+                    .expect("codec replay exceeded its total lifetime");
+                let output = isolated_test_output(
+                    &test_name,
+                    STAGE,
+                    "compare",
+                    remaining.min(Duration::from_secs(60)),
+                );
+                assert_eq!(
+                    replay_digest(&output, format),
+                    expected,
+                    "cross-process trace mismatch for {format:?}, child {index}",
                 );
             }
+            assert!(
+                started.elapsed() < lifetime,
+                "codec replay exceeded its total lifetime"
+            );
+            return;
         }
+        Some(stage) if stage == "repeat" => true,
+        Some(stage) if stage == "compare" => false,
+        Some(_) => panic!("invalid deterministic replay stage"),
+    };
+    let started = StdInstant::now();
+    let expected = scenario(42, format).await;
+    eprintln!(
+        "REPLAY_RUN codec={format:?} iteration=0 elapsed_ms={}",
+        started.elapsed().as_millis(),
+    );
+    if repeat {
+        for iteration in 1..10 {
+            let run_started = StdInstant::now();
+            assert_eq!(scenario(42, format).await, expected);
+            eprintln!(
+                "REPLAY_RUN codec={format:?} iteration={iteration} elapsed_ms={}",
+                run_started.elapsed().as_millis(),
+            );
+        }
+        let alternate = scenario(7, format).await;
+        assert_ne!(
+            alternate["network_trace"], expected["network_trace"],
+            "seed did not change decisions"
+        );
     }
+    let hash = blake3::hash(&serde_json::to_vec(&expected).unwrap());
+    println!("DETERMINISM {format:?} {hash}");
+    eprintln!(
+        "REPLAY_CODEC codec={format:?} elapsed_ms={}",
+        started.elapsed().as_millis(),
+    );
 }
 
 #[tokio::test]

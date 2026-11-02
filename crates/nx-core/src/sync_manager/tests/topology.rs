@@ -3,6 +3,11 @@ use nx_net::{MembershipState, SerializationFormat};
 
 #[tokio::test]
 async fn rotating_full_slot_recovers_six_families_after_data_partition() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::topology::rotating_full_slot_recovers_six_families_after_data_partition",
+    ) {
+        return;
+    }
     for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
         let config = || {
             SyncConfig::new()
@@ -87,7 +92,10 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
         ]
         .map(|json| serde_json::from_str::<serde_json::Value>(&json).unwrap());
         gate.open.send_replace(true);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let phase_started = StdInstant::now();
+        let mut longest_scan = Duration::ZERO;
+        let mut scans = 0;
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut poll = tokio::time::interval(Duration::from_millis(5));
             loop {
                 let mut complete = true;
@@ -104,6 +112,7 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
                         && manager.get_rga_values("topology-a").await == vec![b"value".to_vec(); 2];
                 }
                 if complete {
+                    let scan_started = StdInstant::now();
                     complete = [&sa, &sb, &sc].iter().all(|store| {
                         [
                             read_durable_gcounter_state(store, "topology-g")
@@ -128,6 +137,8 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
                         .map(|json| serde_json::from_str::<serde_json::Value>(&json).unwrap())
                             == expected
                     });
+                    longest_scan = longest_scan.max(scan_started.elapsed());
+                    scans += 1;
                 }
                 if complete {
                     break;
@@ -135,8 +146,19 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
                 poll.tick().await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if result.is_err() {
+            log_sync_phase(
+                "rotating-slot-recovery",
+                phase_started.elapsed(),
+                &[&a, &b, &c],
+            );
+            eprintln!(
+                "SYNC_SCAN codec={format:?} count={scans} longest_ms={}",
+                longest_scan.as_millis(),
+            );
+        }
+        result.unwrap();
         for store in [&sa, &sb, &sc] {
             assert_eq!(read_materialized(store, "topology-g"), 2);
             assert_eq!(read_durable_gcounter_state(store, "topology-g").value(), 2);
@@ -183,6 +205,11 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
 
 #[tokio::test]
 async fn two_full_pairs_reconnect_after_mutual_dead_data_partition() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::topology::two_full_pairs_reconnect_after_mutual_dead_data_partition",
+    ) {
+        return;
+    }
     let config = || {
         SyncConfig::new()
             .with_listen_addr("127.0.0.1:0")
@@ -232,7 +259,8 @@ async fn two_full_pairs_reconnect_after_mutual_dead_data_partition() {
     assert_eq!(d.get_counter_value("partition-left").await, 0);
     gate_a.open.send_replace(true);
     gate_c.open.send_replace(true);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let phase_started = StdInstant::now();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
         let mut poll = tokio::time::interval(Duration::from_millis(5));
         loop {
             let mut complete = true;
@@ -247,10 +275,23 @@ async fn two_full_pairs_reconnect_after_mutual_dead_data_partition() {
             poll.tick().await;
         }
     })
-    .await
-    .unwrap();
-    for manager in [&mut a, &mut b, &mut c, &mut d] {
-        manager.shutdown().await.unwrap();
+    .await;
+    if result.is_err() {
+        log_sync_phase(
+            "two-pair-recovery",
+            phase_started.elapsed(),
+            &[&a, &b, &c, &d],
+        );
+    }
+    result.unwrap();
+    for (index, manager) in [&mut a, &mut b, &mut c, &mut d].into_iter().enumerate() {
+        let started = StdInstant::now();
+        let result = manager.shutdown().await;
+        assert!(
+            result.is_ok(),
+            "node {index} shutdown failed after {:?}: {result:?}",
+            started.elapsed(),
+        );
     }
 }
 

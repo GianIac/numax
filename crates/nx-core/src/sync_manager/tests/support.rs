@@ -1,6 +1,87 @@
 use super::*;
 use crate::sync_manager::schema::ensure_sync_schema;
 
+pub(super) async fn wait_for_store_file_release(
+    directory: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::fs::{OpenOptions, TryLockError};
+    use std::io::{Error, ErrorKind};
+
+    let deadline = StdInstant::now() + Duration::from_secs(5);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join("db"))?;
+    let mut poll = tokio::time::interval(Duration::from_millis(5));
+    loop {
+        if StdInstant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "sled file lock was not released",
+            ));
+        }
+        match file.try_lock() {
+            Ok(()) => {
+                if StdInstant::now() >= deadline {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "sled file lock was released too late",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(TryLockError::WouldBlock) => {
+                poll.tick().await;
+            }
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+pub(super) fn log_sync_phase(phase: &str, elapsed: Duration, managers: &[&SyncManager]) {
+    eprintln!(
+        "SYNC_PHASE phase={phase} pid={} elapsed_ms={}",
+        std::process::id(),
+        elapsed.as_millis()
+    );
+    for (index, manager) in managers.iter().enumerate() {
+        let snapshot = manager
+            .membership
+            .as_ref()
+            .map(|membership| membership.snapshot.borrow().clone());
+        eprintln!(
+            "SYNC_PHASE node={index} store_owners={} broadcast_finished={:?} \
+             entropy_finished={:?} reconnect_finished={:?} op_log_readable={}",
+            Arc::strong_count(&manager.store),
+            manager
+                .broadcast_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager
+                .anti_entropy_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager
+                .reconnect_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager.op_log.try_read().is_ok(),
+        );
+        if let Some(snapshot) = snapshot {
+            eprintln!(
+                "SYNC_PHASE node={index} records={} probes_ok={} probes_failed={} \
+                 health={} error={} max_tick_lateness_us={:?}",
+                snapshot.records.len(),
+                snapshot.successful_probes,
+                snapshot.failed_probes,
+                snapshot.health,
+                snapshot.error.is_some(),
+                snapshot.tick_lateness_micros.iter().max(),
+            );
+        }
+    }
+}
+
 pub(super) fn remote_apply_context(manager: &SyncManager) -> RemoteOpApplyContext<'_> {
     RemoteOpApplyContext {
         counters: &manager.counters,
@@ -528,10 +609,14 @@ pub(super) fn isolated_test_output(
 
     assert_eq!(std::thread::current().name(), Some(test_name));
 
+    let directory = tempfile::tempdir().unwrap();
     let mut output = tempfile::tempfile().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture"])
         .env(marker, value)
+        .env("TMPDIR", directory.path())
+        .env("TMP", directory.path())
+        .env("TEMP", directory.path())
         .stdout(Stdio::from(output.try_clone().unwrap()))
         .stderr(Stdio::from(output.try_clone().unwrap()))
         .spawn()
@@ -555,11 +640,28 @@ pub(super) fn isolated_test_output(
     output.rewind().unwrap();
     let mut bytes = Vec::new();
     output.take(64 * 1024).read_to_end(&mut bytes).unwrap();
-    if result.as_ref().is_ok_and(|status| status.success()) {
+    let directory_cleanup = directory.close();
+    if result.as_ref().is_ok_and(|status| status.success()) && directory_cleanup.is_ok() {
         return bytes;
     }
     let diagnostics = String::from_utf8_lossy(&bytes);
-    panic!("isolated test {test_name} failed: {result:?}; cleanup={cleanup:?}\n{diagnostics}");
+    panic!(
+        "isolated test {test_name} failed: {result:?}; cleanup={cleanup:?}; \
+         directory_cleanup={directory_cleanup:?}\n{diagnostics}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "isolated sync test exceeded its process lifetime")]
+fn isolated_child_timeout_is_reported() {
+    const MARKER: &str = "NUMAX_ISOLATED_TIMEOUT_CHILD";
+    let test_name = std::thread::current().name().unwrap().to_owned();
+    if std::env::var_os(MARKER).is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
+    isolated_test_output(&test_name, MARKER, "1", Duration::from_millis(100));
 }
 
 #[test]

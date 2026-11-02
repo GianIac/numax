@@ -3612,6 +3612,23 @@ async fn local_and_remote_orset_batches_keep_tags_and_ignore_delayed_duplicates(
 }
 
 #[tokio::test]
+async fn store_reopen_waits_for_last_database_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let last_handle = Arc::clone(&store);
+    {
+        let mut waiting = Box::pin(wait_for_store_file_release(directory.path()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        drop(store);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+    }
+    drop(last_handle);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    NxStore::open(directory.path()).unwrap();
+}
+
+#[tokio::test]
 async fn local_rga_batch_restarts_with_parents_tombstones_and_replay_metadata() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(NxStore::open(directory.path()).unwrap());
@@ -3677,10 +3694,14 @@ async fn local_rga_batch_restarts_with_parents_tombstones_and_replay_metadata() 
     assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 3);
     assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 3);
 
+    let store_lifetime = Arc::downgrade(&store);
     drop(handle);
     drop(manager);
+    assert_eq!(Arc::strong_count(&store), 1);
     drop(store);
 
+    assert_eq!(store_lifetime.strong_count(), 0);
+    wait_for_store_file_release(directory.path()).await.unwrap();
     let store = Arc::new(NxStore::open(directory.path()).unwrap());
     let manager = SyncManager::try_new(
         NodeId::new("local-node"),

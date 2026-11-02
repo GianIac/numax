@@ -215,7 +215,7 @@ while peer discovery remains deliberately separated from authentication and auth
 Release-scale loss, partition and detector criteria remain separate below.
 
 **Determinism for tests**:
-- [ ] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
+- [x] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
 
 **Test scenarios**:
 - [ ] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model

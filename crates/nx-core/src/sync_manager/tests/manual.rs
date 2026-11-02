@@ -408,6 +408,11 @@ async fn manual_introspection_distinguishes_candidate_and_source_recovery_failur
 
 #[tokio::test]
 async fn manual_peer_uses_real_admission_membership_and_reconnection() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::manual::manual_peer_uses_real_admission_membership_and_reconnection",
+    ) {
+        return;
+    }
     for format in [
         nx_net::SerializationFormat::Json,
         nx_net::SerializationFormat::Bincode,
@@ -423,7 +428,8 @@ async fn manual_peer_uses_real_admission_membership_and_reconnection() {
         let (mut b, _, _) = started_manager_with_config(config()).await;
         let endpoint = test_owner_record(&mut b).await.endpoint.unwrap();
         ha.add_peer(endpoint).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(8), async {
+        let phase_started = StdInstant::now();
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
             let mut poll = tokio::time::interval(Duration::from_millis(10));
             loop {
                 let snapshot = a.membership.as_ref().unwrap().snapshot.borrow().clone();
@@ -438,8 +444,12 @@ async fn manual_peer_uses_real_admission_membership_and_reconnection() {
                 poll.tick().await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if result.is_err() {
+            log_sync_phase("manual-first-probe", phase_started.elapsed(), &[&a, &b]);
+            eprintln!("SYNC_PHASE codec={format:?}");
+        }
+        result.unwrap();
         let connections = ha.active_connections().await;
         assert_eq!(connections.len(), 1);
         assert_eq!(

@@ -123,8 +123,13 @@ pub(crate) struct Snapshot {
     pub(crate) tick_lateness_micros: Vec<u64>,
 }
 
+struct ShutdownRequest {
+    deadline: tokio::time::Instant,
+    completed: oneshot::Sender<tokio::time::Instant>,
+}
+
 pub(crate) struct Handle {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<oneshot::Sender<ShutdownRequest>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
     pub(crate) snapshot: watch::Receiver<Snapshot>,
 }
@@ -135,19 +140,47 @@ impl Handle {
     }
 
     async fn shutdown_with_budget(mut self, budget: Duration) -> anyhow::Result<()> {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+        let deadline = tokio::time::Instant::now() + budget;
+        let (completed, mut completion) = oneshot::channel();
+        if let Some(stop) = self.stop.take()
+            && stop
+                .send(ShutdownRequest {
+                    deadline,
+                    completed,
+                })
+                .is_err()
+        {
+            tracing::debug!("membership task stopped before receiving the shutdown request");
         }
         if let Some(task) = self.task.as_mut() {
-            match tokio::time::timeout(budget, &mut *task).await {
-                Ok(result) => result??,
+            let timed_out = match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(result) => {
+                    result??;
+                    false
+                }
                 Err(_) => {
                     task.abort();
-                    let _ = task.await;
-                    anyhow::bail!(
-                        "membership shutdown budget exhausted; in-flight storage may still finish without publication"
-                    );
+                    match task.await {
+                        Ok(result) => result?,
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    true
                 }
+            };
+            let completed = completion.try_recv();
+            let lateness = completed
+                .as_ref()
+                .map(|at| at.saturating_duration_since(deadline));
+            anyhow::ensure!(
+                completed.as_ref().is_ok_and(|at| *at < deadline),
+                "membership shutdown budget exhausted; in-flight storage may still finish without publication; critical lateness={lateness:?}",
+            );
+            if timed_out {
+                tracing::warn!(
+                    ?budget,
+                    "membership leave announcements truncated after durable shutdown completion"
+                );
             }
         }
         Ok(())
@@ -408,7 +441,7 @@ impl Actor {
         Ok(self.serial)
     }
 
-    async fn run(mut self, mut stopped: oneshot::Receiver<()>) -> anyhow::Result<()> {
+    async fn run(mut self, mut stopped: oneshot::Receiver<ShutdownRequest>) -> anyhow::Result<()> {
         let result = self.run_inner(&mut stopped).await;
         if let Err(error) = &result {
             self.core.fence();
@@ -421,21 +454,50 @@ impl Actor {
         result
     }
 
-    async fn run_inner(&mut self, stopped: &mut oneshot::Receiver<()>) -> anyhow::Result<()> {
+    async fn run_inner(
+        &mut self,
+        stopped: &mut oneshot::Receiver<ShutdownRequest>,
+    ) -> anyhow::Result<()> {
         let mut next_tick = self.node.now();
         let timer = self.node.clone();
         self.publish_snapshot();
         loop {
             tokio::select! {
                 biased;
-                _ = &mut *stopped => {
+                shutdown = &mut *stopped => {
+                    let shutdown = shutdown.map_err(|error| anyhow::anyhow!("membership shutdown request: {error}"))?;
+                    #[cfg(test)]
+                    let stopped_at = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    let queued = self.write_queue.len() + self.writes.len();
                     let actions = self.core().leave().map_err(core_error)?;
                     self.actions(actions).await?;
                     while let Some(result) = self.writes.join_next().await {
                         self.written(result?).await?;
                     }
+                    #[cfg(test)]
+                    let writes_done = tokio::time::Instant::now();
                     self.jobs.abort_all();
                     while self.jobs.join_next().await.is_some() {}
+                    let completed_at = tokio::time::Instant::now();
+                    if shutdown.completed.send(completed_at).is_err() {
+                        tracing::debug!("membership shutdown completion observer dropped");
+                    }
+                    #[cfg(test)]
+                    if completed_at >= shutdown.deadline {
+                        eprintln!(
+                            "SHUTDOWN_LATE remaining_at_stop_ms={} queued={queued} writes_ms={} \
+                             cancelling_ms={} late_ms={}",
+                            shutdown.deadline.saturating_duration_since(stopped_at).as_millis(),
+                            (writes_done - stopped_at).as_millis(),
+                            (completed_at - writes_done).as_millis(),
+                            completed_at.saturating_duration_since(shutdown.deadline).as_millis(),
+                        );
+                    }
+                    if tokio::time::Instant::now() >= shutdown.deadline {
+                        tracing::warn!("membership leave announcement budget exhausted");
+                        return Ok(());
+                    }
                     let endpoints: Vec<_> = self.records.values().filter_map(|record| record.endpoint.clone()).collect();
                     let request = ControlRequest { request_id: self.serial()?, owner: self.owner.clone(), updates: vec![], kind: ControlKind::Exchange { after: None } };
                     let leave = async {
@@ -448,7 +510,10 @@ impl Actor {
                             while sends.join_next().await.is_some() {}
                         }
                     };
-                    let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
+                    let deadline = shutdown.deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+                    if tokio::time::timeout_at(deadline, leave).await.is_err() {
+                        tracing::warn!("membership leave announcement budget exhausted");
+                    }
                     return Ok(());
                 }
                 dispatched = self.dispatch_rx.recv() => {
@@ -1252,6 +1317,116 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn controlled_shutdown<F>(
+        run: impl FnOnce(ShutdownRequest) -> F + Send + 'static,
+    ) -> (Handle, oneshot::Receiver<()>)
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let (stop, stopped) = oneshot::channel();
+        let (lifetime, dropped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _lifetime = lifetime;
+            run(stopped.await?).await
+        });
+        let (_, snapshot) = watch::channel(Snapshot::default());
+        (
+            Handle {
+                stop: Some(stop),
+                task: Some(task),
+                snapshot,
+            },
+            dropped,
+        )
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_announcements_only_after_timely_critical_completion() {
+        use std::cmp::Ordering;
+
+        for timing in [
+            Some(Ordering::Less),
+            Some(Ordering::Equal),
+            Some(Ordering::Greater),
+            None,
+        ] {
+            let (handle, mut dropped) = controlled_shutdown(move |request| async move {
+                if let Some(timing) = timing {
+                    let at = match timing {
+                        Ordering::Less => request.deadline - Duration::from_nanos(1),
+                        Ordering::Equal => request.deadline,
+                        Ordering::Greater => request.deadline + Duration::from_nanos(1),
+                    };
+                    request.completed.send(at).unwrap();
+                }
+                std::future::pending::<anyhow::Result<()>>().await
+            });
+            let result = handle.shutdown_with_budget(Duration::from_secs(1)).await;
+            assert_eq!(result.is_ok(), timing == Some(Ordering::Less), "{result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("shutdown budget exhausted"));
+            }
+            assert!(matches!(
+                dropped.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_late_confirmation_even_when_task_completes() {
+        let (handle, mut dropped) = controlled_shutdown(|request| async move {
+            request
+                .completed
+                .send(request.deadline + Duration::from_nanos(1))
+                .unwrap();
+            Ok(())
+        });
+        let error = handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown budget exhausted"));
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_task_errors_after_critical_completion() {
+        for panic in [false, true] {
+            let (handle, mut dropped) = controlled_shutdown(move |request| async move {
+                request
+                    .completed
+                    .send(request.deadline - Duration::from_nanos(1))
+                    .unwrap();
+                if panic {
+                    panic!("injected shutdown task panic");
+                }
+                anyhow::bail!("injected shutdown task error");
+            });
+            let error = handle
+                .shutdown_with_budget(Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            if panic {
+                assert!(
+                    error
+                        .downcast_ref::<tokio::task::JoinError>()
+                        .unwrap()
+                        .is_panic()
+                );
+            } else {
+                assert!(error.to_string().contains("injected shutdown task error"));
+            }
+            assert!(matches!(
+                dropped.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+        }
+    }
 
     fn owner(member: &str, epoch: u64, incarnation: u64) -> MembershipRecord {
         MembershipRecord {

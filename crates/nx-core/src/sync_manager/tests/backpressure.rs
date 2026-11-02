@@ -280,6 +280,11 @@ async fn replay_pages_respect_small_wire_budget() {
 
 #[tokio::test]
 async fn baseline_that_cannot_fit_wire_budget_fails_explicitly() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::backpressure::baseline_that_cannot_fit_wire_budget_fails_explicitly",
+    ) {
+        return;
+    }
     wire_limited_recovery(true).await;
 }
 
@@ -308,26 +313,44 @@ async fn wire_limited_recovery(expire_history: bool) {
         let endpoint = test_owner_record(&mut a).await.endpoint.unwrap();
         b.connect_to_peer(&endpoint).await.unwrap();
         if expire_history {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            let phase_started = StdInstant::now();
+            let mut longest_scan = Duration::ZERO;
+            let mut scans = 0;
+            let mut last_progress = Vec::new();
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut poll = tokio::time::interval(Duration::from_millis(5));
                 loop {
-                    if b.handle()
-                        .replication_progress()
-                        .unwrap()
-                        .iter()
-                        .any(|progress| {
-                            progress.recovery_failure.as_ref().is_some_and(|failure| {
-                                failure.reason == nx_sync::BaselineFailure::BudgetExceeded
-                            })
+                    let scan_started = StdInstant::now();
+                    let progress = b.handle().replication_progress().unwrap();
+                    longest_scan = longest_scan.max(scan_started.elapsed());
+                    scans += 1;
+                    let complete = progress.iter().any(|progress| {
+                        progress.recovery_failure.as_ref().is_some_and(|failure| {
+                            failure.reason == nx_sync::BaselineFailure::BudgetExceeded
                         })
-                    {
+                    });
+                    last_progress = progress;
+                    if complete {
                         break;
                     }
                     poll.tick().await;
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            if result.is_err() {
+                log_sync_phase("baseline-wire-budget", phase_started.elapsed(), &[&a, &b]);
+                eprintln!(
+                    "SYNC_SCAN codec={format:?} count={scans} longest_ms={} \
+                 origins={} failed_origins={}",
+                    longest_scan.as_millis(),
+                    last_progress.len(),
+                    last_progress
+                        .iter()
+                        .filter(|progress| progress.recovery_failure.is_some())
+                        .count(),
+                );
+            }
+            result.unwrap();
             assert!(
                 b.handle()
                     .replication_progress()

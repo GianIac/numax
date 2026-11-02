@@ -2,6 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::rate::rate_limited_fast_path_retains_all_families_for_periodic_repair",
+    ) {
+        return;
+    }
     for format in [
         nx_net::SerializationFormat::Json,
         nx_net::SerializationFormat::Bincode,
@@ -40,24 +45,39 @@ async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
         local_orset_remove(&ha, "paced-o", "removed").await;
         let removed = local_rga_insert_after(&ha, "paced-a", None, b"removed").await;
         local_rga_delete(&ha, "paced-a", &removed).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let phase_started = StdInstant::now();
+        let mut longest_scan = Duration::ZERO;
+        let mut scans = 0;
+        let mut last_limited = None;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
             let mut poll = tokio::time::interval(Duration::from_millis(5));
             loop {
+                let scan_started = StdInstant::now();
                 let rendered = a.metrics.render_for_test(&sa);
+                longest_scan = longest_scan.max(scan_started.elapsed());
+                scans += 1;
                 let limited = rendered
                     .lines()
                     .find_map(|line| line.strip_prefix("numax_gossip_rate_limited_total "))
                     .unwrap()
                     .parse::<u64>()
                     .unwrap();
+                last_limited = Some(limited);
                 if limited > 0 {
                     break;
                 }
                 poll.tick().await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if result.is_err() {
+            log_sync_phase("rate-limited-feedback", phase_started.elapsed(), &[&a, &b]);
+            eprintln!(
+                "SYNC_SCAN codec={format:?} count={scans} longest_ms={} limited={last_limited:?}",
+                longest_scan.as_millis(),
+            );
+        }
+        result.unwrap();
         assert_eq!(b.get_counter_value("paced-g").await, 0);
         // Resume the production anti-entropy task with its existing independent budget.
         b.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
@@ -116,8 +136,26 @@ async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
     }
 }
 
+async fn feed_probe_timing(
+    handle: &SyncHandle,
+    timing: Option<nx_net::ControlTiming>,
+    last_fed: &mut Option<StdInstant>,
+) -> Option<nx_net::ControlTiming> {
+    let timing = timing?;
+    if last_fed.is_none_or(|previous| previous < timing.observed_at) {
+        local_increment(handle, "rtt-load", 1).await;
+        *last_fed = Some(timing.observed_at);
+    }
+    Some(timing)
+}
+
 #[tokio::test]
 async fn real_direct_probe_rtt_reduces_and_recovers_gossip_rate() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::rate::real_direct_probe_rtt_reduces_and_recovers_gossip_rate",
+    ) {
+        return;
+    }
     let mut peer = ControlledControlPeer::start().await;
     let maximum = 256 * 1024;
     let (mut manager, handle, store) = started_manager_with_config(
@@ -132,15 +170,31 @@ async fn real_direct_probe_rtt_reduces_and_recovers_gossip_rate() {
     )
     .await;
     manager.connect_to_peer(&peer.endpoint).await.unwrap();
-    local_increment(&handle, "rtt-load", 1).await;
+    let view = manager.membership.as_ref().unwrap().snapshot.clone();
+    let sample_after = |after: StdInstant| {
+        view.borrow()
+            .probe_timings
+            .iter()
+            .filter(|sample| {
+                sample.member == "controlled-peer" && sample.timing.started_at >= after
+            })
+            .map(|sample| sample.timing)
+            .max_by_key(|timing| timing.observed_at)
+    };
+    let healthy_since = StdInstant::now();
+    let mut last_fed = None;
+    // Persist only after each measured probe completes: a blocking flush on
+    // this current-thread runtime must not inflate the controlled RTT itself.
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut poll = tokio::time::interval(Duration::from_millis(20));
         loop {
-            local_increment(&handle, "rtt-load", 1).await;
-            if manager
-                .metrics
-                .render_for_test(&store)
-                .contains("numax_gossip_control_rtt_seconds ")
+            let timing =
+                feed_probe_timing(&handle, sample_after(healthy_since), &mut last_fed).await;
+            if timing.is_some()
+                && manager
+                    .metrics
+                    .render_for_test(&store)
+                    .contains("numax_gossip_control_rtt_seconds ")
             {
                 break;
             }
@@ -149,52 +203,79 @@ async fn real_direct_probe_rtt_reduces_and_recovers_gossip_rate() {
     })
     .await
     .unwrap();
+    let baseline = manager
+        .membership
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .borrow()
+        .clone();
+    let baseline_rate = metric_value(
+        &manager.metrics,
+        &store,
+        "numax_gossip_rate_bytes_per_second",
+    );
+    let mut observations = std::collections::VecDeque::with_capacity(32);
+    let mut slow_rtt = None;
     let changed = StdInstant::now();
     peer.delay_ms
         .store(150, std::sync::atomic::Ordering::Relaxed);
     let low = tokio::time::timeout(Duration::from_secs(8), async {
         let mut poll = tokio::time::interval(Duration::from_millis(20));
         loop {
-            local_increment(&handle, "rtt-load", 1).await;
-            let has_slow_sample = manager
-                .membership
-                .as_ref()
-                .unwrap()
-                .snapshot
-                .borrow()
-                .probe_timings
-                .iter()
-                .any(|sample| {
-                    sample.timing.observed_at > changed
-                        && sample.timing.round_trip >= Duration::from_millis(150)
-                });
+            let timing = feed_probe_timing(&handle, sample_after(changed), &mut last_fed).await;
+            let has_slow_sample = timing.is_some_and(|timing| timing.round_trip >= Duration::from_millis(150));
             let rate = metric_value(
                 &manager.metrics,
                 &store,
                 "numax_gossip_rate_bytes_per_second",
             );
+            let snapshot = manager.membership.as_ref().unwrap().snapshot.borrow().clone();
+            let observation = (
+                snapshot.health,
+                snapshot.successful_probes,
+                snapshot.failed_probes,
+                snapshot.probe_timings.iter().map(|sample| (
+                    sample.timing.round_trip,
+                    sample.timing.started_at >= changed,
+                    sample.timing.observed_at >= changed,
+                )).collect::<Vec<_>>(),
+                rate,
+                snapshot.error,
+            );
+            if observations.back().is_none_or(|(_, previous)| previous != &observation) {
+                if observations.len() == 32 { observations.pop_front(); }
+                observations.push_back((changed.elapsed(), observation));
+            }
             if has_slow_sample && rate < maximum {
+                slow_rtt = timing.map(|timing| timing.round_trip);
                 break rate;
             }
             poll.tick().await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| panic!(
+        "RTT rate reduction failed: {error}; baseline={baseline:?}; baseline_rate={baseline_rate}; observations={observations:?}"
+    ));
     peer.delay_ms
         .store(10, std::sync::atomic::Ordering::Relaxed);
+    let recovering_since = StdInstant::now();
+    let slow_rtt = slow_rtt.unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut poll = tokio::time::interval(Duration::from_millis(20));
         let mut previous = low;
         loop {
-            local_increment(&handle, "rtt-load", 1).await;
+            let timing =
+                feed_probe_timing(&handle, sample_after(recovering_since), &mut last_fed).await;
+            let has_healthy_sample = timing.is_some_and(|timing| timing.round_trip < slow_rtt);
             let rate = metric_value(
                 &manager.metrics,
                 &store,
                 "numax_gossip_rate_bytes_per_second",
             );
             assert!(rate >= 64 * 1024 && rate <= maximum);
-            if rate > previous {
+            if has_healthy_sample && rate > previous {
                 assert!(rate - previous <= maximum / 16);
                 break;
             }
@@ -204,6 +285,30 @@ async fn real_direct_probe_rtt_reduces_and_recovers_gossip_rate() {
     })
     .await
     .unwrap();
+    let accepted = manager.get_counter_value("rtt-load").await;
+    assert!(
+        accepted >= 3,
+        "each RTT phase must reach the production pacing path"
+    );
+    assert_eq!(read_materialized(&store, "rtt-load"), accepted);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "rtt-load").value(),
+        accepted
+    );
+    eprintln!(
+        "RTT phases: baseline={:?}; slow={slow_rtt:?}; recovered={:?}; rate={baseline_rate}->{low}->{}; accepted={accepted}",
+        baseline
+            .probe_timings
+            .iter()
+            .map(|sample| sample.timing.round_trip)
+            .collect::<Vec<_>>(),
+        sample_after(recovering_since).map(|timing| timing.round_trip),
+        metric_value(
+            &manager.metrics,
+            &store,
+            "numax_gossip_rate_bytes_per_second"
+        ),
+    );
     manager.shutdown().await.unwrap();
     peer.shutdown().await;
 }
