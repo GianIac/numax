@@ -231,6 +231,7 @@ pub(in crate::sync_manager) fn local_sequence_sets(
     lease: &StoreWriteLease<'_>,
     op: &Op,
     expected_generation: u64,
+    limits: super::super::types::LocalTransportLimits,
 ) -> anyhow::Result<SequenceSets> {
     let store = lease.store();
     let (origin, generation, previous) =
@@ -246,16 +247,13 @@ pub(in crate::sync_manager) fn local_sequence_sets(
         generation,
         sequence,
     };
-    anyhow::ensure!(
-        serde_json::to_vec(&SequencedOp {
+    validate_local_transport(
+        &SequencedOp {
             op: op.clone(),
-            position
-        })?
-        .len()
-            + 1024
-            <= REPLAY_BYTES,
-        "operation exceeds replay byte budget"
-    );
+            position,
+        },
+        limits,
+    )?;
     let mut progress = tracker(store, &origin)?;
     anyhow::ensure!(
         progress.contiguous == previous,
@@ -275,6 +273,40 @@ pub(in crate::sync_manager) fn local_sequence_sets(
         serde_json::to_vec(&(origin, generation, sequence))?,
     ));
     Ok(sets)
+}
+
+pub(in crate::sync_manager) fn validate_local_transport(
+    entry: &SequencedOp,
+    limits: super::super::types::LocalTransportLimits,
+) -> anyhow::Result<()> {
+    // A valid request identity can require six JSON bytes per UTF-8 byte.
+    // Reserve its worst representation, not the length of generated IDs.
+    let message = nx_sync::HistoryMessage::Replay {
+        request_id: nx_sync::OpId::new("\0".repeat(128)),
+        origin: entry.op.origin.clone(),
+        start: entry.position.sequence,
+        end: entry.position.sequence,
+        ops: vec![entry.clone()],
+    };
+    let formats = match limits.serialization_format {
+        nx_net::SerializationFormat::Json => &[nx_net::SerializationFormat::Json][..],
+        nx_net::SerializationFormat::Bincode => &[
+            nx_net::SerializationFormat::Bincode,
+            nx_net::SerializationFormat::Json,
+        ][..],
+    };
+    for &format in formats {
+        let bytes = nx_net::history_frame_len(&message, format)?;
+        anyhow::ensure!(
+            bytes <= REPLAY_BYTES,
+            "operation exceeds replay byte budget"
+        );
+        anyhow::ensure!(
+            bytes - 4 <= limits.max_message_size,
+            "operation exceeds local transport message limit"
+        );
+    }
+    Ok(())
 }
 
 pub(in crate::sync_manager) fn sequenced_op(
@@ -318,7 +350,7 @@ pub(in crate::sync_manager) fn remote_sequence_sets(
         let progress = tracker(store, origin)?;
         progress.validate_identity(entry.position, entry.op.id.as_str())?;
         anyhow::ensure!(
-            serde_json::to_vec(entry)?.len() + 1024 <= REPLAY_BYTES,
+            serde_json::to_vec(std::slice::from_ref(entry))?.len() <= REPLAY_BYTES,
             "operation exceeds replay byte budget"
         );
         if let Some((own_id, _, last_sequence)) = &allocator {
@@ -366,7 +398,7 @@ pub(in crate::sync_manager) fn remote_sequence_sets(
     ordered.sort_by_key(|entry| (entry.op.origin.as_str(), entry.position.sequence));
     for entry in ordered {
         anyhow::ensure!(
-            serde_json::to_vec(entry)?.len() + 1024 <= REPLAY_BYTES,
+            serde_json::to_vec(std::slice::from_ref(entry))?.len() <= REPLAY_BYTES,
             "operation exceeds replay byte budget"
         );
         let origin = entry.op.origin.as_str();

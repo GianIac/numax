@@ -43,6 +43,7 @@ use super::types::*;
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    local_limits: LocalTransportLimits,
     clock: Arc<dyn crate::peer_io::clock::Clock>,
     ids: Arc<dyn crate::peer_io::random::IdSource>,
     recovery_scan_limit: Arc<Semaphore>,
@@ -112,6 +113,7 @@ impl AcceptedLocalOp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn position(&self) -> nx_sync::OpPosition {
         self.position
     }
@@ -230,7 +232,7 @@ impl SyncHandle {
 
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -307,7 +309,7 @@ impl SyncHandle {
 
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -363,7 +365,7 @@ impl SyncHandle {
             .unwrap_or(candidate);
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -452,7 +454,7 @@ impl SyncHandle {
         }
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -506,7 +508,7 @@ impl SyncHandle {
         set.add(element.to_string(), op_id.clone());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -565,7 +567,7 @@ impl SyncHandle {
         set.apply_remove(element.to_string(), observed_tags);
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -617,7 +619,7 @@ impl SyncHandle {
         rga.insert(id.clone(), parent.clone(), value.clone());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -660,7 +662,7 @@ impl SyncHandle {
         rga.delete(id.to_string());
         let inserted_ids = [op_id];
         let plan = OpPersistencePlan {
-            local_generation: Some(self.generation),
+            local_generation: Some((self.generation, self.local_limits)),
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
@@ -1086,6 +1088,10 @@ impl SyncManager {
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            local_limits: LocalTransportLimits {
+                max_message_size: self.config.max_message_size,
+                serialization_format: self.config.serialization_format,
+            },
             clock: Arc::clone(&self.clock),
             ids: Arc::clone(&self.ids),
             recovery_scan_limit: Arc::clone(&self.recovery_scan_limit),

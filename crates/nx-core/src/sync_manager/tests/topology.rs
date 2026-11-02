@@ -2,6 +2,223 @@ use super::*;
 use nx_net::{MembershipState, SerializationFormat};
 
 #[tokio::test]
+async fn real_control_data_partition_json() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::topology::real_control_data_partition_json",
+    ) {
+        return;
+    }
+    real_control_data_partition(SerializationFormat::Json).await;
+}
+
+#[tokio::test]
+async fn real_control_data_partition_bincode() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::topology::real_control_data_partition_bincode",
+    ) {
+        return;
+    }
+    real_control_data_partition(SerializationFormat::Bincode).await;
+}
+
+async fn wait_mutual_state(a: &SyncManager, b: &SyncManager, expected: MembershipState) {
+    let admission_started = StdInstant::now();
+    let admission = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            let complete = [(a, b), (b, a)].into_iter().all(|(local, remote)| {
+                let snapshot = local.membership.as_ref().unwrap().snapshot.borrow();
+                assert!(snapshot.error.is_none(), "{snapshot:?}");
+                snapshot
+                    .records
+                    .iter()
+                    .any(|r| r.member == remote.node_id.as_str() && r.state == expected)
+            });
+            if complete {
+                break;
+            }
+            poll.tick().await;
+        }
+    })
+    .await;
+    if admission.is_err() {
+        log_sync_phase("control-data-state", admission_started.elapsed(), &[a, b]);
+    }
+    admission.unwrap();
+}
+
+async fn real_control_data_partition(format: SerializationFormat) {
+    let target_a = free_addr();
+    let target_b = free_addr();
+    let gate_a = TestDataGate::new(target_a.clone()).await;
+    let gate_b = TestDataGate::new(target_b.clone()).await;
+    let make = |id: &str, target: &str, advertised: &str, candidate: &str| {
+        SyncManager::try_new_with_discovery(
+            NodeId::new(id),
+            SyncConfig::new()
+                .with_listen_addr(target)
+                .with_serialization_format(format)
+                .with_anti_entropy_interval(Duration::from_millis(100))
+                .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(40)),
+            temp_store(),
+            metrics(),
+            vec![crate::DiscoveryProvider::new(
+                "static",
+                Arc::new(crate::StaticDiscovery::new(vec![candidate.into()])),
+            )],
+            crate::DiscoveryRuntimeConfig::new().with_advertised_endpoint(advertised),
+        )
+        .unwrap()
+    };
+    let mut a = make("tcp-left", &target_a, &gate_a.endpoint, &gate_b.endpoint);
+    let mut b = make("tcp-right", &target_b, &gate_b.endpoint, &gate_a.endpoint);
+    gate_a.open.send_replace(true);
+    gate_b.open.send_replace(true);
+    a.start().await.unwrap();
+    b.start().await.unwrap();
+    wait_mutual_state(&a, &b, MembershipState::Alive).await;
+    let admission_started = StdInstant::now();
+    let admission = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            if a.connected_peer_count().await > 0
+                && b.connected_peer_count().await > 0
+                && [&a, &b].into_iter().all(|m| {
+                    m.membership
+                        .as_ref()
+                        .unwrap()
+                        .snapshot
+                        .borrow()
+                        .successful_probes
+                        > 0
+                })
+            {
+                break;
+            }
+            poll.tick().await;
+        }
+    })
+    .await;
+    if admission.is_err() {
+        log_sync_phase(
+            "control-data-admission",
+            admission_started.elapsed(),
+            &[&a, &b],
+        );
+    }
+    admission.unwrap();
+    eprintln!(
+        "TCP_ADMISSION codec={format:?} sessions_left={} sessions_right={}",
+        a.connected_peer_count().await,
+        b.connected_peer_count().await
+    );
+    for (local, remote) in [(&a, &b), (&b, &a)] {
+        assert!(
+            local
+                .node
+                .as_ref()
+                .unwrap()
+                .connected_peers()
+                .await
+                .iter()
+                .all(|(_, id)| id == &remote.node_id)
+        );
+    }
+    gate_a.open.send_replace(false);
+    gate_b.open.send_replace(false);
+    local_six_family_workload(&a.handle(), 0).await;
+    local_six_family_workload(&b.handle(), 2).await;
+    wait_mutual_state(&a, &b, MembershipState::Dead).await;
+    assert_durable_dead(&a.store, b.node_id.as_str());
+    assert_durable_dead(&b.store, a.node_id.as_str());
+    assert_eq!(a.connected_peer_count().await, 0);
+    assert_eq!(b.connected_peer_count().await, 0);
+    assert_eq!(a.get_counter_value("det-g").await, 7);
+    assert_eq!(b.get_counter_value("det-g").await, 7);
+    let probes: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|m| {
+            m.membership
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .borrow()
+                .successful_probes
+        })
+        .collect();
+    gate_a.open.send_replace(true);
+    gate_b.open.send_replace(true);
+    let rejoined = StdInstant::now();
+    wait_mutual_state(&a, &b, MembershipState::Alive).await;
+    tokio::time::timeout_at(
+        Instant::from_std(rejoined + Duration::from_secs(30)),
+        async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                let mut complete = true;
+                for (index, manager) in [&a, &b].into_iter().enumerate() {
+                    complete &= manager.get_counter_value("det-g").await == 14
+                        && manager
+                            .membership
+                            .as_ref()
+                            .unwrap()
+                            .snapshot
+                            .borrow()
+                            .successful_probes
+                            > probes[index]
+                        && manager
+                            .handle()
+                            .replication_progress()
+                            .unwrap()
+                            .iter()
+                            .filter(|p| {
+                                p.contiguous_sequence == 12
+                                    && p.sparse_positions == 0
+                                    && p.recovery_failure.is_none()
+                            })
+                            .count()
+                            == 2;
+                }
+                if complete {
+                    break;
+                }
+                poll.tick().await;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(rejoined.elapsed() < Duration::from_secs(30));
+    assert_eq!(six_family_states(&a.store), six_family_states(&b.store));
+    for manager in [&a, &b] {
+        assert_six_family_memory(manager).await;
+        assert_six_family_materialized(&manager.store);
+        let progress = manager.handle().replication_progress().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert!(progress.iter().all(|p| p.contiguous_sequence == 12
+            && p.sparse_positions == 0
+            && p.recovery_failure.is_none()));
+        assert!(
+            manager
+                .membership
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .borrow()
+                .records
+                .iter()
+                .find(|r| r.member == manager.node_id.as_str())
+                .unwrap()
+                .version
+                .incarnation
+                > 0
+        );
+    }
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn rotating_full_slot_recovers_six_families_after_data_partition() {
     if run_in_isolated_test_process(
         "sync_manager::manager::tests::topology::rotating_full_slot_recovers_six_families_after_data_partition",

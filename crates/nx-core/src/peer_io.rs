@@ -64,6 +64,7 @@ pub(crate) trait PeerIo: Send + Sync {
     fn now(&self) -> Instant;
     async fn sleep_until(&self, deadline: Instant);
     fn request_id(&self) -> OpId;
+    #[cfg(test)]
     fn max_message_size(&self) -> usize;
     async fn connected_peers(&self) -> Vec<(String, NodeId)>;
     async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo>;
@@ -128,6 +129,7 @@ impl PeerIo for Node {
     fn request_id(&self) -> OpId {
         OpId::generate()
     }
+    #[cfg(test)]
     fn max_message_size(&self) -> usize {
         Node::max_message_size(self)
     }

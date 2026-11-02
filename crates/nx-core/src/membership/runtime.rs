@@ -544,7 +544,7 @@ impl Actor {
     }
 
     async fn observe(&mut self, event: Observation) -> anyhow::Result<()> {
-        self.advance();
+        self.advance().await?;
         match event {
             Observation::Dispatch(dispatched) => {
                 self.metrics.peers.increment(if dispatched.indirect {
@@ -594,15 +594,17 @@ impl Actor {
         Ok(())
     }
 
-    fn advance(&mut self) {
+    async fn advance(&mut self) -> anyhow::Result<()> {
         let observed = self.node.now();
         let elapsed = observed.saturating_duration_since(self.last);
         self.last = observed;
         if elapsed > TICK * 4 {
-            self.core().local_degradation();
+            let actions = self.core().local_degradation();
+            self.actions(actions).await?;
         } else {
             self.now = self.now.saturating_add(elapsed);
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -725,6 +727,14 @@ impl Actor {
             self.records.insert(from.into(), owner);
         }
         Ok(Some(session))
+    }
+
+    fn recovery_verdict(&self, from: &str, owner: &MembershipRecord) -> Option<MembershipRecord> {
+        if owner.member != from || owner.reporter != from || owner.state != MembershipState::Alive {
+            return None;
+        }
+        let update = self.core.recovery_verdict(from, version(owner.version))?;
+        Some(record(update, None, Some(self.owner.member.clone())))
     }
 
     async fn actions(&mut self, actions: Vec<Action>) -> anyhow::Result<()> {
@@ -962,7 +972,7 @@ impl Actor {
             .records
             .values()
             .filter(|record| after.is_none_or(|after| record.member.as_str() > after));
-        let records: Vec<_> = page
+        let mut records: Vec<_> = page
             .by_ref()
             .take(if accepted_session.is_some() {
                 nx_net::MAX_CONTROL_RECORDS
@@ -971,9 +981,15 @@ impl Actor {
             })
             .cloned()
             .collect();
-        let next = page
+        let mut next = page
             .next()
             .and_then(|_| records.last().map(|record| record.member.clone()));
+        if accepted_session.is_none()
+            && let Some(verdict) = self.recovery_verdict(&from, &event.request.owner)
+        {
+            records.push(verdict);
+            next = None;
+        }
         let _ = event.respond_to.send(ControlReply {
             request_id: event.request.request_id,
             owner: self.owner.clone(),
@@ -1002,7 +1018,16 @@ impl Actor {
                 .core
                 .local_epoch()
                 .ok_or_else(|| core_error(Error::NotReady))?;
+            #[cfg(test)]
+            let queued_at = Instant::now();
             self.writes.spawn_blocking(move || {
+                #[cfg(test)]
+                if queued_at.elapsed() > Duration::from_secs(1) {
+                    eprintln!(
+                        "MEMBERSHIP_WRITE_QUEUE elapsed_ms={}",
+                        queued_at.elapsed().as_millis()
+                    );
+                }
                 (
                     token,
                     MembershipStore::new(&store).persist_update(&local, epoch, &update),
@@ -1169,6 +1194,29 @@ impl Actor {
                 if accepted_session.is_some() {
                     Ok((peer, reply))
                 } else {
+                    // This owner is not a reporter or helper. It may only tell us
+                    // its judgment of ourselves so both sides can escape mutual death.
+                    if self
+                        .recovery_verdict(&peer.to_string(), &reply.owner)
+                        .is_some()
+                    {
+                        for record in &reply.records {
+                            if record.member == self.owner.member
+                                && record.reporter == peer.to_string()
+                                && matches!(
+                                    record.state,
+                                    MembershipState::Suspect | MembershipState::Dead
+                                )
+                            {
+                                let now = self.now;
+                                let actions = self
+                                    .core
+                                    .refute_self(version(record.version), now)
+                                    .map_err(core_error)?;
+                                self.actions(actions).await?;
+                            }
+                        }
+                    }
                     Err(nx_net::NetError::InvalidMessage(
                         "unaccepted control owner".into(),
                     ))
@@ -1495,6 +1543,223 @@ mod tests {
                 write_queue: VecDeque::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn recovery_exchange_only_refutes_self_without_readmitting_a_reporter() {
+        for restored in [false, true] {
+            for terminal in [false, true] {
+                let floors = if restored {
+                    vec![super::super::schema::Floor {
+                        member: "bob".into(),
+                        version: Version {
+                            epoch: 1,
+                            incarnation: 0,
+                        },
+                        status: Status::Dead,
+                        closed_epoch: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                let (_directory, mut actor) = actor(&floors);
+                if !restored {
+                    actor.accept_owner("bob", owner("bob", 1, 0)).await.unwrap();
+                    let actions = actor
+                        .core
+                        .probe_failed(
+                            "bob",
+                            Version {
+                                epoch: 1,
+                                incarnation: 0,
+                            },
+                            Duration::ZERO,
+                        )
+                        .unwrap();
+                    actor.actions(actions).await.unwrap();
+                    if terminal {
+                        let actions = actor.core.tick(Duration::from_secs(30)).unwrap();
+                        for action in actions {
+                            if matches!(action, Action::PersistFloor { .. }) {
+                                let published = MembershipStore::new(&actor.store)
+                                    .persist(&mut actor.core, &action)
+                                    .unwrap();
+                                actor.actions(published).await.unwrap();
+                            }
+                        }
+                        actor.now = Duration::from_secs(30);
+                    }
+                }
+                actor
+                    .accept_owner("carol", owner("carol", 1, 0))
+                    .await
+                    .unwrap();
+                let (respond_to, reply) = oneshot::channel();
+                actor
+                    .receive(ControlIncoming {
+                        from: nx_sync::NodeId::new("bob"),
+                        verification: nx_net::PeerIdentityVerification::Unverified,
+                        request: ControlRequest {
+                            request_id: 7,
+                            owner: owner("bob", 1, 0),
+                            updates: vec![],
+                            kind: ControlKind::Exchange {
+                                after: Some("zzz".into()),
+                            },
+                        },
+                        respond_to,
+                    })
+                    .await
+                    .unwrap();
+                let reply = reply.await.unwrap();
+                assert_eq!(reply.records.len(), 1);
+                assert_eq!(reply.records[0].member, "bob");
+                assert!(reply.next.is_none());
+                let sessions = actor.sessions.clone();
+                let before = actor.core.snapshot();
+                let mut accusation = actor.owner.clone();
+                accusation.reporter = "bob".into();
+                accusation.state = MembershipState::Dead;
+                let mut third_party = owner("carol", 1, 0);
+                third_party.reporter = "bob".into();
+                third_party.state = MembershipState::Dead;
+                actor
+                    .completed(Completion {
+                        endpoint: "127.0.0.1:9999".into(),
+                        expected: Some("bob".into()),
+                        mode: Job::Exchange,
+                        timing: None,
+                        result: Ok((
+                            nx_sync::NodeId::new("bob"),
+                            ControlReply {
+                                request_id: 7,
+                                owner: owner("bob", 1, 0),
+                                ack: false,
+                                nack: false,
+                                records: vec![accusation, third_party],
+                                next: Some("not-authorized".into()),
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(actor.owner.version.incarnation, 1);
+                assert_eq!(actor.sessions, sessions);
+                assert_eq!(actor.core.snapshot(), before);
+                assert!(actor.pages.is_empty());
+                assert!(actor.writes.is_empty());
+                assert!(
+                    actor
+                        .accept_owner("bob", owner("bob", 1, 0))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    actor
+                        .accept_owner("bob", owner("bob", 1, 1))
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_cannot_borrow_stale_or_closed_owner_authority() {
+        for (status, epoch, incarnation, wrong_reporter) in [
+            (Status::Dead, 1, 3, false),
+            (Status::Dead, 2, 2, false),
+            (Status::Dead, 2, 3, true),
+            (Status::Left, 2, 3, false),
+            (Status::Left, 2, 4, false),
+        ] {
+            let floor = super::super::schema::Floor {
+                member: "bob".into(),
+                version: Version {
+                    epoch: 2,
+                    incarnation: 3,
+                },
+                status,
+                closed_epoch: (status == Status::Left).then_some(2),
+            };
+            let (_directory, mut actor) = actor(&[floor]);
+            let mut remote = owner("bob", epoch, incarnation);
+            if wrong_reporter {
+                remote.reporter = "carol".into();
+            }
+            let mut accusation = actor.owner.clone();
+            accusation.reporter = "bob".into();
+            accusation.state = MembershipState::Suspect;
+            actor
+                .completed(Completion {
+                    endpoint: "127.0.0.1:9999".into(),
+                    expected: Some("bob".into()),
+                    mode: Job::Exchange,
+                    timing: None,
+                    result: Ok((
+                        nx_sync::NodeId::new("bob"),
+                        ControlReply {
+                            request_id: 1,
+                            owner: remote,
+                            ack: true,
+                            nack: false,
+                            records: vec![accusation],
+                            next: None,
+                        },
+                    )),
+                })
+                .await
+                .unwrap();
+            assert_eq!(actor.owner.version.incarnation, 0);
+            assert!(actor.sessions.is_empty());
+            assert!(actor.pages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_probe_is_accounted_once_and_late_reply_cannot_succeed() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.accept_owner("bob", owner("bob", 1, 0)).await.unwrap();
+        let actions = actor.core.probe_next(Duration::ZERO, |_| 0).unwrap();
+        let (attempt, target) = actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Probe(probe::Action::Direct {
+                    attempt, target, ..
+                }) => Some((attempt, target)),
+                _ => None,
+            })
+            .unwrap();
+        actor
+            .core
+            .probe_dispatched(attempt, &target, Duration::ZERO)
+            .unwrap();
+        actor.last = actor.node.now() - Duration::from_millis(101);
+        actor.advance().await.unwrap();
+        let actions = actor
+            .core
+            .probe_reply(attempt, &target, &target, true, actor.now)
+            .unwrap();
+        assert!(actions.is_empty());
+        actor.last = actor.node.now() - Duration::from_millis(101);
+        actor.advance().await.unwrap();
+        let metrics = actor.metrics.render_for_test(&actor.store);
+        assert!(
+            metrics.lines().any(|line| line
+                == "numax_membership_probe_results_total{outcome=\"local_degradation\"} 1"),
+            "{metrics}"
+        );
+        assert_eq!(actor.successful_probes, 0);
+        assert_eq!(actor.failed_probes, 0);
+        assert!(
+            actor
+                .core
+                .snapshot()
+                .iter()
+                .all(|r| r.status == Status::Alive)
+        );
     }
 
     #[tokio::test]

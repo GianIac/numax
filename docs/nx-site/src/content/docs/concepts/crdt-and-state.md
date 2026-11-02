@@ -107,7 +107,7 @@ Numax ships six CRDT types. Each solves a specific problem. Here they are with n
 
 **Use it for:** totals that can only increase. Page views, event counts, likes, completed tasks, bytes transferred.
 
-**How it works:** each node owns its own `u64` slot. A node can only increment its own slot. The total is the sum of all slots. Merge takes the maximum of each slot.
+**How it works:** each node owns its own `u64` slot. A node can only increment its own slot. The visible total is `min(sum of all slots, u64::MAX)`. Merge takes the maximum of each slot.
 
 ```
 Node A slot: 10
@@ -117,6 +117,11 @@ Total:        17
 ```
 
 If Node A's slot on Node B shows 8 but Node A actually has 10, merge will use 10. A slot can never decrease. This makes concurrent increments safe without coordination.
+
+Each slot saturates at `u64::MAX`. Reading the total sums the stored slots in
+`u128` before clamping to `u64::MAX`; it neither wraps nor panics when several
+valid slots exceed the visible range. The individual slots and their merge
+semantics are unchanged, including in durable state and bounded baselines.
 
 ```rust
 use nx_sdk::crdt::gcounter;
@@ -135,7 +140,19 @@ let total: u64 = gcounter::value("counter:visits")?;
 
 ![PNCounter merge preserves positive and negative per-origin slots and yields visible value 4.](/numax/diagrams/reference/pncounter-merge.svg)
 
-Overflow is handled with `saturating_add` and the final `i64` value is clamped to `[i64::MIN, i64::MAX]`.
+Each positive and negative slot saturates at `u64::MAX`, as in GCounter.
+The visible value is `clamp(sum(P slots) - sum(N slots), i64::MIN, i64::MAX)`.
+Both totals are accumulated in `u128`, then their sign and difference magnitude
+are computed before the final clamp. The totals are **not** separately clamped
+to `u64::MAX`: for example, `P = u64::MAX + 9` and `N = u64::MAX + 4`
+yield `5`, not `0`. Reads do not discard slots, so later opposing updates can
+bring a previously clamped value back into range.
+
+These numeric rules do not broaden recovery guarantees: bounded state transfer
+still requires a complete baseline that dominates the recipient's coverage and
+state. Divergent cuts are rejected without dropping local writes; a successful
+state merge is not a promise of arbitrary divergent-baseline recovery or
+unlimited history retention.
 
 ```rust
 use nx_sdk::crdt::pncounter;

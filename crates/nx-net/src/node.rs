@@ -1003,10 +1003,7 @@ impl Node {
                 peer_id,
             )
         };
-        let bytes = WireMessage {
-            kind: WireMessageKind::History { message },
-        }
-        .to_bytes_with_format(serialization_format)?;
+        let bytes = crate::message::encode_history_frame(message, serialization_format)?;
         validate_payload_len(bytes.len().saturating_sub(4), self.config.max_message_size)?;
         Ok(PreparedHistory {
             owner: Arc::downgrade(&self.tasks),
@@ -2290,6 +2287,86 @@ mod tests {
                     assert!(timing.observed_at >= started);
                 }
                 client.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_transport_exact_payload_limit_and_one_byte_over_in_negotiated_codec() {
+        use nx_sync::{HistoryMessage, OpPosition, SequencedOp};
+        for (preferred, remote, selected) in [
+            (
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+            ),
+            (
+                SerializationFormat::Bincode,
+                SerializationFormat::Bincode,
+                SerializationFormat::Bincode,
+            ),
+            (
+                SerializationFormat::Bincode,
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+            ),
+        ] {
+            let message = HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("\0".repeat(128)),
+                origin: NodeId::new("origin\\\""),
+                start: u64::MAX,
+                end: u64::MAX,
+                ops: vec![SequencedOp {
+                    op: nx_sync::Op::lww_register_set(
+                        NodeId::new("origin\\\""),
+                        "key\\\"\n",
+                        vec![255; 4096],
+                        1,
+                    ),
+                    position: OpPosition {
+                        generation: u64::MAX,
+                        sequence: u64::MAX,
+                    },
+                }],
+            };
+            let encoded = crate::message::encode_history_frame(message.clone(), selected).unwrap();
+            let payload_bytes = encoded.len() - 4;
+            assert_eq!(
+                crate::history_frame_len(&message, selected).unwrap(),
+                encoded.len()
+            );
+            assert_eq!(
+                u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
+                payload_bytes
+            );
+            for extra in [0, 1] {
+                let client = Node::new(
+                    NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                        .with_serialization_format(preferred)
+                        .with_max_message_size(payload_bytes - extra),
+                );
+                let server = Node::new(
+                    NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                        .with_serialization_format(remote),
+                );
+                let address = server.start_listener().await.unwrap().to_string();
+                client.connect_to_peer(&address).await.unwrap();
+                let result = client
+                    .prepare_history_to_addr(&address, message.clone())
+                    .await;
+                if extra == 0 {
+                    let prepared = result.unwrap();
+                    assert_eq!(prepared.encoded_len(), encoded.len());
+                    client.send_prepared_history(prepared).await.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(NetError::MessageTooLarge { len, limit })
+                            if len == payload_bytes && limit + 1 == len
+                    ));
+                }
+                client.shutdown().await;
+                server.shutdown().await;
             }
         }
     }

@@ -173,6 +173,11 @@ impl SyncConfig {
     /// Zero retry delays and anti-entropy intervals retain their 1 ms normalization.
     pub fn validate(&self) -> Result<(), SyncConfigError> {
         self.gossip_rate.validate()?;
+        if self.max_message_size == 0 || self.max_message_size > u32::MAX as usize {
+            return Err(SyncConfigError::Invalid(
+                "max_message_size must be in 1..=u32::MAX payload bytes".into(),
+            ));
+        }
         for (name, limit) in [
             ("queued_ops_limit", self.queued_ops_limit),
             ("max_peers", self.max_peers),
@@ -304,6 +309,30 @@ impl SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_payload_limit_preserves_small_values_and_rejects_invalid_range() {
+        assert!(
+            SyncConfig::new()
+                .with_max_message_size(1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            SyncConfig::new()
+                .with_max_message_size(0)
+                .validate()
+                .is_err()
+        );
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert!(
+                SyncConfig::new()
+                    .with_max_message_size(too_large)
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn validation_preserves_zero_normalization_and_disabled_peer_admission() {

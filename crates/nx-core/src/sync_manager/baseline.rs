@@ -105,24 +105,18 @@ struct Decoded {
     writes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// Validate counter totals before invoking value(), which assumes a representable u64 sum.
+/// Validate origins and individual slots; the visible value clamps the full total.
 fn validate_counter(value: &serde_json::Value) -> anyhow::Result<()> {
     let counts = value
         .get("counts")
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow::anyhow!("missing counter slots"))?;
-    let mut sum = 0u64;
     for (origin, slot) in counts {
         anyhow::ensure!(
             !origin.is_empty() && origin.len() <= 256,
             "invalid counter origin"
         );
-        sum = sum
-            .checked_add(
-                slot.as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid counter slot"))?,
-            )
-            .ok_or_else(|| anyhow::anyhow!("counter total overflow"))?;
+        anyhow::ensure!(slot.as_u64().is_some(), "invalid counter slot");
     }
     Ok(())
 }

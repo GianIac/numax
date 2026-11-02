@@ -241,8 +241,14 @@ pub(super) struct RemoteCrdtUpdateBatch<'a> {
     pub(super) rgas: &'a HashMap<String, Rga>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct LocalTransportLimits {
+    pub(super) max_message_size: usize,
+    pub(super) serialization_format: nx_net::SerializationFormat,
+}
+
 pub(super) struct OpPersistencePlan {
-    pub(super) local_generation: Option<u64>,
+    pub(super) local_generation: Option<(u64, LocalTransportLimits)>,
     pub(super) op: Op,
     pub(super) seen_sequence: u64,
     pub(super) op_log_sequence: u64,

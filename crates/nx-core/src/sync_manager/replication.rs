@@ -722,13 +722,9 @@ async fn forward_batch(
     };
     let source_addr = first.source_addr;
     let mut entries = vec![first.entry];
-    let byte_budget = context
-        .max_message_size
-        .min(REPLAY_BYTES)
-        .saturating_sub(256);
-    let mut encoded_bytes =
-        super::delivery::entry_bytes(&entries[0].op, &entries[0].position).unwrap_or(usize::MAX);
-    if encoded_bytes > byte_budget {
+    let byte_budget = context.max_message_size;
+    let mut sizes = PushFrameSize::default();
+    if !sizes.include(&entries[0], byte_budget) {
         context.metrics.record_sync_error();
         warn!(%source_addr, byte_budget, "forwarded operation exceeds gossip byte budget; durable history remains available for repair");
         return;
@@ -747,14 +743,10 @@ async fn forward_batch(
     for _ in 1..BROADCAST_BATCH_MAX {
         match forwarded_rx.try_recv() {
             Ok(forwarded) if forwarded.source_addr == source_addr => {
-                let item_size =
-                    super::delivery::entry_bytes(&forwarded.entry.op, &forwarded.entry.position)
-                        .unwrap_or(usize::MAX);
-                if encoded_bytes.saturating_add(item_size) > byte_budget {
+                if !sizes.include(&forwarded.entry, byte_budget) {
                     *pending = Some(forwarded);
                     break;
                 }
-                encoded_bytes = encoded_bytes.saturating_add(item_size);
                 entries.push(forwarded.entry);
             }
             Ok(forwarded) => {
@@ -850,6 +842,54 @@ fn enqueue_forwarded_ops(
     }
 }
 
+#[derive(Default)]
+struct PushFrameSize {
+    bytes: [usize; 2],
+    count: usize,
+}
+
+impl PushFrameSize {
+    fn include(&mut self, entry: &nx_sync::SequencedOp, max_message_size: usize) -> bool {
+        let mut next = self.bytes;
+        for (index, format) in [
+            nx_net::SerializationFormat::Json,
+            nx_net::SerializationFormat::Bincode,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Ok(single) = nx_net::history_frame_len(
+                &HistoryMessage::Push {
+                    ops: vec![entry.clone()],
+                },
+                format,
+            ) else {
+                return false;
+            };
+            next[index] = if self.count == 0 {
+                single
+            } else {
+                let Ok(empty) =
+                    nx_net::history_frame_len(&HistoryMessage::Push { ops: Vec::new() }, format)
+                else {
+                    return false;
+                };
+                // JSON adds a comma; wincode uses a fixed-width vector length.
+                // Size each entry once instead of repeatedly encoding the prefix.
+                self.bytes[index]
+                    .saturating_add(single - empty)
+                    .saturating_add(usize::from(format == nx_net::SerializationFormat::Json))
+            };
+            if next[index] > REPLAY_BYTES || next[index] - 4 > max_message_size {
+                return false;
+            }
+        }
+        self.bytes = next;
+        self.count += 1;
+        true
+    }
+}
+
 pub(super) async fn broadcast_batch(
     context: &BroadcastLoopContext,
     op_rx: &mut super::delivery::Receiver<AcceptedLocalOp>,
@@ -860,21 +900,16 @@ pub(super) async fn broadcast_batch(
         queued: op_rx.len().saturating_add(1),
         capacity: op_rx.max_capacity(),
     };
-    let byte_budget = context
-        .max_message_size
-        .min(REPLAY_BYTES)
-        .saturating_sub(256);
-    let mut bytes =
-        super::delivery::entry_bytes(first.op(), &first.position()).unwrap_or(usize::MAX);
-    if bytes > byte_budget {
+    let byte_budget = context.max_message_size;
+    let mut batch = vec![first.into_sequenced()];
+    let mut sizes = PushFrameSize::default();
+    if !sizes.include(&batch[0], byte_budget) {
         context.metrics.record_sync_error();
         debug!("local gossip entry exceeds byte budget; durable repair retains accepted operation");
         return;
     }
-    let seed = super::delivery::seed(first.op().id.as_str())
+    let seed = super::delivery::seed(batch[0].op.id.as_str())
         ^ super::delivery::seed(context.local_id.as_str());
-    let mut batch = Vec::with_capacity(BROADCAST_BATCH_MAX);
-    batch.push(first);
 
     // Give producers a tiny window to fill the channel so sustained load is
     // sent in larger PushOps messages instead of many tiny network writes.
@@ -890,27 +925,17 @@ pub(super) async fn broadcast_batch(
     for _ in 1..BROADCAST_BATCH_MAX {
         match op_rx.try_recv() {
             Ok(op) => {
-                let size =
-                    super::delivery::entry_bytes(op.op(), &op.position()).unwrap_or(usize::MAX);
-                if size > byte_budget {
-                    context.metrics.record_sync_error();
-                    continue;
-                }
-                if bytes.saturating_add(size) > byte_budget {
+                let entry = op.clone().into_sequenced();
+                if !sizes.include(&entry, byte_budget) {
                     *pending = Some(op);
                     break;
                 }
-                bytes += size;
-                batch.push(op);
+                batch.push(entry);
             }
             Err(_) => break,
         }
     }
 
-    let batch = batch
-        .into_iter()
-        .map(AcceptedLocalOp::into_sequenced)
-        .collect::<Vec<_>>();
     let count = batch.len();
     let peers = context.node.connected_peers().await;
     let cluster_size = estimate_gossip_size(
@@ -1434,35 +1459,39 @@ async fn handle_history_message(
                     }
                 }
                 retained.sort_by_key(|entry| entry.position.sequence);
-                let mut envelope = super::delivery::ByteCount::default();
-                serde_json::to_writer(
-                    &mut envelope,
-                    &HistoryMessage::Replay {
+                let mut page = Vec::new();
+                for (expected, entry) in (start..=end).zip(retained) {
+                    if entry.position.sequence != expected {
+                        break;
+                    }
+                    page.push(entry);
+                }
+                let mut fitting = 0;
+                let mut upper = page.len();
+                // Try the complete page first; only oversized pages need a
+                // logarithmic search, avoiding repeated encoding of large prefixes.
+                let mut count = upper;
+                while count > fitting {
+                    let candidate = HistoryMessage::Replay {
                         request_id: request_id.clone(),
                         origin: origin.clone(),
                         start,
-                        end,
-                        ops: Vec::new(),
-                    },
-                )?;
-                let byte_budget = context
-                    .node
-                    .max_message_size()
-                    .saturating_sub(envelope.0.saturating_add(256))
-                    .min(REPLAY_BYTES);
-                let mut page = Vec::new();
-                let mut bytes = 2;
-                for (expected, entry) in (start..=end).zip(retained) {
-                    let size = serde_json::to_vec(&entry)?.len() + 1;
-                    if entry.position.sequence != expected || bytes + size > byte_budget {
-                        break;
+                        end: page[count - 1].position.sequence,
+                        ops: page[..count].to_vec(),
+                    };
+                    match context
+                        .node
+                        .clone()
+                        .prepare_history_to_addr(addr, candidate)
+                        .await
+                    {
+                        Ok(prepared) if prepared.encoded_len() <= REPLAY_BYTES => fitting = count,
+                        Ok(_) | Err(NetError::MessageTooLarge { .. }) => upper = count - 1,
+                        Err(error) => return Err(error.into()),
                     }
-                    bytes += size;
-                    page.push(entry);
-                    if expected == end {
-                        break;
-                    }
+                    count = fitting + (upper - fitting).div_ceil(2);
                 }
+                page.truncate(fitting);
                 if let Some(last) = page.last() {
                     HistoryMessage::Replay {
                         request_id,
@@ -1703,6 +1732,41 @@ mod tests {
     use nx_sync::{GCounter, NodeId};
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn transport_push_packing_matches_real_codecs_without_fixed_margins() {
+        let entries = (1..=4)
+            .map(|sequence| nx_sync::SequencedOp {
+                op: Op::lww_register_set(
+                    NodeId::new("origin\\\""),
+                    "key\0",
+                    vec![255; 128],
+                    sequence,
+                ),
+                position: nx_sync::OpPosition {
+                    generation: u64::MAX,
+                    sequence,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut sizes = PushFrameSize::default();
+        for count in 1..=entries.len() {
+            let message = HistoryMessage::Push {
+                ops: entries[..count].to_vec(),
+            };
+            let actual = [
+                nx_net::SerializationFormat::Json,
+                nx_net::SerializationFormat::Bincode,
+            ]
+            .map(|format| nx_net::history_frame_len(&message, format).unwrap());
+            let limit = actual.into_iter().max().unwrap() - 4;
+            let before = sizes.bytes;
+            assert!(!sizes.include(&entries[count - 1], limit - 1));
+            assert_eq!(sizes.bytes, before);
+            assert!(sizes.include(&entries[count - 1], limit));
+            assert_eq!(sizes.bytes, actual);
+        }
+    }
 
     fn temp_store() -> Arc<NxStore> {
         use std::sync::atomic::{AtomicU64, Ordering};

@@ -336,6 +336,44 @@ impl Membership {
             })
     }
 
+    pub(super) fn recovery_verdict(&self, member: &str, version: Version) -> Option<Update> {
+        self.ready().ok()?;
+        let current = self.members.get(member)?;
+        (current.version == version
+            && matches!(current.status, Status::Suspect | Status::Dead)
+            && current
+                .closed_epoch
+                .is_none_or(|epoch| version.epoch > epoch)
+            && !current
+                .pending
+                .is_some_and(|(_, status)| status == Status::Left))
+        .then(|| Update {
+            member: member.into(),
+            version,
+            status: current.status,
+        })
+    }
+
+    pub(super) fn refute_self(
+        &mut self,
+        version: Version,
+        now: Duration,
+    ) -> Result<Vec<Action>, Error> {
+        self.advance(now)?;
+        let local_version = self.ready()?;
+        if version.epoch != local_version.epoch || version < local_version {
+            return Ok(Vec::new());
+        }
+        let newer = local_version.refute(version)?;
+        self.version = Some(newer);
+        self.health.self_refutation(self.timing.health_max);
+        Ok(vec![Action::Publish(Update {
+            member: self.local.clone(),
+            version: newer,
+            status: Status::Alive,
+        })])
+    }
+
     pub(super) fn owner_alive(
         &mut self,
         member: &str,
@@ -380,19 +418,9 @@ impl Membership {
         now: Duration,
     ) -> Result<Vec<Action>, Error> {
         self.advance(now)?;
-        let local_version = self.ready()?;
+        self.ready()?;
         if target == self.local {
-            if version.epoch != local_version.epoch || version < local_version {
-                return Ok(Vec::new());
-            }
-            let newer = local_version.refute(version)?;
-            self.version = Some(newer);
-            self.health.self_refutation(self.timing.health_max);
-            return Ok(vec![Action::Publish(Update {
-                member: self.local.clone(),
-                version: newer,
-                status: Status::Alive,
-            })]);
+            return self.refute_self(version, now);
         }
         let current = self.members.get(target).ok_or(Error::Unauthorized)?;
         if version != current.version

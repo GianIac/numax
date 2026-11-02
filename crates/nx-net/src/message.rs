@@ -50,6 +50,25 @@ impl SerializationFormat {
 pub const DEFAULT_SUPPORTED_FORMATS: &[SerializationFormat] =
     &[SerializationFormat::Bincode, SerializationFormat::Json];
 
+/// Size of a History frame using the transport encoder, including the codec
+/// byte and four-byte length prefix. Transport payload limits exclude the prefix.
+pub fn history_frame_len(
+    message: &nx_sync::HistoryMessage,
+    format: SerializationFormat,
+) -> NetResult<usize> {
+    Ok(encode_history_frame(message.clone(), format)?.len())
+}
+
+pub(crate) fn encode_history_frame(
+    message: nx_sync::HistoryMessage,
+    format: SerializationFormat,
+) -> NetResult<Vec<u8>> {
+    WireMessage {
+        kind: WireMessageKind::History { message },
+    }
+    .to_bytes_with_format(format)
+}
+
 /// Structured error sent over the wire before closing or rejecting a request.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaRead, wincode::SchemaWrite,

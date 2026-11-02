@@ -31,10 +31,13 @@ impl Runner {
         self.decisions.push(decision);
     }
     fn new(seed: u64, format: nx_net::SerializationFormat) -> Self {
+        Self::with_loss(seed, format, 10)
+    }
+    fn with_loss(seed: u64, format: nx_net::SerializationFormat, loss: u64) -> Self {
         let network = Network::with_timing(
             seed,
             format,
-            10,
+            loss,
             Duration::from_millis(5),
             Duration::from_millis(1),
             2,
@@ -340,48 +343,16 @@ impl Runner {
     }
 }
 
-fn states(store: &NxStore) -> Vec<serde_json::Value> {
-    [
-        read_durable_gcounter_state(store, "det-g")
-            .to_json()
-            .unwrap(),
-        read_durable_pncounter_state(store, "det-p")
-            .to_json()
-            .unwrap(),
-        read_durable_lww_register_state(store, "det-r")
-            .to_json()
-            .unwrap(),
-        read_durable_lww_map_state(store, "det-m")
-            .to_json()
-            .unwrap(),
-        read_durable_orset_state(store, "det-o").to_json().unwrap(),
-        read_durable_rga_state(store, "det-a").to_json().unwrap(),
-    ]
-    .into_iter()
-    .map(|json| serde_json::from_str(&json).unwrap())
-    .collect()
-}
 async fn scenario(seed: u64, format: nx_net::SerializationFormat) -> serde_json::Value {
     let mut runner = Runner::new(seed, format);
     for index in [0, 2] {
         let handle = runner.replicas[index].manager.handle();
-        local_increment(&handle, "det-g", 7).await;
-        local_pncounter_inc(&handle, "det-p", 9).await;
-        local_pncounter_dec(&handle, "det-p", 4).await;
-        local_lww_register_set(&handle, "det-r", b"winner", 200 + index as u64).await;
-        local_lww_map_set(&handle, "det-m", "field", b"removed", 100).await;
-        local_lww_map_remove(&handle, "det-m", "field", 200).await;
-        local_orset_add(&handle, "det-o", "removed").await;
-        local_orset_remove(&handle, "det-o", "removed").await;
-        local_orset_add(&handle, "det-o", "present").await;
-        let removed = local_rga_insert_after(&handle, "det-a", None, b"removed").await;
-        local_rga_delete(&handle, "det-a", &removed).await;
-        local_rga_insert_after(&handle, "det-a", None, b"present").await;
+        local_six_family_workload(&handle, index as u64).await;
     }
     runner.until(Duration::from_secs(3)).await;
-    let expected = states(&runner.replicas[0].manager.store);
+    let expected = six_family_states(&runner.replicas[0].manager.store);
     for replica in &runner.replicas {
-        assert_eq!(states(&replica.manager.store), expected);
+        assert_eq!(six_family_states(&replica.manager.store), expected);
         assert_eq!(
             read_materialized(&replica.manager.store, "det-g"),
             14,
@@ -461,6 +432,180 @@ async fn scenario(seed: u64, format: nx_net::SerializationFormat) -> serde_json:
         "operations": 24, "retention_operations": 10000,
         "network_trace": runner.network.trace(), "membership_trace": runner.decisions,
         "state": expected,
+    });
+    runner.shutdown().await;
+    report
+}
+
+#[tokio::test]
+async fn long_control_data_partition_json() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::determinism::long_control_data_partition_json",
+    ) {
+        return;
+    }
+    replay_partition(nx_net::SerializationFormat::Json).await;
+}
+
+#[tokio::test]
+async fn long_control_data_partition_bincode() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::determinism::long_control_data_partition_bincode",
+    ) {
+        return;
+    }
+    replay_partition(nx_net::SerializationFormat::Bincode).await;
+}
+
+async fn replay_partition(format: nx_net::SerializationFormat) {
+    let first = partition_scenario(42, format).await;
+    println!(
+        "PARTITION_V1 {format:?} {}",
+        blake3::hash(&serde_json::to_vec(&first).unwrap())
+    );
+}
+
+async fn partition_scenario(seed: u64, format: nx_net::SerializationFormat) -> serde_json::Value {
+    let started = StdInstant::now();
+    let mut runner = Runner::with_loss(seed, format, 0);
+    runner.until(Duration::from_secs(3)).await;
+    for replica in &runner.replicas {
+        let snapshot = replica.membership.snapshot();
+        let snapshot = snapshot.borrow();
+        assert_eq!(snapshot.records.len(), 3);
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .all(|r| r.state == nx_net::MembershipState::Alive)
+        );
+    }
+    for peer in [1, 2] {
+        runner.network.partition(
+            "127.0.0.1:12000",
+            &format!("127.0.0.1:{}", 12000 + peer),
+            true,
+        );
+    }
+    for index in [0, 2] {
+        local_six_family_workload(&runner.replicas[index].manager.handle(), index as u64).await;
+    }
+    runner.until(Duration::from_secs(63)).await;
+    eprintln!(
+        "PARTITION_PHASE codec={format:?} phase=dead elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(
+        runner
+            .network
+            .clock
+            .now()
+            .duration_since(runner.network.clock.origin),
+        Duration::from_secs(63)
+    );
+    for (index, peer) in [(0, 1), (0, 2), (1, 0), (2, 0)] {
+        let replica = &runner.replicas[index];
+        let member = format!("simulation-{peer}");
+        let snapshot = replica.membership.snapshot();
+        assert!(
+            snapshot
+                .borrow()
+                .records
+                .iter()
+                .any(|r| r.member == member && r.state == nx_net::MembershipState::Dead)
+        );
+        assert_durable_dead(&replica.manager.store, &member);
+    }
+    let probes: Vec<_> = runner
+        .replicas
+        .iter()
+        .map(|r| r.membership.snapshot().borrow().successful_probes)
+        .collect();
+    for peer in [1, 2] {
+        runner.network.partition(
+            "127.0.0.1:12000",
+            &format!("127.0.0.1:{}", 12000 + peer),
+            false,
+        );
+    }
+    let mut recovered_at = None;
+    // No new writes after rejoin. Each until() drains work at every intervening deadline.
+    for second in 1..=30 {
+        runner.until(Duration::from_secs(63 + second)).await;
+        let expected = six_family_states(&runner.replicas[0].manager.store);
+        let complete = runner.replicas.iter().enumerate().all(|(index, replica)| {
+            let snapshot = replica.membership.snapshot();
+            let snapshot = snapshot.borrow();
+            snapshot.error.is_none()
+                && snapshot
+                    .records
+                    .iter()
+                    .all(|r| r.state == nx_net::MembershipState::Alive)
+                && snapshot.successful_probes > probes[index]
+                && six_family_states(&replica.manager.store) == expected
+                && replica
+                    .manager
+                    .handle()
+                    .replication_progress()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| {
+                        p.origin.as_str() == "simulation-0" || p.origin.as_str() == "simulation-2"
+                    })
+                    .filter(|p| {
+                        p.contiguous_sequence == 12
+                            && p.sparse_positions == 0
+                            && p.recovery_failure.is_none()
+                            && !p.baseline_unconfirmed
+                    })
+                    .count()
+                    == 2
+        });
+        if complete {
+            recovered_at = Some(second);
+            break;
+        }
+    }
+    assert!(
+        recovered_at.is_some(),
+        "seed={seed} codec={format:?} recovery exceeded 30 virtual seconds; snapshots={:?}",
+        runner
+            .replicas
+            .iter()
+            .map(|r| r.membership.snapshot().borrow().clone())
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "PARTITION_PHASE codec={format:?} phase=recovered recovered_by_virtual_s={} elapsed_ms={}",
+        recovered_at.unwrap(),
+        started.elapsed().as_millis()
+    );
+    for replica in &runner.replicas {
+        assert_six_family_memory(&replica.manager).await;
+        assert_six_family_materialized(&replica.manager.store);
+        let owner = replica.membership.snapshot();
+        assert!(
+            owner
+                .borrow()
+                .records
+                .iter()
+                .find(|r| r.member == replica.manager.node_id.as_str())
+                .unwrap()
+                .version
+                .incarnation
+                > 0
+        );
+    }
+    let report = serde_json::json!({
+        "version": 1, "seed": seed, "codec": format!("{format:?}"),
+        "topology": "initial three-node chain, production neighbor selection thereafter; cut {0}|{1,2}",
+        "partition_start_ms": 3000, "partition_duration_ms": 60000,
+        "loss": "bidirectional data and control cut; no additional random loss",
+        "latency_ms": 5, "writer_service_ms": 1, "operations": 24,
+        "retention_operations": 10000, "anti_entropy_interval_ms": 100,
+        "recovery_limit_ms": 30000, "recovered_by_ms": recovered_at.unwrap() * 1000,
+        "network_trace": runner.network.trace(), "membership_trace": runner.decisions,
+        "state": six_family_states(&runner.replicas[0].manager.store),
     });
     runner.shutdown().await;
     report

@@ -23,6 +23,7 @@ pub use control::{
 pub use error::{BootstrapError, BootstrapResult, NetError, NetResult, NodeConfigError};
 pub use message::{
     Message, MessageKind, PROTOCOL_VERSION, SerializationFormat, WireError, WireRetryPolicy,
+    history_frame_len,
 };
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]

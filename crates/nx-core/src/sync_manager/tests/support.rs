@@ -850,6 +850,80 @@ pub(super) async fn local_lww_register_set(
     permit.send(op);
 }
 
+pub(super) async fn local_six_family_workload(handle: &SyncHandle, index: u64) {
+    local_increment(handle, "det-g", 7).await;
+    local_pncounter_inc(handle, "det-p", 9).await;
+    local_pncounter_dec(handle, "det-p", 4).await;
+    local_lww_register_set(handle, "det-r", b"winner", 200 + index).await;
+    local_lww_map_set(handle, "det-m", "field", b"removed", 100).await;
+    local_lww_map_remove(handle, "det-m", "field", 200).await;
+    local_orset_add(handle, "det-o", "removed").await;
+    local_orset_remove(handle, "det-o", "removed").await;
+    local_orset_add(handle, "det-o", "present").await;
+    let removed = local_rga_insert_after(handle, "det-a", None, b"removed").await;
+    local_rga_delete(handle, "det-a", &removed).await;
+    local_rga_insert_after(handle, "det-a", None, b"present").await;
+}
+
+pub(super) fn six_family_states(store: &NxStore) -> Vec<serde_json::Value> {
+    [
+        read_durable_gcounter_state(store, "det-g")
+            .to_json()
+            .unwrap(),
+        read_durable_pncounter_state(store, "det-p")
+            .to_json()
+            .unwrap(),
+        read_durable_lww_register_state(store, "det-r")
+            .to_json()
+            .unwrap(),
+        read_durable_lww_map_state(store, "det-m")
+            .to_json()
+            .unwrap(),
+        read_durable_orset_state(store, "det-o").to_json().unwrap(),
+        read_durable_rga_state(store, "det-a").to_json().unwrap(),
+    ]
+    .into_iter()
+    .map(|json| serde_json::from_str(&json).unwrap())
+    .collect()
+}
+
+pub(super) fn assert_six_family_materialized(store: &NxStore) {
+    assert_eq!(read_materialized(store, "det-g"), 14);
+    assert_eq!(read_materialized_pncounter(store, "det-p"), 10);
+    assert_eq!(read_materialized_lww_register(store, "det-r"), b"winner");
+    assert!(read_materialized_lww_map(store, "det-m").is_empty());
+    assert_eq!(read_materialized_orset(store, "det-o"), vec!["present"]);
+    assert_eq!(
+        read_materialized_rga(store, "det-a"),
+        vec![b"present".to_vec(); 2]
+    );
+}
+
+pub(super) async fn assert_six_family_memory(manager: &SyncManager) {
+    assert_eq!(manager.get_counter_value("det-g").await, 14);
+    assert_eq!(manager.get_pncounter_value("det-p").await, 10);
+    assert_eq!(
+        manager.get_lww_register_value("det-r").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(manager.get_lww_map_entries("det-m").await.is_empty());
+    assert_eq!(manager.get_orset_elements("det-o").await, vec!["present"]);
+    assert_eq!(
+        manager.get_rga_values("det-a").await,
+        vec![b"present".to_vec(); 2]
+    );
+}
+
+pub(super) fn assert_durable_dead(store: &NxStore, member: &str) {
+    let bytes = store
+        .get(format!("__nx/membership/floor/{member}").as_bytes())
+        .unwrap()
+        .unwrap();
+    let floor: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(floor["status"], "dead");
+    assert!(floor["closed_epoch"].is_null());
+}
+
 pub(super) async fn local_orset_add(handle: &SyncHandle, key: &str, element: &str) {
     let permit = reserve_local_op(handle).await;
     let op = handle.add_orset(key, element).await.unwrap();

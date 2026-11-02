@@ -233,7 +233,7 @@ for most single-machine multi-node setups.
 | `queued_ops_limit` | integer | `10000` | Item capacity of each local/forwarding delivery queue |
 | `op_log_limit` | integer | `10000` | Maximum ops kept in the local op-log for anti-entropy |
 | `seen_ops_limit` | integer | `100000` | Maximum op IDs tracked for deduplication |
-| `max_message_size` | string | `16MiB` | Maximum sync message size. Accepts `KiB`, `MiB` or plain bytes |
+| `max_message_size` | string | `16MiB` | Maximum sync payload size, including the codec byte but excluding the four-byte length prefix. Must be in `1..=4294967295`; accepts `KiB`, `MiB` or plain bytes |
 | `socket_timeout_secs` | integer | `30` | Socket read/write timeout in seconds. Must be > 0 |
 | `reconnect_initial_delay` | duration | `500ms` | Initial backoff before reconnecting to a lost peer |
 | `reconnect_max_delay` | duration | `30s` | Maximum backoff ceiling for reconnect attempts |
@@ -244,6 +244,15 @@ for most single-machine multi-node setups.
 | `gossip_min_bytes_per_second` | integer | `65536` | Per-peer adaptive gossip rate floor |
 | `gossip_max_bytes_per_second` | integer | `4194304` | Per-peer adaptive gossip rate ceiling, at least the floor |
 | `gossip_burst_bytes` | string | `256KiB` | Per-peer byte-bucket burst allowance |
+
+Local CRDT acceptance checks the complete single-operation replay against
+`max_message_size` and the internal replay byte budget before persistence.
+The check includes envelope/escaping overhead and every negotiable codec:
+`bincode` can fall back to JSON; `json` negotiates only JSON. Small positive
+limits remain valid configuration, but operations that do not fit are rejected
+through the existing host API error path. This is a local transportability
+contract within retained history, not a guarantee for peers with smaller limits
+or for full-state baselines of arbitrary size. Gossip can be deferred by pacing.
 
 `reconnect_initial_delay` and `reconnect_max_delay` must be provided together
 and `reconnect_initial_delay` must be ≤ `reconnect_max_delay`.

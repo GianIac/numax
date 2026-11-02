@@ -1,6 +1,6 @@
 use super::*;
 use crate::sync_manager::baseline;
-use nx_sync::{BaselineFailure, CrdtBaseline, OpPosition, SequencedOp};
+use nx_sync::{BaselineFailure, CrdtBaseline, HistoryMessage, OpPosition, SequencedOp};
 
 fn manager(id: &str, store: Arc<NxStore>) -> SyncManager {
     SyncManager::try_new(
@@ -90,6 +90,55 @@ fn operations() -> Vec<SequencedOp> {
             },
         })
         .collect()
+}
+
+fn numeric_operations() -> Vec<SequencedOp> {
+    ["writer", "other"]
+        .into_iter()
+        .flat_map(|origin| {
+            [
+                Op::gcounter_increment(
+                    NodeId::new(origin),
+                    "counter",
+                    if origin == "writer" { u64::MAX } else { 1 },
+                ),
+                Op::pncounter_increment(NodeId::new(origin), "pn", u64::MAX),
+                Op::pncounter_decrement(
+                    NodeId::new(origin),
+                    "pn",
+                    if origin == "writer" {
+                        u64::MAX
+                    } else {
+                        u64::MAX - 5
+                    },
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, op)| SequencedOp {
+                op,
+                position: OpPosition {
+                    generation: 1,
+                    sequence: index as u64 + 1,
+                },
+            })
+        })
+        .collect()
+}
+
+async fn assert_numeric_values(manager: &SyncManager, gcounter: u64, pncounter: i64) {
+    assert_eq!(manager.get_counter_value("counter").await, gcounter);
+    assert_eq!(manager.get_pncounter_value("pn").await, pncounter);
+    assert_eq!(read_materialized(&manager.store, "counter"), gcounter);
+    assert_eq!(read_materialized_pncounter(&manager.store, "pn"), pncounter);
+    assert_eq!(
+        read_durable_gcounter_state(&manager.store, "counter").value(),
+        gcounter
+    );
+    assert_eq!(
+        read_durable_pncounter_state(&manager.store, "pn").value(),
+        pncounter
+    );
 }
 
 async fn seed(manager: &SyncManager) {
@@ -252,6 +301,348 @@ async fn baseline_rejects_incomparable_cuts_and_preserves_local_writes() {
     assert_eq!(target.get_counter_value("local").await, 43);
 }
 
+// Arm a live request fixture, then use the production correlation and event handler.
+async fn deliver_requested_history(
+    manager: &SyncManager,
+    source: &str,
+    start: u64,
+    end: u64,
+    message: HistoryMessage,
+) {
+    let (request_id, origin) = match &message {
+        HistoryMessage::Baseline {
+            request_id, origin, ..
+        }
+        | HistoryMessage::Replay {
+            request_id, origin, ..
+        } => (request_id.clone(), origin.clone()),
+        _ => panic!("expected a baseline or replay response"),
+    };
+    let mut context = test_event_context(
+        manager.counters.clone(),
+        manager.seen_ops.clone(),
+        manager.op_log.clone(),
+        manager.store.clone(),
+        manager.metrics.clone(),
+        manager.peer_health.clone(),
+    );
+    context.pncounters = manager.pncounters.clone();
+    context.lww_registers = manager.lww_registers.clone();
+    context.lww_maps = manager.lww_maps.clone();
+    context.orsets = manager.orsets.clone();
+    context.rgas = manager.rgas.clone();
+    context.seen_ops_next_sequence = manager.seen_ops_next_sequence.clone();
+    context.op_log_next_sequence = manager.op_log_next_sequence.clone();
+    context.op_log_limit = manager.config.op_log_limit;
+    context
+        .history_requests
+        .write()
+        .await
+        .entry(source.into())
+        .or_default()
+        .insert(
+            origin.as_str().into(),
+            crate::sync_manager::types::PendingHistoryRequest {
+                request_id,
+                start,
+                end,
+                baseline_revision: if start == 0 {
+                    Some(recovery_revision(&manager.store, &origin).unwrap())
+                } else {
+                    None
+                },
+                deadline: StdInstant::now() + Duration::from_secs(30),
+            },
+        );
+    handle_node_event(
+        NodeEvent::HistoryReceived {
+            from: NodeId::new(source),
+            addr: source.into(),
+            message,
+        },
+        &context,
+    )
+    .await;
+    assert!(context.history_requests.read().await[source].is_empty());
+}
+
+#[tokio::test]
+async fn baseline_coverage_conflict_survives_restart_then_correlated_repair_preserves_local_writes()
+{
+    for replay in [true, false] {
+        let source = manager("source", temp_store());
+        seed(&source).await;
+        let directory = tempfile::tempdir().unwrap();
+        let target = manager("target", Arc::new(NxStore::open(directory.path()).unwrap()));
+        let local = target
+            .handle()
+            .increment_gcounter("counter", 42)
+            .await
+            .unwrap()
+            .into_sequenced();
+        record_summary(
+            &target.store,
+            &nx_sync::HistorySummary {
+                origin: NodeId::new("writer"),
+                high_sequence: 12,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let payload = baseline::export(&remote_apply_context(&source))
+            .await
+            .unwrap();
+        let before_state = read_durable_gcounter_state(&target.store, "counter");
+        deliver_requested_history(
+            &target,
+            "source:1234",
+            0,
+            0,
+            HistoryMessage::Baseline {
+                request_id: nx_sync::OpId::new("conflicting-baseline"),
+                origin: NodeId::new("writer"),
+                version: baseline::VERSION,
+                digest: *blake3::hash(&payload).as_bytes(),
+                payload,
+            },
+        )
+        .await;
+        assert_eq!(target.get_counter_value("counter").await, 42);
+        assert_eq!(read_materialized(&target.store, "counter"), 42);
+        assert_eq!(
+            serde_json::to_value(read_durable_gcounter_state(&target.store, "counter")).unwrap(),
+            serde_json::to_value(&before_state).unwrap()
+        );
+        let before_restart = target.handle().replication_progress().unwrap();
+        assert_eq!(before_restart.len(), 2);
+        let local_progress = before_restart
+            .iter()
+            .find(|p| p.origin.as_str() == "target")
+            .unwrap();
+        assert_eq!(local_progress.contiguous_sequence, 1);
+        assert_eq!(local_progress.known_high_sequence, 1);
+        assert_eq!(local_progress.sparse_positions, 0);
+        let writer = before_restart
+            .iter()
+            .find(|p| p.origin.as_str() == "writer")
+            .unwrap();
+        assert_eq!(writer.contiguous_sequence, 0);
+        assert_eq!(writer.known_high_sequence, 12);
+        assert_eq!(writer.sparse_positions, 0);
+        assert_eq!(
+            writer.recovery_failure.as_ref().unwrap().reason,
+            BaselineFailure::CoverageConflict
+        );
+        assert_eq!(
+            missing_range(&target.store, &NodeId::new("writer")).unwrap(),
+            Some((1, 12))
+        );
+        target.store.flush().unwrap();
+        drop(target);
+        wait_for_store_file_release(directory.path()).await.unwrap();
+        let target = manager("target", Arc::new(NxStore::open(directory.path()).unwrap()));
+        assert_eq!(
+            target.handle().replication_progress().unwrap(),
+            before_restart
+        );
+        assert_eq!(target.get_counter_value("counter").await, 42);
+        assert_eq!(
+            read_durable_gcounter_state(&target.store, "counter").value_for(&NodeId::new("target")),
+            42
+        );
+
+        let repair = SyncManager::try_new(
+            NodeId::new("repair"),
+            SyncConfig::new().with_op_log_limit(32),
+            temp_store(),
+            metrics(),
+        )
+        .unwrap();
+        seed(&repair).await;
+        let message = if replay {
+            let mut retained = repair
+                .op_log
+                .read()
+                .await
+                .iter()
+                .map(|op| sequenced_op(&repair.store, op).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            retained.sort_by_key(|entry| entry.position.sequence);
+            assert_eq!(retained.len(), 12);
+            HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("available-replay"),
+                origin: NodeId::new("writer"),
+                start: 1,
+                end: 12,
+                ops: retained,
+            }
+        } else {
+            apply_sequenced_ops(std::slice::from_ref(&local), &remote_apply_context(&repair))
+                .await
+                .unwrap();
+            let payload = baseline::export(&remote_apply_context(&repair))
+                .await
+                .unwrap();
+            HistoryMessage::Baseline {
+                request_id: nx_sync::OpId::new("dominating-alternate-source"),
+                origin: NodeId::new("writer"),
+                version: baseline::VERSION,
+                digest: *blake3::hash(&payload).as_bytes(),
+                payload,
+            }
+        };
+        deliver_requested_history(
+            &target,
+            "repair:1234",
+            if replay { 1 } else { 0 },
+            if replay { 12 } else { 0 },
+            message,
+        )
+        .await;
+        if replay {
+            apply_sequenced_ops(&[local], &remote_apply_context(&repair))
+                .await
+                .unwrap();
+        }
+        assert_eq!(target.get_counter_value("counter").await, 52);
+        assert_eq!(read_materialized(&target.store, "counter"), 52);
+        assert_durable_equal(&repair.store, &target.store);
+        let progress = target.handle().replication_progress().unwrap();
+        assert_eq!(progress.len(), 2);
+        for progress in progress {
+            assert_eq!(
+                progress.contiguous_sequence,
+                if progress.origin.as_str() == "writer" {
+                    12
+                } else {
+                    1
+                }
+            );
+            assert_eq!(progress.known_high_sequence, progress.contiguous_sequence);
+            assert_eq!(progress.sparse_positions, 0);
+            assert!(progress.recovery_failure.is_none());
+            assert!(!progress.baseline_unconfirmed);
+        }
+        assert_eq!(
+            missing_range(&target.store, &NodeId::new("writer")).unwrap(),
+            None
+        );
+        apply_sequenced_ops(&operations(), &remote_apply_context(&target))
+            .await
+            .unwrap();
+        assert_durable_equal(&repair.store, &target.store);
+    }
+}
+
+#[tokio::test]
+async fn counter_totals_over_u64_materialize_locally_remotely_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = manager("local", Arc::new(NxStore::open(directory.path()).unwrap()));
+    let entries = numeric_operations();
+    apply_sequenced_ops(&entries[..3], &remote_apply_context(&source))
+        .await
+        .unwrap();
+    let handle = source.handle();
+    let local = vec![
+        handle
+            .increment_gcounter("counter", 1)
+            .await
+            .unwrap()
+            .into_sequenced(),
+        handle
+            .increment_pncounter("pn", 9)
+            .await
+            .unwrap()
+            .into_sequenced(),
+        handle
+            .decrement_pncounter("pn", 4)
+            .await
+            .unwrap()
+            .into_sequenced(),
+    ];
+    assert_numeric_values(&source, u64::MAX, 5).await;
+    let remote = manager("remote", temp_store());
+    apply_sequenced_ops(&local, &remote_apply_context(&remote))
+        .await
+        .unwrap();
+    apply_sequenced_ops(&entries[..3], &remote_apply_context(&remote))
+        .await
+        .unwrap();
+    assert_numeric_values(&remote, u64::MAX, 5).await;
+    assert_durable_equal(&source.store, &remote.store);
+    let before = source.handle().replication_progress().unwrap();
+    source.store.flush().unwrap();
+    drop(handle);
+    drop(source);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    let source = manager("local", Arc::new(NxStore::open(directory.path()).unwrap()));
+    assert_numeric_values(&source, u64::MAX, 5).await;
+    assert_durable_equal(&source.store, &remote.store);
+    assert_eq!(source.handle().replication_progress().unwrap(), before);
+    let gcounter = read_durable_gcounter_state(&source.store, "counter");
+    let pncounter = read_durable_pncounter_state(&source.store, "pn");
+    assert_eq!(gcounter.value_for(&NodeId::new("writer")), u64::MAX);
+    assert_eq!(gcounter.value_for(&NodeId::new("local")), 1);
+    assert_eq!(pncounter.positive_for(&NodeId::new("writer")), u64::MAX);
+    assert_eq!(pncounter.negative_for(&NodeId::new("writer")), u64::MAX);
+    assert_eq!(pncounter.positive_for(&NodeId::new("local")), 9);
+    assert_eq!(pncounter.negative_for(&NodeId::new("local")), 4);
+    apply_sequenced_ops(&local, &remote_apply_context(&source))
+        .await
+        .unwrap();
+    apply_sequenced_ops(&entries[..3], &remote_apply_context(&source))
+        .await
+        .unwrap();
+    assert_numeric_values(&source, u64::MAX, 5).await;
+    assert_durable_equal(&source.store, &remote.store);
+}
+
+#[tokio::test]
+async fn baseline_accepts_counter_totals_over_u64_and_preserves_state_and_coverage_on_restart() {
+    let source = manager("source", temp_store());
+    let entries = numeric_operations();
+    apply_sequenced_ops(&entries, &remote_apply_context(&source))
+        .await
+        .unwrap();
+    assert_numeric_values(&source, u64::MAX, 5).await;
+    let directory = tempfile::tempdir().unwrap();
+    let target = manager("target", Arc::new(NxStore::open(directory.path()).unwrap()));
+    apply_sequenced_ops(
+        &[entries.last().unwrap().clone()],
+        &remote_apply_context(&target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        target.handle().replication_progress().unwrap()[0].contiguous_sequence,
+        0
+    );
+    transfer(&source, &target).await.unwrap();
+    assert_numeric_values(&target, u64::MAX, 5).await;
+    assert_durable_equal(&source.store, &target.store);
+    let before = target.handle().replication_progress().unwrap();
+    assert_eq!(before.len(), 2);
+    for progress in &before {
+        assert_eq!(progress.contiguous_sequence, 3);
+        assert_eq!(progress.known_high_sequence, 3);
+        assert_eq!(progress.sparse_positions, 0);
+        assert!(!progress.baseline_unconfirmed);
+        assert!(progress.recovery_failure.is_none());
+    }
+    drop(target);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    let target = manager("target", Arc::new(NxStore::open(directory.path()).unwrap()));
+    assert_numeric_values(&target, u64::MAX, 5).await;
+    assert_durable_equal(&source.store, &target.store);
+    assert_eq!(target.handle().replication_progress().unwrap(), before);
+    apply_sequenced_ops(&entries, &remote_apply_context(&target))
+        .await
+        .unwrap();
+    transfer(&source, &target).await.unwrap();
+    assert_durable_equal(&source.store, &target.store);
+    assert_numeric_values(&target, u64::MAX, 5).await;
+}
+
 #[tokio::test]
 async fn baseline_validation_and_storage_failures_do_not_partially_publish() {
     let source = manager("source", temp_store());
@@ -300,9 +691,30 @@ async fn baseline_validation_and_storage_failures_do_not_partially_publish() {
     let mut corrupt = original.clone();
     corrupt.records[0].state = b"{}".to_vec();
     bad_states.push(corrupt);
-    let mut overflow = original.clone();
-    overflow.records[0].state = br#"{"counts":{"a":18446744073709551615,"b":1}}"#.to_vec();
-    bad_states.push(overflow);
+    for invalid_slots in [
+        serde_json::json!({"": 1}),
+        serde_json::json!({"a".repeat(257): 1}),
+        serde_json::json!({"a": -1}),
+        serde_json::json!({"a": 18446744073709551616.0}),
+        serde_json::json!({"a": 1.5}),
+    ] {
+        for (family, side) in [(1, None), (2, Some("positive")), (2, Some("negative"))] {
+            let mut invalid = original.clone();
+            let record = invalid
+                .records
+                .iter_mut()
+                .find(|record| record.family == family)
+                .unwrap();
+            let mut state: serde_json::Value = serde_json::from_slice(&record.state).unwrap();
+            if let Some(side) = side {
+                state[side]["counts"] = invalid_slots.clone();
+            } else {
+                state["counts"] = invalid_slots.clone();
+            }
+            record.state = serde_json::to_vec(&state).unwrap();
+            bad_states.push(invalid);
+        }
+    }
     let mut cyclic = original.clone();
     cyclic.records.last_mut().unwrap().state =
         br#"{"elements":{"root":{"id":"root","parent":"root","value":[]}},"tombstones":[]}"#

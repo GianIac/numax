@@ -1,6 +1,404 @@
 use super::*;
 use nx_sync::{HistorySummary, OpPosition, SequencedOp};
 
+fn transport_replay(entry: SequencedOp) -> nx_sync::HistoryMessage {
+    nx_sync::HistoryMessage::Replay {
+        request_id: nx_sync::OpId::new("\0".repeat(128)),
+        origin: entry.op.origin.clone(),
+        start: entry.position.sequence,
+        end: entry.position.sequence,
+        ops: vec![entry],
+    }
+}
+
+#[test]
+fn transport_preflight_checks_full_envelope_and_negotiable_codecs_at_exact_boundary() {
+    use crate::sync_manager::types::LocalTransportLimits;
+    use nx_net::{SerializationFormat, history_frame_len};
+    for position in [
+        OpPosition {
+            generation: 1,
+            sequence: 1,
+        },
+        OpPosition {
+            generation: u64::MAX,
+            sequence: u64::MAX,
+        },
+    ] {
+        let entry = SequencedOp {
+            op: Op::lww_register_set(
+                NodeId::new("origin\\\"\n".repeat(20)),
+                "key\\\"\0".repeat(16),
+                [0, 9, 255, 128].repeat(256),
+                u64::MAX,
+            ),
+            position,
+        };
+        let message = transport_replay(entry.clone());
+        let json = history_frame_len(&message, SerializationFormat::Json).unwrap();
+        let binary = history_frame_len(&message, SerializationFormat::Bincode).unwrap();
+        assert!(
+            json > binary,
+            "JSON escaping and numeric byte arrays must be counted"
+        );
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let limits = LocalTransportLimits {
+                max_message_size: json - 4,
+                serialization_format: format,
+            };
+            crate::sync_manager::storage::validate_local_transport(&entry, limits).unwrap();
+            let error = crate::sync_manager::storage::validate_local_transport(
+                &entry,
+                LocalTransportLimits {
+                    max_message_size: limits.max_message_size - 1,
+                    ..limits
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("transport message limit"));
+        }
+        let error = crate::sync_manager::storage::validate_local_transport(
+            &entry,
+            LocalTransportLimits {
+                max_message_size: binary - 4,
+                serialization_format: SerializationFormat::Bincode,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("transport message limit"),
+            "Bincode must also allow JSON fallback"
+        );
+    }
+}
+
+#[test]
+fn transport_preflight_retains_replay_byte_budget_even_with_large_transport_limit() {
+    let entry = SequencedOp {
+        op: Op::lww_register_set(NodeId::new("origin"), "key", vec![255; 2 * 1024 * 1024], 1),
+        position: OpPosition {
+            generation: 1,
+            sequence: 1,
+        },
+    };
+    let error = crate::sync_manager::storage::validate_local_transport(
+        &entry,
+        crate::sync_manager::types::LocalTransportLimits {
+            max_message_size: u32::MAX as usize,
+            serialization_format: crate::SerializationFormat::Bincode,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("replay byte budget"));
+}
+
+#[tokio::test]
+async fn transport_replay_budget_exact_boundary_survives_remote_apply_without_fixed_margin() {
+    let budget = crate::sync_manager::sequence::REPLAY_BYTES;
+    let mut entry = SequencedOp {
+        op: Op::lww_register_set(NodeId::new("origin"), "", vec![255], 1),
+        position: OpPosition {
+            generation: 1,
+            sequence: 1,
+        },
+    };
+    let initial = nx_net::history_frame_len(
+        &transport_replay(entry.clone()),
+        crate::SerializationFormat::Json,
+    )
+    .unwrap();
+    let remaining = budget - initial;
+    let OpKind::LwwRegisterSet { key, value, .. } = &mut entry.op.kind else {
+        unreachable!()
+    };
+    key.push_str(&"x".repeat(remaining % 4));
+    value.resize(1 + remaining / 4, 255);
+    assert_eq!(
+        nx_net::history_frame_len(
+            &transport_replay(entry.clone()),
+            crate::SerializationFormat::Json
+        )
+        .unwrap(),
+        budget,
+    );
+    assert!(serde_json::to_vec(&entry).unwrap().len() + 1024 > budget);
+    let limits = crate::sync_manager::types::LocalTransportLimits {
+        max_message_size: u32::MAX as usize,
+        serialization_format: crate::SerializationFormat::Bincode,
+    };
+    crate::sync_manager::storage::validate_local_transport(&entry, limits).unwrap();
+    let mut oversized = entry.clone();
+    let OpKind::LwwRegisterSet { key, .. } = &mut oversized.op.kind else {
+        unreachable!()
+    };
+    key.push('x');
+    let error =
+        crate::sync_manager::storage::validate_local_transport(&oversized, limits).unwrap_err();
+    assert!(error.to_string().contains("replay byte budget"));
+    let store = temp_store();
+    let target =
+        SyncManager::try_new(NodeId::new("target"), SyncConfig::new(), store, metrics()).unwrap();
+    apply(&target, std::slice::from_ref(&entry)).await.unwrap();
+    assert_eq!(
+        target.handle().replication_progress().unwrap()[0].contiguous_sequence,
+        1
+    );
+    assert_eq!(
+        target.op_log.read().await.as_slice(),
+        std::slice::from_ref(&entry.op)
+    );
+}
+
+#[tokio::test]
+async fn transport_host_api_preserves_internal_error_code_and_rejects_before_acceptance() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("host-local"),
+        SyncConfig::new().with_max_message_size(64),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let before = store.scan_prefix(b"").unwrap();
+    let engine = wasmtime::Engine::default();
+    let mut linker = wasmtime::Linker::new(&engine);
+    crate::host_api::crdt::add_to_linker(&mut linker).unwrap();
+    let module = wasmtime::Module::new(
+        &engine,
+        r#"
+        (module
+          (import "nx" "crdt_lww_set" (func $set (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "key")
+          (data (i32.const 16) "\ff\00\ff")
+          (func (export "run") (result i32)
+            i32.const 0 i32.const 3 i32.const 16 i32.const 3 call $set))
+    "#,
+    )
+    .unwrap();
+    let mut guest = wasmtime::Store::new(
+        &engine,
+        crate::runtime::HostState {
+            wasi: None,
+            store: Arc::clone(&store),
+            sync_handle: Some(manager.handle()),
+            module_id: Arc::from("transport-preflight"),
+            limits: wasmtime::StoreLimitsBuilder::new().build(),
+        },
+    );
+    let instance = linker.instantiate_async(&mut guest, &module).await.unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut guest, "run")
+        .unwrap();
+    assert_eq!(run.call_async(&mut guest, ()).await.unwrap(), -3);
+    assert_eq!(store.scan_prefix(b"").unwrap(), before);
+    assert!(manager.lww_registers.read().await.is_empty());
+    assert!(manager.seen_ops.read().await.ids.is_empty());
+    assert!(manager.op_log.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn transport_rejection_preserves_all_local_crdt_families_and_sequence_metadata() {
+    for format in [
+        crate::SerializationFormat::Json,
+        crate::SerializationFormat::Bincode,
+    ] {
+        let store = temp_store();
+        let manager = SyncManager::try_new(
+            NodeId::new("local"),
+            SyncConfig::new().with_serialization_format(format),
+            Arc::clone(&store),
+            metrics(),
+        )
+        .unwrap();
+        let handle = manager.handle();
+        handle.increment_gcounter("gc", 1).await.unwrap();
+        handle.increment_pncounter("pn", 2).await.unwrap();
+        handle.set_lww_register("reg", vec![1], 1).await.unwrap();
+        handle
+            .set_lww_map("map", "field", vec![2], 1)
+            .await
+            .unwrap();
+        handle.add_orset("set", "element").await.unwrap();
+        let inserted = handle
+            .insert_rga(handle.rga_insert_op("rga", None, vec![3]))
+            .await
+            .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        let before_seen = manager.seen_ops.read().await.ids.clone();
+        let before_log = manager.op_log.read().await.clone();
+        let seen_sequence = manager.seen_ops_next_sequence.load(Ordering::Relaxed);
+        let log_sequence = manager.op_log_next_sequence.load(Ordering::Relaxed);
+        let registries = (
+            format!("{:?}", manager.counters.read().await),
+            format!("{:?}", manager.pncounters.read().await),
+            format!("{:?}", manager.lww_registers.read().await),
+            format!("{:?}", manager.lww_maps.read().await),
+            format!("{:?}", manager.orsets.read().await),
+            format!("{:?}", manager.rgas.read().await),
+        );
+        let mut restricted = handle.clone();
+        restricted.local_limits.max_message_size = 64;
+        assert!(restricted.increment_gcounter("gc", 7).await.is_err());
+        assert!(restricted.increment_pncounter("pn", 7).await.is_err());
+        assert!(restricted.decrement_pncounter("pn", 7).await.is_err());
+        assert!(
+            restricted
+                .set_lww_register("reg", vec![255; 128], 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            restricted
+                .set_lww_map("map", "field", vec![255; 128], 2)
+                .await
+                .is_err()
+        );
+        assert!(restricted.remove_lww_map("map", "field", 2).await.is_err());
+        assert!(restricted.add_orset("set", "new").await.is_err());
+        assert!(restricted.remove_orset("set", "element").await.is_err());
+        assert!(
+            restricted
+                .insert_rga(restricted.rga_insert_op("rga", None, vec![255; 128]))
+                .await
+                .is_err()
+        );
+        assert!(
+            restricted
+                .delete_rga("rga", inserted.id.as_str())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        assert_eq!(manager.seen_ops.read().await.ids, before_seen);
+        assert_eq!(*manager.op_log.read().await, before_log);
+        assert_eq!(
+            manager.seen_ops_next_sequence.load(Ordering::Relaxed),
+            seen_sequence
+        );
+        assert_eq!(
+            manager.op_log_next_sequence.load(Ordering::Relaxed),
+            log_sequence
+        );
+        assert_eq!(
+            registries,
+            (
+                format!("{:?}", manager.counters.read().await),
+                format!("{:?}", manager.pncounters.read().await),
+                format!("{:?}", manager.lww_registers.read().await),
+                format!("{:?}", manager.lww_maps.read().await),
+                format!("{:?}", manager.orsets.read().await),
+                format!("{:?}", manager.rgas.read().await),
+            )
+        );
+        let next = handle.increment_gcounter("gc", 1).await.unwrap();
+        assert_eq!(next.position().sequence, inserted.position().sequence + 1);
+    }
+}
+
+#[tokio::test]
+async fn transport_accepted_exact_limit_operation_replays_over_tcp_including_json_fallback() {
+    use nx_net::{SerializationFormat, history_frame_len};
+    use nx_sync::HistoryMessage;
+    for (local_format, peer_format) in [
+        (SerializationFormat::Json, SerializationFormat::Json),
+        (SerializationFormat::Bincode, SerializationFormat::Bincode),
+        (SerializationFormat::Bincode, SerializationFormat::Json),
+    ] {
+        let origin = NodeId::new("origin\\\"");
+        let value = vec![255; 2048];
+        let mut expected = Op::lww_register_set(origin.clone(), "key\\\"", value.clone(), 1);
+        expected.id = nx_sync::OpId::new("x".repeat(36));
+        let entry = SequencedOp {
+            op: expected,
+            position: OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let limit =
+            history_frame_len(&transport_replay(entry), SerializationFormat::Json).unwrap() - 4;
+        let store = temp_store();
+        let address = free_addr();
+        let mut source = SyncManager::try_new(
+            origin.clone(),
+            SyncConfig::new()
+                .with_listen_addr(address.clone())
+                .with_serialization_format(local_format)
+                .with_max_message_size(limit),
+            Arc::clone(&store),
+            metrics(),
+        )
+        .unwrap();
+        let handle = source.handle();
+        let accepted = handle
+            .set_lww_register("key\\\"", value, 1)
+            .await
+            .unwrap()
+            .into_sequenced();
+        assert_eq!(
+            history_frame_len(
+                &transport_replay(accepted.clone()),
+                SerializationFormat::Json
+            )
+            .unwrap(),
+            limit + 4
+        );
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(
+            handle
+                .set_lww_register("key\\\"", vec![255; 2049], 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        source.start().await.unwrap();
+        let mut peer = Node::new(
+            NodeConfig::new(NodeId::new("requester"), "127.0.0.1:0")
+                .with_serialization_format(peer_format),
+        );
+        let mut events = peer.take_event_receiver().unwrap();
+        peer.connect_to_peer(&address).await.unwrap();
+        let request_id = nx_sync::OpId::new("\0".repeat(128));
+        peer.send_history_to_addr(
+            &address,
+            HistoryMessage::Request {
+                request_id: request_id.clone(),
+                origin,
+                start: 1,
+                end: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let ops = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(NodeEvent::HistoryReceived { message, .. }) = events.recv().await {
+                    match message {
+                        HistoryMessage::Replay {
+                            request_id: received,
+                            ops,
+                            ..
+                        } => {
+                            assert_eq!(received, request_id);
+                            break ops;
+                        }
+                        HistoryMessage::Unavailable { .. } => {
+                            panic!("accepted retained operation was excluded from replay")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ops, vec![accepted]);
+        peer.shutdown().await;
+        source.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn sequenced_unavailable_evidence_survives_reopen_and_clears_only_its_interval() {
     use crate::sync_manager::UnavailableHistory;

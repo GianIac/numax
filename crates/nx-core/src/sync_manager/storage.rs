@@ -1250,11 +1250,11 @@ pub(super) fn persist_remote_ops_batch(
 fn apply_local_sequence_batch(
     lease: &nx_store::StoreWriteLease<'_>,
     op: &Op,
-    generation: u64,
+    (generation, limits): (u64, super::types::LocalTransportLimits),
     state_sets: &[(&[u8], &[u8])],
     deletes: &[&[u8]],
 ) -> anyhow::Result<()> {
-    let sequence_sets = local_sequence_sets(lease, op, generation)?;
+    let sequence_sets = local_sequence_sets(lease, op, generation, limits)?;
     let mut sets = state_sets.to_vec();
     sets.extend(
         sequence_sets

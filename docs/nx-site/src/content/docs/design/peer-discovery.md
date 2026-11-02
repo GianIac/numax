@@ -136,6 +136,20 @@ A NACK is helper feedback, not a death verdict. Relays authenticate the immediat
 sender, not the claimed origin of another node's update. This is a cooperative
 crash-fault model, without transferable owner signatures or Byzantine resistance.
 
+Mutual suspicion or death must not prevent an owner from learning its own
+failure judgment. For a known exact owner pair in an open epoch, a rejected
+`Alive` request may receive only that owner's `Suspect`/`Dead` verdict. A
+correlated reply from an equally rejected owner may trigger only self-refutation:
+it cannot authorize reports about other members, supply hints or pagination,
+relay probes, or complete a probe successfully. This applies to restored durable
+death floors too, without creating an admitted session.
+ 
+Superseded pairs and
+epochs closed by `Left` (including a pending leave) cannot use this path.
+Normal admission still requires a newer owner incarnation; an old `Alive`
+never overrides same-version evidence. Terminal publication still follows a
+covering flush.
+
 <span id="d1--local-acceptance-and-durability"></span>
 
 ## Local acceptance and durability
