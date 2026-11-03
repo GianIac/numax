@@ -2,6 +2,7 @@
 //! A dominating complete cut is required: max-merging partial additive counters is unsafe.
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use nx_sync::{
     BaselineFailure, BaselineRecord, CrdtBaseline, GCounter, LwwMap, LwwRegister, ORSet, PNCounter,
@@ -41,57 +42,65 @@ impl Write for BoundedBytes {
 
 /// All async locks precede the synchronous write lease, matching apply/local writes.
 pub(super) async fn export(context: &RemoteOpApplyContext<'_>) -> anyhow::Result<Vec<u8>> {
-    let _seen = context.seen_ops.read().await;
-    let _log = context.op_log.read().await;
-    let counters = context.counters.read().await;
-    let pncounters = context.pncounters.read().await;
-    let registers = context.lww_registers.read().await;
-    let maps = context.lww_maps.read().await;
-    let sets = context.orsets.read().await;
-    let rgas = context.rgas.read().await;
-    let lease = context.store.acquire_write_lease()?;
-    let origins = baseline_origins(lease.store())?;
-    let mut baseline = CrdtBaseline {
-        origins,
-        records: Vec::new(),
-    };
-    let mut state_bytes = 0usize;
-    macro_rules! collect {
-        ($family:expr, $registry:expr) => {
-            for (key, state) in $registry.iter() {
-                if baseline.records.len() >= MAX_RECORDS || key.len() > MAX_KEY_BYTES {
-                    return Err(Rejected(BaselineFailure::BudgetExceeded).into());
-                }
-                let mut encoded = BoundedBytes(Vec::new());
-                serde_json::to_writer(&mut encoded, state)
-                    .map_err(|_| Rejected(BaselineFailure::BudgetExceeded))?;
-                state_bytes += key.len() + encoded.0.len();
-                if state_bytes > MAX_BYTES {
-                    return Err(Rejected(BaselineFailure::BudgetExceeded).into());
-                }
-                baseline.records.push(BaselineRecord {
-                    family: $family,
-                    key: key.clone(),
-                    state: encoded.0,
-                });
+    let _seen = Arc::clone(context.seen_ops).read_owned().await;
+    let _log = Arc::clone(context.op_log).read_owned().await;
+    let counters = Arc::clone(context.counters).read_owned().await;
+    let pncounters = Arc::clone(context.pncounters).read_owned().await;
+    let registers = Arc::clone(context.lww_registers).read_owned().await;
+    let maps = Arc::clone(context.lww_maps).read_owned().await;
+    let sets = Arc::clone(context.orsets).read_owned().await;
+    let rgas = Arc::clone(context.rgas).read_owned().await;
+    let store = Arc::clone(context.store);
+    context
+        .storage_executor
+        .execute(move || {
+            // Keep receipt and replay guards through the complete cut, including flush.
+            let _guards = (_seen, _log);
+            let lease = store.acquire_write_lease()?;
+            let origins = baseline_origins(lease.store())?;
+            let mut baseline = CrdtBaseline {
+                origins,
+                records: Vec::new(),
+            };
+            let mut state_bytes = 0usize;
+            macro_rules! collect {
+                ($family:expr, $registry:expr) => {
+                    for (key, state) in $registry.iter() {
+                        if baseline.records.len() >= MAX_RECORDS || key.len() > MAX_KEY_BYTES {
+                            return Err(Rejected(BaselineFailure::BudgetExceeded).into());
+                        }
+                        let mut encoded = BoundedBytes(Vec::new());
+                        serde_json::to_writer(&mut encoded, state)
+                            .map_err(|_| Rejected(BaselineFailure::BudgetExceeded))?;
+                        state_bytes += key.len() + encoded.0.len();
+                        if state_bytes > MAX_BYTES {
+                            return Err(Rejected(BaselineFailure::BudgetExceeded).into());
+                        }
+                        baseline.records.push(BaselineRecord {
+                            family: $family,
+                            key: key.clone(),
+                            state: encoded.0,
+                        });
+                    }
+                };
             }
-        };
-    }
-    collect!(1, counters);
-    collect!(2, pncounters);
-    collect!(3, registers);
-    collect!(4, maps);
-    collect!(5, sets);
-    collect!(6, rgas);
-    baseline
-        .records
-        .sort_by(|a, b| (a.family, &a.key).cmp(&(b.family, &b.key)));
-    let mut payload = BoundedBytes(Vec::new());
-    serde_json::to_writer(&mut payload, &baseline)
-        .map_err(|_| Rejected(BaselineFailure::BudgetExceeded))?;
-    // Freeze the cut only after a covering flush. This is not a remote write acknowledgement.
-    lease.flush()?;
-    Ok(payload.0)
+            collect!(1, counters);
+            collect!(2, pncounters);
+            collect!(3, registers);
+            collect!(4, maps);
+            collect!(5, sets);
+            collect!(6, rgas);
+            baseline
+                .records
+                .sort_by(|a, b| (a.family, &a.key).cmp(&(b.family, &b.key)));
+            let mut payload = BoundedBytes(Vec::new());
+            serde_json::to_writer(&mut payload, &baseline)
+                .map_err(|_| Rejected(BaselineFailure::BudgetExceeded))?;
+            // Freeze the cut only after a covering flush. This is not a remote write acknowledgement.
+            lease.flush()?;
+            Ok(payload.0)
+        })
+        .await
 }
 
 #[derive(Default)]
@@ -274,64 +283,73 @@ async fn install(
     decoded: Decoded,
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
-    let _seen = context.seen_ops.write().await;
-    let _log = context.op_log.write().await;
-    let mut counters = context.counters.write().await;
-    let mut pncounters = context.pncounters.write().await;
-    let mut registers = context.lww_registers.write().await;
-    let mut maps = context.lww_maps.write().await;
-    let mut sets = context.orsets.write().await;
-    let mut rgas = context.rgas.write().await;
-    let lease = context.store.acquire_write_lease()?;
-    let sequence_sets = baseline_sequence_sets(&lease, &baseline.origins).map_err(|error| {
-        if error
-            .downcast_ref::<super::sequence::TrackingLimit>()
-            .is_some()
-        {
-            error.context(Rejected(BaselineFailure::BudgetExceeded))
-        } else {
-            error
-        }
-    })?;
-    // Also check state inclusion: a cut alone cannot justify silently dropping an existing key,
-    // a tombstone, or state from a legacy store. Compare canonical JSON values for counters too.
-    macro_rules! check_inclusion {
-        ($old:expr, $new:expr) => {
-            for (key, state) in $old.iter() {
-                let offered = $new
-                    .get(key)
-                    .ok_or(Rejected(BaselineFailure::CoverageConflict))?;
-                let merged = offered.merged_with(state);
-                if serde_json::to_value(&merged)? != serde_json::to_value(offered)? {
-                    return Err(Rejected(BaselineFailure::CoverageConflict).into());
-                }
+    let _seen = Arc::clone(context.seen_ops).write_owned().await;
+    let _log = Arc::clone(context.op_log).write_owned().await;
+    let mut counters = Arc::clone(context.counters).write_owned().await;
+    let mut pncounters = Arc::clone(context.pncounters).write_owned().await;
+    let mut registers = Arc::clone(context.lww_registers).write_owned().await;
+    let mut maps = Arc::clone(context.lww_maps).write_owned().await;
+    let mut sets = Arc::clone(context.orsets).write_owned().await;
+    let mut rgas = Arc::clone(context.rgas).write_owned().await;
+    let store = Arc::clone(context.store);
+    context
+        .storage_executor
+        .execute(move || {
+            // Keep receipt and replay guards through the complete cut, including flush.
+            let _guards = (_seen, _log);
+            let lease = store.acquire_write_lease()?;
+            let sequence_sets =
+                baseline_sequence_sets(&lease, &baseline.origins).map_err(|error| {
+                    if error
+                        .downcast_ref::<super::sequence::TrackingLimit>()
+                        .is_some()
+                    {
+                        error.context(Rejected(BaselineFailure::BudgetExceeded))
+                    } else {
+                        error
+                    }
+                })?;
+            // Also check state inclusion: a cut alone cannot justify silently dropping an existing key,
+            // a tombstone, or state from a legacy store. Compare canonical JSON values for counters too.
+            macro_rules! check_inclusion {
+                ($old:expr, $new:expr) => {
+                    for (key, state) in $old.iter() {
+                        let offered = $new
+                            .get(key)
+                            .ok_or(Rejected(BaselineFailure::CoverageConflict))?;
+                        let merged = offered.merged_with(state);
+                        if serde_json::to_value(&merged)? != serde_json::to_value(offered)? {
+                            return Err(Rejected(BaselineFailure::CoverageConflict).into());
+                        }
+                    }
+                };
             }
-        };
-    }
-    check_inclusion!(counters, decoded.counters);
-    check_inclusion!(pncounters, decoded.pncounters);
-    check_inclusion!(registers, decoded.registers);
-    check_inclusion!(maps, decoded.maps);
-    check_inclusion!(sets, decoded.sets);
-    check_inclusion!(rgas, decoded.rgas);
-    let writes = decoded
-        .writes
-        .iter()
-        .chain(sequence_sets.iter())
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect::<Vec<_>>();
-    lease.apply_batch(&writes, &[])?;
-    // A flush failure is an uncertain outcome: the whole batch may already survive.
-    // Publish that accepted batch coherently in memory, but retain the confirmation marker
-    // and return an error until a retry/restart confirms a covering flush.
-    let flushed = lease.flush();
-    *counters = decoded.counters;
-    *pncounters = decoded.pncounters;
-    *registers = decoded.registers;
-    *maps = decoded.maps;
-    *sets = decoded.sets;
-    *rgas = decoded.rgas;
-    flushed?;
-    lease.delete(BASELINE_UNCONFIRMED)?;
-    Ok(())
+            check_inclusion!(counters, decoded.counters);
+            check_inclusion!(pncounters, decoded.pncounters);
+            check_inclusion!(registers, decoded.registers);
+            check_inclusion!(maps, decoded.maps);
+            check_inclusion!(sets, decoded.sets);
+            check_inclusion!(rgas, decoded.rgas);
+            let writes = decoded
+                .writes
+                .iter()
+                .chain(sequence_sets.iter())
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect::<Vec<_>>();
+            lease.apply_batch(&writes, &[])?;
+            // A flush failure is an uncertain outcome: the whole batch may already survive.
+            // Publish that accepted batch coherently in memory, but retain the confirmation marker
+            // and return an error until a retry/restart confirms a covering flush.
+            let flushed = lease.flush();
+            *counters = decoded.counters;
+            *pncounters = decoded.pncounters;
+            *registers = decoded.registers;
+            *maps = decoded.maps;
+            *sets = decoded.sets;
+            *rgas = decoded.rgas;
+            flushed?;
+            lease.delete(BASELINE_UNCONFIRMED)?;
+            Ok(())
+        })
+        .await
 }

@@ -114,6 +114,7 @@ pub(super) async fn traced_shutdown(manager: &mut SyncManager) {
 
 pub(super) fn remote_apply_context(manager: &SyncManager) -> RemoteOpApplyContext<'_> {
     RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &manager.counters,
         pncounters: &manager.pncounters,
         lww_registers: &manager.lww_registers,
@@ -403,6 +404,7 @@ pub(super) async fn apply_remote_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -438,6 +440,7 @@ pub(super) async fn apply_remote_pncounter_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters,
         lww_registers: &lww_registers,
@@ -473,6 +476,7 @@ pub(super) async fn apply_remote_lww_register_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: registers,
@@ -508,6 +512,7 @@ pub(super) async fn apply_remote_lww_map_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -543,6 +548,7 @@ pub(super) async fn apply_remote_orset_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -578,6 +584,7 @@ pub(super) async fn apply_remote_rga_op_for_test(
     let orsets = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,

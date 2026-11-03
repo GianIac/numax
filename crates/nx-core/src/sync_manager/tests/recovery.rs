@@ -267,6 +267,114 @@ async fn remote_apply_storage_failure_returns_no_forwardable_operations() {
 }
 
 #[tokio::test]
+async fn cancelled_remote_apply_finishes_persistence_and_publication() {
+    cancelled_storage_work_finishes_publication(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_baseline_import_finishes_persistence_and_publication() {
+    cancelled_storage_work_finishes_publication(true).await;
+}
+
+async fn cancelled_storage_work_finishes_publication(import_baseline: bool) {
+    use std::future::Future;
+
+    let source = manager("source", temp_store());
+    seed(&source).await;
+    let payload = baseline::export(&remote_apply_context(&source))
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let target = Arc::new(manager(
+        "target",
+        Arc::new(NxStore::open(directory.path()).unwrap()),
+    ));
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_store = Arc::clone(&target.store);
+    let holder = std::thread::spawn(move || {
+        let lease = held_store.acquire_write_lease().unwrap();
+        held_tx.send(()).unwrap();
+        let released = release_rx.recv_timeout(Duration::from_secs(5));
+        drop(lease);
+        released.unwrap();
+    });
+    held_rx.await.unwrap();
+
+    let worker_target = Arc::clone(&target);
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+    let processing = tokio::spawn(async move {
+        let work = async {
+            let context = remote_apply_context(&worker_target);
+            if import_baseline {
+                baseline::import(
+                    baseline::VERSION,
+                    &payload,
+                    blake3::hash(&payload).as_bytes(),
+                    &NodeId::new("writer"),
+                    &context,
+                )
+                .await
+            } else {
+                apply_sequenced_ops(&operations(), &context).await
+            }
+        };
+        let mut work = std::pin::pin!(work);
+        let mut polled_tx = Some(polled_tx);
+        std::future::poll_fn(|cx| {
+            let result = work.as_mut().poll(cx);
+            if let Some(sender) = polled_tx.take() {
+                sender.send(()).unwrap();
+            }
+            result
+        })
+        .await
+    });
+    polled_rx.await.unwrap();
+    processing.abort();
+    assert!(processing.await.unwrap_err().is_cancelled());
+    assert!(
+        target.seen_ops.try_write().is_err(),
+        "the storage worker must retain its publication guards after caller cancellation"
+    );
+    release_tx.send(()).unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), target.seen_ops.write())
+            .await
+            .unwrap(),
+    );
+    holder.join().unwrap();
+
+    assert_durable_equal(&source.store, &target.store);
+    assert_eq!(target.get_counter_value("counter").await, 10);
+    assert_eq!(target.get_pncounter_value("pn").await, 5);
+    assert_eq!(
+        target.get_lww_register_value("register").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(target.get_lww_map_entries("map").await.is_empty());
+    assert!(target.get_orset_elements("set").await.is_empty());
+    assert_eq!(target.get_rga_values("rga").await, vec![vec![2]]);
+    let progress = target.handle().replication_progress().unwrap();
+    assert_eq!(progress[0].contiguous_sequence, 12);
+    assert_eq!(progress[0].sparse_positions, 0);
+    assert!(!progress[0].baseline_unconfirmed);
+    if !import_baseline {
+        assert_eq!(target.op_log.read().await.len(), 1);
+        assert_eq!(target.seen_ops.read().await.ids.len(), 1);
+    }
+    seed(&target).await;
+    assert_durable_equal(&source.store, &target.store);
+    drop(target);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    let reopened = manager("target", Arc::new(NxStore::open(directory.path()).unwrap()));
+    assert_durable_equal(&source.store, &reopened.store);
+    assert_eq!(reopened.handle().replication_progress().unwrap(), progress);
+    assert_eq!(reopened.get_counter_value("counter").await, 10);
+    assert_eq!(reopened.get_rga_values("rga").await, vec![vec![2]]);
+}
+
+#[tokio::test]
 async fn baseline_rejects_incomparable_cuts_and_preserves_local_writes() {
     let source = manager("source", temp_store());
     let target = manager("target", temp_store());

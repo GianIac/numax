@@ -636,6 +636,7 @@ async fn apply(manager: &SyncManager, operations: &[SequencedOp]) -> anyhow::Res
     apply_sequenced_ops(
         operations,
         &RemoteOpApplyContext {
+            storage_executor: crate::peer_io::StorageExecutor::Blocking,
             counters: &manager.counters,
             pncounters: &manager.pncounters,
             lww_registers: &manager.lww_registers,

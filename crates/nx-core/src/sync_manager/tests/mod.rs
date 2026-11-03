@@ -1698,6 +1698,7 @@ async fn disk_full_does_not_expose_partial_remote_state() {
     let metrics = metrics();
     let op = Op::gcounter_increment(NodeId::new("remote-a"), "counter:visits", 3);
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -2014,6 +2015,7 @@ async fn local_and_remote_gcounter_batches_keep_both_increments() {
         let remote_metrics = Arc::clone(&metrics);
         let remote = tokio::spawn(async move {
             let context = RemoteOpApplyContext {
+                storage_executor: crate::peer_io::StorageExecutor::Blocking,
                 counters: &counters,
                 pncounters: &pncounters,
                 lww_registers: &lww_registers,

@@ -1184,6 +1184,7 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
 
 fn history_apply_context(context: &NodeEventContext) -> RemoteOpApplyContext<'_> {
     RemoteOpApplyContext {
+        storage_executor: context.node.storage_executor(),
         counters: &context.counters,
         pncounters: &context.pncounters,
         lww_registers: &context.lww_registers,
@@ -1236,7 +1237,15 @@ async fn request_history_or_baseline(
 ) -> anyhow::Result<()> {
     let request_id = context.node.request_id();
     let baseline_revision = if start == 0 {
-        Some(super::storage::recovery_revision(&context.store, &origin)?)
+        let store = Arc::clone(&context.store);
+        let tracked_origin = origin.clone();
+        Some(
+            context
+                .node
+                .storage_executor()
+                .execute(move || super::storage::recovery_revision(&store, &tracked_origin))
+                .await?,
+        )
     } else {
         None
     };
@@ -1476,16 +1485,25 @@ async fn handle_history_message(
                 "invalid history request identity"
             );
             let response = {
-                let log = context.op_log.read().await;
-                let mut retained = Vec::new();
-                for op in log.iter().filter(|op| op.origin == origin) {
-                    if let Some(entry) = super::storage::sequenced_op(&context.store, op)?
-                        && entry.position.sequence >= start
-                        && entry.position.sequence <= end
-                    {
-                        retained.push(entry);
-                    }
-                }
+                let log = Arc::clone(&context.op_log).read_owned().await;
+                let store = Arc::clone(&context.store);
+                let requested_origin = origin.clone();
+                let mut retained = context
+                    .node
+                    .storage_executor()
+                    .execute(move || {
+                        let mut retained = Vec::new();
+                        for op in log.iter().filter(|op| op.origin == requested_origin) {
+                            if let Some(entry) = super::storage::sequenced_op(&store, op)?
+                                && entry.position.sequence >= start
+                                && entry.position.sequence <= end
+                            {
+                                retained.push(entry);
+                            }
+                        }
+                        Ok(retained)
+                    })
+                    .await?;
                 retained.sort_by_key(|entry| entry.position.sequence);
                 let mut page = Vec::new();
                 for (expected, entry) in (start..=end).zip(retained) {
@@ -1572,7 +1590,14 @@ async fn handle_history_message(
             let accepted =
                 apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await?;
             enqueue_forwarded_ops(addr, accepted, context);
-            if let Some((start, end)) = super::storage::missing_range(&context.store, &origin)? {
+            let store = Arc::clone(&context.store);
+            let tracked_origin = origin.clone();
+            let missing = context
+                .node
+                .storage_executor()
+                .execute(move || super::storage::missing_range(&store, &tracked_origin))
+                .await?;
+            if let Some((start, end)) = missing {
                 request_history_range(addr, origin, start, end, context).await?;
             }
         }
@@ -1590,16 +1615,21 @@ async fn handle_history_message(
                 debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited unavailable history");
                 return Ok(());
             }
-            super::storage::record_unavailable(
-                &context.store,
-                &origin,
-                super::sequence::UnavailableHistory {
-                    source: addr.to_owned(),
-                    start,
-                    end,
-                    request_id,
-                },
-            )?;
+            let store = Arc::clone(&context.store);
+            let tracked_origin = origin.clone();
+            let evidence = super::sequence::UnavailableHistory {
+                source: addr.to_owned(),
+                start,
+                end,
+                request_id,
+            };
+            context
+                .node
+                .storage_executor()
+                .execute(move || {
+                    super::storage::record_unavailable(&store, &tracked_origin, evidence)
+                })
+                .await?;
             context
                 .metrics
                 .peers
@@ -1696,13 +1726,8 @@ async fn handle_history_message(
             {
                 if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>()
                     && let Some(revision) = request.baseline_revision
-                    && let Err(record_error) = super::storage::record_recovery_failure(
-                        &context.store,
-                        &origin,
-                        addr,
-                        rejected.0,
-                        &revision,
-                    )
+                    && let Err(record_error) =
+                        record_recovery_failure(context, &origin, addr, rejected.0, &revision).await
                 {
                     warn!(%origin, record_error = %format_args!("{record_error:#}"), "could not record baseline rejection");
                 }
@@ -1727,13 +1752,7 @@ async fn handle_history_message(
             let Some(revision) = request.baseline_revision else {
                 return Ok(());
             };
-            if !super::storage::record_recovery_failure(
-                &context.store,
-                &origin,
-                addr,
-                reason,
-                &revision,
-            )? {
+            if !record_recovery_failure(context, &origin, addr, reason, &revision).await? {
                 debug!(%origin, %addr, "ignoring baseline refusal superseded by changed receipt coverage");
                 return Ok(());
             }
@@ -1746,6 +1765,26 @@ async fn handle_history_message(
         }
     }
     Ok(())
+}
+
+async fn record_recovery_failure(
+    context: &NodeEventContext,
+    origin: &NodeId,
+    source: &str,
+    reason: nx_sync::BaselineFailure,
+    revision: &[u8; 32],
+) -> anyhow::Result<bool> {
+    let store = Arc::clone(&context.store);
+    let origin = origin.clone();
+    let source = source.to_owned();
+    let revision = *revision;
+    context
+        .node
+        .storage_executor()
+        .execute(move || {
+            super::storage::record_recovery_failure(&store, &origin, &source, reason, &revision)
+        })
+        .await
 }
 
 // End of main code. Test below:

@@ -199,6 +199,7 @@ impl super::delivery::Item for ForwardedOp {
 }
 
 pub(super) struct RemoteOpApplyContext<'a> {
+    pub(super) storage_executor: crate::peer_io::StorageExecutor,
     pub(super) counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
     pub(super) pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
     pub(super) lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,

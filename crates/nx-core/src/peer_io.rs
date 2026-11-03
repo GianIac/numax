@@ -32,6 +32,7 @@ impl Generation {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum StorageExecutor {
     Blocking,
     #[cfg(test)]
