@@ -61,6 +61,7 @@ impl Runner {
             let mut manager =
                 SyncManager::try_new(NodeId::new(&id), config, temp_store(), metrics()).unwrap();
             manager.clock = runner.network.clock.clone();
+            manager.storage_executor = crate::peer_io::StorageExecutor::Deterministic;
             manager.ids = Arc::new(SeededIds::new(seed, &id, manager.generation, "local"));
             let io = runner.network.endpoint(&addr, &id, manager.generation);
             let membership = Simulation::new(
@@ -715,6 +716,7 @@ async fn deterministic_local_flush_failure_restart_preserves_unknown_outcome() {
     )
     .unwrap();
     manager.clock = crate::peer_io::simulation::Clock::new();
+    manager.storage_executor = crate::peer_io::StorageExecutor::Deterministic;
     manager.ids = Arc::new(SeededIds::new(
         42,
         "simulation-0",

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
@@ -43,6 +43,8 @@ use super::types::*;
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    local_writes: Arc<LocalWrites>,
+    storage_executor: crate::peer_io::StorageExecutor,
     local_limits: LocalTransportLimits,
     clock: Arc<dyn crate::peer_io::clock::Clock>,
     ids: Arc<dyn crate::peer_io::random::IdSource>,
@@ -69,6 +71,12 @@ pub struct SyncHandle {
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
+}
+
+#[derive(Default)]
+struct LocalWrites {
+    stopped: AtomicBool,
+    gate: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +157,44 @@ impl PartialEq<AcceptedLocalOp> for Op {
 }
 
 impl SyncHandle {
+    async fn local_mutation<R: Send + Sync + 'static, T: Send + 'static>(
+        &self,
+        registry: Arc<RwLock<R>>,
+        work: impl FnOnce(&Self, &mut SeenOps, &mut Vec<Op>, &mut R) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<T> {
+        let started = std::time::Instant::now();
+        let admission = Arc::clone(&self.local_writes.gate).read_owned().await;
+        if self.local_writes.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("local operation acceptance is shut down");
+        }
+        // Acquire async guards before dispatch; the owned job retains them through publication.
+        let mut seen = Arc::clone(&self.seen_ops).write_owned().await;
+        let mut log = Arc::clone(&self.op_log).write_owned().await;
+        let mut state = registry.write_owned().await;
+        debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "local registry locks acquired"
+        );
+        let dispatched = std::time::Instant::now();
+        let handle = self.clone();
+        self.storage_executor
+            .execute(move || {
+                let _admission = admission;
+                debug!(
+                    elapsed_us = dispatched.elapsed().as_micros() as u64,
+                    "local storage job started"
+                );
+                let result = work(&handle, &mut seen, &mut log, &mut state);
+                if let Err(error) = &result {
+                    warn!(error = %error, "local operation acceptance failed");
+                }
+                result
+            })
+            .await
+    }
+
     fn local_op(&self, kind: OpKind) -> Op {
         Op {
             id: self.ids.next(),
@@ -213,16 +259,30 @@ impl SyncHandle {
         key: &str,
         delta: u64,
     ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.counters),
+            move |handle, seen, log, counters| {
+                handle.accept_gcounter(&key, delta, seen, log, counters)
+            },
+        )
+        .await
+    }
+
+    fn accept_gcounter(
+        &self,
+        key: &str,
+        delta: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        counters: &mut HashMap<String, GCounter>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = self.local_op(OpKind::GCounterIncrement {
             key: key.into(),
             increment: delta,
         });
         let op_id = op.id.as_str().to_string();
 
-        // Match the remote apply lock order so local and remote updates cannot race.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut counters = self.counters.write().await;
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate GCounter operation id");
         }
@@ -236,18 +296,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_gcounter_op(&self.store, key, &counter, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         counters.insert(key.to_string(), counter);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -281,6 +341,25 @@ impl SyncHandle {
         delta: u64,
         direction: PNCounterDirection,
     ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.pncounters),
+            move |handle, seen, log, counters| {
+                handle.accept_pncounter(&key, delta, direction, seen, log, counters)
+            },
+        )
+        .await
+    }
+
+    fn accept_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+        direction: PNCounterDirection,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        counters: &mut HashMap<String, PNCounter>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = match direction {
             PNCounterDirection::Increment => self.local_op(OpKind::PNCounterIncrement {
                 key: key.into(),
@@ -293,10 +372,6 @@ impl SyncHandle {
         };
         let op_id = op.id.as_str().to_string();
 
-        // Match the remote apply lock order so local and remote updates cannot race.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut counters = self.pncounters.write().await;
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate PNCounter operation id");
         }
@@ -313,18 +388,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_pncounter_op(&self.store, key, &counter, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         counters.insert(key.to_string(), counter);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -340,11 +415,25 @@ impl SyncHandle {
         value: Vec<u8>,
         observed_timestamp_ms: u64,
     ) -> anyhow::Result<AcceptedLocalOp> {
-        // Match the remote apply lock order so the timestamp and winner use the
-        // same register state as the batch committed below.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut registers = self.lww_registers.write().await;
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.lww_registers),
+            move |handle, seen, log, registers| {
+                handle.accept_lww_register(&key, value, observed_timestamp_ms, seen, log, registers)
+            },
+        )
+        .await
+    }
+
+    fn accept_lww_register(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        registers: &mut HashMap<String, LwwRegister>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let timestamp_ms = registers.get(key).map_or(observed_timestamp_ms, |current| {
             observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
         });
@@ -369,18 +458,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_lww_register_op(&self.store, key, &register, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         registers.insert(key.to_string(), register);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -418,10 +507,33 @@ impl SyncHandle {
         change: LwwMapChange,
         observed_timestamp_ms: u64,
     ) -> anyhow::Result<AcceptedLocalOp> {
-        // Match the remote apply lock order while selecting the field timestamp.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut maps = self.lww_maps.write().await;
+        let key = key.to_owned();
+        let field = field.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.lww_maps),
+            move |handle, seen, log, maps| {
+                handle.accept_lww_map(
+                    (&key, &field),
+                    change,
+                    observed_timestamp_ms,
+                    seen,
+                    log,
+                    maps,
+                )
+            },
+        )
+        .await
+    }
+
+    fn accept_lww_map(
+        &self,
+        (key, field): (&str, &str),
+        change: LwwMapChange,
+        observed_timestamp_ms: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        maps: &mut HashMap<String, LwwMap>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
         let timestamp_ms = map.entry(field).map_or(observed_timestamp_ms, |current| {
             observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
@@ -458,18 +570,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_lww_map_op(&self.store, key, &map, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         maps.insert(key.to_string(), map);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -484,6 +596,22 @@ impl SyncHandle {
         key: &str,
         element: &str,
     ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        let element = element.to_owned();
+        self.local_mutation(Arc::clone(&self.orsets), move |handle, seen, log, sets| {
+            handle.accept_orset_add(&key, &element, seen, log, sets)
+        })
+        .await
+    }
+
+    fn accept_orset_add(
+        &self,
+        key: &str,
+        element: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        sets: &mut HashMap<String, ORSet>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let id = self.ids.next();
         let op = Op {
             kind: OpKind::ORSetAdd {
@@ -496,10 +624,6 @@ impl SyncHandle {
         };
         let op_id = op.id.as_str().to_string();
 
-        // Match the remote apply lock order so observed tags and replay agree.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut sets = self.orsets.write().await;
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate ORSet operation id");
         }
@@ -512,18 +636,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_orset_op(&self.store, key, &set, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         sets.insert(key.to_string(), set);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -546,9 +670,22 @@ impl SyncHandle {
         key: &str,
         element: &str,
     ) -> anyhow::Result<Option<AcceptedLocalOp>> {
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut sets = self.orsets.write().await;
+        let key = key.to_owned();
+        let element = element.to_owned();
+        self.local_mutation(Arc::clone(&self.orsets), move |handle, seen, log, sets| {
+            handle.accept_orset_remove(&key, &element, seen, log, sets)
+        })
+        .await
+    }
+
+    fn accept_orset_remove(
+        &self,
+        key: &str,
+        element: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        sets: &mut HashMap<String, ORSet>,
+    ) -> anyhow::Result<Option<AcceptedLocalOp>> {
         let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
         let observed_tags = set.observed_tags(element);
         if observed_tags.is_empty() {
@@ -571,18 +708,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_orset_op(&self.store, key, &set, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         sets.insert(key.to_string(), set);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -593,6 +730,19 @@ impl SyncHandle {
     }
 
     pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<AcceptedLocalOp> {
+        self.local_mutation(Arc::clone(&self.rgas), move |handle, seen, log, rgas| {
+            handle.accept_rga_insert(op, seen, log, rgas)
+        })
+        .await
+    }
+
+    fn accept_rga_insert(
+        &self,
+        op: Op,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        rgas: &mut HashMap<String, Rga>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let OpKind::RgaInsert {
             key,
             id,
@@ -607,10 +757,6 @@ impl SyncHandle {
         }
         let op_id = op.id.as_str().to_string();
 
-        // Match the remote apply lock order so sequence positions and state agree.
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut rgas = self.rgas.write().await;
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate RGA operation id");
         }
@@ -623,18 +769,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_rga_op(&self.store, key, &rga, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         rgas.insert(key.clone(), rga);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -645,15 +791,28 @@ impl SyncHandle {
     }
 
     pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        let id = id.to_owned();
+        self.local_mutation(Arc::clone(&self.rgas), move |handle, seen, log, rgas| {
+            handle.accept_rga_delete(&key, &id, seen, log, rgas)
+        })
+        .await
+    }
+
+    fn accept_rga_delete(
+        &self,
+        key: &str,
+        id: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        rgas: &mut HashMap<String, Rga>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
         let op = self.local_op(OpKind::RgaDelete {
             key: key.into(),
             id: id.into(),
         });
         let op_id = op.id.as_str().to_string();
 
-        let mut seen = self.seen_ops.write().await;
-        let mut log = self.op_log.write().await;
-        let mut rgas = self.rgas.write().await;
         if seen.ids.contains(&op_id) {
             anyhow::bail!("generated duplicate RGA operation id");
         }
@@ -666,18 +825,18 @@ impl SyncHandle {
             op: op.clone(),
             seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
             op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
-            seen_evicted: plan_seen_evictions(&seen, &inserted_ids),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
             op_log_evicted: plan_op_log_evictions(
-                &log,
+                log,
                 std::slice::from_ref(&op),
                 self.op_log_limit,
             ),
         };
         persist_local_rga_op(&self.store, key, &rga, &plan)?;
 
-        apply_seen_insertions(&mut seen, &inserted_ids, &plan.seen_evicted);
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
         log.push(op.clone());
-        prune_op_log_and_return_evicted(&mut log, self.op_log_limit);
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
         rgas.insert(key.to_string(), rga);
         self.seen_ops_next_sequence
             .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
@@ -843,6 +1002,8 @@ async fn run_recovery_scan(
 }
 
 pub struct SyncManager {
+    local_writes: Arc<LocalWrites>,
+    storage_executor: crate::peer_io::StorageExecutor,
     clock: Arc<dyn crate::peer_io::clock::Clock>,
     ids: Arc<dyn crate::peer_io::random::IdSource>,
     recovery_scan_limit: Arc<Semaphore>,
@@ -1032,6 +1193,8 @@ impl SyncManager {
         let rgas = Arc::new(RwLock::new(rgas));
 
         Ok(Self {
+            local_writes: Arc::new(LocalWrites::default()),
+            storage_executor: crate::peer_io::StorageExecutor::Blocking,
             clock: Arc::new(crate::peer_io::clock::SystemClock),
             ids: Arc::new(crate::peer_io::random::UuidIds),
             recovery_scan_limit: Arc::new(Semaphore::new(1)),
@@ -1088,6 +1251,8 @@ impl SyncManager {
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            local_writes: Arc::clone(&self.local_writes),
+            storage_executor: self.storage_executor,
             local_limits: LocalTransportLimits {
                 max_message_size: self.config.max_message_size,
                 serialization_format: self.config.serialization_format,
@@ -1501,8 +1666,12 @@ impl SyncManager {
 
     /// Gracefully stop sync tasks and close network connections.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.local_writes.stopped.store(true, Ordering::Release);
         self.candidates.stop();
         let _ = self.shutdown_tx.send(true);
+        // Drain dispatched jobs before broadcast shutdown; retrying shutdown after a
+        // timeout must still wait for their guards rather than detach their outcome.
+        drop(self.local_writes.gate.write().await);
         let membership_error = if let Some(membership) = self.membership.take() {
             let snapshot = membership.snapshot.borrow().clone();
             debug!(members = snapshot.records.len(), health = snapshot.health,

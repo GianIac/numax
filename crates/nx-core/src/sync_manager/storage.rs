@@ -739,9 +739,8 @@ pub(super) fn persist_local_gcounter_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -752,9 +751,7 @@ pub(super) fn persist_local_gcounter_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -799,9 +796,8 @@ pub(super) fn persist_local_pncounter_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -812,9 +808,7 @@ pub(super) fn persist_local_pncounter_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -857,9 +851,8 @@ pub(super) fn persist_local_lww_register_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -870,9 +863,7 @@ pub(super) fn persist_local_lww_register_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -917,9 +908,8 @@ pub(super) fn persist_local_lww_map_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -930,9 +920,7 @@ pub(super) fn persist_local_lww_map_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -973,9 +961,8 @@ pub(super) fn persist_local_orset_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -986,9 +973,7 @@ pub(super) fn persist_local_orset_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -1029,9 +1014,8 @@ pub(super) fn persist_local_rga_op(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    let lease = store.acquire_write_lease()?;
-    apply_local_sequence_batch(
-        &lease,
+    persist_local_sequence_batch(
+        store,
         &plan.op,
         plan.local_generation
             .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
@@ -1042,9 +1026,7 @@ pub(super) fn persist_local_rga_op(
             (op_log_key.as_slice(), op_log_value.as_slice()),
         ],
         &deletes,
-    )?;
-    lease.flush()?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -1247,21 +1229,42 @@ pub(super) fn persist_remote_ops_batch(
     Ok(())
 }
 
-fn apply_local_sequence_batch(
-    lease: &nx_store::StoreWriteLease<'_>,
+fn persist_local_sequence_batch(
+    store: &NxStore,
     op: &Op,
     (generation, limits): (u64, super::types::LocalTransportLimits),
     state_sets: &[(&[u8], &[u8])],
     deletes: &[&[u8]],
 ) -> anyhow::Result<()> {
-    let sequence_sets = local_sequence_sets(lease, op, generation, limits)?;
+    let started = std::time::Instant::now();
+    let lease = store.acquire_write_lease()?;
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "local storage lease acquired"
+    );
+    let sequence_sets = local_sequence_sets(&lease, op, generation, limits)?;
     let mut sets = state_sets.to_vec();
     sets.extend(
         sequence_sets
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice())),
     );
-    lease.apply_batch(&sets, deletes)?;
+    let started = std::time::Instant::now();
+    let batch = lease.apply_batch(&sets, deletes);
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        success = batch.is_ok(),
+        "local storage batch completed"
+    );
+    batch?;
+    let started = std::time::Instant::now();
+    let flush = lease.flush();
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        success = flush.is_ok(),
+        "local storage flush completed"
+    );
+    flush?;
     Ok(())
 }
 

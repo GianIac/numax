@@ -12,6 +12,7 @@ use tokio::time::{Duration, Instant, sleep};
 mod backpressure;
 mod determinism;
 mod e2e;
+mod local_storage;
 mod manual;
 mod rate;
 mod recovery;

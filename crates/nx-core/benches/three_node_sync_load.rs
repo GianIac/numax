@@ -7,7 +7,7 @@ use std::fs::File;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nx_core::SyncConfig;
@@ -32,7 +32,10 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_LIMIT_HEADROOM_OPS: u64 = 100_000;
 const LOAD_TEST_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
-const REPORT_SCHEMA_VERSION: u32 = 1;
+const REPORT_SCHEMA_VERSION: u32 = 2;
+const ACCEPTANCE_PROFILE: &str = "local-durable-flush-v1";
+const MAX_ERROR_DETAILS: usize = 16;
+const MAX_ERROR_DETAIL_CHARS: usize = 1024;
 #[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
 const CPU_PROFILE_FREQUENCY_HZ: i32 = 100;
 #[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
@@ -87,16 +90,22 @@ struct Report {
     ops_total: u64,
     ops_sec_avg: f64,
     errors_total: u64,
+    attempted_ops_total: u64,
+    uncertain_ops_total: u64,
+    target_ops_total: u64,
+    cleanup_errors_total: u64,
+    report_complete: bool,
+    error_details: Vec<String>,
     queued_ops_limit: usize,
     op_log_limit: usize,
     seen_ops_limit: usize,
     anti_entropy_interval_secs: u64,
-    expected_counter: u64,
     observed_counters: Vec<u64>,
     converged: bool,
     convergence_wait_secs: f64,
     rss_bytes: Option<u64>,
     latency: LatencySnapshot,
+    latencies: LatencyHistogram,
 }
 
 #[derive(Debug)]
@@ -108,6 +117,7 @@ struct LatencySnapshot {
     avg_ms: f64,
 }
 
+#[derive(Debug)]
 struct LatencyHistogram {
     buckets: Vec<u64>,
     count: u64,
@@ -200,17 +210,28 @@ fn run() -> Result<(), String> {
 }
 
 async fn run_async(config: Config) -> Result<(), String> {
+    let limits = LoadLimits::for_config(&config);
+    let mut report = Report::new(&config, limits);
+    let mut nodes = Vec::new();
+    let result = run_load(&config, limits, &mut nodes, &mut report).await;
+    finish_run(&config, report, &mut nodes, result).await
+}
+
+async fn run_load(
+    config: &Config,
+    limits: LoadLimits,
+    nodes: &mut Vec<BenchNode>,
+    report: &mut Report,
+) -> Result<(), String> {
     let key = "load:counter";
     let addrs = reserve_addrs(config.nodes)?;
-    let limits = LoadLimits::for_config(&config);
-    let mut nodes = start_full_mesh(&addrs, limits, config.anti_entropy_interval).await?;
-    wait_for_full_mesh(&nodes).await?;
-
+    start_full_mesh(nodes, &addrs, limits, config.anti_entropy_interval).await?;
+    wait_for_full_mesh(nodes).await?;
     let cpu_profiler = CpuProfiler::start(config.cpu_profile.clone())?;
     let heap_profiler = HeapProfiler::start(config.heap_profile.clone())?;
     let started = Instant::now();
     let mut producers = Vec::new();
-    for node in &nodes {
+    for node in nodes.iter() {
         producers.push(spawn_producer(
             node.handle.clone(),
             key.to_string(),
@@ -219,93 +240,85 @@ async fn run_async(config: Config) -> Result<(), String> {
         ));
     }
 
-    let mut ops_total = 0u64;
-    let mut errors_total = 0u64;
-    let mut latencies = LatencyHistogram::new();
     for producer in producers {
-        let result = timeout(config.duration + SEND_TIMEOUT, producer)
-            .await
-            .map_err(|_| "producer task timed out".to_string())?
-            .map_err(|e| format!("producer task failed: {e}"))?;
-        ops_total += result.ops_total;
-        errors_total += result.errors_total;
-        latencies.merge(&result.latencies);
+        let result = collect_producer(producer, config.duration + SEND_TIMEOUT).await;
+        report.add_producer(&result);
     }
 
     let load_elapsed = started.elapsed();
-    cpu_profiler.finish()?;
-    heap_profiler.finish()?;
-    let expected_counter = ops_total - errors_total;
+    report.load_duration_secs = load_elapsed.as_secs_f64();
+    report.ops_sec_avg = report.ops_total as f64 / load_elapsed.as_secs_f64();
+    for result in [cpu_profiler.finish(), heap_profiler.finish()] {
+        if let Err(error) = result {
+            push_error(&mut report.error_details, error);
+        }
+    }
     let convergence_started = Instant::now();
-    let converged = wait_for_convergence(&nodes, key, expected_counter, config.settle).await;
-    let observed_counters = observed_counters(&nodes, key).await;
+    if let Some(expected) = report.exact_expected_counter() {
+        report.converged = wait_for_convergence(nodes, key, expected, config.settle).await;
+    }
+    match timeout(SEND_TIMEOUT, observed_counters(nodes, key)).await {
+        Ok(values) => report.observed_counters = values,
+        Err(_) => push_error(
+            &mut report.error_details,
+            "counter observation timed out".into(),
+        ),
+    }
+    report.convergence_wait_secs = convergence_started.elapsed().as_secs_f64();
+    report.total_duration_secs = started.elapsed().as_secs_f64();
+    report.rss_bytes = current_rss_bytes();
+    Ok(())
+}
 
-    let report = Report {
-        scenario: "multi-node-sync-gcounter",
-        nodes: nodes.len(),
-        duration_secs: config.duration.as_secs(),
-        load_duration_secs: load_elapsed.as_secs_f64(),
-        total_duration_secs: started.elapsed().as_secs_f64(),
-        target_ops_sec_per_node: config.target_ops_sec_per_node,
-        target_ops_sec_total: config.target_ops_sec_per_node * nodes.len() as u64,
-        ops_total,
-        ops_sec_avg: ops_total as f64 / load_elapsed.as_secs_f64(),
-        errors_total,
-        queued_ops_limit: limits.queued_ops_limit,
-        op_log_limit: limits.op_log_limit,
-        seen_ops_limit: limits.seen_ops_limit,
-        anti_entropy_interval_secs: config.anti_entropy_interval.as_secs(),
-        expected_counter,
-        observed_counters,
-        converged,
-        convergence_wait_secs: convergence_started.elapsed().as_secs_f64(),
-        rss_bytes: current_rss_bytes(),
-        latency: latencies.snapshot(),
-    };
+async fn finish_run(
+    config: &Config,
+    mut report: Report,
+    nodes: &mut [BenchNode],
+    result: Result<(), String>,
+) -> Result<(), String> {
+    let cleanup_started = Instant::now();
+    let cleanup_errors = cleanup_nodes(nodes).await;
+    report.finish(result, cleanup_errors, cleanup_started.elapsed());
     let json = report.to_json();
-
     println!("{json}");
     if let Some(report_path) = &config.report {
-        if let Some(parent) = report_path.parent() {
+        if let Some(parent) = report_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|e| format!("create report dir: {e}"))?;
         }
         fs::write(report_path, format!("{json}\n")).map_err(|e| format!("write report: {e}"))?;
     }
 
-    let mut shutdown_errors = 0u64;
-    for node in &mut nodes {
+    if !report.report_complete {
+        return Err(format!(
+            "incomplete benchmark: target={}, attempted={}, acknowledged={}, failed_or_uncertain={}, cleanup_errors={}, converged={}; {}",
+            report.target_ops_total,
+            report.attempted_ops_total,
+            report.ops_total,
+            report.errors_total,
+            report.cleanup_errors_total,
+            report.converged,
+            report.error_details.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+async fn cleanup_nodes(nodes: &mut [BenchNode]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (index, node) in nodes.iter_mut().enumerate() {
         match timeout(SHUTDOWN_TIMEOUT, node.manager.shutdown()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                shutdown_errors += 1;
-                eprintln!("sync manager shutdown failed: {e}");
+                errors.push(format!("node {index} sync manager shutdown failed: {e}"));
             }
             Err(_) => {
-                shutdown_errors += 1;
-                eprintln!("sync manager shutdown timed out after {SHUTDOWN_TIMEOUT:?}");
+                errors.push(format!(
+                    "node {index} sync manager shutdown timed out after {SHUTDOWN_TIMEOUT:?}"
+                ));
             }
         }
     }
-
-    if report.errors_total > 0 {
-        return Err(format!(
-            "benchmark completed with {} errors",
-            report.errors_total
-        ));
-    }
-    if shutdown_errors > 0 {
-        return Err(format!(
-            "benchmark completed but {shutdown_errors} sync managers failed to shut down cleanly"
-        ));
-    }
-    if !report.converged {
-        return Err(format!(
-            "nodes did not converge to {expected_counter}; observed {:?}",
-            report.observed_counters
-        ));
-    }
-
-    Ok(())
+    errors
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,11 +347,11 @@ impl LoadLimits {
 }
 
 async fn start_full_mesh(
+    nodes: &mut Vec<BenchNode>,
     addrs: &[String],
     limits: LoadLimits,
     anti_entropy_interval: Duration,
-) -> Result<Vec<BenchNode>, String> {
-    let mut nodes = Vec::new();
+) -> Result<(), String> {
     for (index, listen_addr) in addrs.iter().enumerate() {
         let mut config = SyncConfig::new()
             .with_listen_addr(listen_addr.clone())
@@ -354,28 +367,32 @@ async fn start_full_mesh(
             }
         }
 
-        let store_dir = tempfile::tempdir().map_err(|e| format!("create temp store dir: {e}"))?;
+        let store_dir = tempfile::Builder::new()
+            .prefix("benchmark-store-")
+            .tempdir_in(".")
+            .map_err(|e| format!("create benchmark store dir: {e}"))?;
         let store =
             Arc::new(Store::open(store_dir.path()).map_err(|e| format!("open store: {e}"))?);
-        let mut manager = SyncManager::new(
+        let manager = SyncManager::new(
             NodeId::generate(),
             config,
             store,
             Arc::new(RuntimeMetrics::default()),
         );
         let handle = manager.handle();
-        manager
-            .start()
-            .await
-            .map_err(|e| format!("start sync manager: {e}"))?;
         nodes.push(BenchNode {
             manager,
             handle,
             _store_dir: store_dir,
         });
+        nodes[index]
+            .manager
+            .start()
+            .await
+            .map_err(|e| format!("start sync manager {index}: {e}"))?;
     }
 
-    Ok(nodes)
+    Ok(())
 }
 
 fn spawn_producer(
@@ -383,62 +400,146 @@ fn spawn_producer(
     key: String,
     duration: Duration,
     target_ops_sec: u64,
-) -> JoinHandle<ProducerResult> {
-    tokio::spawn(async move {
+) -> Producer {
+    let progress = Arc::new(Mutex::new(ProducerResult::new()));
+    let state = progress.clone();
+    let task = tokio::spawn(async move {
         let started = Instant::now();
         let target_ops = target_ops_sec.saturating_mul(duration.as_secs());
         let mut ticker = interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
-        let mut result = ProducerResult {
-            ops_total: 0,
-            errors_total: 0,
-            latencies: LatencyHistogram::new(),
-        };
-
-        while result.ops_total + result.errors_total < target_ops {
+        while state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attempted_ops_total
+            < target_ops
+        {
             ticker.tick().await;
             let elapsed = started.elapsed().min(duration);
             let expected_by_now = target_ops.min(
                 (elapsed.as_nanos().saturating_mul(target_ops_sec as u128)
                     / Duration::from_secs(1).as_nanos()) as u64,
             );
-            let produced = result.ops_total + result.errors_total;
+            let produced = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .attempted_ops_total;
             let due_ops = expected_by_now.saturating_sub(produced);
 
             for _ in 0..due_ops {
                 let op_started = Instant::now();
-                match local_increment(&handle, &key).await {
-                    Ok(()) => {
-                        result.ops_total += 1;
-                        result.latencies.record(op_started.elapsed());
-                    }
-                    Err(_) => result.errors_total += 1,
-                }
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .begin_attempt();
+                let result = local_increment(&handle, &key).await;
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finish_attempt(result, op_started.elapsed());
             }
         }
+    });
+    Producer { task, progress }
+}
 
-        result
-    })
+struct Producer {
+    task: JoinHandle<()>,
+    progress: Arc<Mutex<ProducerResult>>,
 }
 
 struct ProducerResult {
+    attempted_ops_total: u64,
     ops_total: u64,
     errors_total: u64,
+    uncertain_ops_total: u64,
+    in_flight: bool,
+    error_details: Vec<String>,
     latencies: LatencyHistogram,
 }
 
-async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), ()> {
+impl ProducerResult {
+    fn new() -> Self {
+        Self {
+            attempted_ops_total: 0,
+            ops_total: 0,
+            errors_total: 0,
+            uncertain_ops_total: 0,
+            in_flight: false,
+            error_details: Vec::new(),
+            latencies: LatencyHistogram::new(),
+        }
+    }
+
+    fn begin_attempt(&mut self) {
+        self.attempted_ops_total += 1;
+        self.in_flight = true;
+    }
+
+    fn finish_attempt(&mut self, result: Result<(), String>, elapsed: Duration) {
+        self.in_flight = false;
+        match result {
+            Ok(()) => {
+                self.ops_total += 1;
+                self.latencies.record(elapsed);
+            }
+            Err(error) => {
+                self.errors_total += 1;
+                // A failed acknowledgement does not prove that the transaction rolled back.
+                self.uncertain_ops_total += 1;
+                push_error(&mut self.error_details, error);
+            }
+        }
+    }
+}
+
+async fn collect_producer(mut producer: Producer, deadline: Duration) -> ProducerResult {
+    let error = match timeout(deadline, &mut producer.task).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("producer task failed: {error}")),
+        Err(_) => {
+            producer.task.abort();
+            let joined = producer.task.await;
+            Some(format!(
+                "producer task timed out; aborted and joined: {joined:?}"
+            ))
+        }
+    };
+    let mut progress = producer.progress.lock().unwrap_or_else(|e| e.into_inner());
+    if progress.in_flight {
+        progress.in_flight = false;
+        progress.errors_total += 1;
+        progress.uncertain_ops_total += 1;
+    }
+    if let Some(error) = error {
+        push_error(&mut progress.error_details, error);
+    }
+    std::mem::replace(&mut *progress, ProducerResult::new())
+}
+
+fn push_error(details: &mut Vec<String>, error: String) {
+    if details.len() < MAX_ERROR_DETAILS {
+        details.push(error.chars().take(MAX_ERROR_DETAIL_CHARS).collect());
+    }
+}
+
+async fn local_increment(handle: &SyncHandle, key: &str) -> Result<(), String> {
     timeout(SEND_TIMEOUT, handle.submit_gcounter_increment(key, 1))
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+        .map_err(|_| format!("increment timed out after {SEND_TIMEOUT:?}; outcome unknown"))?
+        .map_err(|error| format!("increment failed; outcome uncertain: {error:#}"))
 }
 
 async fn wait_for_full_mesh(nodes: &[BenchNode]) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let expected_peers = nodes.len().saturating_sub(1);
     loop {
-        let counts = futures_counts(nodes).await;
+        let counts = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            futures_counts(nodes),
+        )
+        .await
+        .map_err(|_| "full mesh observation timed out".to_string())?;
         if counts.iter().all(|count| *count >= expected_peers) {
             return Ok(());
         }
@@ -457,7 +558,14 @@ async fn wait_for_convergence(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        let values = observed_counters(nodes, key).await;
+        let Ok(values) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            observed_counters(nodes, key),
+        )
+        .await
+        else {
+            return false;
+        };
         if values.iter().all(|value| *value == expected) {
             return true;
         }
@@ -712,77 +820,152 @@ impl CpuProfiler {
 }
 
 impl Report {
+    fn new(config: &Config, limits: LoadLimits) -> Self {
+        let latencies = LatencyHistogram::new();
+        Self {
+            scenario: "multi-node-sync-gcounter",
+            nodes: config.nodes,
+            duration_secs: config.duration.as_secs(),
+            load_duration_secs: 0.0,
+            total_duration_secs: 0.0,
+            target_ops_sec_per_node: config.target_ops_sec_per_node,
+            target_ops_sec_total: config
+                .target_ops_sec_per_node
+                .saturating_mul(config.nodes as u64),
+            target_ops_total: config
+                .target_ops_sec_per_node
+                .saturating_mul(config.duration.as_secs())
+                .saturating_mul(config.nodes as u64),
+            ops_total: 0,
+            ops_sec_avg: 0.0,
+            errors_total: 0,
+            attempted_ops_total: 0,
+            uncertain_ops_total: 0,
+            cleanup_errors_total: 0,
+            report_complete: false,
+            error_details: Vec::new(),
+            queued_ops_limit: limits.queued_ops_limit,
+            op_log_limit: limits.op_log_limit,
+            seen_ops_limit: limits.seen_ops_limit,
+            anti_entropy_interval_secs: config.anti_entropy_interval.as_secs(),
+            observed_counters: Vec::new(),
+            converged: false,
+            convergence_wait_secs: 0.0,
+            rss_bytes: current_rss_bytes(),
+            latency: latencies.snapshot(),
+            latencies,
+        }
+    }
+
+    fn add_producer(&mut self, result: &ProducerResult) {
+        self.ops_total += result.ops_total;
+        self.attempted_ops_total += result.attempted_ops_total;
+        self.errors_total += result.errors_total;
+        self.uncertain_ops_total += result.uncertain_ops_total;
+        self.latencies.merge(&result.latencies);
+        self.latency = self.latencies.snapshot();
+        for error in &result.error_details {
+            push_error(&mut self.error_details, error.clone());
+        }
+    }
+
+    fn exact_expected_counter(&self) -> Option<u64> {
+        (self.uncertain_ops_total == 0).then_some(self.ops_total)
+    }
+
+    fn finish(
+        &mut self,
+        result: Result<(), String>,
+        cleanup_errors: Vec<String>,
+        cleanup_duration: Duration,
+    ) {
+        self.total_duration_secs += cleanup_duration.as_secs_f64();
+        if let Err(error) = result {
+            push_error(&mut self.error_details, error);
+        }
+        self.cleanup_errors_total = cleanup_errors.len() as u64;
+        for error in cleanup_errors {
+            push_error(&mut self.error_details, error);
+        }
+        if self.uncertain_ops_total > self.errors_total
+            || self.ops_total.checked_add(self.errors_total) != Some(self.attempted_ops_total)
+        {
+            push_error(
+                &mut self.error_details,
+                "inconsistent operation outcome accounting".into(),
+            );
+        }
+        if self.attempted_ops_total != self.target_ops_total {
+            push_error(
+                &mut self.error_details,
+                format!(
+                    "missed workload: target={}, attempted={}",
+                    self.target_ops_total, self.attempted_ops_total
+                ),
+            );
+        }
+        if !self.converged || self.exact_expected_counter().is_none() {
+            push_error(
+                &mut self.error_details,
+                "exact convergence was not established".into(),
+            );
+        }
+        self.report_complete = self.error_details.is_empty()
+            && self.attempted_ops_total == self.target_ops_total
+            && self.ops_total == self.target_ops_total
+            && self.errors_total == 0
+            && self.uncertain_ops_total == 0
+            && self.cleanup_errors_total == 0
+            && self.converged;
+    }
+
     fn to_json(&self) -> String {
-        format!(
-            concat!(
-                "{{\n",
-                "  \"report_schema_version\": {},\n",
-                "  \"crate\": \"nx-core\",\n",
-                "  \"benchmark\": \"three_node_sync_load\",\n",
-                "  \"scenario\": \"{}\",\n",
-                "  \"profile\": {{\n",
-                "    \"nodes\": {},\n",
-                "    \"duration_secs\": {},\n",
-                "    \"target_ops_sec_per_node\": {},\n",
-                "    \"anti_entropy_interval_secs\": {}\n",
-                "  }},\n",
-                "  \"nodes\": {},\n",
-                "  \"load_duration_secs\": {:.3},\n",
-                "  \"total_duration_secs\": {:.3},\n",
-                "  \"target_ops_sec_per_node\": {},\n",
-                "  \"target_ops_sec_total\": {},\n",
-                "  \"ops_total\": {},\n",
-                "  \"ops_sec_avg\": {:.2},\n",
-                "  \"errors_total\": {},\n",
-                "  \"queued_ops_limit\": {},\n",
-                "  \"op_log_limit\": {},\n",
-                "  \"seen_ops_limit\": {},\n",
-                "  \"anti_entropy_interval_secs\": {},\n",
-                "  \"expected_counter\": {},\n",
-                "  \"observed_counters\": [{}],\n",
-                "  \"converged\": {},\n",
-                "  \"convergence_wait_secs\": {:.3},\n",
-                "  \"resources\": {{\n",
-                "    \"rss_bytes\": {}\n",
-                "  }},\n",
-                "  \"latency_ms\": {{\n",
-                "    \"p50\": {:.3},\n",
-                "    \"p95\": {:.3},\n",
-                "    \"p99\": {:.3},\n",
-                "    \"max\": {:.3},\n",
-                "    \"avg\": {:.3}\n",
-                "  }}\n",
-                "}}"
-            ),
-            REPORT_SCHEMA_VERSION,
-            self.scenario,
-            self.nodes,
-            self.duration_secs,
-            self.target_ops_sec_per_node,
-            self.anti_entropy_interval_secs,
-            self.nodes,
-            self.load_duration_secs,
-            self.total_duration_secs,
-            self.target_ops_sec_per_node,
-            self.target_ops_sec_total,
-            self.ops_total,
-            self.ops_sec_avg,
-            self.errors_total,
-            self.queued_ops_limit,
-            self.op_log_limit,
-            self.seen_ops_limit,
-            self.anti_entropy_interval_secs,
-            self.expected_counter,
-            join_u64s(&self.observed_counters),
-            self.converged,
-            self.convergence_wait_secs,
-            json_option_u64(self.rss_bytes),
-            self.latency.p50_ms,
-            self.latency.p95_ms,
-            self.latency.p99_ms,
-            self.latency.max_ms,
-            self.latency.avg_ms
-        )
+        serde_json::json!({
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "crate": "nx-core",
+            "benchmark": "three_node_sync_load",
+            "scenario": self.scenario,
+            "profile": {
+                "acceptance": ACCEPTANCE_PROFILE,
+                "nodes": self.nodes,
+                "duration_secs": self.duration_secs,
+                "target_ops_sec_per_node": self.target_ops_sec_per_node,
+                "anti_entropy_interval_secs": self.anti_entropy_interval_secs,
+            },
+            "nodes": self.nodes,
+            "load_duration_secs": self.load_duration_secs,
+            "total_duration_secs": self.total_duration_secs,
+            "target_ops_sec_per_node": self.target_ops_sec_per_node,
+            "target_ops_sec_total": self.target_ops_sec_total,
+            "target_ops_total": self.target_ops_total,
+            "attempted_ops_total": self.attempted_ops_total,
+            "ops_total": self.ops_total,
+            "ops_sec_avg": self.ops_sec_avg,
+            "errors_total": self.errors_total,
+            "definite_errors_total": self.errors_total.saturating_sub(self.uncertain_ops_total),
+            "uncertain_ops_total": self.uncertain_ops_total,
+            "unattempted_ops_total": self.target_ops_total.saturating_sub(self.attempted_ops_total),
+            "cleanup_errors_total": self.cleanup_errors_total,
+            "report_complete": self.report_complete,
+            "error_details": self.error_details,
+            "queued_ops_limit": self.queued_ops_limit,
+            "op_log_limit": self.op_log_limit,
+            "seen_ops_limit": self.seen_ops_limit,
+            "anti_entropy_interval_secs": self.anti_entropy_interval_secs,
+            "expected_counter": self.exact_expected_counter(),
+            "observed_counters": self.observed_counters,
+            "converged": self.converged && self.exact_expected_counter().is_some(),
+            "convergence_wait_secs": self.convergence_wait_secs,
+            "resources": { "rss_bytes": self.rss_bytes },
+            "latency_ms": {
+                "p50": self.latency.p50_ms,
+                "p95": self.latency.p95_ms,
+                "p99": self.latency.p99_ms,
+                "max": self.latency.max_ms,
+                "avg": self.latency.avg_ms,
+            },
+        })
+        .to_string()
     }
 }
 
@@ -802,14 +985,6 @@ fn free_addr() -> Result<String, String> {
     Ok(addr.to_string())
 }
 
-fn join_u64s(values: &[u64]) -> String {
-    values
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn parse_next<T: std::str::FromStr>(
     args: &mut impl Iterator<Item = String>,
     name: &str,
@@ -827,13 +1002,6 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 fn micros_to_ms(micros: u64) -> f64 {
     micros as f64 / 1_000.0
-}
-
-fn json_option_u64(value: Option<u64>) -> String {
-    match value {
-        Some(value) => value.to_string(),
-        None => "null".to_string(),
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -879,4 +1047,272 @@ Heap profiling example (Linux):
   cargo bench --profile profiling -p nx-core --features heap-profiling --bench three_node_sync_load -- --duration-secs 5 --target-ops-sec-per-node 250 --heap-profile reports/profiling/three-node-sync-load-heap.json
 "
     );
+}
+
+#[cfg(test)]
+// The harness-free bench compiles these helpers; the integration harness runs the tests.
+#[allow(dead_code)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config::parse(
+            ["--duration-secs", "1", "--target-ops-sec-per-node", "1"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn successes_are_not_reduced_by_failed_attempts() {
+        let mut progress = ProducerResult::new();
+        progress.begin_attempt();
+        progress.finish_attempt(Ok(()), Duration::ZERO);
+        progress.begin_attempt();
+        progress.finish_attempt(Err("storage flush failed".into()), Duration::ZERO);
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.add_producer(&progress);
+        assert_eq!(report.ops_total, 1);
+        assert_eq!(report.attempted_ops_total, 2);
+        assert_eq!(report.errors_total, 1);
+        assert_eq!(report.uncertain_ops_total, 1);
+        assert_eq!(report.exact_expected_counter(), None);
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["definite_errors_total"], 0);
+        assert_eq!(
+            json["attempted_ops_total"].as_u64().unwrap(),
+            json["ops_total"].as_u64().unwrap()
+                + json["definite_errors_total"].as_u64().unwrap()
+                + json["uncertain_ops_total"].as_u64().unwrap()
+        );
+        assert!(
+            report
+                .error_details
+                .iter()
+                .any(|e| e.contains("storage flush failed"))
+        );
+    }
+
+    #[test]
+    fn acknowledged_successes_define_the_exact_counter() {
+        let mut progress = ProducerResult::new();
+        for _ in 0..3 {
+            progress.begin_attempt();
+            progress.finish_attempt(Ok(()), Duration::ZERO);
+        }
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.add_producer(&progress);
+        assert_eq!(report.exact_expected_counter(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn timed_out_producer_is_aborted_joined_and_progress_is_preserved() {
+        let progress = Arc::new(std::sync::Mutex::new(ProducerResult::new()));
+        let state = progress.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            {
+                let mut state = state.lock().unwrap();
+                state.begin_attempt();
+                state.finish_attempt(Ok(()), Duration::ZERO);
+                state.begin_attempt();
+            }
+            entered_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let abort = task.abort_handle();
+        entered_rx.await.unwrap();
+        let result = collect_producer(Producer { task, progress }, Duration::ZERO).await;
+        assert!(abort.is_finished(), "producer must not remain detached");
+        assert_eq!(result.ops_total, 1);
+        assert_eq!(result.attempted_ops_total, 2);
+        assert_eq!(result.uncertain_ops_total, 1);
+        assert_eq!(result.errors_total, result.uncertain_ops_total);
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.add_producer(&result);
+        assert_eq!(report.exact_expected_counter(), None);
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["definite_errors_total"], 0);
+        assert!(result.error_details.iter().any(|e| e.contains("timed out")));
+    }
+
+    #[tokio::test]
+    async fn panicking_producer_retains_the_in_flight_unknown() {
+        let progress = Arc::new(std::sync::Mutex::new(ProducerResult::new()));
+        progress.lock().unwrap().begin_attempt();
+        let task = tokio::spawn(async { panic!("injected producer failure") });
+        let result = collect_producer(Producer { task, progress }, SEND_TIMEOUT).await;
+        assert_eq!(result.uncertain_ops_total, 1);
+        assert!(
+            result
+                .error_details
+                .iter()
+                .any(|e| e.contains("producer task failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_report_is_written_after_cleanup_with_unknown_and_missed_work() {
+        let dir = tempfile::Builder::new()
+            .prefix("benchmark-test-")
+            .tempdir_in(".")
+            .unwrap();
+        let mut config = config();
+        config.report = Some(dir.path().join("report.json"));
+        let mut report = Report::new(&config, LoadLimits::for_config(&config));
+        let mut progress = ProducerResult::new();
+        progress.begin_attempt();
+        progress.finish_attempt(
+            Err("operation timed out; outcome unknown".into()),
+            Duration::ZERO,
+        );
+        report.add_producer(&progress);
+        let result = finish_run(
+            &config,
+            report,
+            &mut [],
+            Err("producer task timed out".into()),
+        )
+        .await;
+        assert!(result.is_err());
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.report.unwrap()).unwrap()).unwrap();
+        assert_eq!(json["report_complete"], false);
+        assert_eq!(json["expected_counter"], serde_json::Value::Null);
+        assert_eq!(json["converged"], false);
+        assert_eq!(json["uncertain_ops_total"], 1);
+        assert_eq!(json["unattempted_ops_total"], 2);
+        assert_eq!(json["cleanup_errors_total"], 0);
+        assert!(json["error_details"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn setup_failure_keeps_started_managers_owned_for_cleanup() {
+        let dir = tempfile::Builder::new()
+            .prefix("benchmark-test-")
+            .tempdir_in(".")
+            .unwrap();
+        let mut config = config();
+        config.report = Some(dir.path().join("setup-failure.json"));
+        let addr = free_addr().unwrap();
+        let mut nodes = Vec::new();
+        let result = start_full_mesh(
+            &mut nodes,
+            &[addr.clone(), addr.clone()],
+            LoadLimits::for_config(&config),
+            config.anti_entropy_interval,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(nodes.len(), 2);
+        let report = Report::new(&config, LoadLimits::for_config(&config));
+        assert!(
+            finish_run(&config, report, &mut nodes, result)
+                .await
+                .is_err()
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.report.unwrap()).unwrap()).unwrap();
+        assert_eq!(json["cleanup_errors_total"], 0);
+        assert_eq!(json["report_complete"], false);
+        assert!(
+            json["error_details"][0]
+                .as_str()
+                .unwrap()
+                .contains("start sync manager")
+        );
+        let listener = TcpListener::bind(addr).expect("cleanup must release the listener");
+        drop(listener);
+    }
+
+    #[test]
+    fn failure_details_are_bounded_without_losing_counts() {
+        let mut progress = ProducerResult::new();
+        for _ in 0..100 {
+            progress.begin_attempt();
+            progress.finish_attempt(Err("injected failure".repeat(200)), Duration::ZERO);
+        }
+        assert_eq!(progress.errors_total, 100);
+        assert_eq!(progress.uncertain_ops_total, 100);
+        assert!(progress.error_details.len() <= MAX_ERROR_DETAILS);
+        assert!(
+            progress
+                .error_details
+                .iter()
+                .all(|detail| detail.chars().count() <= MAX_ERROR_DETAIL_CHARS)
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_invalidates_an_otherwise_complete_report() {
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.ops_total = report.target_ops_total;
+        report.attempted_ops_total = report.target_ops_total;
+        report.converged = true;
+        report.finish(
+            Ok(()),
+            vec!["injected shutdown failure".into()],
+            Duration::ZERO,
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["cleanup_errors_total"], 1);
+        assert_eq!(json["report_complete"], false);
+        assert!(
+            json["error_details"][0]
+                .as_str()
+                .unwrap()
+                .contains("shutdown failure")
+        );
+    }
+
+    #[test]
+    fn total_duration_includes_cleanup_even_when_shutdown_fails() {
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.total_duration_secs = 45.043;
+        report.load_duration_secs = 45.036;
+        report.finish(
+            Ok(()),
+            vec!["injected shutdown timeout".into()],
+            Duration::from_secs(10),
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert!((json["total_duration_secs"].as_f64().unwrap() - 55.043).abs() < 0.000_001);
+        assert_eq!(json["load_duration_secs"], 45.036);
+        assert_eq!(json["cleanup_errors_total"], 1);
+        assert_eq!(json["report_complete"], false);
+    }
+
+    #[test]
+    fn report_separates_definite_and_uncertain_errors_without_double_counting() {
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.attempted_ops_total = 3;
+        report.ops_total = 1;
+        report.errors_total = 2;
+        report.uncertain_ops_total = 1;
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["definite_errors_total"], 1);
+        assert_eq!(json["errors_total"], 2);
+        assert_eq!(
+            json["attempted_ops_total"].as_u64().unwrap(),
+            json["ops_total"].as_u64().unwrap()
+                + json["definite_errors_total"].as_u64().unwrap()
+                + json["uncertain_ops_total"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn successful_complete_report_retains_the_acceptance_profile() {
+        let mut report = Report::new(&config(), LoadLimits::for_config(&config()));
+        report.ops_total = report.target_ops_total;
+        report.attempted_ops_total = report.target_ops_total;
+        report.observed_counters = vec![report.ops_total; report.nodes];
+        report.converged = true;
+        report.finish(Ok(()), Vec::new(), Duration::ZERO);
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["report_complete"], true);
+        assert_eq!(json["report_schema_version"], 2);
+        assert_eq!(json["profile"]["acceptance"], ACCEPTANCE_PROFILE);
+        assert_eq!(json["expected_counter"], report.ops_total);
+    }
 }

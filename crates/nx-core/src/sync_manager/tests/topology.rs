@@ -41,12 +41,18 @@ async fn remote_push_storage_wait_does_not_stall_control() {
     history_storage_wait_does_not_stall_control(StorageWaitCase::Push).await;
 }
 
+#[tokio::test]
+async fn local_acceptance_storage_wait_does_not_stall_control() {
+    history_storage_wait_does_not_stall_control(StorageWaitCase::Local).await;
+}
+
 #[derive(Clone, Copy, Debug)]
 enum StorageWaitCase {
     Summary,
     Unavailable,
     BaselineUnavailable,
     Push,
+    Local,
 }
 
 async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
@@ -65,9 +71,13 @@ async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
     );
     let cursors = Arc::clone(&context.history_cursors);
     let request_deadline = StdInstant::now() + Duration::from_secs(30);
-    let origin = NodeId::new("storage-wait-origin");
+    let origin = if matches!(case, StorageWaitCase::Local) {
+        manager.node_id().clone()
+    } else {
+        NodeId::new("storage-wait-origin")
+    };
     let request_id = nx_sync::OpId::generate();
-    if !matches!(case, StorageWaitCase::Summary) {
+    if !matches!(case, StorageWaitCase::Summary | StorageWaitCase::Local) {
         record_summary(
             &store,
             &nx_sync::HistorySummary {
@@ -102,25 +112,27 @@ async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
             );
     }
     let message = match case {
-        StorageWaitCase::Summary => nx_sync::HistoryMessage::Summary {
+        StorageWaitCase::Summary => Some(nx_sync::HistoryMessage::Summary {
             entries: vec![nx_sync::HistorySummary {
                 baseline_required: false,
                 origin: origin.clone(),
                 high_sequence: 0,
             }],
-        },
-        StorageWaitCase::Unavailable => nx_sync::HistoryMessage::Unavailable {
+        }),
+        StorageWaitCase::Unavailable => Some(nx_sync::HistoryMessage::Unavailable {
             request_id,
             origin: origin.clone(),
             start: 1,
             end: 1,
-        },
-        StorageWaitCase::BaselineUnavailable => nx_sync::HistoryMessage::BaselineUnavailable {
-            request_id,
-            origin: origin.clone(),
-            reason: nx_sync::BaselineFailure::BudgetExceeded,
-        },
-        StorageWaitCase::Push => nx_sync::HistoryMessage::Push {
+        }),
+        StorageWaitCase::BaselineUnavailable => {
+            Some(nx_sync::HistoryMessage::BaselineUnavailable {
+                request_id,
+                origin: origin.clone(),
+                reason: nx_sync::BaselineFailure::BudgetExceeded,
+            })
+        }
+        StorageWaitCase::Push => Some(nx_sync::HistoryMessage::Push {
             ops: vec![nx_sync::SequencedOp {
                 op: Op::gcounter_increment(origin.clone(), "storage-wait", 7),
                 position: nx_sync::OpPosition {
@@ -128,7 +140,8 @@ async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
                     sequence: 1,
                 },
             }],
-        },
+        }),
+        StorageWaitCase::Local => None,
     };
     {
         let mut cursors = cursors.write().await;
@@ -150,16 +163,27 @@ async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
     });
     held_rx.await.unwrap();
     let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+    let local_handle = manager.handle();
     let processing = tokio::spawn(async move {
         let mut polled_tx = Some(polled_tx);
-        let handler = handle_node_event(
-            NodeEvent::HistoryReceived {
-                from: NodeId::new("summary-source"),
-                addr: "unused".into(),
-                message,
-            },
-            &context,
-        );
+        let handler = async move {
+            if let Some(message) = message {
+                handle_node_event(
+                    NodeEvent::HistoryReceived {
+                        from: NodeId::new("summary-source"),
+                        addr: "unused".into(),
+                        message,
+                    },
+                    &context,
+                )
+                .await;
+            } else {
+                local_handle
+                    .increment_gcounter("storage-wait", 7)
+                    .await
+                    .unwrap();
+            }
+        };
         let mut handler = std::pin::pin!(handler);
         entered_tx.send(()).unwrap();
         std::future::poll_fn(|cx| {
@@ -233,7 +257,7 @@ async fn history_storage_wait_does_not_stall_control(case: StorageWaitCase) {
             );
             assert_eq!(receipt.contiguous_sequence, 0);
         }
-        StorageWaitCase::Push => {
+        StorageWaitCase::Push | StorageWaitCase::Local => {
             assert_eq!(receipt.contiguous_sequence, 1);
             assert_eq!(read_materialized(&store, "storage-wait"), 7);
             assert_eq!(

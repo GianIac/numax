@@ -134,6 +134,7 @@ pub struct Runtime {
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
     observability_server: Option<ObservabilityServer>,
+    final_flush: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl Runtime {
@@ -237,6 +238,7 @@ impl Runtime {
             sync_manager,
             sync_handle,
             observability_server: None,
+            final_flush: None,
         })
     }
 
@@ -298,9 +300,19 @@ impl Runtime {
             tracing::debug!("shutdown: no sync configured, skipping sync manager");
         }
 
-        self.store
-            .flush()
-            .map_err(|e| anyhow!("failed to flush datastore: {e}"))?;
+        let flush = self.final_flush.get_or_insert_with(|| {
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                store.flush().map_err(|error| {
+                    tracing::warn!(error = %error, "final datastore flush failed");
+                    anyhow!("failed to flush datastore: {error}")
+                })?;
+                Ok(())
+            })
+        });
+        let result = flush.await;
+        self.final_flush = None;
+        result.map_err(|error| anyhow!("final datastore flush task failed: {error}"))??;
 
         if let Some(server) = self.observability_server.take() {
             server.shutdown().await;
@@ -1358,6 +1370,41 @@ mod tests {
         runtime.settle_for(duration).await.unwrap();
 
         assert!(started.elapsed() >= duration);
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_remains_responsive_during_final_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().to_path_buf(),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let flushes_before = runtime.store.completed_flushes();
+        runtime.store.pause_next_flush(reached_tx, resume_rx);
+        let holder = std::thread::spawn(move || {
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let progressed = progress_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+            resume_tx.send(()).unwrap();
+            progressed
+        });
+        let result = runtime
+            .shutdown_with_timeout(Duration::from_millis(20))
+            .await;
+        let _ = progress_tx.send(());
+        let progressed = holder.join().unwrap();
+        runtime.shutdown().await.unwrap();
+        assert_eq!(runtime.store.completed_flushes(), flushes_before + 1);
+        assert!(progressed, "final flush blocked the async timeout");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown timed out")
+        );
     }
 
     #[tokio::test]

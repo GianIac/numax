@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,16 +12,31 @@ import {
 } from "./compare-benchmark-report.mjs";
 
 const baseline = {
-  report_schema_version: 1,
+  report_schema_version: 2,
   crate: "nx-core",
   benchmark: "three_node_sync_load",
   scenario: "multi-node-sync-gcounter",
   profile: {
+    acceptance: "local-durable-flush-v1",
     nodes: 3,
     duration_secs: 10,
     target_ops_sec_per_node: 1000,
     anti_entropy_interval_secs: 80,
   },
+  nodes: 3,
+  target_ops_total: 30000,
+  attempted_ops_total: 30000,
+  ops_total: 30000,
+  errors_total: 0,
+  definite_errors_total: 0,
+  uncertain_ops_total: 0,
+  unattempted_ops_total: 0,
+  cleanup_errors_total: 0,
+  error_details: [],
+  report_complete: true,
+  expected_counter: 30000,
+  observed_counters: [30000, 30000, 30000],
+  converged: true,
   ops_sec_avg: 1000,
   resources: {
     rss_bytes: 1000,
@@ -70,7 +84,7 @@ function runComparator(args) {
 }
 
 function withTemporaryDirectory(testContext) {
-  const directory = mkdtempSync(join(tmpdir(), "numax-benchmark-comparator-"));
+  const directory = mkdtempSync(join(process.cwd(), ".numax-benchmark-comparator-"));
   testContext.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }
@@ -144,11 +158,63 @@ test("rejects mismatched workload profiles", () => {
         ...baseline,
         profile: {
           ...baseline.profile,
-          nodes: 10,
+          anti_entropy_interval_secs: 81,
         },
       }),
     /profile mismatch/,
   );
+});
+
+test("rejects the historical enqueue-only baseline, even against itself", () => {
+  const historical = JSON.parse(readFileSync(
+    new URL("../crates/nx-core/reports/baselines/three-node-sync-smoke.json", import.meta.url),
+    "utf8",
+  ));
+  assert.throws(
+    () => compareReports(historical, historical),
+    /report_schema_version/,
+  );
+});
+
+test("rejects mismatched acceptance profiles", () => {
+  assert.throws(
+    () => compareReports(baseline, {
+      ...baseline,
+      profile: { ...baseline.profile, acceptance: "enqueue-memory-v1" },
+    }),
+    /acceptance|profile mismatch/,
+  );
+});
+
+test("rejects incomplete or failed runs before taking a median", () => {
+  for (const patch of [
+    { report_complete: false },
+    { errors_total: 1 },
+    { definite_errors_total: 1 },
+    { uncertain_ops_total: 1, expected_counter: null },
+    { cleanup_errors_total: 1 },
+    { unattempted_ops_total: 1 },
+    { attempted_ops_total: 29999 },
+    { ops_total: 29999 },
+    { converged: false },
+    { observed_counters: [30000, 29999, 30000] },
+    { observed_counters: [30000] },
+    { error_details: ["producer task timed out"] },
+    { report_complete: undefined },
+    { definite_errors_total: undefined },
+  ]) {
+    assert.throws(() => compareReportSet(baseline, [baseline, { ...baseline, ...patch }, baseline]));
+  }
+});
+
+test("CLI rejects an incomplete report even in shadow mode", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const result = runComparator([
+    "--baseline", writeReport(directory, "baseline.json", baseline),
+    "--current", writeReport(directory, "incomplete.json", { ...baseline, report_complete: false }),
+    "--mode", "shadow",
+  ]);
+  assert.equal(result.status, 2);
 });
 
 test("compares the median of multiple current reports", () => {
