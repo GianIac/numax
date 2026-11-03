@@ -4780,6 +4780,50 @@ async fn local_success_during_shutdown_still_waits_for_its_flush() {
     assert!(reopened.get(&op_log_store_key(op_id)).unwrap().is_some());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_shutdown_retry_resumes_membership_leave_and_releases_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let config = SyncConfig::new().with_listen_addr(free_addr());
+    let (mut manager, handle) =
+        started_manager_with_store(NodeId::new("leave-node"), config, Arc::clone(&store)).await;
+    let flushes_before = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+    let reached = tokio::task::spawn_blocking(move || {
+        reached_rx.recv_timeout(std::time::Duration::from_secs(5))
+    });
+    {
+        // Cancel the caller while the terminal membership write is paused in its flush.
+        let shutdown = manager.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = &mut shutdown => panic!("shutdown finished during the paused leave flush: {result:?}"),
+            reached = reached => reached.unwrap().unwrap(),
+        }
+    }
+    assert!(
+        manager.membership.is_some(),
+        "a cancelled shutdown released the membership handle"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+
+    resume_tx.send(()).unwrap();
+    // Success requires the actor's confirmation that the terminal floor was flushed.
+    tokio::time::timeout(Duration::from_secs(10), manager.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manager.membership.is_none());
+    assert_eq!(store.completed_flushes(), flushes_before + 1);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+    NxStore::open(directory.path()).expect("shutdown released the datastore");
+}
+
 #[tokio::test]
 async fn manager_hydrates_gcounter_registry_from_materialized_values() {
     let store = temp_store();

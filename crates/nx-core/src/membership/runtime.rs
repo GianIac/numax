@@ -171,15 +171,56 @@ struct ShutdownRequest {
 pub(crate) struct Handle {
     stop: Option<oneshot::Sender<ShutdownRequest>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
+    critical: Option<oneshot::Receiver<tokio::time::Instant>>,
+    critical_completed_at: Option<tokio::time::Instant>,
+    failure: Option<String>,
     pub(crate) snapshot: watch::Receiver<Snapshot>,
 }
 
+/// Records the actor's terminal-floor confirmation once; the oneshot value can only be read once.
+fn critical_completion(
+    critical: &mut Option<oneshot::Receiver<tokio::time::Instant>>,
+    completed_at: &mut Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    if completed_at.is_none()
+        && let Some(receiver) = critical.as_mut()
+        && let Ok(at) = receiver.try_recv()
+    {
+        *completed_at = Some(at);
+    }
+    *completed_at
+}
+
 impl Handle {
-    pub(crate) async fn shutdown(self) -> anyhow::Result<()> {
+    fn new(
+        stop: oneshot::Sender<ShutdownRequest>,
+        task: JoinHandle<anyhow::Result<()>>,
+        snapshot: watch::Receiver<Snapshot>,
+    ) -> Self {
+        Self {
+            stop: Some(stop),
+            task: Some(task),
+            critical: None,
+            critical_completed_at: None,
+            failure: None,
+            snapshot,
+        }
+    }
+
+    /// Requests a durable leave and waits for the actor within the budget.
+    ///
+    /// Retry-safe: if the budget expires before the terminal floor is confirmed,
+    /// the actor keeps running so that it publishes only after its own flush, and
+    /// a later call resumes waiting for the same outcome. Dropping the handle
+    /// remains the terminal abort.
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.shutdown_with_budget(Duration::from_secs(5)).await
     }
 
-    async fn shutdown_with_budget(mut self, budget: Duration) -> anyhow::Result<()> {
+    async fn shutdown_with_budget(&mut self, budget: Duration) -> anyhow::Result<()> {
+        if let Some(failure) = &self.failure {
+            anyhow::bail!("membership shutdown previously failed: {failure}");
+        }
         let deadline = tokio::time::Instant::now() + budget;
         #[cfg(test)]
         shutdown_trace(
@@ -190,56 +231,78 @@ impl Handle {
                 budget.as_micros()
             ),
         );
-        let (completed, mut completion) = oneshot::channel();
-        if let Some(stop) = self.stop.take()
-            && stop
+        let requested_now = if let Some(stop) = self.stop.take() {
+            let (completed, critical) = oneshot::channel();
+            self.critical = Some(critical);
+            if stop
                 .send(ShutdownRequest {
                     deadline,
                     completed,
                 })
                 .is_err()
-        {
-            tracing::debug!("membership task stopped before receiving the shutdown request");
-        }
-        if let Some(task) = self.task.as_mut() {
-            #[cfg(test)]
-            let actor = task.id();
-            let timed_out = match tokio::time::timeout_at(deadline, &mut *task).await {
-                Ok(result) => {
-                    result??;
-                    false
-                }
-                Err(_) => {
-                    #[cfg(test)]
-                    shutdown_trace("handle.timeout", format_args!("actor={}", task.id()));
-                    task.abort();
-                    match task.await {
-                        Ok(result) => result?,
-                        Err(error) if error.is_cancelled() => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    true
-                }
-            };
-            let completed = completion.try_recv();
-            #[cfg(test)]
-            shutdown_trace(
-                "handle.result",
-                format_args!("actor={actor} timed_out={timed_out} completed={completed:?}"),
-            );
-            let lateness = completed
-                .as_ref()
-                .map(|at| at.saturating_duration_since(deadline));
-            anyhow::ensure!(
-                completed.as_ref().is_ok_and(|at| *at < deadline),
-                "membership shutdown budget exhausted; in-flight storage may still finish without publication; critical lateness={lateness:?}",
-            );
-            if timed_out {
-                tracing::warn!(
-                    ?budget,
-                    "membership leave announcements truncated after durable shutdown completion"
-                );
+            {
+                tracing::debug!("membership task stopped before receiving the shutdown request");
             }
+            true
+        } else {
+            false
+        };
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let actor = task.id();
+        let (timed_out, joined) = match tokio::time::timeout_at(deadline, &mut *task).await {
+            Ok(joined) => (false, joined),
+            Err(_) => {
+                #[cfg(test)]
+                shutdown_trace("handle.timeout", format_args!("actor={actor}"));
+                if critical_completion(&mut self.critical, &mut self.critical_completed_at)
+                    .is_none()
+                {
+                    anyhow::bail!(
+                        "membership shutdown budget exhausted before the durable leave was confirmed; \
+                         storage is still in flight and the actor keeps running; retry shutdown to await the outcome"
+                    );
+                }
+                // Only best-effort leave announcements remain after the confirmed critical write.
+                task.abort();
+                (true, task.await)
+            }
+        };
+        self.task = None;
+        let joined = match joined {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = joined {
+            self.failure = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        let completed = critical_completion(&mut self.critical, &mut self.critical_completed_at);
+        #[cfg(test)]
+        shutdown_trace(
+            "handle.result",
+            format_args!("actor={actor} timed_out={timed_out} completed={completed:?}"),
+        );
+        let Some(completed_at) = completed else {
+            let message = "membership shutdown ended without confirming its durable leave";
+            self.failure = Some(message.into());
+            anyhow::bail!(message);
+        };
+        // Lateness is reported only by the call that set this deadline; a retry observes completion.
+        if requested_now && completed_at >= deadline {
+            anyhow::bail!(
+                "membership shutdown budget exhausted; durable leave confirmed late; critical lateness={:?}",
+                completed_at.saturating_duration_since(deadline)
+            );
+        }
+        if timed_out {
+            tracing::warn!(
+                ?budget,
+                "membership leave announcements truncated after durable shutdown completion"
+            );
         }
         Ok(())
     }
@@ -301,11 +364,7 @@ pub(crate) async fn start_with_metrics(
     );
     let snapshot = actor.snapshot_tx.subscribe();
     let task = tokio::spawn(actor.run(stopped));
-    Ok(Handle {
-        stop: Some(stop),
-        task: Some(task),
-        snapshot,
-    })
+    Ok(Handle::new(stop, task, snapshot))
 }
 
 fn initialize(
@@ -1491,14 +1550,7 @@ mod tests {
             run(stopped.await?).await
         });
         let (_, snapshot) = watch::channel(Snapshot::default());
-        (
-            Handle {
-                stop: Some(stop),
-                task: Some(task),
-                snapshot,
-            },
-            dropped,
-        )
+        (Handle::new(stop, task, snapshot), dropped)
     }
 
     #[tokio::test]
@@ -1511,7 +1563,7 @@ mod tests {
             Some(Ordering::Greater),
             None,
         ] {
-            let (handle, mut dropped) = controlled_shutdown(move |request| async move {
+            let (mut handle, mut dropped) = controlled_shutdown(move |request| async move {
                 if let Some(timing) = timing {
                     let at = match timing {
                         Ordering::Less => request.deadline - Duration::from_nanos(1),
@@ -1527,16 +1579,63 @@ mod tests {
             if let Err(error) = result {
                 assert!(error.to_string().contains("shutdown budget exhausted"));
             }
-            assert!(matches!(
-                dropped.try_recv(),
-                Err(oneshot::error::TryRecvError::Closed)
-            ));
+            if timing.is_some() {
+                assert!(matches!(
+                    dropped.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            } else {
+                // Without a critical confirmation the actor is kept for a retry.
+                assert!(matches!(
+                    dropped.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                drop(handle);
+                assert!(dropped.await.is_err());
+            }
         }
     }
 
     #[tokio::test]
+    async fn shutdown_retry_resumes_waiting_for_pending_critical_completion() {
+        let (release, released) = oneshot::channel::<()>();
+        let (mut handle, mut dropped) = controlled_shutdown(|request| async move {
+            released.await?;
+            request.completed.send(tokio::time::Instant::now()).unwrap();
+            Ok(())
+        });
+        let error = handle
+            .shutdown_with_budget(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retry shutdown"));
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let error = handle
+            .shutdown_with_budget(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retry shutdown"));
+        release.send(()).unwrap();
+        handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_rejects_late_confirmation_even_when_task_completes() {
-        let (handle, mut dropped) = controlled_shutdown(|request| async move {
+        let (mut handle, mut dropped) = controlled_shutdown(|request| async move {
             request
                 .completed
                 .send(request.deadline + Duration::from_nanos(1))
@@ -1557,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_propagates_task_errors_after_critical_completion() {
         for panic in [false, true] {
-            let (handle, mut dropped) = controlled_shutdown(move |request| async move {
+            let (mut handle, mut dropped) = controlled_shutdown(move |request| async move {
                 request
                     .completed
                     .send(request.deadline - Duration::from_nanos(1))
@@ -1585,6 +1684,12 @@ mod tests {
                 dropped.try_recv(),
                 Err(oneshot::error::TryRecvError::Closed)
             ));
+            // A retry must not turn the observed failure into success.
+            let retried = handle
+                .shutdown_with_budget(Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(retried.to_string().contains("previously failed"));
         }
     }
 
@@ -2229,7 +2334,7 @@ mod tests {
         }
 
         async fn stop(mut self) {
-            if let Some(handle) = self.handle.take() {
+            if let Some(mut handle) = self.handle.take() {
                 handle.shutdown().await.unwrap();
             }
             self.node.shutdown().await;
@@ -2586,7 +2691,10 @@ mod tests {
         alice.store.pause_next_flush(reached_tx, resume_rx);
         let handle = alice.handle.take().unwrap();
         let snapshot = handle.snapshot.clone();
-        let stopping = tokio::spawn(handle.shutdown());
+        let stopping = tokio::spawn(async move {
+            let mut handle = handle;
+            handle.shutdown().await
+        });
         tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
             .await
             .unwrap()
@@ -2614,21 +2722,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn production_adapter_shutdown_own_late_flush_cannot_publish_after_timeout() {
+    async fn production_adapter_shutdown_retry_confirms_own_left_after_late_flush() {
         let mut alice = Running::new("shutdown-late", nx_net::SerializationFormat::Bincode).await;
         alice.owner("shutdown-late").await;
         let before = alice.store.completed_flushes();
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         alice.store.pause_next_flush(reached_tx, resume_rx);
-        let handle = alice.handle.take().unwrap();
+        let mut handle = alice.handle.take().unwrap();
         let snapshot = handle.snapshot.clone();
-        let stopping = tokio::spawn(handle.shutdown());
+        let stopping = tokio::spawn(async move {
+            let result = handle
+                .shutdown_with_budget(Duration::from_millis(200))
+                .await;
+            (handle, result)
+        });
         tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
             .await
             .unwrap()
             .unwrap();
-        let result = stopping.await.unwrap();
+        let (mut handle, result) = stopping.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("retry shutdown"));
+        assert_eq!(alice.store.completed_flushes(), before);
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-late" && record.state == MembershipState::Left
+        }));
+        resume_tx.send(()).unwrap();
+        handle.shutdown().await.unwrap();
+        assert_eq!(alice.store.completed_flushes(), before + 1);
+        let key = [super::super::schema::FLOOR_PREFIX, b"shutdown-late"].concat();
+        let floor = super::super::schema::Floor::decode(
+            "shutdown-late",
+            &alice.store.get(&key).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor.status, Status::Left);
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_dropped_after_timeout_cannot_publish_late_flush() {
+        let mut alice = Running::new("shutdown-drop", nx_net::SerializationFormat::Bincode).await;
+        alice.owner("shutdown-drop").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let mut handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(async move {
+            let result = handle
+                .shutdown_with_budget(Duration::from_millis(200))
+                .await;
+            (handle, result)
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (handle, result) = stopping.await.unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown budget exhausted")
+        );
+        // Dropping the handle is the terminal abort: the in-flight flush may finish,
+        // but the aborted actor must not publish it.
+        drop(handle);
         let flushed_while_paused = alice.store.completed_flushes();
         resume_tx.send(()).unwrap();
         let store = Arc::clone(&alice.store);
@@ -2636,16 +2797,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("shutdown budget exhausted")
-        );
         assert_eq!(flushed_while_paused, before);
         assert_eq!(alice.store.completed_flushes(), before + 2);
         assert!(!snapshot.borrow().records.iter().any(|record| {
-            record.member == "shutdown-late" && record.state == MembershipState::Left
+            record.member == "shutdown-drop" && record.state == MembershipState::Left
         }));
         alice.node.shutdown().await;
     }
@@ -2656,7 +2811,7 @@ mod tests {
         alice.owner("shutdown-failure").await;
         let before = alice.store.completed_flushes();
         alice.store.inject_disk_full_on_flush(true);
-        let handle = alice.handle.take().unwrap();
+        let mut handle = alice.handle.take().unwrap();
         let snapshot = handle.snapshot.clone();
         let result = handle.shutdown().await;
         assert!(
@@ -2706,7 +2861,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let handle = alice.handle.take().unwrap();
+        let mut handle = alice.handle.take().unwrap();
         let snapshot = handle.snapshot.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2720,12 +2875,6 @@ mod tests {
                 .to_string()
                 .contains("shutdown budget exhausted")
         );
-        resume_tx.send(()).unwrap();
-        let store = Arc::clone(&alice.store);
-        tokio::task::spawn_blocking(move || store.flush())
-            .await
-            .unwrap()
-            .unwrap();
         assert!(
             !snapshot
                 .borrow()
@@ -2733,6 +2882,14 @@ mod tests {
                 .iter()
                 .any(|record| record.member == "alice" && record.state == MembershipState::Left)
         );
+        resume_tx.send(()).unwrap();
+        // The retained actor finishes the queued writes; a retry observes the durable leave.
+        handle.shutdown().await.unwrap();
+        let key = [super::super::schema::FLOOR_PREFIX, b"alice"].concat();
+        let floor =
+            super::super::schema::Floor::decode("alice", &alice.store.get(&key).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(floor.status, Status::Left);
         alice.node.shutdown().await;
         bob.stop().await;
     }

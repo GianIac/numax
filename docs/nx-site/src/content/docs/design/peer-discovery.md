@@ -115,9 +115,13 @@ notifications prioritize telling a suspected owner so it can refute.
 These are internal runtime settings, not CLI options or a universal detection
 latency guarantee. Storage failure fences terminal publication and is exposed
 through service errors. Membership shutdown allows two seconds for leave
-dissemination and five seconds for adapter completion. An in-flight filesystem
-operation may finish after cancellation but cannot publish through the stopped
-adapter.
+dissemination and five seconds for adapter completion. If that budget expires
+before the terminal leave is durably confirmed, shutdown returns an error but
+keeps the adapter running: retrying `SyncManager::shutdown` resumes waiting for
+the same outcome instead of reporting success, and node data loops are joined
+before the leave is written. Dropping the manager is the terminal abort: an
+in-flight filesystem operation may still finish, but cannot publish through the
+stopped adapter.
 
 ### Control authority
 

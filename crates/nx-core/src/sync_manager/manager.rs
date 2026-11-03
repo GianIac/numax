@@ -1360,7 +1360,7 @@ impl SyncManager {
             }
         };
         let node = Arc::new(node);
-        let membership = match crate::membership::runtime::start_with_metrics(
+        let mut membership = match crate::membership::runtime::start_with_metrics(
             self.node_id.to_string(),
             advertised_endpoint.clone(),
             node.clone(),
@@ -1665,6 +1665,12 @@ impl SyncManager {
     }
 
     /// Gracefully stop sync tasks and close network connections.
+    ///
+    /// Retry-safe: owned tasks and the membership handle are released only after
+    /// they have been joined, so a timed-out or cancelled call can be repeated and
+    /// resumes waiting instead of reporting a false success. Data-path loops are
+    /// joined before the membership leave so its terminal write does not compete
+    /// with them for storage; the network stays up for leave announcements.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.local_writes.stopped.store(true, Ordering::Release);
         self.candidates.stop();
@@ -1672,12 +1678,25 @@ impl SyncManager {
         // Drain dispatched jobs before broadcast shutdown; retrying shutdown after a
         // timeout must still wait for their guards rather than detach their outcome.
         drop(self.local_writes.gate.write().await);
-        let membership_error = if let Some(membership) = self.membership.take() {
+
+        join_task(&mut self.broadcast_task, "broadcast").await;
+        join_task(&mut self.forward_task, "forward").await;
+        join_task(&mut self.event_task, "event").await;
+        join_task(&mut self.reconnect_task, "reconnect").await;
+        join_task(&mut self.anti_entropy_task, "anti-entropy").await;
+
+        let membership_error = if let Some(membership) = self.membership.as_mut() {
             let snapshot = membership.snapshot.borrow().clone();
             debug!(members = snapshot.records.len(), health = snapshot.health,
                 successful_probes = snapshot.successful_probes, failed_probes = snapshot.failed_probes,
                 error = ?snapshot.error, "stopping membership service");
-            membership.shutdown().await.err()
+            match membership.shutdown().await {
+                Ok(()) => {
+                    self.membership = None;
+                    None
+                }
+                Err(error) => Some(error),
+            }
         } else {
             None
         };
@@ -1686,24 +1705,6 @@ impl SyncManager {
             coordinator.request_shutdown();
         }
         let mut discovery_error = None;
-
-        if let Some(task) = self.broadcast_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "broadcast task failed during shutdown");
-        }
-
-        if let Some(task) = self.reconnect_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "reconnect task failed during shutdown");
-        }
-
-        if let Some(task) = self.anti_entropy_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "anti-entropy task failed during shutdown");
-        }
 
         if let Some(mut coordinator) = discovery_coordinator.take()
             && let Err(error) = coordinator.shutdown().await
@@ -1717,22 +1718,21 @@ impl SyncManager {
         }
         self.metrics.set_peers_connected(0);
 
-        if let Some(task) = self.event_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "event task failed during shutdown");
-        }
-
-        if let Some(task) = self.forward_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "forward task failed during shutdown");
-        }
-
         info!("sync manager shut down");
         membership_error
             .or_else(|| discovery_error.map(Into::into))
             .map_or(Ok(()), Err)
+    }
+}
+
+/// Joins an owned task, releasing the handle only once the join has completed.
+async fn join_task(task: &mut Option<JoinHandle<()>>, name: &str) {
+    if let Some(handle) = task.as_mut() {
+        let result = handle.await;
+        *task = None;
+        if let Err(error) = result {
+            warn!(task = name, error = %error, "sync task failed during shutdown");
+        }
     }
 }
 
