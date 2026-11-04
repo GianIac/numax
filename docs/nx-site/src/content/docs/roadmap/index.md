@@ -218,7 +218,7 @@ Release-scale loss, partition and detector criteria remain separate below.
 - [x] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
 
 **Test scenarios**:
-- [ ] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model
+- [x] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model: test sync_manager::manager::tests::determinism::split_brain_50_nodes_production_defaults_json
 - [ ] Separate simulated message loss from packet loss over the real transport
 - [ ] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
 - [ ] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
