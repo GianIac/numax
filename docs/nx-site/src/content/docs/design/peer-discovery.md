@@ -110,7 +110,18 @@ notifications prioritize telling a suspected owner so it can refute.
 | Remote member/session capacity | 4,096 |
 | Outgoing control jobs / payload limit | 8 / 16 KiB |
 | Reconciliation page / minimum start spacing | 4 records / 250 ms |
+| Recovery contact spacing / per-endpoint backoff | one per 25 ms tick / 1–30 s |
+| Recovery wake-up minimum spacing | 5 s |
 | Terminal storage queue | 64 actions plus one active worker |
+
+Besides the reconciliation round-robin, a recovery lane contacts endpoints of
+members held `Suspect` or `Dead` (never `Left`) and hints for unknown members.
+It shares the reconciliation job limit, and each endpoint backs off from 1 s to
+30 s, so a genuinely dead member costs at most one exchange per endpoint per
+30 s in steady state. A reply from such an endpoint, or a local self-refutation,
+makes every recovery contact due again at most once per wake-up spacing, so a
+healed partition is contacted promptly and a refuted `Alive` reaches members
+that may still hold the owner dead. These contacts carry no extra authority.
 
 These are internal runtime settings, not CLI options or a universal detection
 latency guarantee. Storage failure fences terminal publication and is exposed
@@ -146,7 +157,9 @@ failure judgment. For a known exact owner pair in an open epoch, a rejected
 correlated reply from an equally rejected owner may trigger only self-refutation:
 it cannot authorize reports about other members, supply hints or pagination,
 relay probes, or complete a probe successfully. This applies to restored durable
-death floors too, without creating an admitted session.
+death floors too, without creating an admitted session. Symmetrically, a
+rejected request from such an owner may make the receiver refute only the
+sender's own `Suspect`/`Dead` verdict about the receiver; it changes nothing else.
  
 Superseded pairs and
 epochs closed by `Left` (including a pending leave) cannot use this path.

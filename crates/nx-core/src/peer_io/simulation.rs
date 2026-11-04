@@ -207,7 +207,49 @@ struct State {
     random: BTreeMap<(String, String, &'static str), Random>,
     partition: BTreeSet<(String, String)>,
     trace: Vec<String>,
+    stats: Stats,
 }
+
+/// Message counters kept even when the full trace is disabled for large scenarios.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Stats {
+    pub(crate) sent: u64,
+    pub(crate) lost_random: u64,
+    pub(crate) lost_partition: u64,
+    pub(crate) rejected_delivery: u64,
+    pub(crate) queue_full: u64,
+}
+
+impl Stats {
+    pub(crate) fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "sent": self.sent,
+            "lost_random": self.lost_random,
+            "lost_partition": self.lost_partition,
+            "rejected_delivery": self.rejected_delivery,
+            "queue_full": self.queue_full,
+        })
+    }
+}
+
+/// In-flight and trace budgets of the simulated network.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Capacity {
+    pub(crate) messages: usize,
+    pub(crate) bytes: usize,
+    pub(crate) trace: bool,
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self {
+            messages: 4096,
+            bytes: 16 * 1024 * 1024,
+            trace: true,
+        }
+    }
+}
+
 pub(crate) struct Network {
     pub(crate) clock: Arc<Clock>,
     state: Mutex<State>,
@@ -218,6 +260,7 @@ pub(crate) struct Network {
     pub(crate) loss_percent: u64,
     pub(crate) max_message_size: usize,
     pub(crate) max_peers: usize,
+    capacity: Capacity,
 }
 impl Network {
     pub(crate) fn new(seed: u64, format: SerializationFormat, loss_percent: u64) -> Arc<Self> {
@@ -238,8 +281,28 @@ impl Network {
         service: Duration,
         max_peers: usize,
     ) -> Arc<Self> {
+        Self::with_capacity(
+            seed,
+            format,
+            loss_percent,
+            latency,
+            service,
+            max_peers,
+            Capacity::default(),
+        )
+    }
+    pub(crate) fn with_capacity(
+        seed: u64,
+        format: SerializationFormat,
+        loss_percent: u64,
+        latency: Duration,
+        service: Duration,
+        max_peers: usize,
+        capacity: Capacity,
+    ) -> Arc<Self> {
         assert!(loss_percent <= 100);
         assert!(max_peers > 0);
+        assert!(capacity.messages > 0 && capacity.bytes > 0);
         Arc::new(Self {
             clock: Clock::new(),
             seed,
@@ -249,6 +312,7 @@ impl Network {
             service,
             max_message_size: nx_net::DEFAULT_MAX_MESSAGE_SIZE,
             max_peers,
+            capacity,
             state: Mutex::new(State {
                 serial: 0,
                 bytes: 0,
@@ -260,6 +324,7 @@ impl Network {
                 random: BTreeMap::new(),
                 partition: BTreeSet::new(),
                 trace: Vec::new(),
+                stats: Stats::default(),
             }),
         })
     }
@@ -295,15 +360,22 @@ impl Network {
             ids: SeededIds::new(self.seed, id, generation, "history"),
         })
     }
-    fn record(state: &mut State, now: Duration, text: String) {
+    fn record(&self, state: &mut State, text: String) {
+        if !self.capacity.trace {
+            return;
+        }
         assert!(
             state.trace.len() < 65_536,
             "simulation trace budget exhausted"
         );
+        let now = self.clock.now().duration_since(self.clock.origin);
         state.trace.push(format!("{}:{text}", now.as_nanos()));
     }
     pub(crate) fn trace(&self) -> Vec<String> {
         self.state.lock().unwrap().trace.clone()
+    }
+    pub(crate) fn stats(&self) -> Stats {
+        self.state.lock().unwrap().stats
     }
     fn dropped(&self, from: &str, to: &str, purpose: &'static str) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -314,9 +386,15 @@ impl Network {
             .or_insert_with(|| Random::stream(self.seed, &format!("{from}>{to}"), purpose))
             .choose(100);
         let lost = blocked || draw < self.loss_percent as usize;
-        Self::record(
+        if blocked {
+            state.stats.lost_partition += 1;
+        } else if lost {
+            state.stats.lost_random += 1;
+        } else {
+            state.stats.sent += 1;
+        }
+        self.record(
             &mut state,
-            self.clock.now().duration_since(self.clock.origin),
             format!(
                 "{purpose}:{from}>{to}:{}",
                 if lost { "lost" } else { "sent" }
@@ -338,9 +416,10 @@ impl Network {
             .now()
             .checked_add(delay)
             .ok_or(NetError::Timeout)?;
-        Self::enqueue_locked(&mut state, at, from, to, bytes, event)
+        self.enqueue_locked(&mut state, at, from, to, bytes, event)
     }
     fn enqueue_locked(
+        &self,
         state: &mut State,
         at: Instant,
         from: &str,
@@ -348,13 +427,16 @@ impl Network {
         bytes: usize,
         event: Incoming,
     ) -> NetResult<()> {
-        if state.queue.len() >= 4096 || state.bytes.saturating_add(bytes) > 16 * 1024 * 1024 {
-            return Err(NetError::PeerLimitReached(4096));
+        if state.queue.len() >= self.capacity.messages
+            || state.bytes.saturating_add(bytes) > self.capacity.bytes
+        {
+            state.stats.queue_full += 1;
+            return Err(NetError::PeerLimitReached(self.capacity.messages));
         }
         let serial = state.serial;
         state.serial = serial
             .checked_add(1)
-            .ok_or(NetError::PeerLimitReached(4096))?;
+            .ok_or(NetError::PeerLimitReached(self.capacity.messages))?;
         let generations = match &event {
             Incoming::Data(NodeEvent::HistoryReceived { .. }) => state
                 .connections
@@ -408,9 +490,9 @@ impl Network {
             let partitioned = !queued.generations.is_empty()
                 && state.partition.contains(&(from.clone(), to.clone()));
             if closed || partitioned {
-                Self::record(
+                state.stats.rejected_delivery += 1;
+                self.record(
                     &mut state,
-                    self.clock.now().duration_since(self.clock.origin),
                     format!(
                         "delivery-rejected:{from}>{to}:{}",
                         if closed { "stale" } else { "partition" }
@@ -462,8 +544,10 @@ impl Network {
         if state.partition.contains(&(a.into(), b.into())) {
             return Err(NetError::ConnectionFailed("simulated partition".into()));
         }
-        if state.queue.len() > 4094 || state.serial > u64::MAX - 2 {
-            return Err(NetError::PeerLimitReached(4096));
+        if state.queue.len() > self.capacity.messages.saturating_sub(2)
+            || state.serial > u64::MAX - 2
+        {
+            return Err(NetError::PeerLimitReached(self.capacity.messages));
         }
         for addr in [a, b] {
             if state
@@ -506,7 +590,7 @@ impl Network {
                     source == from && !c.lease.closed.load(Ordering::Relaxed)
                 })
                 .count();
-            Self::enqueue_locked(
+            self.enqueue_locked(
                 &mut state,
                 self.clock.now(),
                 to,
@@ -565,12 +649,8 @@ impl Prepared for Frame {
             return Err(NetError::PeerDisconnected(self.to));
         }
         if !self.network.dropped(&self.from, &self.to, "history") {
-            Network::record(
+            self.network.record(
                 &mut self.network.state.lock().unwrap(),
-                self.network
-                    .clock
-                    .now()
-                    .duration_since(self.network.clock.origin),
                 format!(
                     "frame:{}>{}:{}",
                     self.from,
@@ -665,19 +745,20 @@ impl PeerIo for Endpoint {
                         source == &key.0 && !c.lease.closed.load(Ordering::Relaxed)
                     })
                     .count();
-                Network::enqueue_locked(
-                    &mut state,
-                    self.now(),
-                    &key.1,
-                    &key.0,
-                    0,
-                    Incoming::Data(NodeEvent::PeerDisconnected {
-                        node_id,
-                        addr: key.1.clone(),
-                        peers_connected,
-                    }),
-                )
-                .expect("checked lifecycle capacity");
+                self.network
+                    .enqueue_locked(
+                        &mut state,
+                        self.now(),
+                        &key.1,
+                        &key.0,
+                        0,
+                        Incoming::Data(NodeEvent::PeerDisconnected {
+                            node_id,
+                            addr: key.1.clone(),
+                            peers_connected,
+                        }),
+                    )
+                    .expect("checked lifecycle capacity");
             }
         }
         true

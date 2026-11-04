@@ -1,12 +1,46 @@
 use super::*;
 use crate::membership::runtime::{Observation, simulation::Simulation};
-use crate::peer_io::simulation::{Incoming, Network, Tasks};
+use crate::peer_io::simulation::{Capacity, Incoming, Network, Tasks};
 use crate::peer_io::{PeerIo, clock::Clock, random::SeededIds};
 use std::collections::BTreeMap;
 
 enum Work {
     Membership(usize, Observation),
     Done,
+}
+
+/// Sync timing of simulated replicas: the compressed replay profile, or the
+/// unmodified `SyncConfig` defaults used by a production node.
+#[derive(Debug, Clone, Copy)]
+enum Timing {
+    Replay { max_peers: usize },
+    Production,
+}
+
+impl Timing {
+    fn max_peers(self) -> usize {
+        match self {
+            Self::Replay { max_peers } => max_peers,
+            Self::Production => crate::sync_config::DEFAULT_MAX_PEERS,
+        }
+    }
+    fn config(self, format: nx_net::SerializationFormat) -> SyncConfig {
+        let config = SyncConfig::new().with_serialization_format(format);
+        match self {
+            Self::Replay { max_peers } => config
+                .with_max_peers(max_peers)
+                .with_anti_entropy_interval(Duration::from_millis(100))
+                .with_socket_timeout(Duration::from_millis(100))
+                .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(40)),
+            Self::Production => config,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replay { .. } => "replay",
+            Self::Production => "production-defaults",
+        }
+    }
 }
 struct Replica {
     _candidates_tx: watch::Sender<Arc<Vec<String>>>,
@@ -21,9 +55,14 @@ struct Runner {
     tasks: Tasks<Work>,
     decisions: Vec<String>,
     stopping: bool,
+    trace: bool,
+    event_budget: usize,
 }
 impl Runner {
     fn record(&mut self, decision: String) {
+        if !self.trace {
+            return;
+        }
         assert!(
             self.decisions.len() < 65_536,
             "simulation decision trace budget exhausted"
@@ -34,13 +73,34 @@ impl Runner {
         Self::with_loss(seed, format, 10)
     }
     fn with_loss(seed: u64, format: nx_net::SerializationFormat, loss: u64) -> Self {
-        let network = Network::with_timing(
+        Self::with_nodes(
+            seed,
+            format,
+            loss,
+            3,
+            Timing::Replay { max_peers: 2 },
+            Capacity::default(),
+        )
+    }
+    /// Builds `nodes` replicas with initial chain candidates. Traces stay complete
+    /// only when the network capacity enables them; budgets scale with `nodes`.
+    fn with_nodes(
+        seed: u64,
+        format: nx_net::SerializationFormat,
+        loss: u64,
+        nodes: usize,
+        timing: Timing,
+        capacity: Capacity,
+    ) -> Self {
+        let max_peers = timing.max_peers();
+        let network = Network::with_capacity(
             seed,
             format,
             loss,
             Duration::from_millis(5),
             Duration::from_millis(1),
-            2,
+            max_peers,
+            capacity,
         );
         let mut runner = Self {
             network,
@@ -48,16 +108,13 @@ impl Runner {
             tasks: Tasks::new(),
             decisions: Vec::new(),
             stopping: false,
+            trace: capacity.trace,
+            event_budget: 65_536 * nodes.div_ceil(3),
         };
-        for index in 0..3 {
+        for index in 0..nodes {
             let addr = format!("127.0.0.1:{}", 12000 + index);
             let id = format!("simulation-{index}");
-            let config = SyncConfig::new()
-                .with_max_peers(2)
-                .with_serialization_format(format)
-                .with_anti_entropy_interval(Duration::from_millis(100))
-                .with_socket_timeout(Duration::from_millis(100))
-                .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(40));
+            let config = timing.config(format);
             let mut manager =
                 SyncManager::try_new(NodeId::new(&id), config, temp_store(), metrics()).unwrap();
             manager.clock = runner.network.clock.clone();
@@ -80,7 +137,7 @@ impl Runner {
             ));
             let pacing = Arc::new(StdMutex::new(crate::sync_manager::pacing::Pacer::new(
                 manager.config.gossip_rate,
-                2,
+                max_peers,
             )));
             let (forward_tx, forward_rx) = crate::sync_manager::delivery::named_channel(
                 manager.config.queued_ops_limit,
@@ -146,7 +203,7 @@ impl Runner {
                 forward_loop(forward, forward_rx, stopped).await;
                 Work::Done
             });
-            let peers: Vec<_> = (0..3)
+            let peers: Vec<_> = (0..nodes)
                 .filter(|peer| (*peer as isize - index as isize).abs() == 1)
                 .map(|peer| format!("127.0.0.1:{}", 12000 + peer))
                 .collect();
@@ -157,7 +214,7 @@ impl Runner {
                 node: io.clone(),
                 rotation_interval: crate::sync_manager::neighbors::NEIGHBOR_ROTATION_INTERVAL,
                 candidates_rx,
-                max_peers: 2,
+                max_peers,
                 initial_delay: manager.config.reconnect_initial_delay,
                 max_delay: manager.config.reconnect_max_delay,
                 peer_dead_after_failures: manager.config.peer_dead_after_failures,
@@ -203,7 +260,8 @@ impl Runner {
         });
     }
     async fn quiesce(&mut self) {
-        for _ in 0..4096 {
+        let microsteps = 4096 * self.replicas.len().div_ceil(3);
+        for _ in 0..microsteps {
             let mut ready = self.tasks.poll_ready();
             for replica in &mut self.replicas {
                 for dispatch in replica.membership.dispatches() {
@@ -311,7 +369,7 @@ impl Runner {
     }
     async fn until(&mut self, end: Duration) {
         let deadline = self.network.clock.origin + end;
-        for _ in 0..65_536 {
+        for _ in 0..self.event_budget {
             self.quiesce().await;
             let next = [
                 self.network.clock.next_deadline(),
@@ -610,6 +668,286 @@ async fn partition_scenario(seed: u64, format: nx_net::SerializationFormat) -> s
     });
     runner.shutdown().await;
     report
+}
+
+const REPLAY_TIMING: Timing = Timing::Replay { max_peers: 8 };
+
+/// Release campaigns default to seed 42; `NUMAX_SPLIT_BRAIN_SEED` selects another.
+fn campaign_seed() -> u64 {
+    std::env::var("NUMAX_SPLIT_BRAIN_SEED").map_or(42, |seed| {
+        seed.parse()
+            .expect("NUMAX_SPLIT_BRAIN_SEED must be an unsigned integer")
+    })
+}
+
+#[tokio::test]
+#[ignore = "release campaign: 50 simulated nodes over real SyncManager storage; long wall time"]
+async fn split_brain_50_nodes_json() {
+    let seed = campaign_seed();
+    split_brain_scenario(seed, nx_net::SerializationFormat::Json, 50, REPLAY_TIMING).await;
+}
+
+#[tokio::test]
+#[ignore = "release campaign: 50 simulated nodes over real SyncManager storage; long wall time"]
+async fn split_brain_50_nodes_bincode() {
+    let seed = campaign_seed();
+    split_brain_scenario(
+        seed,
+        nx_net::SerializationFormat::Bincode,
+        50,
+        REPLAY_TIMING,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "release campaign: 50 nodes with unmodified SyncConfig defaults; long wall time"]
+async fn split_brain_50_nodes_production_defaults_json() {
+    let seed = campaign_seed();
+    split_brain_scenario(
+        seed,
+        nx_net::SerializationFormat::Json,
+        50,
+        Timing::Production,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn split_brain_10_nodes_json() {
+    split_brain_scenario(42, nx_net::SerializationFormat::Json, 10, REPLAY_TIMING).await;
+}
+
+const SPLIT_BRAIN_OPS_PER_NODE: u64 = 12;
+
+fn membership_formed(runner: &Runner, nodes: usize) -> bool {
+    runner.replicas.iter().all(|replica| {
+        let snapshot = replica.membership.snapshot();
+        let snapshot = snapshot.borrow();
+        snapshot.error.is_none()
+            && snapshot.records.len() == nodes
+            && snapshot
+                .records
+                .iter()
+                .all(|r| r.state == nx_net::MembershipState::Alive)
+    })
+}
+
+/// Every replica holds the same durable state and contiguous, gap-free coverage of
+/// every origin's full workload; equal values alone would not prove completeness.
+fn data_converged(runner: &Runner, nodes: usize) -> bool {
+    let expected = six_family_states(&runner.replicas[0].manager.store);
+    runner.replicas.iter().all(|replica| {
+        six_family_states(&replica.manager.store) == expected
+            && replica
+                .manager
+                .handle()
+                .replication_progress()
+                .unwrap()
+                .iter()
+                .filter(|p| {
+                    p.contiguous_sequence == SPLIT_BRAIN_OPS_PER_NODE
+                        && p.sparse_positions == 0
+                        && p.recovery_failure.is_none()
+                        && !p.baseline_unconfirmed
+                })
+                .count()
+                == nodes
+    })
+}
+
+async fn assert_six_family_values(manager: &SyncManager, writers: usize) {
+    let w = writers as u64;
+    let store = &manager.store;
+    assert_eq!(manager.get_counter_value("det-g").await, 7 * w);
+    assert_eq!(read_materialized(store, "det-g"), 7 * w);
+    assert_eq!(manager.get_pncounter_value("det-p").await, 5 * w as i64);
+    assert_eq!(read_materialized_pncounter(store, "det-p"), 5 * w as i64);
+    assert_eq!(
+        manager.get_lww_register_value("det-r").await,
+        Some(b"winner".to_vec())
+    );
+    assert_eq!(read_materialized_lww_register(store, "det-r"), b"winner");
+    assert!(manager.get_lww_map_entries("det-m").await.is_empty());
+    assert!(read_materialized_lww_map(store, "det-m").is_empty());
+    assert_eq!(manager.get_orset_elements("det-o").await, vec!["present"]);
+    assert_eq!(read_materialized_orset(store, "det-o"), vec!["present"]);
+    assert_eq!(
+        manager.get_rga_values("det-a").await,
+        vec![b"present".to_vec(); writers]
+    );
+    assert_eq!(
+        read_materialized_rga(store, "det-a"),
+        vec![b"present".to_vec(); writers]
+    );
+}
+
+/// Release-gate split brain: `nodes` replicas, 10% seeded random loss for the whole
+/// run, a 60 s cut into two contiguous halves with writes on both sides, and no
+/// new writes after rejoin. Convergence must complete within 30 virtual seconds.
+async fn split_brain_scenario(
+    seed: u64,
+    format: nx_net::SerializationFormat,
+    nodes: usize,
+    timing: Timing,
+) -> serde_json::Value {
+    const LOSS_PERCENT: u64 = 10;
+    const PARTITION_S: u64 = 60;
+    const RECOVERY_LIMIT_S: u64 = 30;
+    const OBSERVATION_LIMIT_S: u64 = 180;
+    // Formation is a precondition, not the release criterion; its time is reported.
+    const FORMATION_LIMIT_S: u64 = 300;
+    assert!(nodes >= 4);
+    let started = StdInstant::now();
+    let scale = nodes.div_ceil(3);
+    let mut runner = Runner::with_nodes(
+        seed,
+        format,
+        LOSS_PERCENT,
+        nodes,
+        timing,
+        Capacity {
+            messages: 4096 * scale,
+            bytes: 16 * 1024 * 1024 * scale,
+            trace: false,
+        },
+    );
+    let phase = |name: &str, runner: &Runner| {
+        eprintln!(
+            "SPLIT_BRAIN_PHASE seed={seed} nodes={nodes} codec={format:?} timing={} phase={name} virtual_ms={} wall_ms={} network={:?}",
+            timing.label(),
+            runner
+                .network
+                .clock
+                .now()
+                .duration_since(runner.network.clock.origin)
+                .as_millis(),
+            started.elapsed().as_millis(),
+            runner.network.stats(),
+        );
+    };
+
+    let mut formed_at = None;
+    for second in 1..=FORMATION_LIMIT_S {
+        runner.until(Duration::from_secs(second)).await;
+        if membership_formed(&runner, nodes) {
+            formed_at = Some(second);
+            break;
+        }
+    }
+    let formed_at = formed_at.unwrap_or_else(|| {
+        panic!(
+            "seed={seed} codec={format:?}: membership of {nodes} nodes did not form within {FORMATION_LIMIT_S} virtual s; records per node={:?}",
+            runner
+                .replicas
+                .iter()
+                .map(|r| r.membership.snapshot().borrow().records.len())
+                .collect::<Vec<_>>()
+        )
+    });
+    phase("formed", &runner);
+
+    let half = nodes / 2;
+    let addr = |index: usize| format!("127.0.0.1:{}", 12000 + index);
+    for a in 0..half {
+        for b in half..nodes {
+            runner.network.partition(&addr(a), &addr(b), true);
+        }
+    }
+    for index in 0..nodes {
+        local_six_family_workload(&runner.replicas[index].manager.handle(), index as u64).await;
+    }
+    let healed_at = formed_at + PARTITION_S;
+    runner.until(Duration::from_secs(healed_at)).await;
+    phase("partitioned", &runner);
+
+    for a in 0..half {
+        for b in half..nodes {
+            runner.network.partition(&addr(a), &addr(b), false);
+        }
+    }
+    // No new writes after rejoin; sampling is once per virtual second. Observation
+    // continues past the limit only to measure the overrun; the assertion keeps it.
+    let mut data_at = None;
+    let mut membership_at = None;
+    let mut coverage_at_limit = None;
+    for second in 1..=OBSERVATION_LIMIT_S {
+        runner.until(Duration::from_secs(healed_at + second)).await;
+        if data_at.is_none() && data_converged(&runner, nodes) {
+            data_at = Some(second);
+        }
+        if membership_at.is_none() && membership_formed(&runner, nodes) {
+            membership_at = Some(second);
+        }
+        if second == RECOVERY_LIMIT_S {
+            coverage_at_limit = Some(complete_origins(&runner));
+        }
+        if data_at.is_some() && membership_at.is_some() {
+            break;
+        }
+    }
+    phase("observation-closed", &runner);
+    let config = &runner.replicas[0].manager.config;
+    let report = serde_json::json!({
+        "version": 1, "seed": seed, "codec": format!("{format:?}"), "nodes": nodes,
+        "timing": timing.label(),
+        "topology": "initial chain candidates (index +/- 1), production neighbor selection thereafter",
+        "max_peers": timing.max_peers(),
+        "groups": [[0, half - 1], [half, nodes - 1]],
+        "loss": format!("{LOSS_PERCENT}% independent seeded draws per directed (from, to, purpose) stream, for the whole run including partition and recovery"),
+        "latency_ms": 5, "service_ms": 1,
+        "membership_formed_s": formed_at, "partition_start_s": formed_at,
+        "partition_duration_s": PARTITION_S,
+        "writes": "12 operations per node over six CRDT families at partition start; no writes after rejoin",
+        "operations_total": SPLIT_BRAIN_OPS_PER_NODE * nodes as u64,
+        "payload": "keys det-*, values of at most 7 bytes",
+        "retention_operations": config.op_log_limit,
+        "anti_entropy_interval_ms": config.anti_entropy_interval.as_millis() as u64,
+        "socket_timeout_ms": config.socket_timeout.as_millis() as u64,
+        "reconnect_backoff_ms": [
+            config.reconnect_initial_delay.as_millis() as u64,
+            config.reconnect_max_delay.as_millis() as u64,
+        ],
+        "recovery_limit_s": RECOVERY_LIMIT_S, "observation_limit_s": OBSERVATION_LIMIT_S,
+        "sampling_s": 1,
+        "data_converged_after_s": data_at, "membership_healed_after_s": membership_at,
+        "complete_origins_per_node_at_limit": coverage_at_limit,
+        "network": runner.network.stats().to_json(),
+        "wall_ms": started.elapsed().as_millis() as u64,
+    });
+    println!("SPLIT_BRAIN_REPORT {report}");
+    assert!(
+        data_at.is_some_and(|s| s <= RECOVERY_LIMIT_S),
+        "seed={seed} codec={format:?} timing={}: data converged after {data_at:?} s, limit {RECOVERY_LIMIT_S} s; complete origins per node at limit={coverage_at_limit:?}",
+        timing.label()
+    );
+    assert!(
+        membership_at.is_some_and(|s| s <= RECOVERY_LIMIT_S),
+        "seed={seed} codec={format:?} timing={}: membership healed after {membership_at:?} s, limit {RECOVERY_LIMIT_S} s",
+        timing.label()
+    );
+    for replica in &runner.replicas {
+        assert_six_family_values(&replica.manager, nodes).await;
+    }
+    runner.shutdown().await;
+    report
+}
+
+fn complete_origins(runner: &Runner) -> Vec<usize> {
+    runner
+        .replicas
+        .iter()
+        .map(|replica| {
+            replica
+                .manager
+                .handle()
+                .replication_progress()
+                .unwrap()
+                .iter()
+                .filter(|p| p.contiguous_sequence == SPLIT_BRAIN_OPS_PER_NODE)
+                .count()
+        })
+        .collect()
 }
 
 #[tokio::test]

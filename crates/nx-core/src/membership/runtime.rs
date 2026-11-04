@@ -26,6 +26,13 @@ use nx_net::Node;
 const TICK: Duration = Duration::from_millis(25);
 const CAPACITY: usize = 4096;
 const RPC_BUDGET: Duration = Duration::from_millis(500);
+/// Recovery contacts back off per endpoint between these bounds, so genuinely
+/// dead members cost at most one exchange per endpoint per maximum delay.
+const RECOVERY_DELAY_MIN: Duration = Duration::from_secs(1);
+const RECOVERY_DELAY_MAX: Duration = Duration::from_secs(30);
+/// Minimum spacing between wake-ups that make every recovery contact due again.
+const RECOVERY_WAKE_SPACING: Duration = Duration::from_secs(5);
+const HINT_LIMIT: usize = 64;
 #[cfg(test)]
 const SCHEDULING_SAMPLES_LIMIT: usize = 2048;
 #[cfg(test)]
@@ -433,6 +440,9 @@ impl Actor {
             next_exchange: Duration::ZERO,
             hints: BTreeMap::new(),
             pages: BTreeMap::new(),
+            recovery: BTreeMap::new(),
+            next_recovery: Duration::ZERO,
+            recovery_woken_at: None,
             successful_probes: 0,
             failed_probes: 0,
             #[cfg(test)]
@@ -530,6 +540,9 @@ struct Actor {
     next_exchange: Duration,
     hints: BTreeMap<String, String>,
     pages: BTreeMap<String, Option<String>>,
+    recovery: BTreeMap<String, RecoveryContact>,
+    next_recovery: Duration,
+    recovery_woken_at: Option<Duration>,
     successful_probes: u64,
     failed_probes: u64,
     #[cfg(test)]
@@ -539,6 +552,15 @@ struct Actor {
 }
 
 pub(crate) struct Written((u64, Result<(), super::storage::StorageError>));
+
+/// Backoff state of one endpoint in the recovery lane: a Suspect/Dead member or
+/// an unknown member hint. The observed version restarts backoff on new evidence.
+struct RecoveryContact {
+    member: String,
+    version: Option<MembershipVersion>,
+    due: Duration,
+    delay: Duration,
+}
 pub(crate) enum Observation {
     Dispatch(Dispatch),
     Written(Written),
@@ -723,6 +745,7 @@ impl Actor {
             self.actions(actions).await?;
         }
         self.exchange_next().await?;
+        self.recovery_next().await?;
         Ok(())
     }
 
@@ -912,7 +935,13 @@ impl Actor {
                         }
                     }
                     if update.member == self.owner.member {
+                        let refuted = update.status == Status::Alive
+                            && self.owner.version != wire_version(update.version);
                         self.owner = record(update, self.owner.endpoint.clone(), None);
+                        // Push the newer incarnation to members that may hold us dead.
+                        if refuted {
+                            self.wake_recovery();
+                        }
                     } else {
                         let endpoint = self
                             .records
@@ -1062,6 +1091,25 @@ impl Actor {
             .await?;
         if let Some(session) = accepted_session {
             self.updates(&from, session, &event.request.updates).await?;
+        } else if self.recovery_verdict(&from, &event.request.owner).is_some() {
+            // Mirror of the correlated-reply rule: an equally rejected owner's
+            // request may only make us refute its verdict about ourselves.
+            for record in &event.request.updates {
+                if record.member == self.owner.member
+                    && record.reporter == from
+                    && matches!(
+                        record.state,
+                        MembershipState::Suspect | MembershipState::Dead
+                    )
+                {
+                    let now = self.now;
+                    let actions = self
+                        .core
+                        .refute_self(version(record.version), now)
+                        .map_err(core_error)?;
+                    self.actions(actions).await?;
+                }
+            }
         }
         if accepted_session.is_some()
             && let ControlKind::Indirect { target, version } = &event.request.kind
@@ -1256,12 +1304,18 @@ impl Actor {
         if endpoints.is_empty() {
             return Ok(());
         }
-        self.cursor %= endpoints.len();
-        let (endpoint, expected) = endpoints[self.cursor].clone();
-        self.cursor += 1;
-        if self.pending.contains_key(&endpoint) {
+        // Skip endpoints with an exchange in flight instead of wasting this slot.
+        let len = endpoints.len();
+        let start = self.cursor % len;
+        let Some(offset) = (0..len).find(|offset| {
+            !self
+                .pending
+                .contains_key(&endpoints[(start + offset) % len].0)
+        }) else {
             return Ok(());
-        }
+        };
+        let (endpoint, expected) = endpoints[(start + offset) % len].clone();
+        self.cursor = start + offset + 1;
         let after = self.pages.get(&expected).cloned().flatten();
         self.launch(
             endpoint,
@@ -1270,6 +1324,107 @@ impl Actor {
             Job::Exchange,
         )?;
         Ok(())
+    }
+
+    /// Endpoints that may be on the far side of a healed partition: members this
+    /// node holds Suspect/Dead (never Left) and hints for members not yet known.
+    fn recovery_candidates(&self) -> BTreeMap<String, (String, Option<MembershipVersion>)> {
+        let mut candidates = BTreeMap::new();
+        for record in self.records.values() {
+            if matches!(
+                record.state,
+                MembershipState::Suspect | MembershipState::Dead
+            ) && let Some(endpoint) = &record.endpoint
+            {
+                candidates.insert(
+                    endpoint.clone(),
+                    (record.member.clone(), Some(record.version)),
+                );
+            }
+        }
+        for (member, endpoint) in &self.hints {
+            if !self.records.contains_key(member) {
+                candidates
+                    .entry(endpoint.clone())
+                    .or_insert_with(|| (member.clone(), None));
+            }
+        }
+        candidates
+    }
+
+    /// Recovery lane: at most one exchange per tick toward a due recovery endpoint,
+    /// sharing the exchange job limit. Each endpoint backs off independently.
+    async fn recovery_next(&mut self) -> anyhow::Result<()> {
+        if self.jobs.len() >= 6 || self.now < self.next_recovery {
+            return Ok(());
+        }
+        let now = self.now;
+        let candidates = self.recovery_candidates();
+        self.recovery.retain(|endpoint, contact| {
+            candidates
+                .get(endpoint)
+                .is_some_and(|(member, _)| &contact.member == member)
+        });
+        for (endpoint, (member, version)) in candidates {
+            let contact = self
+                .recovery
+                .entry(endpoint)
+                .or_insert_with(|| RecoveryContact {
+                    member,
+                    version,
+                    due: now,
+                    delay: RECOVERY_DELAY_MIN,
+                });
+            if contact.version != version {
+                contact.version = version;
+                contact.due = now;
+                contact.delay = RECOVERY_DELAY_MIN;
+            }
+        }
+        let Some(endpoint) = self
+            .recovery
+            .iter()
+            .filter(|(endpoint, contact)| {
+                contact.due <= now && !self.pending.contains_key(*endpoint)
+            })
+            .min_by(|a, b| (a.1.due, a.0).cmp(&(b.1.due, b.0)))
+            .map(|(endpoint, _)| endpoint.clone())
+        else {
+            return Ok(());
+        };
+        let contact = self
+            .recovery
+            .get_mut(&endpoint)
+            .ok_or_else(|| anyhow::anyhow!("recovery contact vanished"))?;
+        contact.due = now.saturating_add(contact.delay);
+        contact.delay = contact.delay.saturating_mul(2).min(RECOVERY_DELAY_MAX);
+        let member = contact.member.clone();
+        self.next_recovery = now.saturating_add(TICK);
+        let after = self.pages.get(&member).cloned().flatten();
+        self.launch(
+            endpoint,
+            Some(member),
+            ControlKind::Exchange { after },
+            Job::Exchange,
+        )?;
+        Ok(())
+    }
+
+    /// Makes every recovery contact due again after evidence that a partition may
+    /// have healed (a reply from a recovery endpoint or a local self-refutation).
+    fn wake_recovery(&mut self) {
+        let now = self.now;
+        if self
+            .recovery_woken_at
+            .is_some_and(|woken| now < woken.saturating_add(RECOVERY_WAKE_SPACING))
+        {
+            return;
+        }
+        self.recovery_woken_at = Some(now);
+        for contact in self.recovery.values_mut() {
+            contact.due = now;
+            contact.delay = RECOVERY_DELAY_MIN;
+        }
     }
 
     fn launch(
@@ -1343,6 +1498,16 @@ impl Actor {
     }
 
     async fn completed(&mut self, completion: Completion) -> anyhow::Result<()> {
+        // Any reply from a member held Suspect/Dead shows the path may have healed.
+        if matches!(completion.mode, Job::Exchange)
+            && completion.result.is_ok()
+            && self
+                .recovery
+                .get(&completion.endpoint)
+                .is_some_and(|contact| contact.version.is_some())
+        {
+            self.wake_recovery();
+        }
         let result = completion.result.and_then(|(peer, reply)| {
             if completion
                 .expected
@@ -1500,7 +1665,7 @@ impl Actor {
                 && record.member != self.owner.member
             {
                 if let Some(endpoint) = &record.endpoint
-                    && self.hints.len() < 64
+                    && self.hints.len() < HINT_LIMIT
                     && !self.records.contains_key(&record.member)
                 {
                     self.hints.insert(record.member.clone(), endpoint.clone());
@@ -1753,6 +1918,9 @@ mod tests {
                 next_exchange: Duration::ZERO,
                 hints: BTreeMap::new(),
                 pages: BTreeMap::new(),
+                recovery: BTreeMap::new(),
+                next_recovery: Duration::ZERO,
+                recovery_woken_at: None,
                 successful_probes: 0,
                 failed_probes: 0,
                 tick_lateness_micros: VecDeque::new(),
@@ -1880,6 +2048,229 @@ mod tests {
                         .is_some()
                 );
             }
+        }
+    }
+
+    fn member_record(name: &str, state: MembershipState, endpoint: &str) -> MembershipRecord {
+        MembershipRecord {
+            member: name.into(),
+            reporter: if state == MembershipState::Alive {
+                name.into()
+            } else {
+                "local".into()
+            },
+            version: MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state,
+            endpoint: Some(endpoint.into()),
+        }
+    }
+
+    /// Returns endpoints launched since the last call and completes their jobs.
+    fn drain_launched(actor: &mut Actor) -> Vec<String> {
+        let launched = actor.pending.keys().cloned().collect();
+        for _ in actor.jobs.take() {
+            actor.jobs.finished();
+        }
+        actor.pending.clear();
+        launched
+    }
+
+    #[tokio::test]
+    async fn exchange_slot_skips_endpoints_with_pending_exchange() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for (name, endpoint) in [("a", "e-a"), ("b", "e-b"), ("c", "e-c")] {
+            actor.records.insert(
+                name.into(),
+                member_record(name, MembershipState::Alive, endpoint),
+            );
+        }
+        actor.pending.insert("e-a".into(), ());
+        actor.exchange_next().await.unwrap();
+        let mut pending: Vec<_> = actor.pending.keys().cloned().collect();
+        pending.sort();
+        assert_eq!(pending, ["e-a", "e-b"], "busy endpoint wasted the slot");
+        actor.pending.remove("e-b");
+        actor.now = Duration::from_millis(250);
+        actor.exchange_next().await.unwrap();
+        assert!(actor.pending.contains_key("e-c"), "cursor did not advance");
+    }
+
+    #[tokio::test]
+    async fn recovery_lane_backs_off_and_targets_only_suspect_dead_and_hints() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for (name, state, endpoint) in [
+            ("dead", MembershipState::Dead, "e-dead"),
+            ("suspect", MembershipState::Suspect, "e-suspect"),
+            ("left", MembershipState::Left, "e-left"),
+            ("alive", MembershipState::Alive, "e-alive"),
+        ] {
+            actor
+                .records
+                .insert(name.into(), member_record(name, state, endpoint));
+        }
+        actor.hints.insert("unknown".into(), "e-hint".into());
+        actor.hints.insert("alive".into(), "e-alive-hint".into());
+
+        let mut contacts: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+        let horizon = Duration::from_secs(300);
+        while actor.now <= horizon {
+            actor.recovery_next().await.unwrap();
+            for endpoint in drain_launched(&mut actor) {
+                contacts.entry(endpoint).or_default().push(actor.now);
+            }
+            actor.now += TICK;
+        }
+        let targets: Vec<_> = contacts.keys().cloned().collect();
+        assert_eq!(targets, ["e-dead", "e-hint", "e-suspect"]);
+        for (endpoint, times) in &contacts {
+            // Prompt first contact, then doubling delays capped at the maximum.
+            assert!(times[0] <= TICK * 3, "{endpoint}");
+            let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
+            for gap in &gaps {
+                assert!(*gap >= RECOVERY_DELAY_MIN && *gap <= RECOVERY_DELAY_MAX + TICK * 4);
+            }
+            assert!(
+                gaps.iter()
+                    .rev()
+                    .take(3)
+                    .all(|gap| *gap >= RECOVERY_DELAY_MAX),
+                "{endpoint}: backoff did not reach the cap: {gaps:?}"
+            );
+            let bound = horizon.as_secs() / RECOVERY_DELAY_MAX.as_secs() + 6;
+            assert!(times.len() as u64 <= bound, "{endpoint}: {}", times.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lane_shares_the_exchange_job_limit() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for index in 0..20 {
+            let name = format!("dead-{index:02}");
+            actor.records.insert(
+                name.clone(),
+                member_record(&name, MembershipState::Dead, &format!("e-{index:02}")),
+            );
+        }
+        for _ in 0..40 {
+            actor.recovery_next().await.unwrap();
+            actor.now += TICK;
+        }
+        assert_eq!(actor.jobs.len(), 6);
+        assert_eq!(actor.pending.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn refutation_wakes_recovery_contacts_at_most_once_per_spacing() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        actor.records.insert(
+            "dead".into(),
+            member_record("dead", MembershipState::Dead, "e-dead"),
+        );
+        // Grow the backoff well beyond the minimum.
+        for _ in 0..(20_000 / TICK.as_millis() as usize) {
+            actor.recovery_next().await.unwrap();
+            drain_launched(&mut actor);
+            actor.now += TICK;
+        }
+        let grown = &actor.recovery["e-dead"];
+        assert!(grown.due > actor.now && grown.delay > RECOVERY_DELAY_MIN);
+
+        let refute = |actor: &mut Actor| {
+            let version = Version {
+                epoch: actor.owner.version.epoch,
+                incarnation: actor.owner.version.incarnation,
+            };
+            actor.core.refute_self(version, actor.now).unwrap()
+        };
+        let actions = refute(&mut actor);
+        actor.actions(actions).await.unwrap();
+        assert_eq!(actor.owner.version.incarnation, 1);
+        assert_eq!(actor.recovery["e-dead"].due, actor.now);
+        actor.recovery_next().await.unwrap();
+        assert_eq!(drain_launched(&mut actor), ["e-dead"]);
+
+        // Within the spacing, a second refutation must not make the contact due early.
+        actor.now += Duration::from_millis(500);
+        let actions = refute(&mut actor);
+        actor.actions(actions).await.unwrap();
+        assert_eq!(actor.owner.version.incarnation, 2);
+        assert!(
+            actor.recovery["e-dead"].due > actor.now,
+            "wake-up was not rate limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_request_carrying_own_verdict_refutes_only_self() {
+        for (reporter, held_dead, expect_refutation) in [
+            ("bob", true, true),
+            ("carol", true, false),
+            ("bob", false, false),
+        ] {
+            let floors = if held_dead {
+                vec![super::super::schema::Floor {
+                    member: "bob".into(),
+                    version: Version {
+                        epoch: 1,
+                        incarnation: 0,
+                    },
+                    status: Status::Dead,
+                    closed_epoch: None,
+                }]
+            } else {
+                vec![]
+            };
+            let (_directory, mut actor) = actor(&floors);
+            actor
+                .accept_owner("carol", owner("carol", 1, 0))
+                .await
+                .unwrap();
+            let sessions = actor.sessions.clone();
+            let before = actor.core.snapshot();
+            let mut verdict = actor.owner.clone();
+            verdict.reporter = reporter.into();
+            verdict.state = MembershipState::Dead;
+            let mut third_party = owner("carol", 1, 0);
+            third_party.reporter = "bob".into();
+            third_party.state = MembershipState::Dead;
+            let (respond_to, reply) = oneshot::channel();
+            actor
+                .receive(ControlIncoming {
+                    from: nx_sync::NodeId::new("bob"),
+                    verification: nx_net::PeerIdentityVerification::Unverified,
+                    request: ControlRequest {
+                        request_id: 9,
+                        owner: owner("bob", 1, 0),
+                        updates: vec![verdict, third_party],
+                        kind: ControlKind::Exchange { after: None },
+                    },
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            let reply = reply.await.unwrap();
+            if !held_dead {
+                // An admissible owner takes the normal authenticated path instead.
+                continue;
+            }
+            assert_eq!(
+                actor.owner.version.incarnation,
+                u64::from(expect_refutation),
+                "reporter={reporter}"
+            );
+            assert_eq!(reply.owner.version, actor.owner.version);
+            assert_eq!(reply.records.len(), 1);
+            assert_eq!(reply.records[0].member, "bob");
+            assert_eq!(actor.sessions, sessions);
+            assert_eq!(actor.core.snapshot(), before);
+            assert!(actor.writes.is_empty());
         }
     }
 
