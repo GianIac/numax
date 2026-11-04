@@ -1560,6 +1560,10 @@ impl SyncManager {
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
+            membership: self
+                .membership
+                .as_ref()
+                .map(|membership| membership.snapshot.clone()),
         });
 
         self.discovery_coordinator = Some(discovery_coordinator);

@@ -147,6 +147,12 @@ pub(super) struct ReconnectLoopContext {
 pub(super) struct HistoryCursor {
     pub(super) after_origin: Option<String>,
     pub(super) request_deadline: Option<std::time::Instant>,
+    /// Catch-up session: request summary pages back to back until the walk wraps.
+    pub(super) catch_up: bool,
+    /// The current catch-up walk found missing history.
+    pub(super) walk_gap: bool,
+    /// Walks repeated by this session because earlier ones found gaps.
+    pub(super) rewalks: u32,
 }
 
 pub(super) struct AntiEntropyLoopContext {
@@ -159,6 +165,8 @@ pub(super) struct AntiEntropyLoopContext {
     pub(super) interval: Duration,
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) metrics: Arc<RuntimeMetrics>,
+    /// Membership view used to start catch-up sessions with revived members.
+    pub(super) membership: Option<watch::Receiver<crate::membership::runtime::Snapshot>>,
 }
 
 pub(super) struct BroadcastLoopContext {

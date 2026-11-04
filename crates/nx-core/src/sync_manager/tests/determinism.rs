@@ -236,6 +236,7 @@ impl Runner {
                 interval: manager.config.anti_entropy_interval,
                 shutdown_rx: manager.shutdown_tx.subscribe(),
                 metrics: manager.metrics.clone(),
+                membership: Some(membership.snapshot()),
             };
             runner.tasks.spawn(async move {
                 anti_entropy_loop(entropy).await;
@@ -871,6 +872,9 @@ async fn split_brain_scenario(
     let mut data_at = None;
     let mut membership_at = None;
     let mut coverage_at_limit = None;
+    let mut incomplete_at_limit = Vec::new();
+    // Per second after rejoin: [min complete origins, cross-group data connections].
+    let mut timeline = Vec::new();
     for second in 1..=OBSERVATION_LIMIT_S {
         runner.until(Duration::from_secs(healed_at + second)).await;
         if data_at.is_none() && data_converged(&runner, nodes) {
@@ -881,7 +885,23 @@ async fn split_brain_scenario(
         }
         if second == RECOVERY_LIMIT_S {
             coverage_at_limit = Some(complete_origins(&runner));
+            incomplete_at_limit = incomplete_origins(&runner, 32);
         }
+        let min_coverage = complete_origins(&runner).into_iter().min().unwrap_or(0);
+        let mut cross = 0usize;
+        for (index, replica) in runner.replicas.iter().enumerate() {
+            for (peer, _) in replica.io.connected_peers().await {
+                let peer = peer
+                    .rsplit(':')
+                    .next()
+                    .and_then(|port| port.parse::<usize>().ok())
+                    .map(|port| port - 12000);
+                if peer.is_some_and(|peer| (peer < half) != (index < half)) {
+                    cross += 1;
+                }
+            }
+        }
+        timeline.push([min_coverage, cross]);
         if data_at.is_some() && membership_at.is_some() {
             break;
         }
@@ -912,6 +932,9 @@ async fn split_brain_scenario(
         "sampling_s": 1,
         "data_converged_after_s": data_at, "membership_healed_after_s": membership_at,
         "complete_origins_per_node_at_limit": coverage_at_limit,
+        "incomplete_at_limit": incomplete_at_limit,
+        "recovery_errors_total": recovery_errors(&runner),
+        "recovery_timeline_min_coverage_cross_connections": timeline,
         "network": runner.network.stats().to_json(),
         "wall_ms": started.elapsed().as_millis() as u64,
     });
@@ -931,6 +954,51 @@ async fn split_brain_scenario(
     }
     runner.shutdown().await;
     report
+}
+
+/// Sum of `recovery_events{event="error"}` across replicas, read from the exposition.
+fn recovery_errors(runner: &Runner) -> u64 {
+    runner
+        .replicas
+        .iter()
+        .map(|replica| {
+            let mut output = String::new();
+            replica.manager.metrics.peers.render(&mut output);
+            output
+                .lines()
+                .find(|line| line.contains("recovery_events{event=\"error\"}"))
+                .and_then(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Up to `limit` (node, origin, progress) entries lacking complete coverage.
+fn incomplete_origins(runner: &Runner, limit: usize) -> Vec<serde_json::Value> {
+    let nodes = runner.replicas.len();
+    let mut incomplete = Vec::new();
+    for (index, replica) in runner.replicas.iter().enumerate() {
+        let progress = replica.manager.handle().replication_progress().unwrap();
+        for origin in 0..nodes {
+            let name = format!("simulation-{origin}");
+            let entry = progress.iter().find(|p| p.origin.as_str() == name);
+            if entry.is_some_and(|p| {
+                p.contiguous_sequence == SPLIT_BRAIN_OPS_PER_NODE && p.sparse_positions == 0
+            }) {
+                continue;
+            }
+            incomplete.push(serde_json::json!({
+                "node": index, "origin": origin,
+                "contiguous": entry.map(|p| p.contiguous_sequence),
+                "sparse": entry.map(|p| p.sparse_positions),
+                "failure": entry.and_then(|p| p.recovery_failure.as_ref().map(|f| format!("{f:?}"))),
+            }));
+            if incomplete.len() == limit {
+                return incomplete;
+            }
+        }
+    }
+    incomplete
 }
 
 fn complete_origins(runner: &Runner) -> Vec<usize> {

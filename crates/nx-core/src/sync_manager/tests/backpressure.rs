@@ -262,6 +262,7 @@ async fn exhausted_repair_budget_defers_then_recovers_without_losing_history() {
         interval: b.config.anti_entropy_interval,
         shutdown_rx: b.shutdown_tx.subscribe(),
         metrics: Arc::clone(&b.metrics),
+        membership: None,
     });
     wait_for_counter(&b, "repair-budget", 17).await;
     let progress = b.handle().replication_progress().unwrap();

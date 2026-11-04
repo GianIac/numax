@@ -221,7 +221,7 @@ pub(super) fn spawn_reconnect_loop(context: ReconnectLoopContext) -> Option<Join
 pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
     let ReconnectLoopContext {
         local_id,
-        membership,
+        mut membership,
         rotation_interval,
         node,
         mut candidates_rx,
@@ -241,6 +241,9 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
     let mut neighbors = super::neighbors::Neighbors::new(node.now());
     let mut victim_cursor = 0usize;
     let mut jitter = super::delivery::Jitter::new(super::delivery::seed(local_id.as_str()));
+    let mut seen_alive = HashMap::new();
+    let mut revival_resets: HashMap<String, StdInstant> = HashMap::new();
+    let mut membership_open = true;
 
     'reconnect: loop {
         if *shutdown_rx.borrow() {
@@ -248,7 +251,10 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
         }
         let mut rotation_due = neighbors.rotate(node.now(), rotation_interval);
         let discovery = Arc::clone(&candidates_rx.borrow_and_update());
-        let records = membership.borrow().records.clone();
+        let records = membership.borrow_and_update().records.clone();
+        let alive = alive_endpoints(&records);
+        let revived: HashSet<_> = revived_endpoints(&alive, &seen_alive).collect();
+        seen_alive = alive;
         let was_suppressed = neighbors.recovery_suppressed();
         let candidates = neighbors.candidates(&discovery, &records, local_id.as_str());
         if !was_suppressed && neighbors.recovery_suppressed() {
@@ -265,6 +271,21 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
             node.now(),
         )
         .await;
+        // A member back in Alive with a newer version may sit behind a backoff that
+        // grew while it was unreachable; dial it promptly, once per rotation window.
+        let now = node.now();
+        revival_resets.retain(|addr, _| state.iter().any(|peer| &peer.addr == addr));
+        for peer in state.iter_mut() {
+            if !peer.stopped
+                && revived.contains(&peer.addr)
+                && revival_resets
+                    .get(&peer.addr)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= rotation_interval)
+            {
+                peer.reset(initial_delay, now);
+                revival_resets.insert(peer.addr.clone(), now);
+            }
+        }
         neighbors.advance();
         let connected = node.connected_peers().await;
         let connected_ids: HashSet<_> = connected.iter().map(|(_, id)| id.as_str()).collect();
@@ -406,21 +427,60 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
             break;
         };
 
-        tokio::select! {
-            biased;
-            _ = wait_for_shutdown(&mut shutdown_rx) => {
-                debug!("reconnect loop shutdown requested");
-                break;
-            }
-            changed = candidates_rx.changed() => {
-                if changed.is_err() {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    debug!("reconnect loop shutdown requested");
+                    break 'reconnect;
+                }
+                changed = candidates_rx.changed() => {
+                    if changed.is_err() {
+                        break 'reconnect;
+                    }
                     break;
                 }
+                changed = membership.changed(), if membership_open => {
+                    if changed.is_err() {
+                        membership_open = false;
+                        continue;
+                    }
+                    let alive = alive_endpoints(&membership.borrow().records);
+                    if revived_endpoints(&alive, &seen_alive).next().is_some() {
+                        break;
+                    }
+                }
+                _ = node.sleep_until(deadline) => break,
             }
-            _ = node.sleep_until(deadline) => {}
         }
     }
     debug!("reconnect loop terminated");
+}
+
+/// Canonical endpoints of Alive members with their membership version.
+fn alive_endpoints(
+    records: &[nx_net::MembershipRecord],
+) -> HashMap<String, nx_net::MembershipVersion> {
+    records
+        .iter()
+        .filter(|record| record.state == nx_net::MembershipState::Alive)
+        .filter_map(|record| {
+            let endpoint = record.endpoint.as_ref()?;
+            let endpoint = super::canonicalize_endpoint(endpoint).ok()?;
+            Some((endpoint, record.version))
+        })
+        .collect()
+}
+
+/// Endpoints that became Alive, or Alive at a newer version, since `seen`.
+fn revived_endpoints<'a>(
+    alive: &'a HashMap<String, nx_net::MembershipVersion>,
+    seen: &'a HashMap<String, nx_net::MembershipVersion>,
+) -> impl Iterator<Item = String> + 'a {
+    alive
+        .iter()
+        .filter(|(endpoint, version)| seen.get(*endpoint) != Some(*version))
+        .map(|(endpoint, _)| endpoint.clone())
 }
 
 pub(super) fn spawn_anti_entropy_loop(context: AntiEntropyLoopContext) -> Option<JoinHandle<()>> {
@@ -433,7 +493,12 @@ pub(super) async fn anti_entropy_loop(context: AntiEntropyLoopContext) {
     let mut jitter = super::delivery::Jitter::new(context.jitter_seed);
     let mut peer_cursor = 0usize;
     let mut previous = context.node.now();
-    loop {
+    let mut membership = context.membership.clone();
+    let mut seen_alive = membership
+        .as_mut()
+        .map(|membership| alive_members(&membership.borrow_and_update().records))
+        .unwrap_or_default();
+    'entropy: loop {
         let period =
             interval.saturating_sub(jitter.delay((interval / 8).min(Duration::from_secs(1))));
         let Some(deadline) = checked_anti_entropy_deadline(previous, period, context.node.now())
@@ -443,16 +508,151 @@ pub(super) async fn anti_entropy_loop(context: AntiEntropyLoopContext) {
             break;
         };
         previous = deadline;
-        tokio::select! {
-            biased;
-            _ = wait_for_shutdown(&mut shutdown_rx) => break,
-            _ = async {
-                context.node.sleep_until(deadline).await;
-                anti_entropy_turn(&context, &mut peer_cursor).await
-            } => {}
+        // Between periodic turns, service catch-up sessions: start them for members
+        // that came back Alive and retry summary pages that went unanswered. The
+        // retry deadline is fixed per round so frequent membership updates cannot
+        // postpone it indefinitely.
+        let mut retry_at = context.node.now().checked_add(SUMMARY_REQUEST_TIMEOUT);
+        loop {
+            let poll = retry_at.unwrap_or(deadline).min(deadline);
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => break 'entropy,
+                changed = async {
+                    match membership.as_mut() {
+                        Some(membership) => membership.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(receiver) = membership.as_mut() else { continue };
+                    if changed.is_err() {
+                        membership = None;
+                        continue;
+                    }
+                    let alive = alive_members(&receiver.borrow_and_update().records);
+                    let revived: HashSet<_> = alive
+                        .iter()
+                        .filter(|(member, version)| seen_alive.get(*member) != Some(*version))
+                        .map(|(member, _)| member.clone())
+                        .collect();
+                    seen_alive = alive;
+                    if !revived.is_empty() {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown_rx) => break 'entropy,
+                            _ = start_catch_up(&context, &revived) => {}
+                        }
+                    }
+                }
+                _ = context.node.sleep_until(poll) => {
+                    if poll >= deadline {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown_rx) => break 'entropy,
+                            _ = anti_entropy_turn(&context, &mut peer_cursor) => {}
+                        }
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => break 'entropy,
+                        _ = catch_up_turn(&context) => {}
+                    }
+                    retry_at = context.node.now().checked_add(SUMMARY_REQUEST_TIMEOUT);
+                }
+            }
         }
     }
     debug!("anti-entropy loop terminated");
+}
+
+/// Alive members by identity with their membership version.
+fn alive_members(
+    records: &[nx_net::MembershipRecord],
+) -> HashMap<String, nx_net::MembershipVersion> {
+    records
+        .iter()
+        .filter(|record| record.state == nx_net::MembershipState::Alive)
+        .map(|record| (record.member.clone(), record.version))
+        .collect()
+}
+
+/// Starts a catch-up session on the data connections of revived members: a
+/// partition can heal without the transport ever dropping those sessions.
+async fn start_catch_up(context: &AntiEntropyLoopContext, revived: &HashSet<String>) {
+    let peers: Vec<_> = context
+        .node
+        .connected_peers()
+        .await
+        .into_iter()
+        .filter(|(_, id)| revived.contains(id.as_str()))
+        .map(|(addr, _)| addr)
+        .collect();
+    if peers.is_empty() {
+        return;
+    }
+    {
+        let mut cursors = context.history_cursors.write().await;
+        for addr in &peers {
+            let cursor = cursors.entry(addr.clone()).or_default();
+            cursor.catch_up = true;
+            cursor.after_origin = None;
+            cursor.walk_gap = false;
+            cursor.rewalks = 0;
+        }
+    }
+    let mut turn = super::delivery::Turn::new();
+    for addr in peers {
+        if let Err(error) = request_summary(
+            &context.node,
+            &context.repair_budget,
+            &context.history_cursors,
+            &addr,
+            context.request_timeout,
+            Some(&mut turn),
+        )
+        .await
+        {
+            debug!(peer = %addr, %error, "catch-up summary request deferred");
+        }
+    }
+}
+
+/// Re-requests the next summary page of catch-up sessions whose previous request
+/// went unanswered; bounded by the per-turn message and byte budget.
+async fn catch_up_turn(context: &AntiEntropyLoopContext) {
+    let now = context.node.now();
+    let peers: Vec<_> = {
+        let connected = context.node.connected_peers().await;
+        let cursors = context.history_cursors.read().await;
+        connected
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .filter(|addr| {
+                cursors.get(addr).is_some_and(|cursor| {
+                    cursor.catch_up
+                        && cursor
+                            .request_deadline
+                            .is_none_or(|deadline| deadline <= now)
+                })
+            })
+            .collect()
+    };
+    let mut turn = super::delivery::Turn::new();
+    for addr in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
+        if let Err(error) = request_summary(
+            &context.node,
+            &context.repair_budget,
+            &context.history_cursors,
+            &addr,
+            context.request_timeout,
+            Some(&mut turn),
+        )
+        .await
+        {
+            debug!(peer = %addr, %error, "catch-up summary retry deferred");
+        }
+    }
 }
 
 /// One bounded protocol turn; both adapters execute this function.
@@ -475,40 +675,72 @@ pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cur
     }
     let mut turn = super::delivery::Turn::new();
     for (peer, _) in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
-        let after_origin = {
-            let mut cursors = context.history_cursors.write().await;
-            let cursor = cursors.entry(peer.clone()).or_default();
-            let now = context.node.now();
-            if cursor
-                .request_deadline
-                .is_some_and(|deadline| deadline > now)
-            {
-                continue;
-            }
-            let Some(deadline) = now.checked_add(context.request_timeout) else {
-                context.metrics.record_sync_error();
-                warn!("skipping anti-entropy turn: request deadline overflow");
-                return;
-            };
-            cursor.request_deadline = Some(deadline);
-            cursor.after_origin.clone()
-        };
-        if let Err(error) = send_repair_history(
+        if let Err(error) = request_summary(
             &context.node,
             &context.repair_budget,
+            &context.history_cursors,
             &peer,
-            HistoryMessage::SummaryRequest { after_origin },
+            context.request_timeout,
             Some(&mut turn),
         )
         .await
         {
-            if let Some(cursor) = context.history_cursors.write().await.get_mut(&peer) {
-                cursor.request_deadline = None;
-            }
             context.metrics.record_sync_error();
             debug!(%peer, %error, "history summary request failed");
         }
     }
+}
+
+/// Summary pages are small and idempotent, so a lost request is retried quickly
+/// instead of blocking that peer's walk for the whole socket timeout.
+pub(super) const SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// An origin already requested from another peer is not requested again until
+/// this much of that request's lifetime has elapsed; later requests hedge loss.
+pub(super) const REPAIR_HEDGE_AFTER: Duration = Duration::from_secs(2);
+/// Repeated walks per catch-up session while gaps remain (2, 4, 8 and 16 s apart);
+/// afterwards the periodic anti-entropy cadence takes over.
+pub(super) const CATCH_UP_REWALKS: u32 = 4;
+
+/// Claims the per-peer summary slot and requests the cursor's next page.
+/// Returns `false` when a summary request to that peer is still outstanding.
+async fn request_summary(
+    node: &Arc<dyn crate::peer_io::PeerIo>,
+    budget: &std::sync::Mutex<super::delivery::RepairBudget>,
+    cursors: &RwLock<HashMap<String, HistoryCursor>>,
+    peer: &str,
+    timeout: Duration,
+    turn: Option<&mut super::delivery::Turn>,
+) -> anyhow::Result<bool> {
+    let after_origin = {
+        let mut cursors = cursors.write().await;
+        let cursor = cursors.entry(peer.to_owned()).or_default();
+        let now = node.now();
+        if cursor
+            .request_deadline
+            .is_some_and(|deadline| deadline > now)
+        {
+            return Ok(false);
+        }
+        let deadline = now
+            .checked_add(timeout.min(SUMMARY_REQUEST_TIMEOUT))
+            .ok_or_else(|| anyhow::anyhow!("history summary deadline overflow"))?;
+        cursor.request_deadline = Some(deadline);
+        cursor.after_origin.clone()
+    };
+    if let Err(error) = send_repair_history(
+        node,
+        budget,
+        peer,
+        HistoryMessage::SummaryRequest { after_origin },
+        turn,
+    )
+    .await
+    {
+        // Keep the claimed deadline: a refused or failed send is retried after it,
+        // never in a tight loop.
+        return Err(error.into());
+    }
+    Ok(true)
 }
 
 fn checked_anti_entropy_deadline(
@@ -1160,6 +1392,28 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
             context.metrics.record_peer_connect();
             context.metrics.set_peers_connected(peers_connected);
             info!(peer = %node_id, addr = %addr, "peer connected");
+            // A new session may bridge a healed partition: walk its whole summary now
+            // instead of one page per anti-entropy interval.
+            {
+                let mut cursors = context.history_cursors.write().await;
+                let cursor = cursors.entry(addr.clone()).or_default();
+                cursor.catch_up = true;
+                cursor.after_origin = None;
+                cursor.walk_gap = false;
+                cursor.rewalks = 0;
+            }
+            if let Err(error) = request_summary(
+                &context.node,
+                &context.repair_budget,
+                &context.history_cursors,
+                &addr,
+                context.history_request_timeout,
+                None,
+            )
+            .await
+            {
+                debug!(peer = %addr, %error, "catch-up summary request deferred");
+            }
         }
         NodeEvent::PeerDisconnected {
             node_id,
@@ -1251,8 +1505,22 @@ async fn request_history_or_baseline(
     };
     {
         let mut requests = context.history_requests.write().await;
-        let pending = requests.entry(addr.to_owned()).or_default();
         let now = context.node.now();
+        // A fresh request for this origin to another peer is likely to repair it;
+        // only once it has aged past the hedge delay may another peer be asked.
+        let hedge_window = context
+            .history_request_timeout
+            .saturating_sub(REPAIR_HEDGE_AFTER);
+        if requests.iter().any(|(peer, pending)| {
+            peer != addr
+                && pending.get(origin.as_str()).is_some_and(|request| {
+                    request.deadline > now && request.deadline.duration_since(now) > hedge_window
+                })
+        }) {
+            debug!(%addr, %origin, "deferring history range: fresh request pending at another peer");
+            return Ok(());
+        }
+        let pending = requests.entry(addr.to_owned()).or_default();
         pending.retain(|_, request| request.deadline > now);
         if pending.contains_key(origin.as_str()) || pending.len() >= SUMMARY_PAGE {
             debug!(%addr, %origin, "deferring history range: request pending or peer budget full");
@@ -1441,6 +1709,7 @@ async fn handle_history_message(
             } else {
                 None
             };
+            let mut found_gap = false;
             let result = async {
                 for entry in entries {
                     let store = Arc::clone(&context.store);
@@ -1457,21 +1726,54 @@ async fn handle_history_message(
                         })
                         .await?;
                     if baseline {
+                        found_gap = true;
                         request_baseline(addr, origin, context).await?;
                     } else if let Some((start, end)) = missing {
+                        found_gap = true;
                         request_history_range(addr, origin, start, end, context).await?;
                     }
                 }
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            {
+            let continue_walk = {
                 let mut cursors = context.history_cursors.write().await;
                 let cursor = cursors.entry(addr.to_owned()).or_default();
-                cursor.after_origin = next;
+                cursor.after_origin = next.clone();
                 cursor.request_deadline = None;
-            }
+                cursor.catch_up |= found_gap;
+                cursor.walk_gap |= found_gap;
+                if next.is_some() {
+                    cursor.catch_up
+                } else {
+                    // A walk that found gaps is repeated after a growing delay, so
+                    // origins deferred to another peer's lost request are retried.
+                    if cursor.catch_up && cursor.walk_gap && cursor.rewalks < CATCH_UP_REWALKS {
+                        let delay = SUMMARY_REQUEST_TIMEOUT.saturating_mul(1 << cursor.rewalks);
+                        cursor.rewalks += 1;
+                        cursor.request_deadline = context.node.now().checked_add(delay);
+                    } else {
+                        cursor.catch_up = false;
+                        cursor.rewalks = 0;
+                    }
+                    cursor.walk_gap = false;
+                    false
+                }
+            };
             result?;
+            if continue_walk
+                && let Err(error) = request_summary(
+                    &context.node,
+                    &context.repair_budget,
+                    &context.history_cursors,
+                    addr,
+                    context.history_request_timeout,
+                    None,
+                )
+                .await
+            {
+                debug!(%addr, %error, "catch-up summary continuation deferred");
+            }
         }
         HistoryMessage::Request {
             request_id,
@@ -2188,6 +2490,7 @@ mod tests {
             interval: Duration::MAX,
             shutdown_rx,
             metrics: metrics(),
+            membership: None,
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(1), task)
@@ -3505,6 +3808,7 @@ mod tests {
             interval: Duration::from_millis(1),
             shutdown_rx,
             metrics: metrics(),
+            membership: None,
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3551,5 +3855,427 @@ mod tests {
             .unwrap();
         node.shutdown().await;
         source.shutdown().await;
+    }
+
+    async fn listening_source(
+        name: &str,
+    ) -> (Node, tokio::sync::mpsc::Receiver<NodeEvent>, String) {
+        let mut source = Node::new(NodeConfig::new(NodeId::new(name), "127.0.0.1:0"));
+        let events = source.take_event_receiver().unwrap();
+        let addr = source.start_listener().await.unwrap().to_string();
+        (source, events, addr)
+    }
+
+    async fn next_history(
+        events: &mut tokio::sync::mpsc::Receiver<NodeEvent>,
+        within: Duration,
+    ) -> Option<HistoryMessage> {
+        tokio::time::timeout(within, async {
+            loop {
+                if let NodeEvent::HistoryReceived { message, .. } = events.recv().await? {
+                    return Some(message);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    fn summary_entries(count: usize, high_sequence: u64) -> Vec<nx_sync::HistorySummary> {
+        (0..count)
+            .map(|index| nx_sync::HistorySummary {
+                origin: NodeId::new(format!("origin-{index:02}")),
+                high_sequence,
+                baseline_required: false,
+            })
+            .collect()
+    }
+
+    fn snapshot_with(
+        member: &str,
+        endpoint: &str,
+        state: nx_net::MembershipState,
+        incarnation: u64,
+    ) -> crate::membership::runtime::Snapshot {
+        crate::membership::runtime::Snapshot {
+            records: vec![nx_net::MembershipRecord {
+                member: member.into(),
+                reporter: member.into(),
+                version: nx_net::MembershipVersion {
+                    epoch: 1,
+                    incarnation,
+                },
+                state,
+                endpoint: Some(endpoint.into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_connected_starts_catch_up_walk_from_first_page() {
+        let (source, mut events, addr) = listening_source("source").await;
+        let context = baseline_test_context();
+        context.node.connect_to_peer(&addr).await.unwrap();
+        context
+            .history_cursors
+            .write()
+            .await
+            .entry(addr.clone())
+            .or_default()
+            .after_origin = Some("origin-07".into());
+        handle_node_event(
+            NodeEvent::PeerConnected {
+                node_id: NodeId::new("source"),
+                addr: addr.clone(),
+                peers_connected: 1,
+            },
+            &context,
+        )
+        .await;
+        assert!(matches!(
+            next_history(&mut events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::SummaryRequest { after_origin: None })
+        ));
+        let cursor = context.history_cursors.read().await[&addr].clone();
+        assert!(cursor.catch_up && cursor.request_deadline.is_some());
+        context.node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_walk_continues_to_wrap_and_rewalks_only_while_gaps_remain() {
+        let (source, mut events, addr) = listening_source("source").await;
+        let context = baseline_test_context();
+        context.node.connect_to_peer(&addr).await.unwrap();
+        context
+            .history_cursors
+            .write()
+            .await
+            .entry(addr.clone())
+            .or_default()
+            .catch_up = true;
+        // A full page without gaps continues the walk immediately.
+        handle_history_message(
+            &addr,
+            HistoryMessage::Summary {
+                entries: summary_entries(SUMMARY_PAGE, 0),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_history(&mut events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::SummaryRequest { after_origin: Some(after) }) if after == "origin-15"
+        ));
+        // A wrapped walk that found no gap ends the session without more requests.
+        handle_history_message(&addr, HistoryMessage::Summary { entries: vec![] }, &context)
+            .await
+            .unwrap();
+        assert!(!context.history_cursors.read().await[&addr].catch_up);
+        assert!(
+            next_history(&mut events, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+
+        // A walk that found a gap is repeated after growing delays, then given up.
+        let mut delays = Vec::new();
+        for _ in 0..=CATCH_UP_REWALKS {
+            {
+                let mut cursors = context.history_cursors.write().await;
+                let cursor = cursors.get_mut(&addr).unwrap();
+                cursor.catch_up = true;
+                cursor.request_deadline = None;
+            }
+            context.history_requests.write().await.clear();
+            let before = StdInstant::now();
+            handle_history_message(
+                &addr,
+                HistoryMessage::Summary {
+                    entries: summary_entries(1, 3),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            let cursor = context.history_cursors.read().await[&addr].clone();
+            delays.push(
+                cursor
+                    .catch_up
+                    .then(|| cursor.request_deadline.unwrap().duration_since(before)),
+            );
+        }
+        let expected: Vec<_> = (0..CATCH_UP_REWALKS)
+            .map(|n| Some(SUMMARY_REQUEST_TIMEOUT * (1 << n)))
+            .chain([None])
+            .collect();
+        for (delay, expected) in delays.iter().zip(&expected) {
+            match (delay, expected) {
+                (Some(delay), Some(expected)) => {
+                    assert!(*delay >= *expected && *delay < *expected + Duration::from_secs(1))
+                }
+                (None, None) => {}
+                other => panic!("unexpected rewalk schedule: {other:?} in {delays:?}"),
+            }
+        }
+        assert_eq!(context.history_cursors.read().await[&addr].rewalks, 0);
+        context.node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hedged_range_requests_defer_fresh_duplicates_then_ask_another_peer() {
+        let (first, mut first_events, first_addr) = listening_source("first").await;
+        let (second, mut second_events, second_addr) = listening_source("second").await;
+        let context = baseline_test_context();
+        context.node.connect_to_peer(&first_addr).await.unwrap();
+        context.node.connect_to_peer(&second_addr).await.unwrap();
+        let origin = NodeId::new("writer");
+        request_history_range(&first_addr, origin.clone(), 1, 3, &context)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_history(&mut first_events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::Request {
+                start: 1,
+                end: 3,
+                ..
+            })
+        ));
+        request_history_range(&second_addr, origin.clone(), 1, 3, &context)
+            .await
+            .unwrap();
+        assert!(
+            next_history(&mut second_events, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "a fresh request at another peer was duplicated"
+        );
+        assert!(
+            !context
+                .history_requests
+                .read()
+                .await
+                .get(&second_addr)
+                .is_some_and(|pending| pending.contains_key(origin.as_str()))
+        );
+        // Once the first request has aged past the hedge delay, another peer is asked.
+        context
+            .history_requests
+            .write()
+            .await
+            .get_mut(&first_addr)
+            .unwrap()
+            .get_mut(origin.as_str())
+            .unwrap()
+            .deadline = StdInstant::now() + context.history_request_timeout
+            - REPAIR_HEDGE_AFTER
+            - Duration::from_millis(100);
+        request_history_range(&second_addr, origin.clone(), 1, 3, &context)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_history(&mut second_events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::Request {
+                start: 1,
+                end: 3,
+                ..
+            })
+        ));
+        context.node.shutdown().await;
+        first.shutdown().await;
+        second.shutdown().await;
+    }
+
+    fn quiet_anti_entropy(
+        node: Arc<Node>,
+        cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+        membership: Option<watch::Receiver<crate::membership::runtime::Snapshot>>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> AntiEntropyLoopContext {
+        AntiEntropyLoopContext {
+            store: temp_store(),
+            jitter_seed: 1,
+            repair_budget: Arc::new(std::sync::Mutex::new(
+                super::super::delivery::RepairBudget::new(StdInstant::now()),
+            )),
+            history_cursors: cursors,
+            request_timeout: Duration::from_secs(30),
+            node,
+            // Periodic turns stay out of the observed window.
+            interval: Duration::from_secs(3600),
+            shutdown_rx,
+            metrics: metrics(),
+            membership,
+        }
+    }
+
+    #[tokio::test]
+    async fn revived_member_starts_catch_up_on_an_existing_connection() {
+        let (source, mut events, addr) = listening_source("source").await;
+        let node = Arc::new(Node::new(NodeConfig::new(
+            NodeId::new("target"),
+            "127.0.0.1:0",
+        )));
+        node.connect_to_peer(&addr).await.unwrap();
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let (membership_tx, membership_rx) = watch::channel(snapshot_with(
+            "source",
+            &addr,
+            nx_net::MembershipState::Dead,
+            0,
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_anti_entropy_loop(quiet_anti_entropy(
+            node.clone(),
+            Arc::clone(&cursors),
+            Some(membership_rx),
+            shutdown_rx,
+        ))
+        .unwrap();
+        assert!(
+            next_history(&mut events, Duration::from_millis(300))
+                .await
+                .is_none()
+        );
+        membership_tx.send_replace(snapshot_with(
+            "source",
+            &addr,
+            nx_net::MembershipState::Alive,
+            1,
+        ));
+        assert!(matches!(
+            next_history(&mut events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::SummaryRequest { after_origin: None })
+        ));
+        assert!(cursors.read().await[&addr].catch_up);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unanswered_catch_up_summary_is_retried_despite_frequent_membership_updates() {
+        let (source, mut events, addr) = listening_source("source").await;
+        let node = Arc::new(Node::new(NodeConfig::new(
+            NodeId::new("target"),
+            "127.0.0.1:0",
+        )));
+        node.connect_to_peer(&addr).await.unwrap();
+        let cursors = Arc::new(RwLock::new(HashMap::from([(
+            addr.clone(),
+            HistoryCursor {
+                catch_up: true,
+                request_deadline: Some(StdInstant::now()),
+                ..Default::default()
+            },
+        )])));
+        let (membership_tx, membership_rx) = watch::channel(snapshot_with(
+            "source",
+            &addr,
+            nx_net::MembershipState::Alive,
+            0,
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_anti_entropy_loop(quiet_anti_entropy(
+            node.clone(),
+            Arc::clone(&cursors),
+            Some(membership_rx),
+            shutdown_rx,
+        ))
+        .unwrap();
+        // Unrelated membership publications must not postpone the retry deadline.
+        let churn = tokio::spawn(async move {
+            loop {
+                membership_tx.send_modify(|snapshot| snapshot.health += 1);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        assert!(matches!(
+            next_history(
+                &mut events,
+                SUMMARY_REQUEST_TIMEOUT + Duration::from_secs(1)
+            )
+            .await,
+            Some(HistoryMessage::SummaryRequest { .. })
+        ));
+        churn.abort();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn revived_member_resets_grown_reconnect_backoff() {
+        let endpoint = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let node = Arc::new(Node::new(NodeConfig::new(
+            NodeId::new("dialer"),
+            "127.0.0.1:0",
+        )));
+        let metrics = metrics();
+        let (membership_tx, membership_rx) = watch::channel(snapshot_with(
+            "remote",
+            &endpoint,
+            nx_net::MembershipState::Dead,
+            0,
+        ));
+        let (_candidates_tx, candidates_rx) = watch::channel(Arc::new(Vec::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_reconnect_loop(ReconnectLoopContext {
+            local_id: NodeId::new("dialer"),
+            membership: membership_rx,
+            rotation_interval: Duration::from_secs(3600),
+            node: node.clone(),
+            candidates_rx,
+            max_peers: 4,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(20),
+            peer_dead_after_failures: 3,
+            shutdown_rx,
+            metrics: Arc::clone(&metrics),
+            peer_health: Arc::new(RwLock::new(HashMap::new())),
+        })
+        .unwrap();
+        // Failed dials to the unreachable member grow its backoff to several seconds.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let mut remote = Node::new(NodeConfig::new(NodeId::new("remote"), &endpoint));
+        let _events = remote.take_event_receiver().unwrap();
+        remote.start_listener().await.unwrap();
+        let revived = StdInstant::now();
+        membership_tx.send_replace(snapshot_with(
+            "remote",
+            &endpoint,
+            nx_net::MembershipState::Alive,
+            1,
+        ));
+        tokio::time::timeout(Duration::from_millis(1500), async {
+            while node.connected_peer_count().await == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("revived member waited for its grown backoff");
+        assert!(revived.elapsed() < Duration::from_millis(1500));
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        node.shutdown().await;
+        remote.shutdown().await;
     }
 }

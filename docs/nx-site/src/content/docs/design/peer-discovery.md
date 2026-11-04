@@ -283,7 +283,9 @@ Each turn advances dial priority and attempts at most eight dials with existing
 per-endpoint backoff. Every 30 seconds the recovery window rotates. With full
 slots and an eligible alternative, at most one managed neighbor is replaced in
 that interval. Existing connections to the same membership identity satisfy the
-contact without a redundant reverse dial.
+contact without a redundant reverse dial. When a member returns to `Alive` at a
+newer version, its endpoint's backoff restarts from the initial delay at most
+once per rotation interval, so a healed partition is redialed promptly.
 
 `Dead` contacts remain eligible so healed partitions can reconnect. `Left`
 contacts are excluded until fresh owner admission supersedes them. Discovery
@@ -353,6 +355,19 @@ Anti-entropy uses all active data connections, including inbound sessions and
 connections no longer present in discovery. Its default interval is 30 seconds.
 It exchanges per-origin summaries, compares advertised history with durable
 receipt coverage and requests missing ranges.
+
+Between periodic turns, a **catch-up session** walks one peer's summary pages
+back to back instead of one page per interval. It starts when a data session
+connects and when a membership record returns to `Alive` at a newer version,
+because a partition can heal without the transport ever dropping that session.
+A periodic page that reveals missing history also continues the walk. A walk
+that found gaps is repeated after 2, 4, 8 and 16 seconds at most, then the
+periodic cadence takes over; a walk without gaps ends the session. A summary
+request is considered unanswered after `min(socket timeout, 2 s)` and is
+retried by the session; range and baseline requests keep the socket timeout.
+An origin already requested from another peer within the last 2 seconds is not
+requested again, so a reconnecting cluster does not ask every peer for the
+same history while a lost request is still hedged by later walks.
 
 Summary pages contain at most 16 origins. A replay request covers at most 128
 positions; replay pages are limited to 8 MiB and reserve space under the

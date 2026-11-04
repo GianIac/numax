@@ -92,6 +92,7 @@ async fn rate_limited_fast_path_retains_all_families_for_periodic_repair() {
             interval: Duration::from_millis(10),
             shutdown_rx: b.shutdown_tx.subscribe(),
             metrics: Arc::clone(&b.metrics),
+            membership: None,
         });
         wait_for_counter(&b, "paced-g", 7).await;
         wait_for_pncounter(&b, "paced-p", 5).await;
