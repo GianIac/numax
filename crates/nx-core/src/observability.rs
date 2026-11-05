@@ -426,6 +426,39 @@ impl RuntimeMetrics {
         self.ready.load(Ordering::Relaxed)
     }
 
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn replication_work_for_test(&self) -> BTreeMap<&'static str, u64> {
+        [
+            ("peer_connects_total", &self.peer_connects_total),
+            ("peer_disconnects_total", &self.peer_disconnects_total),
+            ("broadcast_batches_total", &self.broadcast_batches_total),
+            ("broadcast_ops_total", &self.broadcast_ops_total),
+            ("remote_ops_received_total", &self.remote_ops_received_total),
+            ("remote_ops_applied_total", &self.remote_ops_applied_total),
+            (
+                "remote_ops_duplicate_total",
+                &self.remote_ops_duplicate_total,
+            ),
+            ("remote_op_batches_total", &self.remote_op_batches_total),
+            (
+                "remote_op_apply_errors_total",
+                &self.remote_op_apply_errors_total,
+            ),
+            (
+                "remote_op_batch_apply_sum_ns",
+                &self.remote_op_batch_apply_duration.sum_ns,
+            ),
+            (
+                "remote_op_batch_apply_count",
+                &self.remote_op_batch_apply_duration.count,
+            ),
+            ("sync_errors_total", &self.sync_errors_total),
+        ]
+        .into_iter()
+        .map(|(name, counter)| (name, counter.load(Ordering::Relaxed)))
+        .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn render_for_test(&self, store: &NxStore) -> String {
         render_metrics(self.snapshot(store))

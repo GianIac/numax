@@ -649,7 +649,7 @@ pub(super) fn isolated_test_output(
     let directory = tempfile::tempdir().unwrap();
     let mut output = tempfile::tempfile().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test_name, "--nocapture"])
+        .args(["--exact", test_name, "--include-ignored", "--nocapture"])
         .env(marker, value)
         .env("TMPDIR", directory.path())
         .env("TMP", directory.path())

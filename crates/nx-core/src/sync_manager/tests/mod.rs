@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 mod backpressure;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod detector_soak;
 mod determinism;
 mod e2e;
 mod local_storage;
