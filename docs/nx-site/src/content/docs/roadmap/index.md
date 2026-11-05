@@ -220,9 +220,9 @@ Release-scale loss, partition and detector criteria remain separate below.
 **Test scenarios**:
 - [x] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model: test sync_manager::manager::tests::determinism::split_brain_50_nodes_production_defaults_json
 - [ ] Separate simulated message loss from packet loss over the real transport
-- [ ] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
-- [ ] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
-- [ ] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
+- [x] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
+- [x] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
+- [x] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
 - [ ] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use
 
 **Closing criterion**:

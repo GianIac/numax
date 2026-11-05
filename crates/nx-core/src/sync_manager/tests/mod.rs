@@ -16,6 +16,7 @@ mod local_storage;
 mod manual;
 mod rate;
 mod recovery;
+mod restart;
 mod sequencing;
 mod support;
 mod topology;

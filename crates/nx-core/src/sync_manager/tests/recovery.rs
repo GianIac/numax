@@ -255,6 +255,7 @@ async fn remote_apply_forwards_only_new_persisted_operations_for_all_families() 
 #[tokio::test]
 async fn remote_apply_storage_failure_returns_no_forwardable_operations() {
     let target = manager("forward-failed", temp_store());
+    let before = target.store.scan_prefix(b"__nx/crdt/").unwrap();
     target.store.inject_disk_full_on_writes(true);
 
     assert!(
@@ -262,8 +263,44 @@ async fn remote_apply_storage_failure_returns_no_forwardable_operations() {
             .await
             .is_err()
     );
-    assert_eq!(target.get_counter_value("counter").await, 0);
+    assert_eq!(before, target.store.scan_prefix(b"__nx/crdt/").unwrap());
+    assert!(target.counters.read().await.is_empty());
+    assert!(target.pncounters.read().await.is_empty());
+    assert!(target.lww_registers.read().await.is_empty());
+    assert!(target.lww_maps.read().await.is_empty());
+    assert!(target.orsets.read().await.is_empty());
+    assert!(target.rgas.read().await.is_empty());
+    assert_eq!(target.seen_ops.read().await.len(), 0);
     assert!(target.op_log.read().await.is_empty());
+    assert!(target.handle().replication_progress().unwrap().is_empty());
+
+    target.store.inject_disk_full_on_writes(false);
+    let entries = operations();
+    let forwarded = apply_sequenced_ops_and_collect(&entries, &remote_apply_context(&target))
+        .await
+        .unwrap();
+    assert_eq!(forwarded, entries);
+    let source = manager("forward-source", temp_store());
+    seed(&source).await;
+    assert_durable_equal(&source.store, &target.store);
+    assert_eq!(target.get_counter_value("counter").await, 10);
+    assert_eq!(target.get_pncounter_value("pn").await, 5);
+    assert_eq!(
+        target.get_lww_register_value("register").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(target.get_lww_map_entries("map").await.is_empty());
+    assert!(target.get_orset_elements("set").await.is_empty());
+    assert_eq!(target.get_rga_values("rga").await, vec![vec![2]]);
+    let progress = target.handle().replication_progress().unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].contiguous_sequence, entries.len() as u64);
+    assert_eq!(progress[0].sparse_positions, 0);
+    let duplicate = apply_sequenced_ops_and_collect(&entries, &remote_apply_context(&target))
+        .await
+        .unwrap();
+    assert!(duplicate.is_empty());
+    assert_durable_equal(&source.store, &target.store);
 }
 
 #[tokio::test]
@@ -1117,7 +1154,144 @@ fn baseline_process_crash_preserves_atomic_state_and_coverage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_brain_expired_history_fails_explicitly_over_real_tcp_json_and_bincode() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::recovery::split_brain_expired_history_fails_explicitly_over_real_tcp_json_and_bincode",
+    ) {
+        return;
+    }
+    let state_snapshot = |store: &NxStore| {
+        crate::sync_manager::schema::StoreTable::ALL
+            .into_iter()
+            .take(12)
+            .map(|table| store.scan_prefix(table.data_prefix().as_bytes()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let mut before = Vec::new();
+        for (index, directory) in directories.iter().enumerate() {
+            let isolated = manager(
+                &format!("retention-{index}"),
+                Arc::new(NxStore::open(directory.path()).unwrap()),
+            );
+            local_six_family_workload(&isolated.handle(), index as u64).await;
+            assert_eq!(isolated.op_log.read().await.len(), 1);
+            let progress = isolated.handle().replication_progress().unwrap();
+            assert_eq!(progress.len(), 1);
+            assert_eq!(progress[0].contiguous_sequence, 12);
+            before.push(state_snapshot(&isolated.store));
+        }
+        // Reopen without pending broadcast queues: only retained durable history
+        // and a qualifying baseline may repair the divergent states.
+        let mut replicas = Vec::new();
+        for (index, directory) in directories.iter().enumerate() {
+            wait_for_store_file_release(directory.path()).await.unwrap();
+            let mut replica = manager(
+                &format!("retention-{index}"),
+                Arc::new(NxStore::open(directory.path()).unwrap()),
+            );
+            replica.config.listen_addr = Some(free_addr());
+            replica.config.serialization_format = format;
+            replica.config.anti_entropy_interval = Duration::from_millis(25);
+            replica.start().await.unwrap();
+            replicas.push(replica);
+        }
+        let peer = replicas[1].config.listen_addr.as_ref().unwrap();
+        replicas[0].connect_to_peer(peer).await.unwrap();
+        // Once both summaries are known, neither source has a complete cut:
+        // its own accepted operations are intact, but the other origin is missing.
+        let refused = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                poll.tick().await;
+                let mut complete = true;
+                for (index, replica) in replicas.iter().enumerate() {
+                    let progress = replica.handle().replication_progress().unwrap();
+                    complete &= progress.iter().any(|entry| {
+                        entry.origin.as_str() == format!("retention-{}", 1 - index)
+                            && entry.recovery_failure.as_ref().is_some_and(|failure| {
+                                failure.reason == BaselineFailure::SourceIncomplete
+                            })
+                    });
+                }
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            refused.is_ok(),
+            "codec={format:?}: expected explicit divergent-cut refusal, progress={:?}",
+            replicas
+                .iter()
+                .map(|replica| replica.handle().replication_progress().unwrap())
+                .collect::<Vec<_>>()
+        );
+        for replica in &mut replicas {
+            replica.shutdown().await.unwrap();
+        }
+        for (index, replica) in replicas.iter().enumerate() {
+            assert_eq!(replica.connected_peer_count().await, 0);
+            assert_eq!(
+                state_snapshot(&replica.store),
+                before[index],
+                "codec={format:?}: durable and materialized local state changed"
+            );
+            assert_eq!(replica.get_counter_value("det-g").await, 7);
+            assert_eq!(replica.get_pncounter_value("det-p").await, 5);
+            assert_eq!(
+                replica.get_lww_register_value("det-r").await,
+                Some(b"winner".to_vec())
+            );
+            assert!(replica.get_lww_map_entries("det-m").await.is_empty());
+            assert_eq!(replica.get_orset_elements("det-o").await, vec!["present"]);
+            assert_eq!(
+                replica.get_rga_values("det-a").await,
+                vec![b"present".to_vec()]
+            );
+            let progress = replica.handle().replication_progress().unwrap();
+            assert_eq!(progress.len(), 2);
+            let local = progress
+                .iter()
+                .find(|entry| entry.origin == replica.node_id)
+                .unwrap();
+            assert_eq!(local.contiguous_sequence, 12);
+            assert_eq!(local.sparse_positions, 0);
+            let remote = progress
+                .iter()
+                .find(|entry| entry.origin != replica.node_id)
+                .unwrap();
+            assert_eq!(remote.contiguous_sequence, 0);
+            assert_eq!(remote.known_high_sequence, 12);
+            assert_eq!(remote.sparse_positions, 0);
+            assert!(remote.source_unavailable);
+            assert_eq!(
+                remote.recovery_failure.as_ref().unwrap().reason,
+                BaselineFailure::SourceIncomplete
+            );
+            assert_eq!(
+                missing_range(&replica.store, &remote.origin).unwrap(),
+                Some((1, 12))
+            );
+        }
+        println!(
+            "RETENTION_SPLIT_BRAIN codec={format:?} nodes=2 operations_per_node=12 retention_operations=1 recovery=SourceIncomplete local_state=preserved"
+        );
+    }
+}
+
+#[tokio::test]
 async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repair() {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::recovery::baseline_unrecoverable_source_is_observable_and_another_source_can_repair",
+    ) {
+        return;
+    }
     let mut incomplete = manager("incomplete", temp_store());
     apply_sequenced_ops(
         &[operations().pop().unwrap()],
@@ -1134,7 +1308,9 @@ async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repa
     target.config.anti_entropy_interval = Duration::from_millis(25);
     target.start().await.unwrap();
     target.connect_to_peer(&incomplete_addr).await.unwrap();
-    let failure_result = tokio::time::timeout(Duration::from_secs(10), async {
+    let recovery_limit = Duration::from_secs(10);
+    let failure_started = std::time::Instant::now();
+    let failure_result = tokio::time::timeout(recovery_limit, async {
         let mut poll = tokio::time::interval(Duration::from_millis(10));
         loop {
             poll.tick().await;
@@ -1149,9 +1325,10 @@ async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repa
         }
     })
     .await;
+    let failure_elapsed = failure_started.elapsed();
     assert!(
-        failure_result.is_ok(),
-        "timed out waiting for source-scoped failure: progress={:?}, connected_peers={}",
+        failure_result.is_ok() && failure_elapsed <= recovery_limit,
+        "timed out waiting for source-scoped failure: elapsed={failure_elapsed:?}, progress={:?}, connected_peers={}",
         target.handle().replication_progress().unwrap(),
         target.connected_peer_count().await
     );
@@ -1164,7 +1341,8 @@ async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repa
     complete.config.anti_entropy_interval = Duration::from_millis(25);
     complete.start().await.unwrap();
     target.connect_to_peer(&complete_addr).await.unwrap();
-    let repair_result = tokio::time::timeout(Duration::from_secs(10), async {
+    let repair_started = std::time::Instant::now();
+    let repair_result = tokio::time::timeout(recovery_limit, async {
         let mut poll = tokio::time::interval(Duration::from_millis(10));
         loop {
             poll.tick().await;
@@ -1184,6 +1362,7 @@ async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repa
         }
     })
     .await;
+    let repair_elapsed = repair_started.elapsed();
     let peers = target.node.as_ref().unwrap().connected_peers().await;
     let summary_cursors = target
         .history_cursors
@@ -1199,8 +1378,8 @@ async fn baseline_unrecoverable_source_is_observable_and_another_source_can_repa
         })
         .collect::<Vec<_>>();
     assert!(
-        repair_result.is_ok(),
-        "timed out waiting for alternate-source repair: progress={:?}, peers={peers:?}, summary_cursors={summary_cursors:?}, expected_source={complete_addr}",
+        repair_result.is_ok() && repair_elapsed <= recovery_limit,
+        "timed out waiting for alternate-source repair: elapsed={repair_elapsed:?}, progress={:?}, peers={peers:?}, summary_cursors={summary_cursors:?}, expected_source={complete_addr}",
         target.handle().replication_progress().unwrap(),
     );
     assert_durable_equal(&complete.store, &target.store);

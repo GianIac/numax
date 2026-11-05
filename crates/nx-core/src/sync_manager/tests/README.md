@@ -10,6 +10,8 @@ production module:
   `support.rs`.
 - Deterministic multi-family replay lives in `determinism.rs`; it drives the
   same production loops and membership actor through the internal test ports.
+- Rolling and full-cluster restart integration lives in `restart.rs`; it
+  reopens on-disk stores and checks all six families over real loopback TCP.
 
 The E2E files must exercise behavior through the sync manager and its handle.
 They must not contain family-independent setup or duplicate helpers from
@@ -28,6 +30,19 @@ Run the complete suite with:
 ```bash
 cargo test -p nx-core
 ```
+
+Run the three-node rolling and full-cluster restart checks with both codecs:
+
+```bash
+cargo test --release --locked -p nx-core --lib \
+  sync_manager::manager::tests::restart:: -- --nocapture --test-threads=1
+```
+
+Each restart test uses the existing bounded child-process helper. A restarted
+node is a new `SyncManager` using a reopened datastore, not a separate daemon
+process. Rolling restart covers all three nodes, with recovery between stops;
+full shutdown stops every node concurrently before reopening any store. Both
+are orderly-shutdown checks, not abrupt crashes or a 50-node campaign.
 
 ## Timing-sensitive storage tests
 

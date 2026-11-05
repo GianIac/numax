@@ -642,6 +642,18 @@ async fn rotating_full_slot_recovers_six_families_after_data_partition() {
                         && manager.get_orset_elements("topology-o").await
                             == vec!["value".to_string()]
                         && manager.get_rga_values("topology-a").await == vec![b"value".to_vec(); 2];
+                    let progress = manager.handle().replication_progress().unwrap();
+                    complete &= [&b.node_id, &c.node_id].into_iter().all(|origin| {
+                        progress.iter().any(|entry| {
+                            &entry.origin == origin
+                                && entry.contiguous_sequence == 11
+                                && entry.known_high_sequence == 11
+                                && entry.sparse_positions == 0
+                                && entry.recovery_failure.is_none()
+                                && !entry.baseline_missing
+                                && !entry.baseline_unconfirmed
+                        })
+                    });
                 }
                 if complete {
                     let scan_started = StdInstant::now();

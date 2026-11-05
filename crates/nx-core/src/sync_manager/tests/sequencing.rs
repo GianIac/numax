@@ -1194,11 +1194,50 @@ async fn sequenced_all_families_ignore_delayed_replay_after_eviction_and_restart
     apply(&target, &operations).await.unwrap();
     assert_eq!(target.get_counter_value("visits").await, 7);
     assert_eq!(target.get_pncounter_value("balance").await, 5);
-    assert_eq!(target.op_log.read().await.len(), 1);
     assert_eq!(
-        target.handle().replication_progress().unwrap()[0].sparse_positions,
-        0
+        target.get_lww_register_value("status").await,
+        Some(b"ready".to_vec())
     );
+    assert!(target.get_lww_map_entries("settings").await.is_empty());
+    assert!(target.get_orset_elements("tags").await.is_empty());
+    assert!(target.get_rga_values("comments").await.is_empty());
+    assert_eq!(read_materialized(&store, "visits"), 7);
+    assert_eq!(read_materialized_pncounter(&store, "balance"), 5);
+    assert_eq!(read_materialized_lww_register(&store, "status"), b"ready");
+    assert!(read_materialized_lww_map(&store, "settings").is_empty());
+    assert!(read_materialized_orset(&store, "tags").is_empty());
+    assert!(read_materialized_rga(&store, "comments").is_empty());
+    assert_eq!(
+        serde_json::to_value(read_durable_gcounter_state(&store, "visits")).unwrap(),
+        serde_json::to_value(read_durable_gcounter_state(&source.store, "visits")).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(read_durable_pncounter_state(&store, "balance")).unwrap(),
+        serde_json::to_value(read_durable_pncounter_state(&source.store, "balance")).unwrap()
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status"),
+        read_durable_lww_register_state(&source.store, "status")
+    );
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings"),
+        read_durable_lww_map_state(&source.store, "settings")
+    );
+    assert_eq!(
+        read_durable_orset_state(&store, "tags"),
+        read_durable_orset_state(&source.store, "tags")
+    );
+    assert_eq!(
+        read_durable_rga_state(&store, "comments"),
+        read_durable_rga_state(&source.store, "comments")
+    );
+    assert_eq!(target.op_log.read().await.len(), 1);
+    let progress = target.handle().replication_progress().unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].contiguous_sequence, operations.len() as u64);
+    assert_eq!(progress[0].known_high_sequence, operations.len() as u64);
+    assert_eq!(progress[0].sparse_positions, 0);
+    assert!(progress[0].recovery_failure.is_none());
 }
 
 #[tokio::test]
