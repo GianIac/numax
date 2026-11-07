@@ -12,6 +12,17 @@ use super::replication::{
 };
 use super::types::*;
 
+#[cfg(test)]
+fn record_remote_storage_timing(stage: &'static str, started: std::time::Instant, success: bool) {
+    debug!(
+        target: "nx_core::sync_manager::storage",
+        message = stage,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success,
+        "bounded remote persistence diagnostic"
+    );
+}
+
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::Materialized, key)
 }
@@ -1222,9 +1233,50 @@ pub(super) fn persist_remote_ops_batch(
             .map(|(k, v)| (k.as_slice(), v.as_slice())),
     );
     if let Some(lease) = lease {
-        lease.apply_batch(&sets, &deletes)?;
+        #[cfg(test)]
+        let batch_started = std::time::Instant::now();
+        let batch_result = lease.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage batch completed",
+            batch_started,
+            batch_result.is_ok(),
+        );
+        batch_result?;
+        // Couple remote admission to storage completion: sled can enqueue log
+        // synchronization during apply_batch. Keep the publication guards and
+        // lease until the covering flush succeeds, including on cancellation.
+        #[cfg(test)]
+        let flush_started = std::time::Instant::now();
+        let flush_result = lease.flush();
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage flush completed",
+            flush_started,
+            flush_result.is_ok(),
+        );
+        flush_result?;
     } else {
-        store.apply_batch(&sets, &deletes)?;
+        #[cfg(test)]
+        let batch_started = std::time::Instant::now();
+        let batch_result = store.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage batch completed",
+            batch_started,
+            batch_result.is_ok(),
+        );
+        batch_result?;
+        #[cfg(test)]
+        let flush_started = std::time::Instant::now();
+        let flush_result = store.flush();
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage flush completed",
+            flush_started,
+            flush_result.is_ok(),
+        );
+        flush_result?;
     }
     Ok(())
 }

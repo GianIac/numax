@@ -62,6 +62,16 @@ pub enum NodeConfigError {
     #[error("event_channel_capacity must be in 1..={limit}")]
     InvalidEventChannelCapacity { limit: usize },
 
+    #[error(
+        "priority event capacity must be less than event_channel_capacity ({event_channel_capacity})"
+    )]
+    InvalidPriorityEventChannelCapacity { event_channel_capacity: usize },
+
+    #[error(
+        "priority event channel must be configured before event receiver access or network startup"
+    )]
+    PriorityEventChannelAlreadyStarted,
+
     #[error("socket_timeout must be positive and form a representable deadline")]
     InvalidSocketTimeout,
 }

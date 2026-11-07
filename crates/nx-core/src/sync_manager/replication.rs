@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -141,6 +141,7 @@ pub(super) async fn try_connect_configured_peer(
             debug!(
                 peer = %peer_addr,
                 limit,
+                error_class = "peer_limit_reached",
                 "skipping configured peer connect: peer slot limit reached"
             );
             ConfiguredPeerConnectOutcome::SlotLimitReached
@@ -167,6 +168,7 @@ pub(super) async fn try_connect_configured_peer(
                     debug!(
                         peer = %peer_addr,
                         error = %e,
+                        error_class = connection_error_class(&e),
                         "configured peer connect failed with fatal wire error"
                     );
                 }
@@ -174,12 +176,18 @@ pub(super) async fn try_connect_configured_peer(
                     debug!(
                         peer = %peer_addr,
                         error = %e,
+                        error_class = connection_error_class(&e),
                         retry_after_ms = delay.as_millis(),
                         "configured peer connect rate limited"
                     );
                 }
                 ConfiguredPeerConnectOutcome::Failed => {
-                    debug!(peer = %peer_addr, error = %e, "configured peer connect failed");
+                    debug!(
+                        peer = %peer_addr,
+                        error = %e,
+                        error_class = connection_error_class(&e),
+                        "configured peer connect failed"
+                    );
                 }
                 ConfiguredPeerConnectOutcome::Connected
                 | ConfiguredPeerConnectOutcome::AlreadyConnected
@@ -204,6 +212,176 @@ fn connect_failure_outcome(error: &NetError) -> ConfiguredPeerConnectOutcome {
     }
 }
 
+fn connection_error_class(error: &NetError) -> &'static str {
+    match error {
+        NetError::Io(error) => match error.kind() {
+            std::io::ErrorKind::ConnectionRefused => "io_connection_refused",
+            std::io::ErrorKind::ConnectionReset => "io_connection_reset",
+            std::io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+            std::io::ErrorKind::BrokenPipe => "io_broken_pipe",
+            std::io::ErrorKind::UnexpectedEof => "io_unexpected_eof",
+            std::io::ErrorKind::TimedOut => "io_timed_out",
+            std::io::ErrorKind::WouldBlock => "io_would_block",
+            _ => "io_other",
+        },
+        NetError::ConnectionFailed(message)
+            if message.starts_with("outbound connection attempt limit reached:") =>
+        {
+            "outbound_attempt_limit"
+        }
+        NetError::ConnectionFailed(_) => "connection_failed",
+        NetError::PeerDisconnected(_) => "peer_disconnected",
+        NetError::InvalidMessage(_) => "invalid_message",
+        NetError::Wire(error) => match error.retry_policy() {
+            WireRetryPolicy::Fatal => "wire_fatal",
+            WireRetryPolicy::RetryAfter(_) => "wire_retry_after",
+            WireRetryPolicy::Retry | WireRetryPolicy::RequestFatal => "wire_retry",
+            _ => "wire_other",
+        },
+        NetError::MessageTooLarge { .. } => "message_too_large",
+        NetError::Timeout => "timeout",
+        NetError::ChannelClosed => "channel_closed",
+        NetError::TlsError(_) => "tls_error",
+        NetError::PeerNotAllowed(_) => "peer_not_allowed",
+        NetError::PeerLimitReached(_) => "peer_limit_reached",
+        NetError::NodeIdMismatch { .. } => "node_id_mismatch",
+        NetError::Serialization(_)
+        | NetError::BinarySerialization(_)
+        | NetError::BinaryDeserialization(_) => "serialization",
+    }
+}
+
+#[cfg(test)]
+fn trace_recovery_event(event: &'static str, items: u64) {
+    debug!(
+        target: "nx_core::sync_manager::replication",
+        recovery_event = event,
+        recovery_items = items,
+        "bounded recovery diagnostic"
+    );
+}
+
+#[cfg(test)]
+fn trace_recovery_send_failure(kind: &'static str, error: &NetError) {
+    let class = match connection_error_class(error) {
+        "io_unexpected_eof" => "eof",
+        "io_connection_reset" | "io_connection_aborted" | "io_broken_pipe" => "reset",
+        "io_connection_refused" => "refused",
+        "io_timed_out" | "timeout" => "timeout",
+        "io_would_block" => "budget",
+        "peer_limit_reached" => "peer_limit",
+        "connection_failed" | "outbound_attempt_limit" => "connection",
+        "peer_disconnected" => "peer_disconnected",
+        "channel_closed" => "channel_closed",
+        "wire_fatal" | "wire_retry_after" | "wire_retry" | "wire_other" => "wire",
+        "serialization" => "serialization",
+        "invalid_message" | "message_too_large" | "tls_error" | "peer_not_allowed"
+        | "node_id_mismatch" => "protocol",
+        "io_other" => "io",
+        _ => "other",
+    };
+    let event = match (kind, class) {
+        ("summary", "eof") => "summary_send_failed_eof",
+        ("summary", "reset") => "summary_send_failed_reset",
+        ("summary", "refused") => "summary_send_failed_refused",
+        ("summary", "timeout") => "summary_send_failed_timeout",
+        ("summary", "peer_limit") => "summary_send_failed_peer_limit",
+        ("summary", "budget") => "summary_send_failed_budget",
+        ("summary", "connection") => "summary_send_failed_connection",
+        ("summary", "peer_disconnected") => "summary_send_failed_peer_disconnected",
+        ("summary", "channel_closed") => "summary_send_failed_channel_closed",
+        ("summary", "wire") => "summary_send_failed_wire",
+        ("summary", "serialization") => "summary_send_failed_serialization",
+        ("summary", "protocol") => "summary_send_failed_protocol",
+        ("summary", "io") => "summary_send_failed_io",
+        ("range", "eof") => "range_send_failed_eof",
+        ("range", "reset") => "range_send_failed_reset",
+        ("range", "refused") => "range_send_failed_refused",
+        ("range", "timeout") => "range_send_failed_timeout",
+        ("range", "peer_limit") => "range_send_failed_peer_limit",
+        ("range", "budget") => "range_send_failed_budget",
+        ("range", "connection") => "range_send_failed_connection",
+        ("range", "peer_disconnected") => "range_send_failed_peer_disconnected",
+        ("range", "channel_closed") => "range_send_failed_channel_closed",
+        ("range", "wire") => "range_send_failed_wire",
+        ("range", "serialization") => "range_send_failed_serialization",
+        ("range", "protocol") => "range_send_failed_protocol",
+        ("range", "io") => "range_send_failed_io",
+        ("baseline", "eof") => "baseline_send_failed_eof",
+        ("baseline", "reset") => "baseline_send_failed_reset",
+        ("baseline", "refused") => "baseline_send_failed_refused",
+        ("baseline", "timeout") => "baseline_send_failed_timeout",
+        ("baseline", "peer_limit") => "baseline_send_failed_peer_limit",
+        ("baseline", "budget") => "baseline_send_failed_budget",
+        ("baseline", "connection") => "baseline_send_failed_connection",
+        ("baseline", "peer_disconnected") => "baseline_send_failed_peer_disconnected",
+        ("baseline", "channel_closed") => "baseline_send_failed_channel_closed",
+        ("baseline", "wire") => "baseline_send_failed_wire",
+        ("baseline", "serialization") => "baseline_send_failed_serialization",
+        ("baseline", "protocol") => "baseline_send_failed_protocol",
+        ("baseline", "io") => "baseline_send_failed_io",
+        ("summary", _) => "summary_send_failed_other",
+        ("range", _) => "range_send_failed_other",
+        ("baseline", _) => "baseline_send_failed_other",
+        _ => "recovery_send_failed_other",
+    };
+    trace_recovery_event(event, 0);
+}
+
+#[cfg(test)]
+pub(super) fn trace_recovery_latency(event: &'static str, elapsed: Duration, items: u64) {
+    let bucket = if elapsed < Duration::from_millis(100) {
+        0
+    } else if elapsed < Duration::from_millis(500) {
+        1
+    } else if elapsed < Duration::from_secs(2) {
+        2
+    } else {
+        3
+    };
+    let event = match (event, bucket) {
+        ("summary", 0) => "summary_response_lt_100ms",
+        ("summary", 1) => "summary_response_lt_500ms",
+        ("summary", 2) => "summary_response_lt_2s",
+        ("summary", _) => "summary_response_gte_2s",
+        ("summary_record", 0) => "summary_record_lt_100ms",
+        ("summary_record", 1) => "summary_record_lt_500ms",
+        ("summary_record", 2) => "summary_record_lt_2s",
+        ("summary_record", _) => "summary_record_gte_2s",
+        ("summary_gap_send", 0) => "summary_gap_send_lt_100ms",
+        ("summary_gap_send", 1) => "summary_gap_send_lt_500ms",
+        ("summary_gap_send", 2) => "summary_gap_send_lt_2s",
+        ("summary_gap_send", _) => "summary_gap_send_gte_2s",
+        ("summary_gap_dispatch", 0) => "summary_gap_dispatch_lt_100ms",
+        ("summary_gap_dispatch", 1) => "summary_gap_dispatch_lt_500ms",
+        ("summary_gap_dispatch", 2) => "summary_gap_dispatch_lt_2s",
+        ("summary_gap_dispatch", _) => "summary_gap_dispatch_gte_2s",
+        ("range_replay", 0) => "range_replay_lt_100ms",
+        ("range_replay", 1) => "range_replay_lt_500ms",
+        ("range_replay", 2) => "range_replay_lt_2s",
+        ("range_replay", _) => "range_replay_gte_2s",
+        ("range_unavailable", 0) => "range_unavailable_lt_100ms",
+        ("range_unavailable", 1) => "range_unavailable_lt_500ms",
+        ("range_unavailable", 2) => "range_unavailable_lt_2s",
+        ("range_unavailable", _) => "range_unavailable_gte_2s",
+        ("baseline_accepted", 0) => "baseline_accepted_lt_100ms",
+        ("baseline_accepted", 1) => "baseline_accepted_lt_500ms",
+        ("baseline_accepted", 2) => "baseline_accepted_lt_2s",
+        ("baseline_accepted", _) => "baseline_accepted_gte_2s",
+        ("baseline_unavailable", 0) => "baseline_unavailable_lt_100ms",
+        ("baseline_unavailable", 1) => "baseline_unavailable_lt_500ms",
+        ("baseline_unavailable", 2) => "baseline_unavailable_lt_2s",
+        ("baseline_unavailable", _) => "baseline_unavailable_gte_2s",
+        _ => "other_recovery_response",
+    };
+    trace_recovery_event(event, items);
+}
+
+#[cfg(test)]
+fn request_age(now: StdInstant, deadline: StdInstant, timeout: Duration) -> Duration {
+    timeout.saturating_sub(deadline.saturating_duration_since(now))
+}
+
 fn bounded_retry_after(delay: Duration, max_delay: Duration) -> Duration {
     normalize_reconnect_delay(delay).min(max_delay)
 }
@@ -223,6 +401,7 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
         local_id,
         mut membership,
         rotation_interval,
+        mut recovery_rotation,
         node,
         mut candidates_rx,
         max_peers,
@@ -244,12 +423,30 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
     let mut seen_alive = HashMap::new();
     let mut revival_resets: HashMap<String, StdInstant> = HashMap::new();
     let mut membership_open = true;
+    let mut recovery_rotation_generation = RecoveryRotation::default().generation;
+    let mut recovery_rotation_pending = false;
+    let mut preferred_rotation_peer: Option<String> = None;
 
     'reconnect: loop {
         if *shutdown_rx.borrow() {
             break;
         }
-        let mut rotation_due = neighbors.rotate(node.now(), rotation_interval);
+        let now = node.now();
+        let periodic_rotation_due = neighbors.rotate(now, rotation_interval);
+        let mut rotation_due = periodic_rotation_due;
+        let mut recovery_rotation_wait = None;
+        if recovery_rotation_pending {
+            if periodic_rotation_due {
+                recovery_rotation_pending = false;
+            } else if neighbors.rotate(now, super::neighbors::RECOVERY_ROTATION_COOLDOWN) {
+                rotation_due = true;
+                recovery_rotation_pending = false;
+            } else {
+                recovery_rotation_wait = Some(
+                    neighbors.rotation_wait(now, super::neighbors::RECOVERY_ROTATION_COOLDOWN),
+                );
+            }
+        }
         let discovery = Arc::clone(&candidates_rx.borrow_and_update());
         let records = membership.borrow_and_update().records.clone();
         let alive = alive_endpoints(&records);
@@ -287,6 +484,13 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
             }
         }
         neighbors.advance();
+        let removed_duplicates = node.deduplicate_peer_connections().await;
+        if removed_duplicates > 0 {
+            debug!(
+                removed_duplicates,
+                "deduplicated active connections by peer identity"
+            );
+        }
         let connected = node.connected_peers().await;
         let connected_ids: HashSet<_> = connected.iter().map(|(_, id)| id.as_str()).collect();
         let mut connected_endpoints: HashSet<_> =
@@ -308,7 +512,7 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
             }
         }
         let mut attempts = 0usize;
-        let mut sleep_for: Option<Duration> = None;
+        let mut sleep_for = recovery_rotation_wait;
         let now = node.now();
         let connect_context = ConfiguredPeerConnectContext {
             node: node.as_ref(),
@@ -350,17 +554,28 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
                     .filter(|(addr, id)| {
                         candidate_set.contains(addr.as_str())
                             || replaceable_ids.contains(id.as_str())
+                            || preferred_rotation_peer.as_deref() == Some(addr.as_str())
                     })
                     .collect();
                 if !replaceable.is_empty() && rotation_due {
                     rotation_due = false;
-                    let (addr, id) = replaceable[victim_cursor % replaceable.len()];
+                    let selected = preferred_rotation_peer
+                        .as_ref()
+                        .and_then(|preferred| {
+                            replaceable
+                                .iter()
+                                .copied()
+                                .find(|(addr, _)| addr == preferred)
+                        })
+                        .unwrap_or_else(|| replaceable[victim_cursor % replaceable.len()]);
+                    let (addr, id) = selected;
                     victim_cursor = victim_cursor.wrapping_add(1);
                     tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown_rx) => break 'reconnect,
                         _ = node.disconnect_peer(addr, id) => {},
                     }
+                    preferred_rotation_peer = None;
                 }
             }
 
@@ -373,10 +588,22 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
             };
             match outcome {
                 ConfiguredPeerConnectOutcome::Connected => {
+                    if preferred_rotation_peer
+                        .as_deref()
+                        .is_some_and(|preferred| preferred != peer_addr)
+                    {
+                        preferred_rotation_peer = None;
+                    }
                     info!(peer = %peer_addr, "reconnected configured peer");
                     peer.reset(initial_delay, node.now());
                 }
                 ConfiguredPeerConnectOutcome::AlreadyConnected => {
+                    if preferred_rotation_peer
+                        .as_deref()
+                        .is_some_and(|preferred| preferred != peer_addr)
+                    {
+                        preferred_rotation_peer = None;
+                    }
                     peer.reset(initial_delay, node.now());
                 }
                 ConfiguredPeerConnectOutcome::SlotLimitReached => {
@@ -447,6 +674,25 @@ pub(super) async fn reconnect_loop(context: ReconnectLoopContext) {
                     }
                     let alive = alive_endpoints(&membership.borrow().records);
                     if revived_endpoints(&alive, &seen_alive).next().is_some() {
+                        break;
+                    }
+                }
+                changed = async {
+                    match recovery_rotation.as_mut() {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(receiver) = recovery_rotation.as_mut() else { continue };
+                    if changed.is_err() {
+                        recovery_rotation = None;
+                        continue;
+                    }
+                    let request = receiver.borrow_and_update().clone();
+                    if request.generation != recovery_rotation_generation {
+                        recovery_rotation_generation = request.generation;
+                        recovery_rotation_pending = request.source_addr.is_some();
+                        preferred_rotation_peer = request.source_addr;
                         break;
                     }
                 }
@@ -675,6 +921,14 @@ pub(super) async fn anti_entropy_turn(context: &AntiEntropyLoopContext, peer_cur
     }
     let mut turn = super::delivery::Turn::new();
     for (peer, _) in peers.into_iter().take(super::delivery::TURN_MESSAGES) {
+        // An aligned prefix does not prove that later summary pages have no gaps.
+        context
+            .history_cursors
+            .write()
+            .await
+            .entry(peer.clone())
+            .or_default()
+            .catch_up = true;
         if let Err(error) = request_summary(
             &context.node,
             &context.repair_budget,
@@ -719,7 +973,16 @@ async fn request_summary(
             .request_deadline
             .is_some_and(|deadline| deadline > now)
         {
+            #[cfg(test)]
+            trace_recovery_event("summary_request_deferred_pending", 0);
             return Ok(false);
+        }
+        #[cfg(test)]
+        if cursor
+            .request_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            trace_recovery_event("summary_request_expired", 0);
         }
         let deadline = now
             .checked_add(timeout.min(SUMMARY_REQUEST_TIMEOUT))
@@ -736,10 +999,14 @@ async fn request_summary(
     )
     .await
     {
+        #[cfg(test)]
+        trace_recovery_send_failure("summary", &error);
         // Keep the claimed deadline: a refused or failed send is retried after it,
         // never in a tight loop.
         return Err(error.into());
     }
+    #[cfg(test)]
+    trace_recovery_event("summary_request_sent", 0);
     Ok(true)
 }
 
@@ -869,6 +1136,18 @@ async fn send_repair_history(
     message: HistoryMessage,
     turn: Option<&mut super::delivery::Turn>,
 ) -> nx_net::NetResult<()> {
+    #[cfg(test)]
+    let budget_event = match &message {
+        HistoryMessage::SummaryRequest { .. } => "summary_send_budget_deferred",
+        HistoryMessage::Request { .. } => "range_send_budget_deferred",
+        HistoryMessage::BaselineRequest { .. } => "baseline_send_budget_deferred",
+        HistoryMessage::Push { .. } => "push_send_budget_deferred",
+        HistoryMessage::Summary { .. }
+        | HistoryMessage::Replay { .. }
+        | HistoryMessage::Unavailable { .. }
+        | HistoryMessage::Baseline { .. }
+        | HistoryMessage::BaselineUnavailable { .. } => "response_send_budget_deferred",
+    };
     let prepared = node.clone().prepare_history_to_addr(addr, message).await?;
     let bytes = prepared.encoded_len();
     if turn.is_some_and(|turn| !turn.admit(bytes))
@@ -877,6 +1156,8 @@ async fn send_repair_history(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .admit(bytes, node.now())
     {
+        #[cfg(test)]
+        trace_recovery_event(budget_event, 0);
         return Err(NetError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "recovery budget exhausted; periodic repair will retry",
@@ -1318,13 +1599,487 @@ pub(super) async fn op_log_since(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn drain_node_events(
     event_rx: &mut mpsc::Receiver<NodeEvent>,
     context: &NodeEventContext,
 ) {
+    let mut priority_event_rx = None;
     while let Ok(event) = event_rx.try_recv() {
+        let _ = handle_node_events(
+            event,
+            event_rx,
+            &mut priority_event_rx,
+            false,
+            context,
+            None,
+        )
+        .await;
+    }
+}
+
+pub(super) const PRIORITY_EVENT_BURST: usize = 8;
+pub(super) const REMOTE_HISTORY_COALESCE_WINDOW: Duration = Duration::from_millis(5);
+
+pub(super) async fn drain_node_event_queues(
+    event_rx: &mut mpsc::Receiver<NodeEvent>,
+    priority_event_rx: &mut Option<mpsc::Receiver<NodeEvent>>,
+    context: &NodeEventContext,
+) {
+    let mut priority_events = 0;
+    loop {
+        if (priority_events < PRIORITY_EVENT_BURST || event_rx.is_empty())
+            && let Some(event) = priority_event_rx
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok())
+        {
+            priority_events += 1;
+            handle_node_event(event, context).await;
+            continue;
+        }
+
+        match event_rx.try_recv() {
+            Ok(event) => {
+                priority_events = 0;
+                let _ =
+                    handle_node_events(event, event_rx, priority_event_rx, false, context, None)
+                        .await;
+            }
+            Err(_) => {
+                if let Some(event) = priority_event_rx
+                    .as_mut()
+                    .and_then(|receiver| receiver.try_recv().ok())
+                {
+                    priority_events += 1;
+                    handle_node_event(event, context).await;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct IncomingPush {
+    from: NodeId,
+    addr: String,
+    ops: Vec<nx_sync::SequencedOp>,
+}
+
+struct IncomingReplay {
+    from: NodeId,
+    addr: String,
+    request_id: nx_sync::OpId,
+    origin: NodeId,
+    start: u64,
+    end: u64,
+    ops: Vec<nx_sync::SequencedOp>,
+}
+
+enum IncomingHistory {
+    Push(IncomingPush),
+    Replay(IncomingReplay),
+}
+
+impl IncomingHistory {
+    fn into_event(self) -> NodeEvent {
+        match self {
+            Self::Push(push) => NodeEvent::HistoryReceived {
+                from: push.from,
+                addr: push.addr,
+                message: HistoryMessage::Push { ops: push.ops },
+            },
+            Self::Replay(replay) => replay.into_event(),
+        }
+    }
+
+    fn ops(&self) -> &[nx_sync::SequencedOp] {
+        match self {
+            Self::Push(push) => &push.ops,
+            Self::Replay(replay) => &replay.ops,
+        }
+    }
+}
+
+impl IncomingReplay {
+    fn into_event(self) -> NodeEvent {
+        NodeEvent::HistoryReceived {
+            from: self.from,
+            addr: self.addr,
+            message: HistoryMessage::Replay {
+                request_id: self.request_id,
+                origin: self.origin,
+                start: self.start,
+                end: self.end,
+                ops: self.ops,
+            },
+        }
+    }
+}
+
+fn push_work(event: &NodeEvent) -> Option<(usize, usize)> {
+    match event {
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Push { ops },
+            ..
+        } if !ops.is_empty() && ops.len() <= 1024 => {
+            let bytes = ops.iter().try_fold(0usize, |total, entry| {
+                total.checked_add(super::delivery::entry_bytes(&entry.op, &entry.position)?)
+            })?;
+            Some((ops.len(), bytes))
+        }
+        _ => None,
+    }
+}
+
+fn replay_work(event: &NodeEvent) -> Option<(usize, usize)> {
+    match event {
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Replay { ops, .. },
+            ..
+        } if !ops.is_empty() && ops.len() <= 1024 => {
+            let mut encoded = super::delivery::ByteCount::default();
+            serde_json::to_writer(&mut encoded, ops).ok()?;
+            if encoded.0 > REPLAY_BYTES {
+                return None;
+            }
+            let bytes = ops.iter().try_fold(0usize, |total, entry| {
+                total.checked_add(super::delivery::entry_bytes(&entry.op, &entry.position)?)
+            })?;
+            Some((ops.len(), bytes))
+        }
+        _ => None,
+    }
+}
+
+fn remote_history_work(event: &NodeEvent) -> Option<(usize, usize)> {
+    push_work(event).or_else(|| replay_work(event))
+}
+
+#[cfg(test)]
+fn remote_history_stop_reason(event: &NodeEvent) -> &'static str {
+    match event {
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Summary { .. },
+            ..
+        } => "control_summary",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::SummaryRequest { .. },
+            ..
+        } => "control_summary_request",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Request { .. },
+            ..
+        } => "control_range_request",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Unavailable { .. },
+            ..
+        } => "control_unavailable",
+        NodeEvent::HistoryReceived {
+            message:
+                HistoryMessage::BaselineRequest { .. }
+                | HistoryMessage::Baseline { .. }
+                | HistoryMessage::BaselineUnavailable { .. },
+            ..
+        } => "control_baseline",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Push { ops },
+            ..
+        } if ops.is_empty() => "empty_push",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Replay { ops, .. },
+            ..
+        } if ops.is_empty() => "empty_replay",
+        NodeEvent::HistoryReceived {
+            message: HistoryMessage::Push { .. } | HistoryMessage::Replay { .. },
+            ..
+        } => "invalid_data_envelope",
+        NodeEvent::OpsReceived { .. } | NodeEvent::PullRequested { .. } => "legacy_event",
+        _ => "other_event",
+    }
+}
+
+#[cfg(test)]
+pub(super) fn trace_remote_history_batch(
+    kind: &'static str,
+    pushes: usize,
+    replays: usize,
+    operations: usize,
+    bytes: usize,
+    stop_reason: &'static str,
+) {
+    let envelopes = pushes + replays;
+    tracing::debug!(
+        target: "nx_core::sync_manager::replication",
+        history_batch_kind = kind,
+        history_batch_stop = stop_reason,
+        history_batch_envelopes = envelopes as u64,
+        history_batch_pushes = pushes as u64,
+        history_batch_replays = replays as u64,
+        history_batch_operations = operations as u64,
+        history_batch_estimated_bytes = bytes as u64,
+        "bounded remote history batch"
+    );
+}
+
+async fn collect_remote_history(
+    first: NodeEvent,
+    event_rx: &mut mpsc::Receiver<NodeEvent>,
+    priority_event_rx: &mut Option<mpsc::Receiver<NodeEvent>>,
+    allow_priority_interrupt: bool,
+    coalesce_window: Option<Duration>,
+) -> (Vec<IncomingHistory>, Option<NodeEvent>, Option<NodeEvent>) {
+    enum BatchRead {
+        Data(Option<NodeEvent>),
+        Priority(Option<NodeEvent>),
+        Timeout,
+    }
+
+    let mut history = Vec::new();
+    let mut pending = Some(first);
+    let mut pending_priority = None;
+    let mut operations = 0;
+    let mut bytes = 0;
+    let deadline = coalesce_window
+        .filter(|_| {
+            pending
+                .as_ref()
+                .is_some_and(|event| remote_history_work(event).is_some())
+        })
+        .map(|window| tokio::time::Instant::now() + window);
+    #[cfg(test)]
+    let mut stop_reason = "queue_empty";
+    while history.len() < super::delivery::TURN_MESSAGES {
+        if allow_priority_interrupt
+            && deadline.is_some()
+            && let Some(priority_rx) = priority_event_rx.as_mut()
+        {
+            match priority_rx.try_recv() {
+                Ok(event) => {
+                    pending_priority = Some(event);
+                    #[cfg(test)]
+                    {
+                        stop_reason = "control_priority";
+                    }
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    priority_event_rx.take();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        let event = match pending.take() {
+            Some(event) => Some(event),
+            None => match event_rx.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    #[cfg(test)]
+                    {
+                        stop_reason = "data_channel_closed";
+                    }
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if let Some(deadline) = deadline {
+                        let read = if allow_priority_interrupt
+                            && let Some(priority_rx) = priority_event_rx.as_mut()
+                        {
+                            tokio::select! {
+                                biased;
+                                event = priority_rx.recv() => BatchRead::Priority(event),
+                                event = event_rx.recv() => BatchRead::Data(event),
+                                _ = tokio::time::sleep_until(deadline) => BatchRead::Timeout,
+                            }
+                        } else {
+                            tokio::select! {
+                                event = event_rx.recv() => BatchRead::Data(event),
+                                _ = tokio::time::sleep_until(deadline) => BatchRead::Timeout,
+                            }
+                        };
+                        match read {
+                            BatchRead::Data(Some(event)) => Some(event),
+                            BatchRead::Data(None) => {
+                                #[cfg(test)]
+                                {
+                                    stop_reason = "data_channel_closed";
+                                }
+                                break;
+                            }
+                            BatchRead::Priority(Some(event)) => {
+                                pending_priority = Some(event);
+                                #[cfg(test)]
+                                {
+                                    stop_reason = "control_priority";
+                                }
+                                break;
+                            }
+                            BatchRead::Priority(None) => {
+                                priority_event_rx.take();
+                                continue;
+                            }
+                            BatchRead::Timeout => {
+                                #[cfg(test)]
+                                {
+                                    stop_reason = "coalesce_timeout";
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+        let Some(event) = event else {
+            #[cfg(test)]
+            {
+                stop_reason = "queue_empty";
+            }
+            break;
+        };
+        let Some((count, size)) = remote_history_work(&event) else {
+            #[cfg(test)]
+            {
+                stop_reason = remote_history_stop_reason(&event);
+            }
+            pending = Some(event);
+            break;
+        };
+        if operations + count > 1024 {
+            #[cfg(test)]
+            {
+                stop_reason = "operation_budget";
+            }
+            pending = Some(event);
+            break;
+        }
+        if bytes + size > super::delivery::TURN_BYTES {
+            #[cfg(test)]
+            {
+                stop_reason = "byte_budget";
+            }
+            pending = Some(event);
+            break;
+        }
+        let incoming = match event {
+            NodeEvent::HistoryReceived {
+                from,
+                addr,
+                message: HistoryMessage::Push { ops },
+            } => IncomingHistory::Push(IncomingPush { from, addr, ops }),
+            NodeEvent::HistoryReceived {
+                from,
+                addr,
+                message:
+                    HistoryMessage::Replay {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                        ops,
+                    },
+            } => IncomingHistory::Replay(IncomingReplay {
+                from,
+                addr,
+                request_id,
+                origin,
+                start,
+                end,
+                ops,
+            }),
+            event => {
+                pending = Some(event);
+                break;
+            }
+        };
+        operations += count;
+        bytes += size;
+        history.push(incoming);
+    }
+    #[cfg(test)]
+    if history.len() == super::delivery::TURN_MESSAGES {
+        stop_reason = "message_limit";
+    }
+    #[cfg(test)]
+    if !history.is_empty() {
+        let pushes = history
+            .iter()
+            .filter(|envelope| matches!(envelope, IncomingHistory::Push(_)))
+            .count();
+        let replays = history.len() - pushes;
+        let kind = if pushes == history.len() {
+            "push_only"
+        } else if pushes == 0 {
+            "replay_only"
+        } else {
+            "mixed"
+        };
+        trace_remote_history_batch(kind, pushes, replays, operations, bytes, stop_reason);
+    }
+    (history, pending, pending_priority)
+}
+
+pub(super) async fn handle_node_events(
+    first: NodeEvent,
+    event_rx: &mut mpsc::Receiver<NodeEvent>,
+    priority_event_rx: &mut Option<mpsc::Receiver<NodeEvent>>,
+    allow_priority_interrupt: bool,
+    context: &NodeEventContext,
+    coalesce_window: Option<Duration>,
+) -> Option<NodeEvent> {
+    let (history, pending, pending_priority) = collect_remote_history(
+        first,
+        event_rx,
+        priority_event_rx,
+        allow_priority_interrupt,
+        coalesce_window,
+    )
+    .await;
+    if history.len() == 1 {
+        if let Some(envelope) = history.into_iter().next() {
+            handle_node_event(envelope.into_event(), context).await;
+        }
+    } else if !history.is_empty() {
+        handle_remote_history_batch(history, context).await;
+    }
+    if let Some(event) = pending {
         handle_node_event(event, context).await;
     }
+    pending_priority
+}
+
+async fn finish_history_event(
+    from: NodeId,
+    addr: &str,
+    observed_id: Option<String>,
+    result: &anyhow::Result<()>,
+    context: &NodeEventContext,
+) {
+    if let Err(error) = result {
+        context
+            .metrics
+            .peers
+            .increment(crate::peer_metrics::Counter::RecoveryError);
+        context.metrics.record_sync_error();
+        if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>() {
+            // Decoder errors can contain supplied values; log only the bounded reason.
+            warn!(%from, reason = ?rejected.0, "replication baseline rejected");
+        } else {
+            warn!(%from, %addr, error = %format_args!("{error:#}"), "replication history exchange failed");
+        }
+    } else if let Some(id) = observed_id {
+        context
+            .anti_entropy_watermarks
+            .write()
+            .await
+            .insert(from, id);
+    }
+    context
+        .node
+        .refresh_recovery(&context.metrics, Arc::clone(&context.store))
+        .await;
 }
 
 pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventContext) {
@@ -1340,29 +2095,8 @@ pub(super) async fn handle_node_event(event: NodeEvent, context: &NodeEventConte
                 }
                 _ => None,
             };
-            if let Err(error) = handle_history_message(&addr, message, context).await {
-                context
-                    .metrics
-                    .peers
-                    .increment(crate::peer_metrics::Counter::RecoveryError);
-                context.metrics.record_sync_error();
-                if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>() {
-                    // Decoder errors can contain supplied values; log only the bounded reason.
-                    warn!(%from, reason = ?rejected.0, "replication baseline rejected");
-                } else {
-                    warn!(%from, error = %format_args!("{error:#}"), "replication history exchange failed");
-                }
-            } else if let Some(id) = observed_id {
-                context
-                    .anti_entropy_watermarks
-                    .write()
-                    .await
-                    .insert(from, id);
-            }
-            context
-                .node
-                .refresh_recovery(&context.metrics, Arc::clone(&context.store))
-                .await;
+            let result = handle_history_message(&addr, message, context).await;
+            finish_history_event(from, &addr, observed_id, &result, context).await;
         }
         NodeEvent::OpsReceived { from, .. } => {
             context.metrics.record_sync_error();
@@ -1489,6 +2223,18 @@ async fn request_history_or_baseline(
     end: u64,
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
+    request_history_or_baseline_inner(addr, origin, start, end, context)
+        .await
+        .map(|_| ())
+}
+
+async fn request_history_or_baseline_inner(
+    addr: &str,
+    origin: nx_sync::NodeId,
+    start: u64,
+    end: u64,
+    context: &NodeEventContext,
+) -> anyhow::Result<bool> {
     let request_id = context.node.request_id();
     let baseline_revision = if start == 0 {
         let store = Arc::clone(&context.store);
@@ -1517,14 +2263,34 @@ async fn request_history_or_baseline(
                     request.deadline > now && request.deadline.duration_since(now) > hedge_window
                 })
         }) {
+            #[cfg(test)]
+            trace_recovery_event("range_request_deferred_hedge", 0);
             debug!(%addr, %origin, "deferring history range: fresh request pending at another peer");
-            return Ok(());
+            return Ok(false);
         }
         let pending = requests.entry(addr.to_owned()).or_default();
+        #[cfg(test)]
+        {
+            let expired = pending
+                .values()
+                .filter(|request| request.deadline <= now)
+                .count() as u64;
+            if expired > 0 {
+                trace_recovery_event("range_request_expired", expired);
+            }
+        }
         pending.retain(|_, request| request.deadline > now);
-        if pending.contains_key(origin.as_str()) || pending.len() >= SUMMARY_PAGE {
+        if pending.contains_key(origin.as_str()) {
+            #[cfg(test)]
+            trace_recovery_event("range_request_deferred_same_peer", 0);
             debug!(%addr, %origin, "deferring history range: request pending or peer budget full");
-            return Ok(());
+            return Ok(false);
+        }
+        if pending.len() >= SUMMARY_PAGE {
+            #[cfg(test)]
+            trace_recovery_event("range_request_deferred_peer_limit", 0);
+            debug!(%addr, %origin, "deferring history range: request pending or peer budget full");
+            return Ok(false);
         }
         let deadline = now
             .checked_add(context.history_request_timeout)
@@ -1563,15 +2329,25 @@ async fn request_history_or_baseline(
     .await
     {
         complete_history_request(addr, &origin, &request_id, start, end, context).await;
+        #[cfg(test)]
+        trace_recovery_send_failure(if start == 0 { "baseline" } else { "range" }, &error);
         return Err(error.into());
     }
     if start == 0 {
+        #[cfg(test)]
+        trace_recovery_event("baseline_request_sent", 0);
         context
             .metrics
             .peers
             .increment(crate::peer_metrics::Counter::BaselineRequested);
+    } else {
+        #[cfg(test)]
+        trace_recovery_event(
+            "range_request_sent",
+            end.saturating_sub(start).saturating_add(1),
+        );
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn complete_history_request(
@@ -1596,6 +2372,415 @@ async fn complete_history_request(
     None
 }
 
+async fn complete_replay_request(
+    addr: &str,
+    request_id: &nx_sync::OpId,
+    origin: &nx_sync::NodeId,
+    start: u64,
+    end: u64,
+    ops: &[nx_sync::SequencedOp],
+    context: &NodeEventContext,
+) -> anyhow::Result<bool> {
+    validate_range(start, end)?;
+    anyhow::ensure!(
+        ops.len() as u64 == end - start + 1,
+        "partial replay interval"
+    );
+    anyhow::ensure!(
+        serde_json::to_vec(ops)?.len() <= REPLAY_BYTES,
+        "replay exceeds byte budget"
+    );
+    for (index, entry) in ops.iter().enumerate() {
+        anyhow::ensure!(
+            entry.op.origin == *origin && entry.position.sequence == start + index as u64,
+            "replay position mismatch"
+        );
+    }
+    let Some(_request) =
+        complete_history_request(addr, origin, request_id, start, end, context).await
+    else {
+        debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited history replay");
+        return Ok(false);
+    };
+    #[cfg(test)]
+    {
+        let items = u64::try_from(ops.len()).unwrap_or(u64::MAX);
+        trace_recovery_event("range_replay_received", items);
+        trace_recovery_latency(
+            "range_replay",
+            request_age(
+                context.node.now(),
+                _request.deadline,
+                context.history_request_timeout,
+            ),
+            items,
+        );
+    }
+    Ok(true)
+}
+
+async fn finish_push(
+    addr: &str,
+    ops: &[nx_sync::SequencedOp],
+    accepted: Vec<nx_sync::SequencedOp>,
+    tracking_error: Option<anyhow::Error>,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    for summary in push_summaries(ops)? {
+        let store = Arc::clone(&context.store);
+        let tracked = summary.clone();
+        let missing = context
+            .node
+            .storage_executor()
+            .execute(move || super::storage::record_summary(&store, &tracked))
+            .await?;
+        if let Some((start, end)) = missing {
+            request_history_range(addr, summary.origin, start, end, context).await?;
+        }
+    }
+    if let Some(error) = tracking_error {
+        return Err(error);
+    }
+    enqueue_forwarded_ops(addr, accepted, context);
+    Ok(())
+}
+
+fn push_summaries(ops: &[nx_sync::SequencedOp]) -> anyhow::Result<Vec<nx_sync::HistorySummary>> {
+    let mut origins = BTreeMap::<String, u64>::new();
+    for entry in ops {
+        anyhow::ensure!(
+            entry.position.generation > 0 && entry.position.sequence > 0,
+            "invalid pushed position"
+        );
+        origins
+            .entry(entry.op.origin.as_str().to_owned())
+            .and_modify(|high| *high = (*high).max(entry.position.sequence))
+            .or_insert(entry.position.sequence);
+    }
+    Ok(origins
+        .into_iter()
+        .take(SUMMARY_PAGE)
+        .map(|(origin, high_sequence)| nx_sync::HistorySummary {
+            baseline_required: false,
+            origin: NodeId::new(origin),
+            high_sequence,
+        })
+        .collect())
+}
+
+type PushSummaryGroups = BTreeMap<String, Vec<nx_sync::HistorySummary>>;
+type PushSummaryRepairs = BTreeMap<String, BTreeMap<String, Option<(u64, u64)>>>;
+
+fn group_push_summaries(history: &[IncomingHistory]) -> anyhow::Result<PushSummaryGroups> {
+    let mut groups = BTreeMap::<String, BTreeMap<String, nx_sync::HistorySummary>>::new();
+    for envelope in history {
+        let IncomingHistory::Push(push) = envelope else {
+            continue;
+        };
+        for summary in push_summaries(&push.ops)? {
+            groups
+                .entry(push.addr.clone())
+                .or_default()
+                .entry(summary.origin.as_str().to_owned())
+                .and_modify(|existing| {
+                    existing.high_sequence = existing.high_sequence.max(summary.high_sequence);
+                })
+                .or_insert(summary);
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(addr, summaries)| (addr, summaries.into_values().collect()))
+        .collect())
+}
+
+#[cfg(test)]
+fn trace_remote_push_summary_timing(started: StdInstant, success: bool) {
+    tracing::debug!(
+        target: "nx_core::sync_manager::replication",
+        message = "remote push summaries recorded",
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success,
+        "phase timing"
+    );
+}
+
+async fn record_grouped_push_summaries(
+    groups: PushSummaryGroups,
+    context: &NodeEventContext,
+) -> (PushSummaryRepairs, HashSet<String>) {
+    let mut repairs_by_source = PushSummaryRepairs::new();
+    let mut failed_sources = HashSet::new();
+    for (addr, summaries) in groups {
+        #[cfg(test)]
+        let started = StdInstant::now();
+        let store = Arc::clone(&context.store);
+        let result = context
+            .node
+            .storage_executor()
+            .execute(move || {
+                let mut repairs = BTreeMap::new();
+                for chunk in summaries.chunks(SUMMARY_PAGE) {
+                    for repair in super::storage::record_summaries(&store, chunk)? {
+                        repairs.insert(repair.origin.as_str().to_owned(), repair.missing);
+                    }
+                }
+                Ok(repairs)
+            })
+            .await;
+        #[cfg(test)]
+        trace_remote_push_summary_timing(started, result.is_ok());
+        match result {
+            Ok(repairs) => {
+                repairs_by_source.insert(addr, repairs);
+            }
+            Err(error) => {
+                debug!(%addr, %error, "batched push summary tracking failed; retrying individually");
+                failed_sources.insert(addr);
+            }
+        }
+    }
+    (repairs_by_source, failed_sources)
+}
+
+async fn finish_push_with_recorded_summaries(
+    addr: &str,
+    ops: &[nx_sync::SequencedOp],
+    accepted: Vec<nx_sync::SequencedOp>,
+    repairs: &BTreeMap<String, Option<(u64, u64)>>,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    for summary in push_summaries(ops)? {
+        let missing = repairs
+            .get(summary.origin.as_str())
+            .ok_or_else(|| anyhow::anyhow!("push summary missing for origin {}", summary.origin))?;
+        if let Some((start, end)) = missing {
+            request_history_range(addr, summary.origin, *start, *end, context).await?;
+        }
+    }
+    enqueue_forwarded_ops(addr, accepted, context);
+    Ok(())
+}
+
+async fn finish_replay_after_apply(
+    addr: &str,
+    origin: NodeId,
+    accepted: Vec<nx_sync::SequencedOp>,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    enqueue_forwarded_ops(addr, accepted, context);
+    let store = Arc::clone(&context.store);
+    let tracked_origin = origin.clone();
+    let missing = context
+        .node
+        .storage_executor()
+        .execute(move || super::storage::missing_range(&store, &tracked_origin))
+        .await?;
+    if let Some((start, end)) = missing {
+        request_history_range(addr, origin, start, end, context).await?;
+    }
+    Ok(())
+}
+
+async fn apply_prepared_replay(
+    replay: &IncomingReplay,
+    context: &NodeEventContext,
+) -> anyhow::Result<()> {
+    let accepted =
+        apply_sequenced_ops_and_collect(&replay.ops, &history_apply_context(context)).await?;
+    finish_replay_after_apply(&replay.addr, replay.origin.clone(), accepted, context).await
+}
+
+fn remote_history_batch_has_duplicate_ids(history: &[IncomingHistory]) -> bool {
+    let mut ids = HashMap::new();
+    history
+        .iter()
+        .flat_map(IncomingHistory::ops)
+        .any(|entry| ids.insert(entry.op.id.as_str(), ()).is_some())
+}
+
+async fn apply_remote_history_individually(
+    history: Vec<IncomingHistory>,
+    context: &NodeEventContext,
+) {
+    for envelope in history {
+        match envelope {
+            IncomingHistory::Push(push) => {
+                handle_node_event(
+                    NodeEvent::HistoryReceived {
+                        from: push.from,
+                        addr: push.addr,
+                        message: HistoryMessage::Push { ops: push.ops },
+                    },
+                    context,
+                )
+                .await;
+            }
+            IncomingHistory::Replay(replay) => {
+                let observed_id = replay
+                    .ops
+                    .last()
+                    .map(|entry| entry.op.id.as_str().to_owned());
+                let result = apply_prepared_replay(&replay, context).await;
+                finish_history_event(replay.from, &replay.addr, observed_id, &result, context)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn handle_remote_history_batch(history: Vec<IncomingHistory>, context: &NodeEventContext) {
+    let mut admitted = Vec::with_capacity(history.len());
+    for envelope in history {
+        match envelope {
+            IncomingHistory::Push(push) => admitted.push(IncomingHistory::Push(push)),
+            IncomingHistory::Replay(replay) => {
+                let observed_id = replay
+                    .ops
+                    .last()
+                    .map(|entry| entry.op.id.as_str().to_owned());
+                match complete_replay_request(
+                    &replay.addr,
+                    &replay.request_id,
+                    &replay.origin,
+                    replay.start,
+                    replay.end,
+                    &replay.ops,
+                    context,
+                )
+                .await
+                {
+                    Ok(true) => admitted.push(IncomingHistory::Replay(replay)),
+                    Ok(false) => {
+                        let result = Ok(());
+                        finish_history_event(
+                            replay.from,
+                            &replay.addr,
+                            observed_id,
+                            &result,
+                            context,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let result = Err(error);
+                        finish_history_event(
+                            replay.from,
+                            &replay.addr,
+                            observed_id,
+                            &result,
+                            context,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+    if admitted.is_empty() {
+        return;
+    }
+    if remote_history_batch_has_duplicate_ids(&admitted) {
+        debug!(
+            "queued remote history batch contains duplicate operation ids; handling envelopes individually"
+        );
+        apply_remote_history_individually(admitted, context).await;
+        return;
+    }
+
+    let ops = admitted
+        .iter()
+        .flat_map(|envelope| envelope.ops().iter().cloned())
+        .collect::<Vec<_>>();
+    match apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await {
+        Ok(accepted) => {
+            let mut accepted = accepted
+                .into_iter()
+                .map(|entry| (entry.op.id.as_str().to_owned(), entry))
+                .collect::<HashMap<_, _>>();
+            let push_summary_recording = match group_push_summaries(&admitted) {
+                Ok(groups) => Some(record_grouped_push_summaries(groups, context).await),
+                Err(error) => {
+                    debug!(%error, "cannot group push summaries; retrying individually");
+                    None
+                }
+            };
+            for envelope in admitted {
+                let ops = envelope.ops();
+                let forwarded = ops
+                    .iter()
+                    .filter_map(|entry| accepted.remove(entry.op.id.as_str()))
+                    .collect();
+                let observed_id = ops.last().map(|entry| entry.op.id.as_str().to_owned());
+                match envelope {
+                    IncomingHistory::Push(push) => {
+                        let result = match &push_summary_recording {
+                            Some((repairs, failed_sources))
+                                if !failed_sources.contains(&push.addr)
+                                    && let Some(source_repairs) = repairs.get(&push.addr) =>
+                            {
+                                finish_push_with_recorded_summaries(
+                                    &push.addr,
+                                    &push.ops,
+                                    forwarded,
+                                    source_repairs,
+                                    context,
+                                )
+                                .await
+                            }
+                            _ => finish_push(&push.addr, &push.ops, forwarded, None, context).await,
+                        };
+                        finish_history_event(push.from, &push.addr, observed_id, &result, context)
+                            .await;
+                    }
+                    IncomingHistory::Replay(replay) => {
+                        let result = finish_replay_after_apply(
+                            &replay.addr,
+                            replay.origin,
+                            forwarded,
+                            context,
+                        )
+                        .await;
+                        finish_history_event(
+                            replay.from,
+                            &replay.addr,
+                            observed_id,
+                            &result,
+                            context,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(error) if error.is::<super::apply::RemoteBatchPreparation>() => {
+            debug!(%error, "queued remote history batch rejected before persistence; handling envelopes individually");
+            apply_remote_history_individually(admitted, context).await;
+        }
+        Err(error) => {
+            let result = Err(error);
+            for envelope in admitted {
+                let (from, addr, observed_id) = match envelope {
+                    IncomingHistory::Push(push) => (
+                        push.from,
+                        push.addr,
+                        push.ops.last().map(|entry| entry.op.id.as_str().to_owned()),
+                    ),
+                    IncomingHistory::Replay(replay) => (
+                        replay.from,
+                        replay.addr,
+                        replay
+                            .ops
+                            .last()
+                            .map(|entry| entry.op.id.as_str().to_owned()),
+                    ),
+                };
+                finish_history_event(from, &addr, observed_id, &result, context).await;
+            }
+        }
+    }
+}
+
 async fn handle_history_message(
     addr: &str,
     message: HistoryMessage,
@@ -1604,6 +2789,13 @@ async fn handle_history_message(
     // Bound response construction, including baseline export, before storage work.
     // Refusing a request leaves its requester to the existing bounded timeout and
     // periodic retry path; it does not delete any operation or baseline.
+    #[cfg(test)]
+    let recovery_work_event = match &message {
+        HistoryMessage::SummaryRequest { .. } => "summary_work_budget_exhausted",
+        HistoryMessage::Request { .. } => "range_work_budget_exhausted",
+        HistoryMessage::BaselineRequest { .. } => "baseline_work_budget_exhausted",
+        _ => "other_recovery_work_budget_exhausted",
+    };
     if matches!(
         &message,
         HistoryMessage::SummaryRequest { .. }
@@ -1615,6 +2807,8 @@ async fn handle_history_message(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .admit_work(context.node.now())
     {
+        #[cfg(test)]
+        trace_recovery_event(recovery_work_event, 0);
         anyhow::bail!("recovery work budget exhausted; periodic repair will retry");
     }
     match message {
@@ -1639,39 +2833,7 @@ async fn handle_history_message(
                 }
                 Err(error) => return Err(error),
             };
-            let mut origins = std::collections::BTreeMap::<String, u64>::new();
-            for entry in &ops {
-                anyhow::ensure!(
-                    entry.position.generation > 0 && entry.position.sequence > 0,
-                    "invalid pushed position"
-                );
-                origins
-                    .entry(entry.op.origin.as_str().to_owned())
-                    .and_modify(|high| *high = (*high).max(entry.position.sequence))
-                    .or_insert(entry.position.sequence);
-            }
-            // A far-ahead rejection must still permit earliest-range recovery.
-            for (origin, high_sequence) in origins.into_iter().take(SUMMARY_PAGE) {
-                let summary = nx_sync::HistorySummary {
-                    baseline_required: false,
-                    origin: nx_sync::NodeId::new(origin),
-                    high_sequence,
-                };
-                let store = Arc::clone(&context.store);
-                let tracked = summary.clone();
-                let missing = context
-                    .node
-                    .storage_executor()
-                    .execute(move || super::storage::record_summary(&store, &tracked))
-                    .await?;
-                if let Some((start, end)) = missing {
-                    request_history_range(addr, summary.origin, start, end, context).await?;
-                }
-            }
-            if let Some(error) = tracking_error {
-                return Err(error);
-            }
-            enqueue_forwarded_ops(addr, accepted, context);
+            finish_push(addr, &ops, accepted, tracking_error, context).await?;
         }
         HistoryMessage::SummaryRequest { after_origin } => {
             let store = Arc::clone(&context.store);
@@ -1684,6 +2846,8 @@ async fn handle_history_message(
                     Ok(entries)
                 })
                 .await?;
+            #[cfg(test)]
+            let entry_count = entries.len() as u64;
             send_repair_history(
                 &context.node,
                 &context.repair_budget,
@@ -1692,12 +2856,35 @@ async fn handle_history_message(
                 None,
             )
             .await?;
+            #[cfg(test)]
+            trace_recovery_event("summary_page_sent", entry_count);
         }
         HistoryMessage::Summary { entries } => {
             anyhow::ensure!(
                 entries.len() <= SUMMARY_PAGE,
                 "history summary page exceeds budget"
             );
+            #[cfg(test)]
+            {
+                trace_recovery_event("summary_page_received", entries.len() as u64);
+                if let Some(deadline) = context
+                    .history_cursors
+                    .read()
+                    .await
+                    .get(addr)
+                    .and_then(|cursor| cursor.request_deadline)
+                {
+                    trace_recovery_latency(
+                        "summary",
+                        request_age(
+                            context.node.now(),
+                            deadline,
+                            context.history_request_timeout.min(SUMMARY_REQUEST_TIMEOUT),
+                        ),
+                        entries.len() as u64,
+                    );
+                }
+            }
             anyhow::ensure!(
                 entries
                     .windows(2)
@@ -1711,39 +2898,70 @@ async fn handle_history_message(
             };
             let mut found_gap = false;
             let result = async {
-                for entry in entries {
-                    let store = Arc::clone(&context.store);
-                    let origin = entry.origin.clone();
-                    let (missing, baseline) = context
-                        .node
-                        .storage_executor()
-                        .execute(move || -> anyhow::Result<_> {
-                            let missing = super::storage::record_summary(&store, &entry)?;
-                            let baseline =
-                                super::storage::needs_baseline(&store, entry.origin.as_str())?
-                                    || store.exists(super::storage::BASELINE_UNCONFIRMED)?;
-                            Ok((missing, baseline))
-                        })
-                        .await?;
-                    if baseline {
-                        found_gap = true;
-                        request_baseline(addr, origin, context).await?;
-                    } else if let Some((start, end)) = missing {
-                        found_gap = true;
-                        request_history_range(addr, origin, start, end, context).await?;
+                let store = Arc::clone(&context.store);
+                #[cfg(test)]
+                let record_started = std::time::Instant::now();
+                let repairs_result = context
+                    .node
+                    .storage_executor()
+                    .execute(move || super::storage::record_summaries(&store, &entries))
+                    .await;
+                #[cfg(test)]
+                trace_recovery_latency(
+                    "summary_record",
+                    record_started.elapsed(),
+                    repairs_result.as_ref().map_or(0, |repairs| {
+                        u64::try_from(repairs.len()).unwrap_or(u64::MAX)
+                    }),
+                );
+                let repairs = repairs_result?;
+                #[cfg(test)]
+                let gap_count = u64::try_from(repairs.len()).unwrap_or(u64::MAX);
+                #[cfg(test)]
+                let dispatch_started = std::time::Instant::now();
+                let dispatch_result = async {
+                    for repair in repairs {
+                        #[cfg(test)]
+                        let request_started = std::time::Instant::now();
+                        let request_result = if repair.baseline {
+                            found_gap = true;
+                            request_baseline(addr, repair.origin, context).await
+                        } else if let Some((start, end)) = repair.missing {
+                            found_gap = true;
+                            request_history_range(addr, repair.origin, start, end, context).await
+                        } else {
+                            Ok(())
+                        };
+                        #[cfg(test)]
+                        trace_recovery_latency("summary_gap_send", request_started.elapsed(), 1);
+                        request_result?;
                     }
+                    Ok::<(), anyhow::Error>(())
                 }
+                .await;
+                #[cfg(test)]
+                trace_recovery_latency(
+                    "summary_gap_dispatch",
+                    dispatch_started.elapsed(),
+                    gap_count,
+                );
+                dispatch_result?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
             let continue_walk = {
                 let mut cursors = context.history_cursors.write().await;
                 let cursor = cursors.entry(addr.to_owned()).or_default();
-                cursor.after_origin = next.clone();
+                // A failed page has an unobserved suffix; retry it without skipping ahead.
+                if result.is_ok() {
+                    cursor.after_origin = next.clone();
+                }
                 cursor.request_deadline = None;
-                cursor.catch_up |= found_gap;
+                cursor.catch_up |= found_gap || result.is_err();
                 cursor.walk_gap |= found_gap;
-                if next.is_some() {
+                if result.is_err() {
+                    false
+                } else if next.is_some() {
                     cursor.catch_up
                 } else {
                     // A walk that found gaps is repeated after a growing delay, so
@@ -1857,8 +3075,21 @@ async fn handle_history_message(
                     }
                 }
             };
+            #[cfg(test)]
+            let response_diagnostic = match &response {
+                HistoryMessage::Replay { ops, .. } => Some(("range_replay_sent", ops.len() as u64)),
+                HistoryMessage::Unavailable { start, end, .. } => Some((
+                    "range_unavailable_sent",
+                    end.saturating_sub(*start).saturating_add(1),
+                )),
+                _ => None,
+            };
             send_repair_history(&context.node, &context.repair_budget, addr, response, None)
                 .await?;
+            #[cfg(test)]
+            if let Some((event, items)) = response_diagnostic {
+                trace_recovery_event(event, items);
+            }
         }
         HistoryMessage::Replay {
             request_id,
@@ -1867,41 +3098,14 @@ async fn handle_history_message(
             end,
             ops,
         } => {
-            validate_range(start, end)?;
-            anyhow::ensure!(
-                ops.len() as u64 == end - start + 1,
-                "partial replay interval"
-            );
-            anyhow::ensure!(
-                serde_json::to_vec(&ops)?.len() <= REPLAY_BYTES,
-                "replay exceeds byte budget"
-            );
-            for (index, entry) in ops.iter().enumerate() {
-                anyhow::ensure!(
-                    entry.op.origin == origin && entry.position.sequence == start + index as u64,
-                    "replay position mismatch"
-                );
-            }
-            if complete_history_request(addr, &origin, &request_id, start, end, context)
-                .await
-                .is_none()
+            if !complete_replay_request(addr, &request_id, &origin, start, end, &ops, context)
+                .await?
             {
-                debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited history replay");
                 return Ok(());
             }
             let accepted =
                 apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await?;
-            enqueue_forwarded_ops(addr, accepted, context);
-            let store = Arc::clone(&context.store);
-            let tracked_origin = origin.clone();
-            let missing = context
-                .node
-                .storage_executor()
-                .execute(move || super::storage::missing_range(&store, &tracked_origin))
-                .await?;
-            if let Some((start, end)) = missing {
-                request_history_range(addr, origin, start, end, context).await?;
-            }
+            finish_replay_after_apply(addr, origin, accepted, context).await?;
         }
         HistoryMessage::Unavailable {
             request_id,
@@ -1910,12 +3114,27 @@ async fn handle_history_message(
             end,
         } => {
             validate_range(start, end)?;
-            if complete_history_request(addr, &origin, &request_id, start, end, context)
-                .await
-                .is_none()
-            {
+            let Some(_request) =
+                complete_history_request(addr, &origin, &request_id, start, end, context).await
+            else {
                 debug!(%addr, %origin, %request_id, "ignoring stale or unsolicited unavailable history");
                 return Ok(());
+            };
+            #[cfg(test)]
+            {
+                trace_recovery_event(
+                    "range_unavailable_received",
+                    end.saturating_sub(start).saturating_add(1),
+                );
+                trace_recovery_latency(
+                    "range_unavailable",
+                    request_age(
+                        context.node.now(),
+                        _request.deadline,
+                        context.history_request_timeout,
+                    ),
+                    end.saturating_sub(start).saturating_add(1),
+                );
             }
             let store = Arc::clone(&context.store);
             let tracked_origin = origin.clone();
@@ -1925,11 +3144,15 @@ async fn handle_history_message(
                 end,
                 request_id,
             };
-            context
+            let (recorded, previous) = context
                 .node
                 .storage_executor()
                 .execute(move || {
-                    super::storage::record_unavailable(&store, &tracked_origin, evidence)
+                    super::storage::record_unavailable_and_previous(
+                        &store,
+                        &tracked_origin,
+                        evidence,
+                    )
                 })
                 .await?;
             context
@@ -1937,9 +3160,44 @@ async fn handle_history_message(
                 .peers
                 .increment(crate::peer_metrics::Counter::HistoryUnavailable);
             warn!(%origin, start, end, "source cannot supply missing history; another source or state baseline is required");
-            if let Err(error) = request_baseline(addr, origin, context).await {
-                context.metrics.record_sync_error();
-                debug!(%addr, %error, "baseline request deferred after unavailable replay; periodic repair will retry");
+            let mut alternative_requested = false;
+            if recorded && previous.is_none() {
+                let mut alternatives = context
+                    .node
+                    .connected_peers()
+                    .await
+                    .into_iter()
+                    .map(|(peer, _)| peer)
+                    .filter(|peer| peer != addr)
+                    .collect::<Vec<_>>();
+                alternatives.sort();
+                if let Some(alternative) = alternatives.first() {
+                    match request_history_or_baseline_inner(
+                        alternative,
+                        origin.clone(),
+                        start,
+                        end,
+                        context,
+                    )
+                    .await
+                    {
+                        Ok(true) => alternative_requested = true,
+                        Ok(false) => {}
+                        Err(error) => {
+                            context.metrics.record_sync_error();
+                            debug!(%alternative, %error, "alternate range request deferred after unavailable replay");
+                        }
+                    }
+                }
+            }
+            if !alternative_requested {
+                if recorded {
+                    signal_recovery_rotation(context, addr);
+                }
+                if let Err(error) = request_baseline(addr, origin, context).await {
+                    context.metrics.record_sync_error();
+                    debug!(%addr, %error, "baseline request deferred after unavailable replay; periodic repair will retry");
+                }
             }
         }
         HistoryMessage::BaselineRequest {
@@ -1976,6 +3234,12 @@ async fn handle_history_message(
                     }
                 }
             };
+            #[cfg(test)]
+            let mut response_event = match &response {
+                HistoryMessage::Baseline { .. } => "baseline_sent",
+                HistoryMessage::BaselineUnavailable { .. } => "baseline_unavailable_sent",
+                _ => "other_recovery_response_sent",
+            };
             let correlation = match &response {
                 HistoryMessage::Baseline {
                     request_id, origin, ..
@@ -1999,10 +3263,16 @@ async fn handle_history_message(
                             None,
                         )
                         .await?;
+                        #[cfg(test)]
+                        {
+                            response_event = "baseline_unavailable_sent";
+                        }
                     }
                 }
                 other => other?,
             }
+            #[cfg(test)]
+            trace_recovery_event(response_event, 0);
         }
         HistoryMessage::Baseline {
             request_id,
@@ -2017,6 +3287,12 @@ async fn handle_history_message(
                 debug!(%addr, "ignoring stale or unsolicited baseline");
                 return Ok(());
             };
+            #[cfg(test)]
+            let response_age = request_age(
+                context.node.now(),
+                request.deadline,
+                context.history_request_timeout,
+            );
             if let Err(error) = super::baseline::import(
                 version,
                 &payload,
@@ -2026,19 +3302,40 @@ async fn handle_history_message(
             )
             .await
             {
+                #[cfg(test)]
+                trace_recovery_event(
+                    if error.downcast_ref::<super::baseline::Rejected>().is_some() {
+                        "baseline_import_rejected"
+                    } else {
+                        "baseline_import_error"
+                    },
+                    0,
+                );
                 if let Some(rejected) = error.downcast_ref::<super::baseline::Rejected>()
                     && let Some(revision) = request.baseline_revision
-                    && let Err(record_error) =
-                        record_recovery_failure(context, &origin, addr, rejected.0, &revision).await
                 {
-                    warn!(%origin, record_error = %format_args!("{record_error:#}"), "could not record baseline rejection");
+                    match record_recovery_failure(context, &origin, addr, rejected.0, &revision)
+                        .await
+                    {
+                        Ok(true) => signal_recovery_rotation(context, addr),
+                        Ok(false) => {}
+                        Err(record_error) => {
+                            warn!(%origin, record_error = %format_args!("{record_error:#}"), "could not record baseline rejection");
+                        }
+                    }
                 }
                 return Err(error.context("baseline import failed"));
+            }
+            #[cfg(test)]
+            {
+                trace_recovery_event("baseline_import_accepted", 0);
+                trace_recovery_latency("baseline_accepted", response_age, 0);
             }
             context
                 .metrics
                 .peers
                 .increment(crate::peer_metrics::Counter::BaselineAccepted);
+            clear_recovery_rotation(context, addr);
         }
         HistoryMessage::BaselineUnavailable {
             request_id,
@@ -2054,10 +3351,28 @@ async fn handle_history_message(
             let Some(revision) = request.baseline_revision else {
                 return Ok(());
             };
+            #[cfg(test)]
+            {
+                trace_recovery_event("baseline_unavailable_received", 0);
+                trace_recovery_latency(
+                    "baseline_unavailable",
+                    request_age(
+                        context.node.now(),
+                        request.deadline,
+                        context.history_request_timeout,
+                    ),
+                    0,
+                );
+            }
             if !record_recovery_failure(context, &origin, addr, reason, &revision).await? {
+                #[cfg(test)]
+                trace_recovery_event("baseline_refusal_superseded", 0);
                 debug!(%origin, %addr, "ignoring baseline refusal superseded by changed receipt coverage");
                 return Ok(());
             }
+            signal_recovery_rotation(context, addr);
+            #[cfg(test)]
+            trace_recovery_event("baseline_rejected", 0);
             context.metrics.record_sync_error();
             context
                 .metrics
@@ -2087,6 +3402,33 @@ async fn record_recovery_failure(
             super::storage::record_recovery_failure(&store, &origin, &source, reason, &revision)
         })
         .await
+}
+
+fn signal_recovery_rotation(context: &NodeEventContext, source_addr: &str) {
+    let Some(sender) = &context.recovery_rotation else {
+        return;
+    };
+
+    sender.send_modify(|request| {
+        request.generation = request.generation.wrapping_add(1);
+        request.source_addr = Some(source_addr.to_owned());
+    });
+}
+
+fn clear_recovery_rotation(context: &NodeEventContext, source_addr: &str) {
+    let Some(sender) = &context.recovery_rotation else {
+        return;
+    };
+
+    sender.send_if_modified(|request| {
+        if request.source_addr.as_deref() == Some(source_addr) {
+            request.generation = request.generation.wrapping_add(1);
+            request.source_addr = None;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 // End of main code. Test below:
@@ -2509,6 +3851,7 @@ mod tests {
             local_id: NodeId::new("overflow"),
             membership,
             rotation_interval: super::super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
+            recovery_rotation: None,
             node: Arc::new(
                 Node::try_new(NodeConfig::new(NodeId::generate(), "127.0.0.1:0")).unwrap(),
             ),
@@ -2602,6 +3945,7 @@ mod tests {
             repair_budget: Arc::new(std::sync::Mutex::new(
                 super::super::delivery::RepairBudget::new(StdInstant::now()),
             )),
+            recovery_rotation: None,
             history_cursors: Arc::new(RwLock::new(HashMap::new())),
             history_requests: Arc::new(RwLock::new(HashMap::new())),
             history_request_timeout: Duration::from_secs(30),
@@ -2641,6 +3985,1128 @@ mod tests {
         )
     }
 
+    fn queued_entries() -> Vec<nx_sync::SequencedOp> {
+        queued_entries_for("queued-origin")
+    }
+
+    fn queued_entries_for(name: &str) -> Vec<nx_sync::SequencedOp> {
+        let origin = NodeId::new(name);
+        [
+            Op::gcounter_increment(origin.clone(), "det-g", 7),
+            Op::pncounter_increment(origin.clone(), "det-p", 9),
+            Op::pncounter_decrement(origin.clone(), "det-p", 4),
+            Op::lww_register_set(origin.clone(), "det-r", b"winner".to_vec(), 200),
+            Op::lww_map_set(origin.clone(), "det-m", "field", b"removed".to_vec(), 100),
+            Op::lww_map_remove(origin.clone(), "det-m", "field", 200),
+            Op::orset_add(origin.clone(), "det-o", "removed", format!("{name}/tag")),
+            Op::orset_remove(
+                origin.clone(),
+                "det-o",
+                "removed",
+                vec![format!("{name}/tag")],
+            ),
+            Op::orset_add(
+                origin.clone(),
+                "det-o",
+                "present",
+                format!("{name}/present-tag"),
+            ),
+            Op::rga_insert(
+                origin.clone(),
+                "det-a",
+                format!("{name}/removed-id"),
+                None::<String>,
+                b"removed".to_vec(),
+            ),
+            Op::rga_delete(origin.clone(), "det-a", format!("{name}/removed-id")),
+            Op::rga_insert(
+                origin,
+                "det-a",
+                format!("{name}/present-id"),
+                None::<String>,
+                b"present".to_vec(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, op)| nx_sync::SequencedOp {
+            op,
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: index as u64 + 1,
+            },
+        })
+        .collect()
+    }
+
+    fn queued_event(ops: Vec<nx_sync::SequencedOp>, index: usize) -> NodeEvent {
+        NodeEvent::HistoryReceived {
+            from: NodeId::new(format!("source-{}", index % 2)),
+            addr: format!("source-{}", index % 2),
+            message: HistoryMessage::Push { ops },
+        }
+    }
+
+    fn queued_replay_event(
+        ops: Vec<nx_sync::SequencedOp>,
+        request_id: nx_sync::OpId,
+        source: &str,
+    ) -> NodeEvent {
+        let origin = ops
+            .first()
+            .map(|entry| entry.op.origin.clone())
+            .unwrap_or_else(|| NodeId::new("empty-replay"));
+        let start = ops.first().map_or(1, |entry| entry.position.sequence);
+        let end = ops.last().map_or(0, |entry| entry.position.sequence);
+        NodeEvent::HistoryReceived {
+            from: NodeId::new(source),
+            addr: source.to_owned(),
+            message: HistoryMessage::Replay {
+                request_id,
+                origin,
+                start,
+                end,
+                ops,
+            },
+        }
+    }
+
+    async fn queued_memory(context: &NodeEventContext) -> Vec<serde_json::Value> {
+        [
+            context.counters.read().await["det-g"].to_json().unwrap(),
+            context.pncounters.read().await["det-p"].to_json().unwrap(),
+            context.lww_registers.read().await["det-r"]
+                .to_json()
+                .unwrap(),
+            context.lww_maps.read().await["det-m"].to_json().unwrap(),
+            context.orsets.read().await["det-o"].to_json().unwrap(),
+            context.rgas.read().await["det-a"].to_json().unwrap(),
+        ]
+        .into_iter()
+        .map(|state| serde_json::from_str(&state).unwrap())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_pushes_share_one_batch_and_preserve_every_family_and_forward_source() {
+        let mut context = baseline_test_context();
+        let reference = baseline_test_context();
+        let entries = queued_entries();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let (sender, mut events) = mpsc::channel(64);
+        for (index, entry) in entries.iter().enumerate() {
+            sender
+                .try_send(queued_event(vec![entry.clone()], index))
+                .unwrap();
+            handle_node_event(queued_event(vec![entry.clone()], index), &reference).await;
+        }
+        let before = context.store.completed_batch_work().0;
+        drain_node_events(&mut events, &context).await;
+        assert_eq!(context.store.completed_batch_work().0 - before, 1);
+        assert_eq!(
+            reference.store.completed_batch_work().0,
+            entries.len() as u64
+        );
+        assert_eq!(
+            context.store.scan_prefix(b"__nx/").unwrap(),
+            reference.store.scan_prefix(b"__nx/").unwrap()
+        );
+        assert_eq!(
+            queued_memory(&context).await,
+            queued_memory(&reference).await
+        );
+        assert_eq!(context.anti_entropy_watermarks.read().await.len(), 2);
+        for (index, entry) in entries.iter().enumerate() {
+            let actual = forwarded.try_recv().unwrap();
+            assert_eq!(actual.entry, *entry);
+            assert_eq!(actual.source_addr, format!("source-{}", index % 2));
+            sender
+                .try_send(queued_event(vec![entry.clone(), entry.clone()], index))
+                .unwrap();
+        }
+        drain_node_events(&mut events, &context).await;
+        assert_eq!(context.store.completed_batch_work().0 - before, 1);
+        assert!(forwarded.try_recv().is_err());
+        assert_eq!(
+            queued_memory(&context).await,
+            queued_memory(&reference).await
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_pushes_wait_for_flush_before_forwarding() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let context = Arc::new(context);
+        let entries = queued_entries();
+        let (sender, mut events) = mpsc::channel(64);
+        for (index, entry) in entries.iter().enumerate() {
+            sender
+                .try_send(queued_event(vec![entry.clone()], index))
+                .unwrap();
+        }
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        context.store.pause_next_flush(reached_tx, resume_rx);
+        let worker = Arc::clone(&context);
+        let processing = tokio::spawn(async move { drain_node_events(&mut events, &worker).await });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!processing.is_finished());
+        assert!(forwarded.try_recv().is_err());
+        assert!(context.counters.try_read().is_err());
+        assert!(context.anti_entropy_watermarks.read().await.is_empty());
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), processing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.store.completed_flushes(), 1);
+        assert_eq!(context.store.completed_batch_work().0, 1);
+        for (index, entry) in entries.iter().enumerate() {
+            let actual = forwarded.try_recv().unwrap();
+            assert_eq!(actual.entry, *entry);
+            assert_eq!(actual.source_addr, format!("source-{}", index % 2));
+        }
+        assert!(forwarded.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_flush_failure_does_not_publish_forward_or_retry() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let (sender, mut events) = mpsc::channel(64);
+        for (index, entry) in queued_entries().into_iter().enumerate() {
+            sender.try_send(queued_event(vec![entry], index)).unwrap();
+        }
+        context.store.inject_disk_full_on_flush(true);
+        drain_node_events(&mut events, &context).await;
+        assert_eq!(context.store.completed_batch_work().0, 1);
+        assert_eq!(context.store.completed_flushes(), 0);
+        assert!(context.counters.read().await.is_empty());
+        assert!(context.pncounters.read().await.is_empty());
+        assert!(context.lww_registers.read().await.is_empty());
+        assert!(context.lww_maps.read().await.is_empty());
+        assert!(context.orsets.read().await.is_empty());
+        assert!(context.rgas.read().await.is_empty());
+        assert!(context.seen_ops.read().await.ids.is_empty());
+        assert!(context.op_log.read().await.is_empty());
+        assert!(context.anti_entropy_watermarks.read().await.is_empty());
+        assert!(forwarded.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_invalid_envelope_does_not_discard_valid_neighbors() {
+        let context = baseline_test_context();
+        let reference = baseline_test_context();
+        let entries = queued_entries();
+        let mut invalid = entries[1].clone();
+        invalid.position.generation = 0;
+        let (sender, mut events) = mpsc::channel(8);
+        for (index, entry) in [entries[0].clone(), invalid, entries[1].clone()]
+            .into_iter()
+            .enumerate()
+        {
+            sender.try_send(queued_event(vec![entry], index)).unwrap();
+        }
+        drain_node_events(&mut events, &context).await;
+        for (index, entry) in entries[..2].iter().enumerate() {
+            handle_node_event(queued_event(vec![entry.clone()], index), &reference).await;
+        }
+        assert_eq!(
+            context.store.scan_prefix(b"__nx/").unwrap(),
+            reference.store.scan_prefix(b"__nx/").unwrap()
+        );
+        assert_eq!(context.store.completed_batch_work().0, 2);
+        assert_eq!(context.counters.read().await["det-g"].value(), 7);
+        assert_eq!(context.pncounters.read().await["det-p"].value(), 9);
+    }
+
+    #[tokio::test]
+    async fn queued_interleaved_origins_match_individual_six_family_application() {
+        let context = baseline_test_context();
+        let reference = baseline_test_context();
+        let (sender, mut events) = mpsc::channel(64);
+        for (left, right) in queued_entries_for("writer-a")
+            .into_iter()
+            .zip(queued_entries_for("writer-b"))
+        {
+            for (index, entry) in [left, right].into_iter().enumerate() {
+                sender
+                    .try_send(queued_event(vec![entry.clone()], index))
+                    .unwrap();
+                handle_node_event(queued_event(vec![entry], index), &reference).await;
+            }
+        }
+        drain_node_events(&mut events, &context).await;
+        assert_eq!(context.store.completed_batch_work().0, 1);
+        assert_eq!(
+            queued_memory(&context).await,
+            queued_memory(&reference).await
+        );
+        for key in [
+            super::super::storage::durable_gcounter_state_key("det-g"),
+            super::super::storage::durable_pncounter_state_key("det-p"),
+            super::super::storage::durable_lww_register_state_key("det-r"),
+            super::super::storage::durable_lww_map_state_key("det-m"),
+            super::super::storage::durable_orset_state_key("det-o"),
+            super::super::storage::durable_rga_state_key("det-a"),
+        ] {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&context.store.get(&key).unwrap().unwrap()).unwrap();
+            let expected: serde_json::Value =
+                serde_json::from_slice(&reference.store.get(&key).unwrap().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            super::super::storage::replication_progress(&context.store).unwrap(),
+            super::super::storage::replication_progress(&reference.store).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_mixed_history_matches_individual_six_family_application() {
+        let context = baseline_test_context();
+        let reference = baseline_test_context();
+        let push_entries = queued_entries_for("mixed-writer-a");
+        let replay_entries = queued_entries_for("mixed-writer-b");
+        let replay_origin = NodeId::new("mixed-writer-b");
+        let request_id = nx_sync::OpId::generate();
+        let replay_source = "mixed-history-source";
+        arm_replay_request(&context, replay_source, &replay_origin, &request_id).await;
+        arm_replay_request(&reference, replay_source, &replay_origin, &request_id).await;
+        let (sender, mut events) = mpsc::channel(8);
+        sender
+            .try_send(queued_event(push_entries.clone(), 0))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                replay_entries.clone(),
+                request_id.clone(),
+                replay_source,
+            ))
+            .unwrap();
+        handle_node_event(queued_event(push_entries, 0), &reference).await;
+        handle_node_event(
+            queued_replay_event(replay_entries, request_id, replay_source),
+            &reference,
+        )
+        .await;
+
+        drain_node_events(&mut events, &context).await;
+
+        assert_eq!(context.store.completed_batch_work().0, 1);
+        assert_eq!(
+            queued_memory(&context).await,
+            queued_memory(&reference).await
+        );
+        assert_eq!(
+            context.store.scan_prefix(b"__nx/").unwrap(),
+            reference.store.scan_prefix(b"__nx/").unwrap()
+        );
+        assert_eq!(
+            super::super::storage::replication_progress(&context.store).unwrap(),
+            super::super::storage::replication_progress(&reference.store).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_storage_failure_does_not_publish_or_forward_or_retry() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let (sender, mut events) = mpsc::channel(8);
+        let entries = queued_entries();
+        let before = context.store.scan_prefix(b"__nx/").unwrap();
+        context.store.inject_disk_full_on_writes(true);
+        for (index, entry) in entries[..2].iter().enumerate() {
+            sender
+                .try_send(queued_event(vec![entry.clone()], index))
+                .unwrap();
+        }
+        drain_node_events(&mut events, &context).await;
+        assert_eq!(context.store.scan_prefix(b"__nx/").unwrap(), before);
+        assert_eq!(context.store.completed_batch_work().0, 0);
+        assert!(context.counters.read().await.is_empty());
+        assert!(context.pncounters.read().await.is_empty());
+        assert!(context.seen_ops.read().await.ids.is_empty());
+        assert!(context.op_log.read().await.is_empty());
+        assert!(context.anti_entropy_watermarks.read().await.is_empty());
+        assert!(forwarded.try_recv().is_err());
+        assert!(
+            context
+                .metrics
+                .render_for_test(&context.store)
+                .contains("numax_remote_op_apply_errors_total 1\n")
+        );
+        context.store.inject_disk_full_on_writes(false);
+    }
+
+    #[tokio::test]
+    async fn queued_pushes_and_replays_share_one_flush_and_publish_only_afterward() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let mut entries = Vec::new();
+        for (origin_name, source) in [
+            ("replay-origin-a", "replay-source-a:1234"),
+            ("replay-origin-b", "replay-source-b:1234"),
+        ] {
+            let origin = NodeId::new(origin_name);
+            let request_id = nx_sync::OpId::generate();
+            let entry = nx_sync::SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "replay-batch", 1),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            };
+            arm_replay_request(&context, source, &origin, &request_id).await;
+            entries.push((entry, request_id, source));
+        }
+
+        let before_batches = context.store.completed_batch_work().0;
+        let before_flushes = context.store.completed_flushes();
+        let (sender, mut events) = mpsc::channel(16);
+        let push_origin = NodeId::new("replay-origin-c");
+        let push_entry = nx_sync::SequencedOp {
+            op: Op::gcounter_increment(push_origin, "replay-batch", 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        for (index, (entry, request_id, source)) in entries.iter().enumerate() {
+            sender
+                .try_send(queued_replay_event(
+                    vec![entry.clone()],
+                    request_id.clone(),
+                    source,
+                ))
+                .unwrap();
+            if index == 0 {
+                sender
+                    .try_send(queued_event(vec![push_entry.clone()], 2))
+                    .unwrap();
+            }
+        }
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        context.store.pause_next_flush(reached_tx, resume_rx);
+        let context = Arc::new(context);
+        let worker = Arc::clone(&context);
+        let processing = tokio::spawn(async move { drain_node_events(&mut events, &worker).await });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!processing.is_finished());
+        assert!(forwarded.try_recv().is_err());
+        assert!(context.counters.try_read().is_err());
+        assert!(context.anti_entropy_watermarks.read().await.is_empty());
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), processing)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(context.store.completed_batch_work().0 - before_batches, 1);
+        assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+        assert_eq!(context.counters.read().await["replay-batch"].value(), 3);
+        let pending_requests = context.history_requests.read().await;
+        for (_, request_id, _) in &entries {
+            assert!(!pending_requests.values().any(|requests| {
+                requests
+                    .values()
+                    .any(|request| &request.request_id == request_id)
+            }));
+        }
+        drop(pending_requests);
+        let mut forwarded_items = Vec::new();
+        for _ in 0..=entries.len() {
+            let item = forwarded.try_recv().unwrap();
+            forwarded_items.push((item.entry.op.origin.as_str().to_owned(), item.source_addr));
+        }
+        forwarded_items.sort();
+        assert_eq!(
+            forwarded_items,
+            vec![
+                (
+                    "replay-origin-a".to_owned(),
+                    "replay-source-a:1234".to_owned(),
+                ),
+                (
+                    "replay-origin-b".to_owned(),
+                    "replay-source-b:1234".to_owned(),
+                ),
+                ("replay-origin-c".to_owned(), "source-0".to_owned()),
+            ]
+        );
+        assert!(forwarded.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_mixed_history_ignores_stale_replay_and_applies_valid_push() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let stale_origin = NodeId::new("mixed-stale-origin");
+        let stale_entry = nx_sync::SequencedOp {
+            op: Op::gcounter_increment(stale_origin, "stale-replay", 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let push_origin = NodeId::new("mixed-valid-origin");
+        let push_entry = nx_sync::SequencedOp {
+            op: Op::gcounter_increment(push_origin, "valid-push", 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let (sender, mut events) = mpsc::channel(8);
+        sender
+            .try_send(queued_replay_event(
+                vec![stale_entry],
+                nx_sync::OpId::generate(),
+                "stale-replay-source",
+            ))
+            .unwrap();
+        sender
+            .try_send(queued_event(vec![push_entry.clone()], 0))
+            .unwrap();
+
+        drain_node_events(&mut events, &context).await;
+
+        assert_eq!(context.store.completed_flushes(), 1);
+        assert_eq!(context.counters.read().await["valid-push"].value(), 1);
+        assert!(!context.counters.read().await.contains_key("stale-replay"));
+        let item = forwarded.try_recv().unwrap();
+        assert_eq!(item.entry, push_entry);
+        assert_eq!(item.source_addr, "source-0");
+        assert!(forwarded.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_push_summary_batches_keep_each_repair_source() {
+        let context = baseline_test_context();
+        let incoming = [
+            ("push-summary-a", "source-0"),
+            ("push-summary-b", "source-0"),
+            ("push-summary-c", "source-1"),
+        ]
+        .into_iter()
+        .map(|(origin, addr)| {
+            IncomingHistory::Push(IncomingPush {
+                from: NodeId::new(addr),
+                addr: addr.to_owned(),
+                ops: vec![nx_sync::SequencedOp {
+                    op: Op::gcounter_increment(NodeId::new(origin), "push-summary-batch", 1),
+                    position: nx_sync::OpPosition {
+                        generation: 1,
+                        sequence: 2,
+                    },
+                }],
+            })
+        })
+        .collect::<Vec<_>>();
+
+        let groups = group_push_summaries(&incoming).unwrap();
+        let (repairs, failed_sources) = record_grouped_push_summaries(groups, &context).await;
+
+        assert!(failed_sources.is_empty());
+        assert_eq!(repairs["source-0"].len(), 2);
+        assert_eq!(repairs["source-1"].len(), 1);
+        for origin in ["push-summary-a", "push-summary-b"] {
+            assert_eq!(repairs["source-0"][origin], Some((1, 2)));
+        }
+        assert_eq!(repairs["source-1"]["push-summary-c"], Some((1, 2)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_processes_priority_and_data_event_queues() {
+        let context = baseline_test_context();
+        let (data_tx, mut event_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        let (priority_tx, priority_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        data_tx
+            .send(NodeEvent::HistoryReceived {
+                from: NodeId::new("data-peer"),
+                addr: "data-peer".to_owned(),
+                message: HistoryMessage::Push { ops: Vec::new() },
+            })
+            .await
+            .unwrap();
+        for _ in 0..=PRIORITY_EVENT_BURST {
+            priority_tx
+                .send(NodeEvent::HistoryReceived {
+                    from: NodeId::new("priority-peer"),
+                    addr: "priority-peer".to_owned(),
+                    message: HistoryMessage::Summary {
+                        entries: Vec::new(),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut priority_event_rx = Some(priority_rx);
+        drain_node_event_queues(&mut event_rx, &mut priority_event_rx, &context).await;
+
+        assert!(event_rx.try_recv().is_err());
+        assert!(priority_event_rx.as_mut().unwrap().try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_mixed_history_storage_failure_does_not_publish_or_forward() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let source = "replay-source:1234";
+        let mut replay_events = Vec::new();
+        let mut original_request_ids = Vec::new();
+        for origin_name in ["replay-failed-a", "replay-failed-b"] {
+            let origin = NodeId::new(origin_name);
+            let request_id = nx_sync::OpId::generate();
+            let entry = nx_sync::SequencedOp {
+                op: Op::gcounter_increment(origin.clone(), "failed-replay-batch", 1),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            };
+            arm_replay_request(&context, source, &origin, &request_id).await;
+            original_request_ids.push(request_id.clone());
+            replay_events.push(queued_replay_event(vec![entry], request_id, source));
+        }
+        let push_origin = NodeId::new("queued-push-failed");
+        replay_events.insert(
+            1,
+            queued_event(
+                vec![nx_sync::SequencedOp {
+                    op: Op::gcounter_increment(push_origin, "failed-replay-batch", 1),
+                    position: nx_sync::OpPosition {
+                        generation: 1,
+                        sequence: 1,
+                    },
+                }],
+                0,
+            ),
+        );
+        let before = context.store.scan_prefix(b"__nx/").unwrap();
+        context.store.inject_disk_full_on_writes(true);
+        let (sender, mut events) = mpsc::channel(16);
+        for event in replay_events {
+            sender.try_send(event).unwrap();
+        }
+        drain_node_events(&mut events, &context).await;
+
+        assert_eq!(context.store.scan_prefix(b"__nx/").unwrap(), before);
+        assert!(context.counters.read().await.is_empty());
+        assert!(context.seen_ops.read().await.ids.is_empty());
+        assert!(context.op_log.read().await.is_empty());
+        let pending_requests = context.history_requests.read().await;
+        for request_id in &original_request_ids {
+            assert!(!pending_requests.values().any(|requests| {
+                requests
+                    .values()
+                    .any(|request| &request.request_id == request_id)
+            }));
+        }
+        drop(pending_requests);
+        assert!(context.anti_entropy_watermarks.read().await.is_empty());
+        assert!(forwarded.try_recv().is_err());
+        assert!(
+            context
+                .metrics
+                .render_for_test(&context.store)
+                .contains("numax_remote_op_apply_errors_total 1\n")
+        );
+        context.store.inject_disk_full_on_writes(false);
+    }
+
+    #[tokio::test]
+    async fn queued_mixed_history_duplicate_ids_commit_once() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let origin = NodeId::new("mixed-duplicate-origin");
+        let entry = nx_sync::SequencedOp {
+            op: Op::gcounter_increment(origin.clone(), "mixed-duplicate", 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let request_id = nx_sync::OpId::generate();
+        let replay_source = "mixed-duplicate-replay-source";
+        arm_replay_request(&context, replay_source, &origin, &request_id).await;
+        let (sender, mut events) = mpsc::channel(8);
+        sender
+            .try_send(queued_event(vec![entry.clone()], 0))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                request_id.clone(),
+                replay_source,
+            ))
+            .unwrap();
+        let before_flushes = context.store.completed_flushes();
+
+        drain_node_events(&mut events, &context).await;
+
+        assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+        assert_eq!(context.counters.read().await["mixed-duplicate"].value(), 1);
+        let item = forwarded.try_recv().unwrap();
+        assert_eq!(item.entry, entry);
+        assert_eq!(item.source_addr, "source-0");
+        assert!(forwarded.try_recv().is_err());
+        assert!(
+            !context
+                .history_requests
+                .read()
+                .await
+                .values()
+                .flat_map(|requests| requests.values())
+                .any(|request| request.request_id == request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_replays_with_duplicate_ids_keep_individual_commit_order() {
+        let mut context = baseline_test_context();
+        let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+            64,
+            super::super::delivery::QUEUE_BYTES,
+            context.metrics.clone(),
+            true,
+        );
+        context.forward_tx = Some(forward_tx);
+        let source = "replay-source:1234";
+        let mut events = Vec::new();
+        for origin_name in ["replay-duplicate-a", "replay-duplicate-b"] {
+            let origin = NodeId::new(origin_name);
+            let request_id = nx_sync::OpId::generate();
+            let mut op = Op::gcounter_increment(origin.clone(), "replay-duplicate", 1);
+            op.id = nx_sync::OpId::new("replay-shared-id");
+            let entry = nx_sync::SequencedOp {
+                op,
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: 1,
+                },
+            };
+            arm_replay_request(&context, source, &origin, &request_id).await;
+            events.push(queued_replay_event(vec![entry], request_id, source));
+        }
+        let before_flushes = context.store.completed_flushes();
+        let (sender, mut event_rx) = mpsc::channel(16);
+        for event in events {
+            sender.try_send(event).unwrap();
+        }
+        drain_node_events(&mut event_rx, &context).await;
+
+        assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+        assert_eq!(context.counters.read().await["replay-duplicate"].value(), 1);
+        let item = forwarded.try_recv().unwrap();
+        assert_eq!(item.source_addr, source);
+        assert_eq!(item.entry.op.id.as_str(), "replay-shared-id");
+        assert!(forwarded.try_recv().is_err());
+        assert!(
+            context
+                .metrics
+                .render_for_test(&context.store)
+                .contains("numax_sync_errors_total 1\n")
+        );
+    }
+
+    async fn collect_remote_history_without_coalescing(
+        first: NodeEvent,
+        event_rx: &mut mpsc::Receiver<NodeEvent>,
+    ) -> (Vec<IncomingHistory>, Option<NodeEvent>) {
+        let mut priority_event_rx = None;
+        let (history, pending, priority) =
+            collect_remote_history(first, event_rx, &mut priority_event_rx, false, None).await;
+        assert!(priority.is_none());
+        (history, pending)
+    }
+
+    #[tokio::test]
+    async fn remote_history_collection_preserves_sources_and_combined_work_budgets() {
+        let entry = queued_entries_for("replay-collector").remove(0);
+        let (sender, mut events) = mpsc::channel(128);
+        for _ in 0..=super::super::delivery::TURN_MESSAGES {
+            sender
+                .try_send(queued_replay_event(
+                    vec![entry.clone()],
+                    nx_sync::OpId::generate(),
+                    "replay-source",
+                ))
+                .unwrap();
+        }
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), super::super::delivery::TURN_MESSAGES);
+        assert!(
+            history
+                .iter()
+                .all(|envelope| matches!(envelope, IncomingHistory::Replay(_)))
+        );
+        assert!(pending.is_none());
+        assert_eq!(events.len(), 1);
+        events.try_recv().unwrap();
+
+        let (sender, mut events) = mpsc::channel(8);
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                nx_sync::OpId::generate(),
+                "replay-source-a",
+            ))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                nx_sync::OpId::generate(),
+                "replay-source-b",
+            ))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                nx_sync::OpId::generate(),
+                "replay-source-a",
+            ))
+            .unwrap();
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history
+                .iter()
+                .map(|envelope| match envelope {
+                    IncomingHistory::Replay(replay) => replay.addr.as_str(),
+                    IncomingHistory::Push(_) => "unexpected-push",
+                })
+                .collect::<Vec<_>>(),
+            vec!["replay-source-a", "replay-source-b", "replay-source-a"]
+        );
+        assert!(pending.is_none());
+        assert!(events.is_empty());
+
+        let (sender, mut events) = mpsc::channel(8);
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                nx_sync::OpId::generate(),
+                "replay-source-a",
+            ))
+            .unwrap();
+        sender
+            .try_send(queued_event(vec![entry.clone()], 1))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                vec![entry.clone()],
+                nx_sync::OpId::generate(),
+                "replay-source-b",
+            ))
+            .unwrap();
+        sender
+            .try_send(NodeEvent::PullRequested {
+                from: NodeId::new("boundary"),
+                addr: "boundary".into(),
+                since_op_id: None,
+            })
+            .unwrap();
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(&history[0], IncomingHistory::Replay(_)));
+        assert!(matches!(&history[1], IncomingHistory::Push(_)));
+        assert!(matches!(&history[2], IncomingHistory::Replay(_)));
+        assert!(matches!(pending, Some(NodeEvent::PullRequested { .. })));
+        assert!(events.is_empty());
+
+        let large_origin = NodeId::new("replay-large");
+        let large_entry = nx_sync::SequencedOp {
+            op: Op::lww_register_set(large_origin, "large", vec![0; 60 * 1024], 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let large_ops = vec![large_entry; 56];
+        assert!(
+            replay_work(&queued_replay_event(
+                large_ops.clone(),
+                nx_sync::OpId::generate(),
+                "replay-large-source",
+            ))
+            .is_some()
+        );
+        let (sender, mut events) = mpsc::channel(8);
+        for index in 0..3 {
+            let event = if index == 1 {
+                queued_event(large_ops.clone(), index)
+            } else {
+                queued_replay_event(
+                    large_ops.clone(),
+                    nx_sync::OpId::generate(),
+                    "replay-large-source",
+                )
+            };
+            sender.try_send(event).unwrap();
+        }
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 2);
+        assert!(pending.is_some());
+        assert!(events.is_empty());
+
+        let (sender, mut events) = mpsc::channel(4);
+        sender
+            .try_send(queued_event(vec![entry.clone(); 1024], 0))
+            .unwrap();
+        sender
+            .try_send(queued_replay_event(
+                vec![entry],
+                nx_sync::OpId::generate(),
+                "replay-source",
+            ))
+            .unwrap();
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], IncomingHistory::Push(push) if push.ops.len() == 1024));
+        assert!(pending.is_some());
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_collection_preserves_boundaries_and_work_limits() {
+        let entry = queued_entries().remove(0);
+        let (sender, mut events) = mpsc::channel(128);
+        for index in 0..65 {
+            sender
+                .try_send(queued_event(vec![entry.clone()], index))
+                .unwrap();
+        }
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), super::super::delivery::TURN_MESSAGES);
+        assert!(
+            history
+                .iter()
+                .all(|envelope| matches!(envelope, IncomingHistory::Push(_)))
+        );
+        assert!(pending.is_none());
+        assert_eq!(events.len(), 1);
+        events.try_recv().unwrap();
+        sender
+            .try_send(queued_event(vec![entry.clone(); 1024], 0))
+            .unwrap();
+        sender
+            .try_send(queued_event(vec![entry.clone()], 1))
+            .unwrap();
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], IncomingHistory::Push(_)));
+        assert!(pending.is_some());
+        assert!(events.is_empty());
+        sender
+            .try_send(queued_event(vec![entry.clone()], 0))
+            .unwrap();
+        sender
+            .try_send(NodeEvent::PullRequested {
+                from: NodeId::new("boundary"),
+                addr: "boundary".into(),
+                since_op_id: None,
+            })
+            .unwrap();
+        sender.try_send(queued_event(vec![entry], 1)).unwrap();
+        let first = events.try_recv().unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], IncomingHistory::Push(_)));
+        assert!(matches!(pending, Some(NodeEvent::PullRequested { .. })));
+        assert_eq!(events.len(), 1);
+        events.try_recv().unwrap();
+        let large = nx_sync::SequencedOp {
+            op: Op::lww_register_set(NodeId::new("large"), "large", vec![0; 32 * 1024], 1),
+            position: nx_sync::OpPosition {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+        let first = queued_event(vec![large.clone(); 192], 0);
+        let (_, bytes) = push_work(&first).unwrap();
+        assert!(bytes < super::super::delivery::TURN_BYTES);
+        assert!(bytes * 2 > super::super::delivery::TURN_BYTES);
+        sender.try_send(queued_event(vec![large; 192], 1)).unwrap();
+        let (history, pending) =
+            collect_remote_history_without_coalescing(first, &mut events).await;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], IncomingHistory::Push(_)));
+        assert!(pending.is_some());
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coalesced_remote_history_flushes_once_after_second_event_arrives() {
+        let context = baseline_test_context();
+        let before_flushes = context.store.completed_flushes();
+        let first = queued_event(
+            queued_entries_for("coalesce-a")
+                .into_iter()
+                .take(1)
+                .collect(),
+            0,
+        );
+        let second = queued_event(
+            queued_entries_for("coalesce-b")
+                .into_iter()
+                .take(1)
+                .collect(),
+            1,
+        );
+        let (sender, mut event_rx) = mpsc::channel(8);
+        let mut priority_event_rx = None;
+        let priority_event = {
+            let processing = handle_node_events(
+                first,
+                &mut event_rx,
+                &mut priority_event_rx,
+                true,
+                &context,
+                Some(REMOTE_HISTORY_COALESCE_WINDOW),
+            );
+            tokio::pin!(processing);
+            tokio::select! {
+                biased;
+                _ = &mut processing => panic!("collector returned before the coalescing window ended"),
+                result = sender.send(second) => result.unwrap(),
+            }
+            processing.await
+        };
+        assert!(priority_event.is_none());
+        assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+        assert_eq!(context.counters.read().await["det-g"].value(), 14);
+        assert!(event_rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coalescing_returns_priority_event_without_consuming_later_data() {
+        let context = baseline_test_context();
+        let first = queued_event(
+            queued_entries_for("coalesce-first")
+                .into_iter()
+                .take(1)
+                .collect(),
+            0,
+        );
+        let later_data = queued_event(
+            queued_entries_for("coalesce-later")
+                .into_iter()
+                .take(1)
+                .collect(),
+            1,
+        );
+        let (data_sender, mut event_rx) = mpsc::channel(8);
+        let (priority_sender, priority_receiver) = mpsc::channel(8);
+        let mut priority_event_rx = Some(priority_receiver);
+        let control = NodeEvent::PullRequested {
+            from: NodeId::new("priority-boundary"),
+            addr: "priority-boundary".into(),
+            since_op_id: None,
+        };
+        let priority_event = {
+            let processing = handle_node_events(
+                first,
+                &mut event_rx,
+                &mut priority_event_rx,
+                true,
+                &context,
+                Some(Duration::from_secs(5)),
+            );
+            tokio::pin!(processing);
+            tokio::select! {
+                biased;
+                _ = &mut processing => panic!("collector returned before a priority event arrived"),
+                result = priority_sender.send(control) => result.unwrap(),
+            }
+            data_sender.send(later_data).await.unwrap();
+            processing.await
+        };
+        assert!(matches!(
+            priority_event,
+            Some(NodeEvent::PullRequested { .. })
+        ));
+        assert_eq!(event_rx.len(), 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(NodeEvent::HistoryReceived { .. })
+        ));
+    }
+
     async fn arm_baseline_request(context: &NodeEventContext, origin: &NodeId) -> nx_sync::OpId {
         let id = nx_sync::OpId::generate();
         context
@@ -2664,6 +5130,30 @@ mod tests {
         id
     }
 
+    async fn arm_replay_request(
+        context: &NodeEventContext,
+        addr: &str,
+        origin: &NodeId,
+        request_id: &nx_sync::OpId,
+    ) {
+        context
+            .history_requests
+            .write()
+            .await
+            .entry(addr.to_owned())
+            .or_default()
+            .insert(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: request_id.clone(),
+                    start: 1,
+                    end: 1,
+                    baseline_revision: None,
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            );
+    }
+
     fn baseline_payload(origin: &NodeId, sequence: u64, legacy: bool) -> Vec<u8> {
         let mut counter = GCounter::new();
         counter.increment(origin, 7);
@@ -2685,7 +5175,9 @@ mod tests {
     #[tokio::test]
     async fn baseline_live_refusal_after_other_source_repair_cannot_describe_a_new_gap() {
         for mode in ["complete", "partial", "legacy"] {
-            let context = baseline_test_context();
+            let (rotation_tx, rotation_rx) = watch::channel(RecoveryRotation::default());
+            let mut context = baseline_test_context();
+            context.recovery_rotation = Some(rotation_tx);
             let origin = NodeId::new("origin");
             let legacy = mode == "legacy";
             super::super::storage::record_summary(
@@ -2742,6 +5234,7 @@ mod tests {
                 before,
                 "{mode}"
             );
+            assert_eq!(rotation_rx.borrow().generation, 0, "{mode}");
             super::super::storage::record_summary(
                 &context.store,
                 &nx_sync::HistorySummary {
@@ -2763,7 +5256,9 @@ mod tests {
     #[tokio::test]
     async fn baseline_failure_is_invalidated_by_partial_repair_or_a_new_target() {
         for change_high in [false, true] {
-            let context = baseline_test_context();
+            let (rotation_tx, rotation_rx) = watch::channel(RecoveryRotation::default());
+            let mut context = baseline_test_context();
+            context.recovery_rotation = Some(rotation_tx);
             let origin = NodeId::new("origin");
             let summary = nx_sync::HistorySummary {
                 origin: origin.clone(),
@@ -2783,6 +5278,11 @@ mod tests {
             )
             .await
             .unwrap();
+            assert_eq!(rotation_rx.borrow().generation, 1);
+            assert_eq!(
+                rotation_rx.borrow().source_addr.as_deref(),
+                Some("source:1234")
+            );
             // Repeating the same summary must retain a still-relevant failure.
             super::super::storage::record_summary(&context.store, &summary).unwrap();
             assert!(
@@ -2817,6 +5317,43 @@ mod tests {
             assert!(progress[0].contiguous_sequence < progress[0].known_high_sequence);
             assert!(progress[0].recovery_failure.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn successful_baseline_cancels_pending_recovery_rotation() {
+        let (rotation_tx, rotation_rx) = watch::channel(RecoveryRotation::default());
+        let mut context = baseline_test_context();
+        context.recovery_rotation = Some(rotation_tx);
+        let origin = NodeId::new("origin");
+        super::super::storage::record_summary(
+            &context.store,
+            &nx_sync::HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let request_id = arm_baseline_request(&context, &origin).await;
+        signal_recovery_rotation(&context, "source:1234");
+        let payload = baseline_payload(&origin, 1, false);
+        handle_history_message(
+            "source:1234",
+            HistoryMessage::Baseline {
+                request_id,
+                origin: origin.clone(),
+                version: super::super::baseline::VERSION,
+                digest: *blake3::hash(&payload).as_bytes(),
+                payload,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let rotation = rotation_rx.borrow();
+        assert_eq!(rotation.generation, 2);
+        assert_eq!(rotation.source_addr, None);
     }
 
     #[tokio::test]
@@ -3237,6 +5774,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn connection_error_classes_are_bounded_and_do_not_include_error_text() {
+        assert_eq!(
+            connection_error_class(&NetError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset
+            ))),
+            "io_connection_reset"
+        );
+        assert_eq!(
+            connection_error_class(&NetError::ConnectionFailed(
+                "outbound connection attempt limit reached: 8".into()
+            )),
+            "outbound_attempt_limit"
+        );
+        assert_eq!(
+            connection_error_class(&NetError::ConnectionFailed(
+                "sensitive endpoint-specific detail".into()
+            )),
+            "connection_failed"
+        );
+        assert_eq!(
+            connection_error_class(&NetError::Wire(WireError::RateLimited {
+                retry_after_ms: Some(50),
+            })),
+            "wire_retry_after"
+        );
+    }
+
     #[tokio::test]
     async fn peer_events_update_known_peer_health() {
         let peer = "127.0.0.1:42000";
@@ -3405,7 +5970,8 @@ mod tests {
     async fn sequenced_stale_unavailable_cannot_describe_a_new_gap_or_retry() {
         use nx_sync::{HistorySummary, OpId, OpPosition, SequencedOp};
         let store = temp_store();
-        let context = test_event_context(
+        let (rotation_tx, rotation_rx) = watch::channel(RecoveryRotation::default());
+        let mut context = test_event_context(
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(RwLock::new(SeenOps::new(1))),
             Arc::new(RwLock::new(Vec::new())),
@@ -3413,6 +5979,7 @@ mod tests {
             metrics(),
             Arc::new(RwLock::new(HashMap::new())),
         );
+        context.recovery_rotation = Some(rotation_tx);
         let origin = NodeId::new("origin");
         let addr = "source-a:1234";
         let old_id = OpId::generate();
@@ -3513,6 +6080,8 @@ mod tests {
         .unwrap();
         let progress = super::super::storage::replication_progress(&store).unwrap();
         assert!(progress[0].source_unavailable);
+        assert_eq!(rotation_rx.borrow().generation, 1);
+        assert_eq!(rotation_rx.borrow().source_addr.as_deref(), Some(addr));
         let evidence = progress[0].unavailable_evidence.as_ref().unwrap();
         assert_eq!(evidence.source, addr);
         assert_eq!(evidence.request_id, new_id);
@@ -3558,6 +6127,152 @@ mod tests {
         assert_eq!(progress[0].known_high_sequence, 3);
         assert!(!progress[0].source_unavailable);
         assert!(progress[0].unavailable_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_range_tries_one_connected_alternative_before_baseline() {
+        use nx_sync::{HistorySummary, OpId};
+
+        let store = temp_store();
+        let (rotation_tx, rotation_rx) = watch::channel(RecoveryRotation::default());
+        let mut local = Node::new(NodeConfig::new(
+            NodeId::new("range-requester"),
+            "127.0.0.1:0",
+        ));
+        let _local_events = local.take_event_receiver().unwrap();
+        local.start_listener().await.unwrap();
+
+        let alternative_id = NodeId::new("range-alternative");
+        let mut alternative = Node::new(NodeConfig::new(alternative_id.clone(), "127.0.0.1:0"));
+        let mut alternative_events = alternative.take_event_receiver().unwrap();
+        let alternative_endpoint = alternative.start_listener().await.unwrap().to_string();
+        local.connect_to_peer(&alternative_endpoint).await.unwrap();
+        let alternative_addr = local
+            .connected_peers()
+            .await
+            .into_iter()
+            .find(|(_, id)| id == &alternative_id)
+            .unwrap()
+            .0;
+        let local = Arc::new(local);
+
+        let mut context = test_event_context(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SeenOps::new(1))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::clone(&store),
+            metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        context.node = local.clone();
+        context.recovery_rotation = Some(rotation_tx);
+        let origin = NodeId::new("origin");
+        super::super::storage::record_summary(
+            &store,
+            &HistorySummary {
+                origin: origin.clone(),
+                high_sequence: 1,
+                baseline_required: false,
+            },
+        )
+        .unwrap();
+        let failed_source = "failed-source:1234";
+        let first_request = OpId::generate();
+        context.history_requests.write().await.insert(
+            failed_source.to_owned(),
+            HashMap::from([(
+                origin.as_str().to_owned(),
+                PendingHistoryRequest {
+                    request_id: first_request.clone(),
+                    start: 1,
+                    end: 1,
+                    baseline_revision: None,
+                    deadline: StdInstant::now() + Duration::from_secs(30),
+                },
+            )]),
+        );
+
+        handle_history_message(
+            failed_source,
+            HistoryMessage::Unavailable {
+                request_id: first_request,
+                origin: origin.clone(),
+                start: 1,
+                end: 1,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::super::storage::replication_progress(&store).unwrap()[0]
+                .unavailable_evidence
+                .as_ref()
+                .unwrap()
+                .source,
+            failed_source
+        );
+        let first_message = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(event) = alternative_events.recv().await else {
+                    panic!("alternative peer event stream closed");
+                };
+                if let NodeEvent::HistoryReceived { message, .. } = event {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("alternative range request was not sent");
+        let HistoryMessage::Request {
+            request_id: alternate_request,
+            origin: alternate_origin,
+            start,
+            end,
+        } = first_message
+        else {
+            panic!("expected an alternate range request");
+        };
+        assert_eq!(alternate_origin, origin);
+        assert_eq!((start, end), (1, 1));
+        assert_eq!(rotation_rx.borrow().generation, 0);
+
+        handle_history_message(
+            &alternative_addr,
+            HistoryMessage::Unavailable {
+                request_id: alternate_request,
+                origin: origin.clone(),
+                start,
+                end,
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        let fallback_message = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(event) = alternative_events.recv().await else {
+                    panic!("alternative peer event stream closed");
+                };
+                if let NodeEvent::HistoryReceived { message, .. } = event {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("baseline fallback request was not sent");
+        assert!(matches!(
+            fallback_message,
+            HistoryMessage::BaselineRequest { origin: requested, .. } if requested == origin
+        ));
+        assert_eq!(rotation_rx.borrow().generation, 1);
+        assert_eq!(
+            rotation_rx.borrow().source_addr.as_deref(),
+            Some(alternative_addr.as_str())
+        );
+
+        local.shutdown().await;
+        alternative.shutdown().await;
     }
 
     #[tokio::test]
@@ -3945,6 +6660,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn periodic_summary_walk_reaches_later_gap_and_preserves_pending_deadlines() {
+        for format in [
+            nx_net::SerializationFormat::Json,
+            nx_net::SerializationFormat::Bincode,
+        ] {
+            let mut source = Node::new(
+                NodeConfig::new(NodeId::new("source"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let mut events = source.take_event_receiver().unwrap();
+            let addr = source.start_listener().await.unwrap().to_string();
+            let mut context = baseline_test_context();
+            context.node = Arc::new(Node::new(
+                NodeConfig::new(NodeId::new("target"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            ));
+            context.node.connect_to_peer(&addr).await.unwrap();
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let entropy = AntiEntropyLoopContext {
+                store: Arc::clone(&context.store),
+                jitter_seed: 1,
+                repair_budget: Arc::clone(&context.repair_budget),
+                history_cursors: Arc::clone(&context.history_cursors),
+                request_timeout: context.history_request_timeout,
+                node: Arc::clone(&context.node),
+                interval: Duration::from_secs(30),
+                shutdown_rx,
+                metrics: Arc::clone(&context.metrics),
+                membership: None,
+            };
+            let mut peer_cursor = 0;
+            anti_entropy_turn(&entropy, &mut peer_cursor).await;
+            assert!(matches!(
+                next_history(&mut events, Duration::from_secs(1)).await,
+                Some(HistoryMessage::SummaryRequest { after_origin: None })
+            ));
+            let pending = context.history_cursors.read().await[&addr].clone();
+            anti_entropy_turn(&entropy, &mut peer_cursor).await;
+            assert_eq!(
+                context.history_cursors.read().await[&addr].request_deadline,
+                pending.request_deadline
+            );
+            assert!(
+                next_history(&mut events, Duration::from_millis(100))
+                    .await
+                    .is_none()
+            );
+            handle_history_message(
+                &addr,
+                HistoryMessage::Summary {
+                    entries: summary_entries(SUMMARY_PAGE, 0),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                next_history(&mut events, Duration::from_secs(1)).await,
+                Some(HistoryMessage::SummaryRequest { after_origin: Some(after) }) if after == "origin-15"
+            ));
+            let origin = NodeId::new("origin-16");
+            handle_history_message(
+                &addr,
+                HistoryMessage::Summary {
+                    entries: vec![nx_sync::HistorySummary {
+                        origin: origin.clone(),
+                        high_sequence: 1,
+                        baseline_required: false,
+                    }],
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            let Some(HistoryMessage::Request {
+                request_id,
+                origin: requested_origin,
+                start: 1,
+                end: 1,
+            }) = next_history(&mut events, Duration::from_secs(1)).await
+            else {
+                panic!("periodic walk did not request the later page's missing operation");
+            };
+            assert_eq!(requested_origin, origin);
+            let backoff = context.history_cursors.read().await[&addr].clone();
+            assert!(backoff.catch_up);
+            assert_eq!(backoff.rewalks, 1);
+            anti_entropy_turn(&entropy, &mut peer_cursor).await;
+            let current = context.history_cursors.read().await[&addr].clone();
+            assert_eq!(current.request_deadline, backoff.request_deadline);
+            assert_eq!(current.after_origin, backoff.after_origin);
+            assert_eq!(current.rewalks, backoff.rewalks);
+            assert!(
+                next_history(&mut events, Duration::from_millis(100))
+                    .await
+                    .is_none()
+            );
+            handle_history_message(
+                &addr,
+                HistoryMessage::Replay {
+                    request_id,
+                    origin: origin.clone(),
+                    start: 1,
+                    end: 1,
+                    ops: vec![nx_sync::SequencedOp {
+                        op: Op::gcounter_increment(origin.clone(), "periodic-page", 1),
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: 1,
+                        },
+                    }],
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(context.counters.read().await["periodic-page"].value(), 1);
+            assert_eq!(context.store.completed_flushes(), 1);
+            let progress = super::super::storage::replication_progress(&context.store).unwrap();
+            let receipt = progress
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .unwrap();
+            assert_eq!(receipt.contiguous_sequence, 1);
+            assert_eq!(receipt.known_high_sequence, 1);
+            assert_eq!(receipt.sparse_positions, 0);
+            assert!(!receipt.source_unavailable);
+            assert!(receipt.recovery_failure.is_none());
+            context.node.shutdown().await;
+            source.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_summary_page_retries_unprocessed_origins_without_reapplying_prefix() {
+        let (source, mut events, addr) = listening_source("source").await;
+        let context = baseline_test_context();
+        context.node.connect_to_peer(&addr).await.unwrap();
+        context
+            .history_cursors
+            .write()
+            .await
+            .entry(addr.clone())
+            .or_default()
+            .catch_up = true;
+        {
+            let mut budget = context.repair_budget.lock().unwrap();
+            for _ in 1..super::super::delivery::TURN_MESSAGES {
+                assert!(budget.admit(0, context.node.now()));
+            }
+        }
+        let error = handle_history_message(
+            &addr,
+            HistoryMessage::Summary {
+                entries: summary_entries(SUMMARY_PAGE, 1),
+            },
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<NetError>(),
+            Some(NetError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let Some(HistoryMessage::Request {
+            request_id,
+            origin,
+            start: 1,
+            end: 1,
+        }) = next_history(&mut events, Duration::from_secs(1)).await
+        else {
+            panic!("the admitted prefix request was not delivered");
+        };
+        assert_eq!(origin.as_str(), "origin-00");
+        let progress = super::super::storage::replication_progress(&context.store).unwrap();
+        assert_eq!(progress.len(), SUMMARY_PAGE);
+        assert_eq!(progress.last().unwrap().known_high_sequence, 1);
+        let cursor = context.history_cursors.read().await[&addr].clone();
+        assert!(
+            cursor.after_origin.is_none(),
+            "failed page skipped its unprocessed suffix"
+        );
+        assert!(cursor.request_deadline.is_none());
+        assert!(cursor.catch_up);
+        assert_eq!(cursor.rewalks, 0);
+        assert_eq!(context.history_requests.read().await[&addr].len(), 1);
+        handle_history_message(
+            &addr,
+            HistoryMessage::Replay {
+                request_id,
+                origin: origin.clone(),
+                start: 1,
+                end: 1,
+                ops: vec![nx_sync::SequencedOp {
+                    op: Op::gcounter_increment(origin.clone(), "retry-page", 1),
+                    position: nx_sync::OpPosition {
+                        generation: 1,
+                        sequence: 1,
+                    },
+                }],
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        *context.repair_budget.lock().unwrap() =
+            super::super::delivery::RepairBudget::new(context.node.now());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let entropy = AntiEntropyLoopContext {
+            store: Arc::clone(&context.store),
+            jitter_seed: 1,
+            repair_budget: Arc::clone(&context.repair_budget),
+            history_cursors: Arc::clone(&context.history_cursors),
+            request_timeout: context.history_request_timeout,
+            node: Arc::clone(&context.node),
+            interval: Duration::from_secs(30),
+            shutdown_rx,
+            metrics: Arc::clone(&context.metrics),
+            membership: None,
+        };
+        catch_up_turn(&entropy).await;
+        assert!(matches!(
+            next_history(&mut events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::SummaryRequest { after_origin: None })
+        ));
+        handle_history_message(
+            &addr,
+            HistoryMessage::Summary {
+                entries: summary_entries(SUMMARY_PAGE, 1),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+        for index in 1..SUMMARY_PAGE {
+            assert!(matches!(
+                next_history(&mut events, Duration::from_secs(1)).await,
+                Some(HistoryMessage::Request { origin, start: 1, end: 1, .. })
+                    if origin.as_str() == format!("origin-{index:02}")
+            ));
+        }
+        assert!(matches!(
+            next_history(&mut events, Duration::from_secs(1)).await,
+            Some(HistoryMessage::SummaryRequest { after_origin: Some(after) }) if after == "origin-15"
+        ));
+        assert_eq!(context.counters.read().await["retry-page"].value(), 1);
+        assert_eq!(context.store.completed_flushes(), 1);
+        let progress = super::super::storage::replication_progress(&context.store).unwrap();
+        assert_eq!(progress.len(), SUMMARY_PAGE);
+        let receipt = progress
+            .iter()
+            .find(|entry| entry.origin == origin)
+            .unwrap();
+        assert_eq!(receipt.contiguous_sequence, 1);
+        assert_eq!(receipt.known_high_sequence, 1);
+        assert_eq!(receipt.sparse_positions, 0);
+        context.node.shutdown().await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn catch_up_walk_continues_to_wrap_and_rewalks_only_while_gaps_remain() {
         let (source, mut events, addr) = listening_source("source").await;
         let context = baseline_test_context();
@@ -4239,6 +7215,7 @@ mod tests {
             local_id: NodeId::new("dialer"),
             membership: membership_rx,
             rotation_interval: Duration::from_secs(3600),
+            recovery_rotation: None,
             node: node.clone(),
             candidates_rx,
             max_peers: 4,

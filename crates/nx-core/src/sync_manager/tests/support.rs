@@ -360,6 +360,7 @@ pub(super) fn test_event_context(
         repair_budget: Arc::new(std::sync::Mutex::new(
             crate::sync_manager::delivery::RepairBudget::new(StdInstant::now()),
         )),
+        recovery_rotation: None,
         history_cursors: Arc::new(RwLock::new(HashMap::new())),
         history_requests: Arc::new(RwLock::new(HashMap::new())),
         history_request_timeout: Duration::from_secs(30),
@@ -626,6 +627,7 @@ pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
     if std::env::var_os(CHILD_TEST).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
         return false;
     }
+    let _scenario = process_scenario_io();
     isolated_test_output(
         test_name,
         CHILD_TEST,
@@ -633,6 +635,28 @@ pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
         std::time::Duration::from_secs(60),
     );
     true
+}
+
+pub(super) fn process_scenario_io() -> std::sync::MutexGuard<'static, ()> {
+    // Queue independent host-I/O scenarios before starting any scenario deadline.
+    static PROCESS_SCENARIO_IO: StdMutex<()> = StdMutex::new(());
+    PROCESS_SCENARIO_IO.lock().unwrap_or_else(|poisoned| {
+        // The gate protects no state; expected-panic tests must not poison later scenarios.
+        eprintln!("recovering process scenario I/O gate after a panicking scenario");
+        PROCESS_SCENARIO_IO.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+#[test]
+fn process_scenario_gate_survives_panicking_scenario() {
+    let failed = std::thread::spawn(|| {
+        let _scenario = process_scenario_io();
+        panic!("injected scenario panic");
+    })
+    .join();
+    assert!(failed.is_err());
+    drop(process_scenario_io());
 }
 
 pub(super) fn isolated_test_output(
@@ -1192,6 +1216,7 @@ pub(super) async fn test_topology_reconnect(
         local_id: manager.node_id.clone(),
         membership,
         rotation_interval,
+        recovery_rotation: None,
         node: (manager.node.as_ref().unwrap()).clone(),
         candidates_rx,
         max_peers: manager.config.max_peers,

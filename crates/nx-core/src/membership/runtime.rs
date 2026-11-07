@@ -175,6 +175,33 @@ struct ShutdownRequest {
     completed: oneshot::Sender<tokio::time::Instant>,
 }
 
+/// A bounded shutdown call ended without completing the retry-safe lifecycle.
+#[derive(Debug)]
+pub enum ShutdownPending {
+    /// The actor still owns the unconfirmed terminal write.
+    DurabilityUnconfirmed,
+    /// The terminal write completed after this call's deadline.
+    DurableLeaveConfirmedLate { lateness: Duration },
+}
+
+impl std::fmt::Display for ShutdownPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DurabilityUnconfirmed => formatter.write_str(
+                "membership shutdown budget exhausted before the durable leave was confirmed; \
+                 storage is still in flight and the actor keeps running; retry shutdown to await the outcome",
+            ),
+            Self::DurableLeaveConfirmedLate { lateness } => write!(
+                formatter,
+                "membership shutdown budget exhausted; durable leave confirmed late; \
+                 critical lateness={lateness:?}; retry shutdown to finish cleanup"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownPending {}
+
 pub(crate) struct Handle {
     stop: Option<oneshot::Sender<ShutdownRequest>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
@@ -267,10 +294,7 @@ impl Handle {
                 if critical_completion(&mut self.critical, &mut self.critical_completed_at)
                     .is_none()
                 {
-                    anyhow::bail!(
-                        "membership shutdown budget exhausted before the durable leave was confirmed; \
-                         storage is still in flight and the actor keeps running; retry shutdown to await the outcome"
-                    );
+                    return Err(ShutdownPending::DurabilityUnconfirmed.into());
                 }
                 // Only best-effort leave announcements remain after the confirmed critical write.
                 task.abort();
@@ -300,10 +324,10 @@ impl Handle {
         };
         // Lateness is reported only by the call that set this deadline; a retry observes completion.
         if requested_now && completed_at >= deadline {
-            anyhow::bail!(
-                "membership shutdown budget exhausted; durable leave confirmed late; critical lateness={:?}",
-                completed_at.saturating_duration_since(deadline)
-            );
+            return Err(ShutdownPending::DurableLeaveConfirmedLate {
+                lateness: completed_at.saturating_duration_since(deadline),
+            }
+            .into());
         }
         if timed_out {
             tracing::warn!(
@@ -357,21 +381,40 @@ pub(crate) async fn start_with_metrics(
         tokio::task::spawn_blocking(move || initialize(local, endpoint, &persisted_store))
             .await??;
     let (stop, stopped) = oneshot::channel();
-    let mut seed = [0u8; 8];
-    getrandom::fill(&mut seed)
-        .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
-    let actor = Actor::new(
-        core,
-        owner,
-        node,
-        store,
-        incoming,
-        metrics,
-        u64::from_le_bytes(seed),
-    );
+    let seed = probe_seed()?;
+    let actor = Actor::new(core, owner, node, store, incoming, metrics, seed);
     let snapshot = actor.snapshot_tx.subscribe();
     let task = tokio::spawn(actor.run(stopped));
     Ok(Handle::new(stop, task, snapshot))
+}
+
+fn random_probe_seed() -> anyhow::Result<u64> {
+    let mut seed = [0u8; 8];
+    getrandom::fill(&mut seed)
+        .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
+    Ok(u64::from_le_bytes(seed))
+}
+
+#[cfg(test)]
+fn probe_seed() -> anyhow::Result<u64> {
+    match std::env::var("NUMAX_TEST_PROBE_SEED") {
+        Ok(seed) => parse_probe_seed(&seed),
+        Err(std::env::VarError::NotPresent) => random_probe_seed(),
+        Err(error) => Err(anyhow::anyhow!(
+            "cannot read NUMAX_TEST_PROBE_SEED: {error}"
+        )),
+    }
+}
+
+#[cfg(test)]
+fn parse_probe_seed(seed: &str) -> anyhow::Result<u64> {
+    seed.parse()
+        .map_err(|error| anyhow::anyhow!("invalid NUMAX_TEST_PROBE_SEED: {error}"))
+}
+
+#[cfg(not(test))]
+fn probe_seed() -> anyhow::Result<u64> {
+    random_probe_seed()
 }
 
 fn initialize(
@@ -630,6 +673,7 @@ impl Actor {
                     shutdown_trace("actor.writes_done", format_args!("node={}", self.owner.member));
                     self.jobs.abort_all();
                     while self.jobs.join_next().await.is_some() {}
+                    self.publish_snapshot();
                     let completed_at = tokio::time::Instant::now();
                     #[cfg(test)]
                     shutdown_trace("actor.confirm", format_args!("node={} late_us={}", self.owner.member,
@@ -1702,6 +1746,12 @@ impl Actor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn configured_probe_seed_parses_and_rejects_invalid_values() {
+        assert_eq!(parse_probe_seed("42").unwrap(), 42);
+        assert!(parse_probe_seed("not-a-seed").is_err());
+    }
+
     fn controlled_shutdown<F>(
         run: impl FnOnce(ShutdownRequest) -> F + Send + 'static,
     ) -> (Handle, oneshot::Receiver<()>)
@@ -1773,6 +1823,10 @@ mod tests {
             .shutdown_with_budget(Duration::from_millis(20))
             .await
             .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ShutdownPending>(),
+            Some(ShutdownPending::DurabilityUnconfirmed)
+        ));
         assert!(error.to_string().contains("retry shutdown"));
         assert!(matches!(
             dropped.try_recv(),
@@ -1811,6 +1865,10 @@ mod tests {
             .shutdown_with_budget(Duration::from_secs(1))
             .await
             .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ShutdownPending>(),
+            Some(ShutdownPending::DurableLeaveConfirmedLate { .. })
+        ));
         assert!(error.to_string().contains("shutdown budget exhausted"));
         assert!(matches!(
             dropped.try_recv(),

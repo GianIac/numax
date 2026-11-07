@@ -28,6 +28,12 @@ pub struct Store {
     flush_pause: Arc<Mutex<Option<FlushPause>>>,
     #[cfg(feature = "test-utils")]
     completed_flushes: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    completed_batches: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    completed_batch_bytes: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    completed_single_mutation_batches: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "test-utils")]
@@ -86,6 +92,12 @@ impl Store {
             flush_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "test-utils")]
             completed_flushes: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            completed_batches: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            completed_batch_bytes: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            completed_single_mutation_batches: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -182,6 +194,23 @@ impl Store {
         self.completed_flushes.load(Ordering::Acquire)
     }
 
+    /// Successful batches and logical key/value bytes, not physical disk writes.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_batch_work(&self) -> (u64, u64) {
+        (
+            self.completed_batches.load(Ordering::Acquire),
+            self.completed_batch_bytes.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_single_mutation_batches(&self) -> u64 {
+        self.completed_single_mutation_batches
+            .load(Ordering::Acquire)
+    }
+
     pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
         let guard = self
             .write_lock
@@ -217,6 +246,21 @@ impl Store {
             batch.remove(*key);
         }
         self.db.apply_batch(batch)?;
+        #[cfg(feature = "test-utils")]
+        {
+            let bytes = sets
+                .iter()
+                .map(|(key, value)| key.len() as u64 + value.len() as u64)
+                .chain(deletes.iter().map(|key| key.len() as u64))
+                .sum::<u64>();
+            self.completed_batch_bytes
+                .fetch_add(bytes, Ordering::Release);
+            if matches!((sets.len(), deletes.len()), (1, 0) | (0, 1)) {
+                self.completed_single_mutation_batches
+                    .fetch_add(1, Ordering::Release);
+            }
+            self.completed_batches.fetch_add(1, Ordering::Release);
+        }
         #[cfg(feature = "test-utils")]
         self.wait_at_crash_checkpoint(CrashCheckpoint::AfterBatch);
         Ok(())

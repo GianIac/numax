@@ -10,6 +10,7 @@ use super::canonicalize_endpoint;
 pub(super) const RECOVERY_CONTACT_LIMIT: usize = 64;
 const WITHDRAWN_ENDPOINT_LIMIT: usize = 4096;
 pub(super) const NEIGHBOR_ROTATION_INTERVAL: Duration = Duration::from_secs(30);
+pub(super) const RECOVERY_ROTATION_COOLDOWN: Duration = Duration::from_secs(2);
 
 pub(super) struct Neighbors {
     discovery: BTreeSet<String>,
@@ -116,6 +117,10 @@ impl Neighbors {
         self.last_rotation = now;
         self.recovery_cursor = self.recovery_cursor.wrapping_add(RECOVERY_CONTACT_LIMIT);
         true
+    }
+
+    pub(super) fn rotation_wait(&self, now: Instant, interval: Duration) -> Duration {
+        interval.saturating_sub(now.saturating_duration_since(self.last_rotation))
     }
 }
 
@@ -225,6 +230,31 @@ mod tests {
             .collect();
         assert_eq!(second.len(), RECOVERY_CONTACT_LIMIT);
         assert!(first.is_disjoint(&second));
+    }
+
+    #[test]
+    fn recovery_rotation_uses_its_own_cooldown() {
+        let now = Instant::now();
+        let mut policy = Neighbors::new(now);
+        let records: Vec<_> = (0..128)
+            .map(|index| member(index, MembershipState::Dead))
+            .collect();
+        let first: BTreeSet<_> = policy
+            .candidates(&[], &records, "local")
+            .into_iter()
+            .collect();
+
+        assert!(!policy.rotate(now, RECOVERY_ROTATION_COOLDOWN));
+        assert!(policy.rotate(now + RECOVERY_ROTATION_COOLDOWN, RECOVERY_ROTATION_COOLDOWN));
+        assert_eq!(
+            policy
+                .candidates(&[], &records, "local")
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            RECOVERY_CONTACT_LIMIT
+        );
+        assert_eq!(first.len(), RECOVERY_CONTACT_LIMIT);
     }
 
     #[test]

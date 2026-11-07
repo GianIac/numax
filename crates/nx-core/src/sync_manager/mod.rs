@@ -23,6 +23,7 @@ pub(crate) fn storage_progress(
 pub use sequence::{RecoveryFailure, ReplicationProgress, UnavailableHistory};
 mod types;
 
+pub use crate::membership::runtime::ShutdownPending;
 pub use manager::{SyncHandle, SyncManager};
 pub use migration::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationError, MigrationOptions,

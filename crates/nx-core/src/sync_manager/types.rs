@@ -132,6 +132,7 @@ pub(super) struct ReconnectLoopContext {
     pub(super) local_id: NodeId,
     pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
     pub(super) rotation_interval: Duration,
+    pub(super) recovery_rotation: Option<watch::Receiver<RecoveryRotation>>,
     pub(super) node: Arc<dyn PeerIo>,
     pub(super) candidates_rx: watch::Receiver<Arc<Vec<String>>>,
     pub(super) max_peers: usize,
@@ -141,6 +142,12 @@ pub(super) struct ReconnectLoopContext {
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct RecoveryRotation {
+    pub(super) generation: u64,
+    pub(super) source_addr: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -279,6 +286,7 @@ pub(super) type HistoryRequests = HashMap<String, HashMap<String, PendingHistory
 #[derive(Clone)]
 pub(super) struct NodeEventContext {
     pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
+    pub(super) recovery_rotation: Option<watch::Sender<RecoveryRotation>>,
     pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
     pub(super) history_requests: Arc<RwLock<HistoryRequests>>,
     pub(super) history_request_timeout: Duration,

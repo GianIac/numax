@@ -460,19 +460,63 @@ pub(in crate::sync_manager) fn record_summary(
     store: &NxStore,
     summary: &HistorySummary,
 ) -> anyhow::Result<Option<(u64, u64)>> {
-    let lease = store.acquire_write_lease()?;
-    let origin = summary.origin.as_str();
-    if let Some((own, _, last)) = local(store)? {
-        anyhow::ensure!(
-            origin != own || summary.high_sequence <= last,
-            "summary claims unallocated local history"
-        );
+    let repairs = record_summaries(store, std::slice::from_ref(summary))?;
+    repairs
+        .into_iter()
+        .next()
+        .map(|repair| repair.missing)
+        .ok_or_else(|| anyhow::anyhow!("summary batch returned no repair state"))
+}
+
+pub(in crate::sync_manager) struct SummaryRepair {
+    pub(in crate::sync_manager) origin: NodeId,
+    pub(in crate::sync_manager) missing: Option<(u64, u64)>,
+    pub(in crate::sync_manager) baseline: bool,
+}
+
+pub(in crate::sync_manager) fn record_summaries(
+    store: &NxStore,
+    summaries: &[HistorySummary],
+) -> anyhow::Result<Vec<SummaryRepair>> {
+    if summaries.is_empty() {
+        return Ok(Vec::new());
     }
-    let mut progress = tracker(store, origin)?;
-    progress.high = progress.high.max(summary.high_sequence);
-    progress.baseline_required |= summary.baseline_required;
-    let missing = progress.missing_page();
-    let sets = tracker_sets(store, BTreeMap::from([(origin.to_owned(), progress)]))?;
+
+    let lease = store.acquire_write_lease()?;
+    let local_origin = local(store)?;
+    let baseline_unconfirmed = store.exists(BASELINE_UNCONFIRMED)?;
+    let mut updates = BTreeMap::new();
+    let mut repairs = Vec::with_capacity(summaries.len());
+    let mut previous_origin = None;
+    for summary in summaries {
+        let origin = summary.origin.as_str();
+        anyhow::ensure!(
+            previous_origin.is_none_or(|previous| previous < origin),
+            "unordered history summary page"
+        );
+        previous_origin = Some(origin);
+        if let Some((own, _, last)) = &local_origin {
+            anyhow::ensure!(
+                origin != own || summary.high_sequence <= *last,
+                "summary claims unallocated local history"
+            );
+        }
+
+        let mut progress = tracker(store, origin)?;
+        progress.high = progress.high.max(summary.high_sequence);
+        progress.baseline_required |= summary.baseline_required;
+        let missing = progress.missing_page();
+        let baseline =
+            baseline_unconfirmed || (progress.baseline_required && !has_baseline(store, origin)?);
+        updates.insert(origin.to_owned(), progress);
+        repairs.push(SummaryRepair {
+            origin: summary.origin.clone(),
+            missing,
+            baseline,
+        });
+    }
+
+    let sets = tracker_sets(store, updates)?;
     let mut refs = Vec::new();
     for (key, value) in &sets {
         if store.get(key)?.as_deref() != Some(value.as_slice()) {
@@ -481,20 +525,26 @@ pub(in crate::sync_manager) fn record_summary(
     }
     if !refs.is_empty() {
         lease.apply_batch(&refs, &[])?;
+        #[cfg(test)]
+        tracing::debug!(target: "nx_core::sync_manager::replication", "summary tracking batch persisted");
     }
-    Ok(missing)
+    Ok(repairs)
 }
 
-pub(in crate::sync_manager) fn record_unavailable(
+pub(in crate::sync_manager) fn record_unavailable_and_previous(
     store: &NxStore,
     origin: &NodeId,
     evidence: UnavailableHistory,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(bool, Option<UnavailableHistory>)> {
     let lease = store.acquire_write_lease()?;
     let mut progress = tracker(store, origin.as_str())?;
     if evidence.end > progress.high || !progress.has_missing(evidence.start, evidence.end) {
-        return Ok(());
+        return Ok((false, None));
     }
+    let previous = progress
+        .unavailable
+        .clone()
+        .filter(|previous| previous.start == evidence.start && previous.end == evidence.end);
     progress.unavailable = Some(evidence);
     ReceiptTracker::decode(&progress.encode()?)?;
     let sets = tracker_sets(
@@ -506,7 +556,7 @@ pub(in crate::sync_manager) fn record_unavailable(
         .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect::<Vec<_>>();
     lease.apply_batch(&refs, &[])?;
-    Ok(())
+    Ok((true, previous))
 }
 
 pub(in crate::sync_manager) fn missing_range(

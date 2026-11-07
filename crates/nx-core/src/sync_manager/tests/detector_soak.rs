@@ -8,6 +8,7 @@ use tokio::task::JoinSet;
 const KEY: &str = "detector-nominal";
 const FORMATION_LIMIT: Duration = Duration::from_secs(300);
 const DETECTION_LIMIT: Duration = Duration::from_secs(120);
+const CONVERGENCE_LIMIT: Duration = Duration::from_secs(30);
 const MARKER: &str = "NUMAX_DETECTOR_SOAK_CHILD";
 #[path = "detector_diagnostics.rs"]
 mod diagnostics;
@@ -27,6 +28,9 @@ async fn detector_smoke_json_and_bincode() {
         .await
         .unwrap();
     process::storage_scenario(3, Duration::from_secs(8), Duration::from_secs(1))
+        .await
+        .unwrap();
+    process::storage_metadata_scenario(3, Duration::from_secs(8), Duration::from_secs(1))
         .await
         .unwrap();
 }
@@ -56,6 +60,29 @@ async fn detector_100_nodes_preflight_json() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detector_convergence_smoke_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_convergence_smoke_json";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    process::convergence_scenario(3, Duration::from_secs(8), Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "100 real processes; separate post-load convergence verification"]
+async fn detector_100_nodes_convergence_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_100_nodes_convergence_json";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    process::convergence_scenario(100, Duration::from_secs(30), Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "100 real TCP nodes, one real hour of nominal load, then transport failure"]
 async fn detector_100_nodes_one_hour_json() {
     let name = "sync_manager::manager::tests::detector_soak::detector_100_nodes_one_hour_json";
@@ -65,6 +92,48 @@ async fn detector_100_nodes_one_hour_json() {
     process::scenario(100, Duration::from_secs(3600), Duration::from_secs(10))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "storage-only diagnostic at 100 durable requests/s, not the nominal detector profile"]
+async fn storage_100_processes_high_load_preflight() {
+    let name =
+        "sync_manager::manager::tests::detector_soak::storage_100_processes_high_load_preflight";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    process::storage_scenario(100, Duration::from_secs(30), Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "storage-only diagnostic with metadata-sized batches, not a detector criterion"]
+async fn storage_100_processes_metadata_preflight() {
+    let name =
+        "sync_manager::manager::tests::detector_soak::storage_100_processes_metadata_preflight";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    process::storage_metadata_scenario(100, Duration::from_secs(30), Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "same metadata records in one atomic batch; storage-only causal comparison"]
+async fn storage_100_processes_batched_metadata_preflight() {
+    let name = "sync_manager::manager::tests::detector_soak::storage_100_processes_batched_metadata_preflight";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    process::storage_batched_metadata_scenario(
+        100,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -84,6 +153,7 @@ fn child(name: &str, lifetime: Duration) -> bool {
     if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) {
         return false;
     }
+    let _scenario = process_scenario_io();
     let output = isolated_test_output(name, MARKER, name, lifetime);
     let text = String::from_utf8_lossy(&output);
     assert!(
@@ -327,6 +397,8 @@ fn drain_limit(period: Duration) -> anyhow::Result<Duration> {
 enum WriteTarget {
     Replicated(Arc<SyncHandle>),
     Storage(Arc<NxStore>),
+    StorageMetadata(Arc<NxStore>),
+    StorageMetadataBatched(Arc<NxStore>),
 }
 
 fn storage_counter(store: &NxStore) -> anyhow::Result<u64> {
@@ -342,7 +414,14 @@ impl WriteTarget {
     async fn submit(&self) -> anyhow::Result<()> {
         match self {
             Self::Replicated(handle) => handle.submit_gcounter_increment(KEY, 1).await,
-            Self::Storage(store) => {
+            Self::Storage(store)
+            | Self::StorageMetadata(store)
+            | Self::StorageMetadataBatched(store) => {
+                let metadata = matches!(
+                    self,
+                    Self::StorageMetadata(_) | Self::StorageMetadataBatched(_)
+                );
+                let batched = matches!(self, Self::StorageMetadataBatched(_));
                 let store = store.clone();
                 tokio::task::spawn_blocking(move || {
                     let lease = store.acquire_write_lease()?;
@@ -350,13 +429,76 @@ impl WriteTarget {
                         .checked_add(1)
                         .context("storage baseline counter overflow")?
                         .to_le_bytes();
-                    lease.apply_batch(&[(KEY.as_bytes(), &next)], &[])?;
+                    if batched {
+                        let keys = (0..5)
+                            .map(|index| storage_metadata_key(u64::from_le_bytes(next), index))
+                            .collect::<Vec<_>>();
+                        let payload = [0u8; 2048];
+                        let mut sets = keys
+                            .iter()
+                            .map(|key| (key.as_bytes(), payload.as_slice()))
+                            .collect::<Vec<_>>();
+                        sets.push((KEY.as_bytes(), next.as_slice()));
+                        lease.apply_batch(&sets, &[])?;
+                    } else {
+                        if metadata {
+                            for index in 0..5 {
+                                let key = storage_metadata_key(u64::from_le_bytes(next), index);
+                                lease.apply_batch(&[(key.as_bytes(), &[0u8; 2048])], &[])?;
+                            }
+                        }
+                        lease.apply_batch(&[(KEY.as_bytes(), &next)], &[])?;
+                    }
                     lease.flush()?;
                     anyhow::Ok(())
                 })
                 .await?
             }
         }
+    }
+}
+
+fn storage_metadata_key(sequence: u64, index: usize) -> String {
+    format!("metadata/{sequence}/{index}")
+}
+
+fn verify_storage_metadata(store: &NxStore, operations: u64) -> anyhow::Result<()> {
+    for sequence in 1..=operations {
+        for index in 0..5 {
+            ensure!(
+                store
+                    .get(storage_metadata_key(sequence, index).as_bytes())?
+                    .as_deref()
+                    == Some([0u8; 2048].as_slice()),
+                "storage metadata record missing or invalid"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_metadata_profile_flushes_all_records_and_reports_failure() {
+    for batched in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(NxStore::open(directory.path()).unwrap());
+        let target = |store| {
+            if batched {
+                WriteTarget::StorageMetadataBatched(store)
+            } else {
+                WriteTarget::StorageMetadata(store)
+            }
+        };
+        target(store.clone()).submit().await.unwrap();
+        assert_eq!(storage_counter(&store).unwrap(), 1);
+        assert_eq!(store.completed_batch_work().0, if batched { 1 } else { 6 });
+        assert_eq!(store.completed_flushes(), 1);
+        verify_storage_metadata(&store, 1).unwrap();
+        drop(store);
+        let store = Arc::new(NxStore::open(directory.path()).unwrap());
+        verify_storage_metadata(&store, 1).unwrap();
+        store.inject_disk_full_on_flush(true);
+        assert!(target(store.clone()).submit().await.is_err());
     }
 }
 

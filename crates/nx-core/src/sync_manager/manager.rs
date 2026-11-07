@@ -7,9 +7,7 @@ use std::sync::{
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
-#[cfg(test)]
-use tokio::sync::mpsc;
-use tokio::sync::{RwLock, Semaphore, watch};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -25,7 +23,8 @@ use super::peer::{
     normalize_peer_dead_after_failures,
 };
 use super::replication::{
-    apply_seen_insertions, drain_node_events, handle_node_event, normalize_op_log_limit,
+    PRIORITY_EVENT_BURST, REMOTE_HISTORY_COALESCE_WINDOW, apply_seen_insertions,
+    drain_node_event_queues, handle_node_event, handle_node_events, normalize_op_log_limit,
     normalize_seen_ops_limit, plan_op_log_evictions, plan_seen_evictions,
     prune_op_log_and_return_evicted, spawn_anti_entropy_loop, spawn_broadcast_loop,
     spawn_forward_loop, spawn_reconnect_loop, try_connect_configured_peer,
@@ -39,6 +38,59 @@ use super::storage::{
     persist_local_rga_op,
 };
 use super::types::*;
+
+const MAX_PRIORITY_EVENT_CAPACITY: usize = 64;
+
+fn priority_event_capacity(event_channel_capacity: usize) -> usize {
+    if event_channel_capacity > 1 {
+        (event_channel_capacity / 4).clamp(1, MAX_PRIORITY_EVENT_CAPACITY)
+    } else {
+        0
+    }
+}
+
+async fn receive_scheduled_node_event(
+    event_rx: &mut mpsc::Receiver<nx_net::NodeEvent>,
+    priority_event_rx: &mut Option<mpsc::Receiver<nx_net::NodeEvent>>,
+    priority_events: &mut usize,
+    event_rx_open: &mut bool,
+) -> Option<(nx_net::NodeEvent, bool, bool)> {
+    loop {
+        if !*event_rx_open && priority_event_rx.is_none() {
+            return None;
+        }
+        let priority_allowed =
+            *priority_events < PRIORITY_EVENT_BURST || !*event_rx_open || event_rx.is_empty();
+        tokio::select! {
+            biased;
+            event = async {
+                match priority_event_rx.as_mut() {
+                    Some(receiver) if priority_allowed => receiver.recv().await,
+                    _ => std::future::pending().await,
+                }
+            } => match event {
+                Some(event) => {
+                    *priority_events = (*priority_events).saturating_add(1);
+                    return Some((event, true, true));
+                }
+                None => *priority_event_rx = None,
+            },
+            event = async {
+                if *event_rx_open {
+                    event_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => match event {
+                Some(event) => {
+                    *priority_events = 0;
+                    return Some((event, false, priority_allowed));
+                }
+                None => *event_rx_open = false,
+            }
+        }
+    }
+}
 
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
@@ -1305,12 +1357,14 @@ impl SyncManager {
 
         // Reject local configuration before acquiring provider watches or tasks.
         // The reconnect loop consumes live candidates, not NodeConfig::initial_peers.
+        let event_channel_capacity = self.config.queued_ops_limit.max(1);
+        let priority_event_capacity = priority_event_capacity(event_channel_capacity);
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
             .with_socket_timeout(self.config.socket_timeout)
             .with_serialization_format(self.config.serialization_format)
-            .with_event_channel_capacity(self.config.queued_ops_limit.max(1));
+            .with_event_channel_capacity(event_channel_capacity);
         let bootstrap_server = BootstrapServerConfig::new(self.discovery_config.cluster_id())?
             .with_max_cached_candidates(self.discovery_config.max_candidates())?
             .with_max_response_candidates(
@@ -1323,8 +1377,19 @@ impl SyncManager {
         }
 
         let mut node = Node::try_new_with_bootstrap_server(node_config, bootstrap_server)?;
+        if priority_event_capacity > 0 {
+            node.enable_priority_event_channel(priority_event_capacity)?;
+        }
         let Some(mut event_rx) = node.take_event_receiver() else {
             anyhow::bail!("network event receiver is unavailable");
+        };
+        let mut priority_event_rx = if priority_event_capacity > 0 {
+            Some(
+                node.take_priority_event_receiver()
+                    .ok_or_else(|| anyhow::anyhow!("priority event receiver is unavailable"))?,
+            )
+        } else {
+            None
         };
         let control_rx = node
             .take_control_receiver()
@@ -1449,8 +1514,11 @@ impl SyncManager {
         let repair_budget = Arc::new(std::sync::Mutex::new(super::delivery::RepairBudget::new(
             self.clock.now(),
         )));
+        let (recovery_rotation_tx, recovery_rotation_rx) =
+            watch::channel(super::types::RecoveryRotation::default());
         let event_context = NodeEventContext {
             repair_budget: Arc::clone(&repair_budget),
+            recovery_rotation: Some(recovery_rotation_tx),
             history_cursors: Arc::clone(&self.history_cursors),
             history_requests: Arc::clone(&self.history_requests),
             history_request_timeout: self.config.socket_timeout,
@@ -1478,20 +1546,95 @@ impl SyncManager {
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.event_task = Some(tokio::spawn(async move {
+            let mut priority_events = 0;
+            let mut event_rx_open = true;
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             debug!("event loop shutdown requested");
-                            drain_node_events(&mut event_rx, &event_context).await;
+                            drain_node_event_queues(
+                                &mut event_rx,
+                                &mut priority_event_rx,
+                                &event_context,
+                            )
+                            .await;
                             break;
                         }
                     }
-                    event = event_rx.recv() => {
-                        let Some(event) = event else {
+                    scheduled = receive_scheduled_node_event(
+                        &mut event_rx,
+                        &mut priority_event_rx,
+                        &mut priority_events,
+                        &mut event_rx_open,
+                    ) => {
+                        let Some((event, is_priority, allow_priority_interrupt)) = scheduled else {
                             break;
                         };
-                        handle_node_event(event, &event_context).await;
+                        #[cfg(test)]
+                        let event_kind = match &event {
+                            nx_net::NodeEvent::HistoryReceived { message, .. } => match message {
+                                nx_sync::HistoryMessage::Push { .. } => "push",
+                                nx_sync::HistoryMessage::Summary { .. } => "summary",
+                                nx_sync::HistoryMessage::SummaryRequest { .. } => "summary_request",
+                                nx_sync::HistoryMessage::Request { .. } => "range_request",
+                                nx_sync::HistoryMessage::Replay { .. } => "replay",
+                                nx_sync::HistoryMessage::Unavailable { .. } => "unavailable",
+                                nx_sync::HistoryMessage::BaselineRequest { .. }
+                                | nx_sync::HistoryMessage::Baseline { .. }
+                                | nx_sync::HistoryMessage::BaselineUnavailable { .. } => "baseline",
+                            },
+                            nx_net::NodeEvent::PeerConnected { .. }
+                            | nx_net::NodeEvent::PeerDisconnected { .. } => "peer_lifecycle",
+                            nx_net::NodeEvent::OpsReceived { .. }
+                            | nx_net::NodeEvent::PullRequested { .. } => "legacy",
+                        };
+                        #[cfg(test)]
+                        let data_queue_depth_before = event_rx.len();
+                        #[cfg(test)]
+                        let priority_queue_depth_before =
+                            priority_event_rx.as_ref().map_or(0, |rx| rx.len());
+                        #[cfg(test)]
+                        let queue_depth_before = data_queue_depth_before
+                            .saturating_add(priority_queue_depth_before);
+                        #[cfg(test)]
+                        let event_started = std::time::Instant::now();
+                        let pending_priority_event = if is_priority {
+                            handle_node_event(event, &event_context).await;
+                            None
+                        } else {
+                            handle_node_events(
+                                event,
+                                &mut event_rx,
+                                &mut priority_event_rx,
+                                allow_priority_interrupt,
+                                &event_context,
+                                Some(REMOTE_HISTORY_COALESCE_WINDOW),
+                            )
+                            .await
+                        };
+                        if let Some(event) = pending_priority_event {
+                            priority_events = priority_events.saturating_add(1);
+                            handle_node_event(event, &event_context).await;
+                        }
+                        #[cfg(test)]
+                        let data_queue_depth_after = event_rx.len();
+                        #[cfg(test)]
+                        let priority_queue_depth_after =
+                            priority_event_rx.as_ref().map_or(0, |rx| rx.len());
+                        #[cfg(test)]
+                        debug!(
+                            target: "nx_core::sync_manager::manager",
+                            event_handler_kind = %event_kind,
+                            elapsed_us = u64::try_from(event_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                            queue_depth_before = u64::try_from(queue_depth_before).unwrap_or(u64::MAX),
+                            queue_depth_after = u64::try_from(data_queue_depth_after.saturating_add(priority_queue_depth_after)).unwrap_or(u64::MAX),
+                            data_queue_depth_before = u64::try_from(data_queue_depth_before).unwrap_or(u64::MAX),
+                            priority_queue_depth_before = u64::try_from(priority_queue_depth_before).unwrap_or(u64::MAX),
+                            data_queue_depth_after = u64::try_from(data_queue_depth_after).unwrap_or(u64::MAX),
+                            priority_queue_depth_after = u64::try_from(priority_queue_depth_after).unwrap_or(u64::MAX),
+                            "bounded event-loop diagnostic"
+                        );
                     }
                 }
             }
@@ -1539,6 +1682,7 @@ impl SyncManager {
             local_id: self.node_id.clone(),
             membership: membership_snapshot,
             rotation_interval: super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
+            recovery_rotation: Some(recovery_rotation_rx),
             node: node.clone(),
             candidates_rx,
             max_peers: self.config.max_peers,
@@ -1675,6 +1819,8 @@ impl SyncManager {
     /// resumes waiting instead of reporting a false success. Data-path loops are
     /// joined before the membership leave so its terminal write does not compete
     /// with them for storage; the network stays up for leave announcements.
+    /// An error containing [`super::ShutdownPending`] retains the services needed
+    /// to resume the same shutdown; other errors are not retryable completion.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.local_writes.stopped.store(true, Ordering::Release);
         self.candidates.stop();
@@ -1698,6 +1844,10 @@ impl SyncManager {
                 Ok(()) => {
                     self.membership = None;
                     None
+                }
+                Err(error) if error.is::<super::ShutdownPending>() => {
+                    warn!(%error, "sync shutdown remains pending; services retained for completion");
+                    return Err(error);
                 }
                 Err(error) => Some(error),
             }
@@ -1743,6 +1893,93 @@ async fn join_task(task: &mut Option<JoinHandle<()>>, name: &str) {
 async fn rollback_discovery(coordinator: &mut DiscoveryCoordinator) {
     if let Err(error) = coordinator.rollback().await {
         warn!(error = %error, "discovery rollback failed");
+    }
+}
+
+#[cfg(test)]
+mod priority_event_tests {
+    use super::*;
+
+    fn recovery_event() -> nx_net::NodeEvent {
+        nx_net::NodeEvent::HistoryReceived {
+            from: NodeId::new("recovery-peer"),
+            addr: "recovery-peer".to_owned(),
+            message: nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+        }
+    }
+
+    #[test]
+    fn priority_capacity_reserves_a_bounded_share_of_the_existing_budget() {
+        assert_eq!(priority_event_capacity(1), 0);
+        assert_eq!(priority_event_capacity(2), 1);
+        assert_eq!(priority_event_capacity(1024), MAX_PRIORITY_EVENT_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn recovery_events_progress_without_starving_queued_data() {
+        let (data_tx, mut event_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        let (priority_tx, priority_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        data_tx
+            .send(nx_net::NodeEvent::OpsReceived {
+                from: NodeId::new("data-peer"),
+                ops: Vec::new(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..=PRIORITY_EVENT_BURST {
+            priority_tx.send(recovery_event()).await.unwrap();
+        }
+
+        let mut priority_event_rx = Some(priority_rx);
+        let mut priority_events = 0;
+        let mut event_rx_open = true;
+        for _ in 0..PRIORITY_EVENT_BURST {
+            let (event, is_priority, _) = receive_scheduled_node_event(
+                &mut event_rx,
+                &mut priority_event_rx,
+                &mut priority_events,
+                &mut event_rx_open,
+            )
+            .await
+            .unwrap();
+            assert!(is_priority);
+            assert!(matches!(
+                event,
+                nx_net::NodeEvent::HistoryReceived {
+                    message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                    ..
+                }
+            ));
+        }
+
+        let (event, is_priority, allow_priority_interrupt) = receive_scheduled_node_event(
+            &mut event_rx,
+            &mut priority_event_rx,
+            &mut priority_events,
+            &mut event_rx_open,
+        )
+        .await
+        .unwrap();
+        assert!(!is_priority);
+        assert!(!allow_priority_interrupt);
+        assert!(matches!(event, nx_net::NodeEvent::OpsReceived { .. }));
+
+        let (event, is_priority, _) = receive_scheduled_node_event(
+            &mut event_rx,
+            &mut priority_event_rx,
+            &mut priority_events,
+            &mut event_rx_open,
+        )
+        .await
+        .unwrap();
+        assert!(is_priority);
+        assert!(matches!(
+            event,
+            nx_net::NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                ..
+            }
+        ));
     }
 }
 

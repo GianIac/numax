@@ -703,6 +703,64 @@ impl PeerIo for Endpoint {
             .map(|((_, to), c)| (to.clone(), c.info.identity.node_id.clone()))
             .collect()
     }
+    async fn deduplicate_peer_connections(&self) -> usize {
+        let duplicates = {
+            let state = self.network.state.lock().unwrap();
+            let Some(local_id) = state.endpoints.get(&self.addr) else {
+                return 0;
+            };
+            let mut by_peer = BTreeMap::<
+                String,
+                Vec<(String, nx_net::ConnectionDirection, (String, String))>,
+            >::new();
+            for ((from, to), connection) in &state.connections {
+                if from != &self.addr || connection.lease.closed.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let peer_id = connection.info.identity.node_id.clone();
+                let route = if local_id.as_str() < peer_id.as_str() {
+                    (from.clone(), to.clone())
+                } else {
+                    (to.clone(), from.clone())
+                };
+                by_peer.entry(peer_id.to_string()).or_default().push((
+                    to.clone(),
+                    connection.info.direction,
+                    route,
+                ));
+            }
+
+            let mut duplicates = Vec::new();
+            for (peer_id, mut connections) in by_peer {
+                let preferred_direction = if local_id.as_str() < peer_id.as_str() {
+                    nx_net::ConnectionDirection::Outbound
+                } else {
+                    nx_net::ConnectionDirection::Inbound
+                };
+                connections.sort_by(|left, right| {
+                    (right.1 == preferred_direction)
+                        .cmp(&(left.1 == preferred_direction))
+                        .then_with(|| left.2.cmp(&right.2))
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                duplicates.extend(
+                    connections
+                        .into_iter()
+                        .skip(1)
+                        .map(|(addr, _, _)| (addr, NodeId::new(peer_id.as_str()))),
+                );
+            }
+            duplicates
+        };
+
+        let mut removed = 0;
+        for (addr, node_id) in duplicates {
+            if self.disconnect_peer(&addr, &node_id).await {
+                removed += 1;
+            }
+        }
+        removed
+    }
     async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo> {
         self.network
             .state
@@ -924,6 +982,29 @@ impl PeerIo for Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deduplication_keeps_the_same_logical_route_for_a_peer_identity() {
+        let network = Network::new(7, SerializationFormat::Bincode, 0);
+        let peer_a = network.endpoint("a:1", "peer-a", 1);
+        let peer_a_alias = network.endpoint("a:2", "peer-a", 1);
+        let peer_b = network.endpoint("b:1", "peer-b", 1);
+        peer_b.connect_to_peer("a:2").await.unwrap();
+        peer_b.connect_to_peer("a:1").await.unwrap();
+
+        assert_eq!(peer_b.connected_peers().await.len(), 2);
+        assert_eq!(peer_b.deduplicate_peer_connections().await, 1);
+        assert_eq!(
+            peer_b.connected_peers().await,
+            [("a:1".into(), NodeId::new("peer-a"))]
+        );
+        assert_eq!(
+            peer_a.connected_peers().await,
+            [("b:1".into(), NodeId::new("peer-b"))]
+        );
+        assert!(peer_a_alias.connected_peers().await.is_empty());
+    }
+
     #[test]
     fn timers_cancel_and_zero_latency_tasks_quiesce() {
         let clock = Clock::new();

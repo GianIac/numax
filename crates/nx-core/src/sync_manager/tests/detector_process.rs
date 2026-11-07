@@ -8,6 +8,18 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 const WORKER: &str = "sync_manager::manager::tests::detector_soak::process::worker";
 const CONFIG: &str = "NUMAX_DETECTOR_WORKER";
 const PREFIX: &str = "DETECTOR_WORKER ";
+const MAX_WORKER_OUTPUT_LINE_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_DETAIL_SAMPLES: usize = 8;
+const MAX_CONVERGENCE_DETAIL_WORKERS: usize = 4;
+const DETECTOR_PROBE_SEED: u64 = 0x4e55_4d41_5801_0001;
+const PROBE_SEED_ENV: &str = "NUMAX_TEST_PROBE_SEED";
+
+#[derive(Clone, Copy)]
+enum StorageWorkload {
+    Counter,
+    Metadata,
+    MetadataBatched,
+}
 
 pub(super) fn number(value: &Value, key: &str) -> anyhow::Result<u64> {
     value
@@ -17,7 +29,25 @@ pub(super) fn number(value: &Value, key: &str) -> anyhow::Result<u64> {
 }
 
 fn emit(value: Value) {
-    println!("{PREFIX}{value}");
+    let line = format!("{PREFIX}{value}");
+    assert!(
+        line.len().saturating_add(1) <= MAX_WORKER_OUTPUT_LINE_BYTES,
+        "worker diagnostic line exceeds 64 KiB: {} bytes",
+        line.len().saturating_add(1)
+    );
+    println!("{line}");
+}
+
+fn bounded_diagnostic_samples<T>(items: impl IntoIterator<Item = T>) -> (usize, Vec<T>) {
+    let mut count = 0;
+    let mut samples = Vec::with_capacity(MAX_RECOVERY_DETAIL_SAMPLES);
+    for item in items {
+        count += 1;
+        if samples.len() < MAX_RECOVERY_DETAIL_SAMPLES {
+            samples.push(item);
+        }
+    }
+    (count, samples)
 }
 
 fn epoch_ms() -> anyhow::Result<u64> {
@@ -64,6 +94,417 @@ fn status(
     }))
 }
 
+struct RecoveryProgressInputs<'a> {
+    expected_origins: &'a std::collections::HashSet<String>,
+    operations: u64,
+    progress: &'a [crate::sync_manager::ReplicationProgress],
+}
+
+async fn recovery_progress_sample(
+    node: &SyncManager,
+    diagnostics: &diagnostics::Diagnostics,
+    diagnostic_baseline: &diagnostics::Baseline,
+    elapsed: Duration,
+    value: u64,
+    expected: u64,
+    inputs: RecoveryProgressInputs<'_>,
+) -> anyhow::Result<Value> {
+    let known_origins = inputs
+        .progress
+        .iter()
+        .filter(|entry| inputs.expected_origins.contains(entry.origin.as_str()))
+        .collect::<Vec<_>>();
+    let incomplete_receipts = known_origins
+        .iter()
+        .filter(|entry| {
+            entry.contiguous_sequence != inputs.operations
+                || entry.known_high_sequence != inputs.operations
+                || entry.sparse_positions != 0
+                || entry.source_unavailable
+                || entry.baseline_missing
+                || entry.baseline_unconfirmed
+                || entry.recovery_failure.is_some()
+        })
+        .map(|entry| {
+            json!({
+                "origin": entry.origin.as_str(),
+                "contiguous": entry.contiguous_sequence,
+                "known_high": entry.known_high_sequence,
+                "sparse": entry.sparse_positions,
+                "source_unavailable": entry.source_unavailable,
+                "baseline_missing": entry.baseline_missing,
+                "baseline_unconfirmed": entry.baseline_unconfirmed,
+                "recovery_failure": entry.recovery_failure.is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (incomplete_receipt_count, incomplete_receipts) =
+        bounded_diagnostic_samples(incomplete_receipts);
+    let active_peers = node
+        .node
+        .as_ref()
+        .context("worker peer node missing")?
+        .connected_peers()
+        .await
+        .into_iter()
+        .map(|(_, id)| id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let mut replication_work = node.metrics.replication_work_for_test();
+    replication_work.retain(|name, _| {
+        matches!(
+            *name,
+            "remote_ops_applied_total"
+                | "remote_ops_duplicate_total"
+                | "remote_op_apply_errors_total"
+                | "sync_errors_total"
+        )
+    });
+    let mut recovery_metrics = String::new();
+    node.metrics.peers.render(&mut recovery_metrics);
+    let recovery_events = [
+        "history_unavailable",
+        "baseline_requested",
+        "baseline_accepted",
+        "baseline_rejected",
+        "error",
+    ]
+    .into_iter()
+    .map(|event| {
+        let label = format!("numax_recovery_events_total{{event=\"{event}\"}} ");
+        let value = recovery_metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&label))
+            .context("recovery metric missing")?
+            .parse::<u64>()?;
+        Ok::<_, anyhow::Error>((event, value))
+    })
+    .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?;
+
+    let now = node.clock.now();
+    let cursors = node.history_cursors.read().await;
+    let summary_pending = cursors
+        .values()
+        .filter(|cursor| {
+            cursor
+                .request_deadline
+                .is_some_and(|deadline| deadline > now)
+        })
+        .count();
+    let summary_expired = cursors
+        .values()
+        .filter(|cursor| {
+            cursor
+                .request_deadline
+                .is_some_and(|deadline| deadline <= now)
+        })
+        .count();
+    let catch_up = cursors.values().filter(|cursor| cursor.catch_up).count();
+    let cursor_states = cursors
+        .values()
+        .take(MAX_RECOVERY_DETAIL_SAMPLES)
+        .map(|cursor| {
+            json!({
+                "after_origin": cursor.after_origin,
+                "catch_up": cursor.catch_up,
+                "walk_gap": cursor.walk_gap,
+                "rewalks": cursor.rewalks,
+                "deadline_remaining_ms": cursor.request_deadline
+                    .map(|deadline| deadline.saturating_duration_since(now).as_millis()),
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(cursors);
+
+    let requests = node.history_requests.read().await;
+    let requests = requests
+        .values()
+        .flat_map(|origins| origins.values())
+        .collect::<Vec<_>>();
+    let pending_ranges = requests
+        .iter()
+        .filter(|request| request.deadline > now)
+        .count();
+    let expired_ranges = requests
+        .iter()
+        .filter(|request| request.deadline <= now)
+        .count();
+    let pending_range_age_ms = requests
+        .iter()
+        .filter(|request| request.deadline > now)
+        .map(|request| {
+            node.config
+                .socket_timeout
+                .saturating_sub(request.deadline.duration_since(now))
+                .as_millis()
+        })
+        .max()
+        .unwrap_or_default();
+    let (pending_range_detail_count, pending_range_details) = bounded_diagnostic_samples(
+        node.history_requests
+            .read()
+            .await
+            .values()
+            .flat_map(|origins| origins.iter())
+            .filter(|(_, request)| request.deadline > now)
+            .map(|(origin, request)| {
+                json!({
+                    "origin": origin,
+                    "start": request.start,
+                    "end": request.end,
+                    "remaining_ms": request.deadline.saturating_duration_since(now).as_millis(),
+                })
+            }),
+    );
+    let diagnostics = diagnostic_baseline.sample(node, diagnostics)?;
+
+    Ok(json!({
+        "elapsed_ms": elapsed.as_millis(),
+        "value": value,
+        "expected": expected,
+        "known_origins": known_origins.len(),
+        "contiguous_ops": known_origins.iter().map(|entry| entry.contiguous_sequence.min(inputs.operations)).sum::<u64>(),
+        "known_high_ops": known_origins.iter().map(|entry| entry.known_high_sequence.min(inputs.operations)).sum::<u64>(),
+        "origins_with_gaps": known_origins.iter().filter(|entry| entry.contiguous_sequence < entry.known_high_sequence).count(),
+        "sparse_positions": known_origins.iter().map(|entry| entry.sparse_positions).sum::<usize>(),
+        "source_unavailable": known_origins.iter().filter(|entry| entry.source_unavailable).count(),
+        "recovery_failures": known_origins.iter().filter(|entry| entry.recovery_failure.is_some()).count(),
+        "incomplete_receipt_count": incomplete_receipt_count,
+        "incomplete_receipts": incomplete_receipts,
+        "active_peers": active_peers,
+        "summary_requests_pending": summary_pending,
+        "summary_requests_expired": summary_expired,
+        "catch_up_peers": catch_up,
+        "summary_cursors": cursor_states,
+        "range_requests_pending": pending_ranges,
+        "range_requests_expired": expired_ranges,
+        "oldest_range_request_age_ms": pending_range_age_ms,
+        "pending_range_details_count": pending_range_detail_count,
+        "pending_ranges": pending_range_details,
+        "replication_work": replication_work,
+        "recovery_events": recovery_events,
+        "repair_trace_events": diagnostics["repair_trace_events"],
+        "repair_trace_items": diagnostics["repair_trace_items"],
+        "connection_error_classes": diagnostics["connection_error_classes"],
+        "network_events": diagnostics["network_events"],
+        "event_loop": diagnostics["event_loop"],
+        "history_batches": diagnostics["history_batches"],
+        "remote_apply_stages": diagnostics["remote_apply_stages"],
+    }))
+}
+
+fn numeric_summary(mut values: Vec<u64>) -> Value {
+    values.sort_unstable();
+    json!({
+        "min": values.first(),
+        "median": values.get(values.len() / 2),
+        "max": values.last(),
+    })
+}
+
+fn aggregate_sample_counts(
+    samples: &[(usize, Value)],
+    key: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, u64>> {
+    let mut totals = std::collections::BTreeMap::new();
+    for (_, sample) in samples {
+        for (name, value) in sample[key]
+            .as_object()
+            .with_context(|| format!("convergence sample missing {key}"))?
+        {
+            let total = totals.entry(name.clone()).or_insert(0u64);
+            *total = total
+                .checked_add(
+                    value
+                        .as_u64()
+                        .with_context(|| format!("invalid {key} counter"))?,
+                )
+                .with_context(|| format!("{key} counter overflow"))?;
+        }
+    }
+    Ok(totals)
+}
+
+fn nominal_status_samples<'a>(rows: &[&'a Value]) -> Vec<&'a Value> {
+    rows.iter()
+        .copied()
+        .filter(|row| row.get("nominal_counters").is_some())
+        .collect()
+}
+
+fn convergence_failure_report(
+    samples: &[(usize, Value)],
+    expected_workers: usize,
+) -> anyhow::Result<Value> {
+    let numeric = |key: &str| {
+        samples
+            .iter()
+            .filter_map(|(_, sample)| sample[key].as_u64())
+            .collect::<Vec<_>>()
+    };
+    let mut least_progress = samples.iter().collect::<Vec<_>>();
+    least_progress.sort_by_key(|(worker, sample)| {
+        (
+            sample["value"].as_u64().unwrap_or(u64::MAX),
+            sample["elapsed_ms"].as_u64().unwrap_or_default(),
+            *worker,
+        )
+    });
+    let least_progress = least_progress
+        .into_iter()
+        .take(MAX_CONVERGENCE_DETAIL_WORKERS)
+        .map(|(worker, sample)| {
+            json!({
+                "worker": worker,
+                "elapsed_ms": sample["elapsed_ms"],
+                "value": sample["value"],
+                "contiguous_ops": sample["contiguous_ops"],
+                "known_high_ops": sample["known_high_ops"],
+                "known_origins": sample["known_origins"],
+                "origins_with_gaps": sample["origins_with_gaps"],
+                "range_requests_pending": sample["range_requests_pending"],
+                "range_requests_expired": sample["range_requests_expired"],
+                "summary_requests_pending": sample["summary_requests_pending"],
+                "summary_requests_expired": sample["summary_requests_expired"],
+                "active_peers": sample["active_peers"],
+                "connection_error_classes": sample["connection_error_classes"],
+                "network_events": sample["network_events"],
+                "recovery_events": sample["recovery_events"],
+                "repair_trace_events": sample["repair_trace_events"],
+                "repair_trace_items": sample["repair_trace_items"],
+                "event_loop": sample["event_loop"],
+                "history_batches": sample["history_batches"],
+                "remote_apply_stages": sample["remote_apply_stages"],
+                "incomplete_receipts": sample["incomplete_receipts"].as_array()
+                    .map(|entries| entries.iter().take(3).cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                "pending_ranges": sample["pending_ranges"].as_array()
+                    .map(|entries| entries.iter().take(3).cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let node_ids = samples
+        .iter()
+        .map(|(worker, _)| format!("detector-{worker}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut peer_graph = node_ids
+        .iter()
+        .map(|node_id| (node_id.clone(), std::collections::BTreeSet::new()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (worker, sample) in samples {
+        let node_id = format!("detector-{worker}");
+        let peers = sample["active_peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|peer| node_ids.contains(*peer) && *peer != node_id)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for peer in peers {
+            peer_graph
+                .entry(node_id.clone())
+                .or_default()
+                .insert(peer.clone());
+            peer_graph.entry(peer).or_default().insert(node_id.clone());
+        }
+    }
+    let mut unvisited = node_ids.clone();
+    let mut component_sizes = Vec::new();
+    while let Some(start) = unvisited.pop_first() {
+        let mut pending = vec![start];
+        let mut component_size = 0usize;
+        while let Some(node_id) = pending.pop() {
+            component_size += 1;
+            if let Some(peers) = peer_graph.get(&node_id) {
+                for peer in peers {
+                    if unvisited.remove(peer) {
+                        pending.push(peer.clone());
+                    }
+                }
+            }
+        }
+        component_sizes.push(component_size);
+    }
+    let peer_graph_edges = peer_graph
+        .values()
+        .map(std::collections::BTreeSet::len)
+        .sum::<usize>()
+        / 2;
+    component_sizes.sort_unstable();
+    let peer_graph_summary = json!({
+        "snapshot_workers": samples.len(),
+        "undirected_edges": peer_graph_edges,
+        "components": component_sizes.len(),
+        "smallest_component": component_sizes.first().copied().unwrap_or_default(),
+        "largest_component": component_sizes.last().copied().unwrap_or_default(),
+        "isolated_workers": component_sizes.iter().filter(|size| **size == 1).count(),
+        "scope": "undirected union of per-worker snapshots; samples are not a simultaneous graph observation"
+    });
+    let active_peer_counts = samples
+        .iter()
+        .filter_map(|(_, sample)| {
+            sample["active_peers"]
+                .as_array()
+                .map(|peers| u64::try_from(peers.len()).unwrap_or_default())
+        })
+        .collect();
+    let unique_active_peer_counts = samples
+        .iter()
+        .filter_map(|(_, sample)| {
+            sample["active_peers"].as_array().map(|peers| {
+                peers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as u64
+            })
+        })
+        .collect::<Vec<_>>();
+    let duplicate_peer_samples = samples
+        .iter()
+        .filter_map(|(_, sample)| {
+            let peers = sample["active_peers"].as_array()?;
+            let unique = peers
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            Some(peers.len().saturating_sub(unique))
+        })
+        .collect::<Vec<_>>();
+    let workers_with_duplicate_peer_ids = duplicate_peer_samples
+        .iter()
+        .filter(|duplicates| **duplicates > 0)
+        .count();
+    let duplicate_active_peer_slots = duplicate_peer_samples.iter().sum::<usize>();
+
+    Ok(json!({
+        "workers_sampled": samples.len(),
+        "workers_expected": expected_workers,
+        "elapsed_ms": numeric_summary(numeric("elapsed_ms")),
+        "value": numeric_summary(numeric("value")),
+        "contiguous_ops": numeric_summary(numeric("contiguous_ops")),
+        "known_high_ops": numeric_summary(numeric("known_high_ops")),
+        "known_origins": numeric_summary(numeric("known_origins")),
+        "origins_with_gaps": numeric_summary(numeric("origins_with_gaps")),
+        "range_requests_pending": numeric_summary(numeric("range_requests_pending")),
+        "range_requests_expired": numeric_summary(numeric("range_requests_expired")),
+        "summary_requests_pending": numeric_summary(numeric("summary_requests_pending")),
+        "summary_requests_expired": numeric_summary(numeric("summary_requests_expired")),
+        "active_peer_count": numeric_summary(active_peer_counts),
+        "unique_active_peer_count": numeric_summary(unique_active_peer_counts),
+        "workers_with_duplicate_peer_ids": workers_with_duplicate_peer_ids,
+        "duplicate_active_peer_slots": duplicate_active_peer_slots,
+        "peer_graph": peer_graph_summary,
+        "connection_error_classes": aggregate_sample_counts(samples, "connection_error_classes")?,
+        "network_events": aggregate_sample_counts(samples, "network_events")?,
+        "repair_trace_events": aggregate_sample_counts(samples, "repair_trace_events")?,
+        "repair_trace_items": aggregate_sample_counts(samples, "repair_trace_items")?,
+        "least_progress_workers": least_progress,
+    }))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "internal worker; invoked only by the detector process coordinator"]
 async fn worker() {
@@ -88,7 +529,15 @@ async fn worker_run() -> anyhow::Result<()> {
         .context("worker datastore path missing")?;
     let store = Arc::new(NxStore::open(directory)?);
     if config["storage_only"] == true {
-        return storage_worker_run(index, count, directory, store).await;
+        return storage_worker_run(
+            index,
+            count,
+            directory,
+            store,
+            config["storage_metadata"] == true,
+            config["metadata_batched"] == true,
+        )
+        .await;
     }
     let diagnostics = diagnostics::Diagnostics::default();
     diagnostics.install()?;
@@ -117,7 +566,7 @@ async fn worker_run() -> anyhow::Result<()> {
         let mut poll = tokio::time::interval(Duration::from_secs(1));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut before = observe(std::slice::from_ref(&node))?.0;
-        let mut work_before = diagnostics::Baseline::new(&node);
+        let mut work_before = diagnostics::Baseline::new(&node, &diagnostics)?;
         let mut nominal_end = None;
         let mut nominal_started = None;
         let mut duration = Duration::ZERO;
@@ -158,7 +607,7 @@ async fn worker_run() -> anyhow::Result<()> {
                             emit(json!({"phase": "nominal-armed"}));
                             tokio::time::sleep(Duration::from_millis(wait)).await;
                             before = observe(std::slice::from_ref(&node))?.0;
-                            work_before = diagnostics::Baseline::new(&node);
+                            work_before = diagnostics::Baseline::new(&node, &diagnostics)?;
                             let start = Instant::now();
                             nominal_started = Some(StdInstant::now());
                             nominal_end = Some(start + duration);
@@ -172,6 +621,69 @@ async fn worker_run() -> anyhow::Result<()> {
                             poll = tokio::time::interval(Duration::from_millis(100));
                             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             emit(json!({"phase": "failure-armed", "counters": before.raw()}));
+                        }
+                        "convergence" => {
+                            ensure!(writer.is_none() && nominal_end.is_none(), "convergence before nominal completion");
+                            let expected = operations.checked_mul(u64::try_from(count)?).context("convergence total overflow")?;
+                            let expected_origins = (0..count).map(|origin| format!("detector-{origin}"))
+                                .collect::<std::collections::HashSet<_>>();
+                            let started = StdInstant::now();
+                            let deadline = Instant::now() + CONVERGENCE_LIMIT;
+                            let convergence_diagnostics = diagnostics::Baseline::new(&node, &diagnostics)?;
+                            let mut next_diagnostic = Duration::from_secs(5);
+                            let mut progress_samples = Vec::new();
+                            loop {
+                                let value = node.get_counter_value(KEY).await;
+                                let progress = node.handle().replication_progress()?;
+                                let complete_receipt = |entry: &crate::sync_manager::ReplicationProgress| {
+                                    expected_origins.contains(entry.origin.as_str())
+                                        && entry.contiguous_sequence == operations
+                                        && entry.known_high_sequence == operations
+                                        && entry.sparse_positions == 0
+                                        && !entry.source_unavailable
+                                        && !entry.baseline_missing
+                                        && !entry.baseline_unconfirmed
+                                        && entry.recovery_failure.is_none()
+                                };
+                                let receipts_complete = progress.len() == count && progress.iter().all(complete_receipt);
+                                let elapsed = started.elapsed();
+                                if elapsed >= next_diagnostic || elapsed >= CONVERGENCE_LIMIT {
+                                    let sample = recovery_progress_sample(
+                                        &node,
+                                        &diagnostics,
+                                        &convergence_diagnostics,
+                                        elapsed,
+                                        value,
+                                        expected,
+                                        RecoveryProgressInputs {
+                                            expected_origins: &expected_origins,
+                                            operations,
+                                            progress: &progress,
+                                        },
+                                    ).await?;
+                                    progress_samples.push(sample.clone());
+                                    emit(json!({"phase": "status", "convergence": sample}));
+                                    next_diagnostic = elapsed.saturating_add(Duration::from_secs(5));
+                                }
+                                if value == expected && receipts_complete {
+                                    let verified_at = elapsed;
+                                    ensure!(read_materialized(&node.store, KEY) == expected, "convergence materialized value mismatch");
+                                    ensure!(read_durable_gcounter_state(&node.store, KEY).value() == expected, "convergence durable state mismatch");
+                                    ensure!(Instant::now() < deadline,
+                                        "convergence exceeded its declared limit: value={value}/{expected}, complete_origins={}, receipt_check_ms={}, durable_check_ms={}",
+                                        progress.len(), verified_at.as_millis(), started.elapsed().saturating_sub(verified_at).as_millis());
+                                    emit(json!({"phase": "converged", "value": expected, "origins": progress.len(),
+                                        "operations_per_origin": operations, "elapsed_ms": started.elapsed().as_millis()}));
+                                    break;
+                                }
+                                ensure!(Instant::now() < deadline,
+                                    "convergence exceeded its declared limit: value={value}/{expected}, origins={}/{count}, incomplete_receipts={:?}, progress_samples={}",
+                                    progress.len(), progress.iter().filter(|entry| !complete_receipt(entry)).take(8)
+                                        .map(|entry| (entry.origin.as_str(), entry.contiguous_sequence, entry.known_high_sequence, entry.sparse_positions, entry.source_unavailable))
+                                        .collect::<Vec<_>>(),
+                                    serde_json::to_string(&progress_samples)?);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
                         }
                         "stop" => break,
                         other => anyhow::bail!("unknown worker command {other}"),
@@ -233,7 +745,10 @@ async fn worker_run() -> anyhow::Result<()> {
             Ok(result) => result?,
         }
     }
-    let shutdown = node.shutdown().await;
+    let shutdown = finish_shutdown(&mut node, Instant::now() + Duration::from_secs(120)).await;
+    if let Ok(pending_calls) = &shutdown {
+        emit(json!({"phase": "shutdown-complete", "pending_calls": pending_calls}));
+    }
     // The parent closes stdin after its stop command, allowing this reader to finish.
     if result.is_ok() {
         input
@@ -245,6 +760,98 @@ async fn worker_run() -> anyhow::Result<()> {
         "worker={result:?}; shutdown={shutdown:?}"
     );
     Ok(())
+}
+
+async fn finish_shutdown(node: &mut SyncManager, deadline: Instant) -> anyhow::Result<u64> {
+    tokio::time::timeout_at(deadline, async {
+        let mut pending_calls = 0u64;
+        loop {
+            match node.shutdown().await {
+                Ok(()) => return Ok(pending_calls),
+                Err(error) if error.is::<crate::sync_manager::ShutdownPending>() => {
+                    pending_calls += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("detector worker durable shutdown exceeded its existing total budget")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_shutdown_retains_services_and_propagates_durable_outcome() {
+    for fail_flush in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(NxStore::open(directory.path()).unwrap());
+        let endpoint = free_addr();
+        let (mut manager, handle) = started_manager_with_store(
+            NodeId::new(format!("pending-leave-{fail_flush}")),
+            SyncConfig::new().with_listen_addr(endpoint.clone()),
+            Arc::clone(&store),
+        )
+        .await;
+        let snapshot = manager.membership.as_ref().unwrap().snapshot.clone();
+        let before = store.completed_flushes();
+        if fail_flush {
+            store.inject_disk_full_on_flush(true);
+        } else {
+            let (reached, paused) = std::sync::mpsc::channel();
+            let (resume, released) = std::sync::mpsc::channel();
+            store.pause_next_flush(reached, released);
+            let stopping = tokio::spawn(async move {
+                let result = manager.shutdown().await;
+                (manager, result)
+            });
+            tokio::task::spawn_blocking(move || paused.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .unwrap();
+            let (retained, result) = stopping.await.unwrap();
+            manager = retained;
+            assert!(matches!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<crate::sync_manager::ShutdownPending>(),
+                Some(crate::sync_manager::ShutdownPending::DurabilityUnconfirmed)
+            ));
+            assert!(manager.membership.is_some());
+            assert!(manager.discovery_coordinator.is_some());
+            assert_eq!(store.completed_flushes(), before);
+            assert!(!snapshot.borrow().records.iter().any(|record| {
+                record.member == manager.node_id.as_str() && record.state == MembershipState::Left
+            }));
+            drop(tokio::net::TcpStream::connect(&endpoint).await.unwrap());
+            resume.send(()).unwrap();
+        }
+        let result = finish_shutdown(&mut manager, Instant::now() + Duration::from_secs(5)).await;
+        if fail_flush {
+            let error = result.unwrap_err();
+            assert!(!error.is::<crate::sync_manager::ShutdownPending>());
+            assert!(error.to_string().contains("membership storage"));
+            assert_eq!(store.completed_flushes(), before);
+            assert!(snapshot.borrow().error.is_some());
+            assert!(!snapshot.borrow().records.iter().any(|record| {
+                record.member == manager.node_id.as_str() && record.state == MembershipState::Left
+            }));
+            assert!(
+                finish_shutdown(&mut manager, Instant::now() + Duration::from_secs(5))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert_eq!(result.unwrap(), 0);
+            assert!(manager.membership.is_none());
+            assert_eq!(store.completed_flushes(), before + 1);
+            assert!(snapshot.borrow().records.iter().any(|record| {
+                record.member == manager.node_id.as_str() && record.state == MembershipState::Left
+            }));
+        }
+        drop(handle);
+        drop(manager);
+        drop(store);
+        NxStore::open(directory.path()).expect("shutdown released its datastore");
+    }
 }
 
 fn command_input() -> (
@@ -271,6 +878,8 @@ async fn storage_worker_run(
     count: usize,
     directory: &str,
     store: Arc<NxStore>,
+    metadata: bool,
+    batched: bool,
 ) -> anyhow::Result<()> {
     let (mut commands, input) = command_input();
     let stats = Arc::new(Writer::default());
@@ -290,7 +899,8 @@ async fn storage_worker_run(
         let started = StdInstant::now();
         let start = Instant::now();
         let offset = Duration::from_micros(u64::try_from(index)? * u64::try_from(period.as_micros())? / u64::try_from(count)?);
-        writer = Some(tokio::spawn(write_load(WriteTarget::Storage(store.clone()), stats.clone(), start, offset, duration, period, index)));
+        let target = if batched { WriteTarget::StorageMetadataBatched(store.clone()) } else if metadata { WriteTarget::StorageMetadata(store.clone()) } else { WriteTarget::Storage(store.clone()) };
+        writer = Some(tokio::spawn(write_load(target, stats.clone(), start, offset, duration, period, index)));
         let mut poll = tokio::time::interval(Duration::from_secs(1));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -313,6 +923,7 @@ async fn storage_worker_run(
                     && stats.accepted.load(Ordering::Relaxed) == operations,
                     "storage worker did not confirm the entire offered load");
                 ensure!(storage_counter(&store)? == operations, "storage baseline lost an increment");
+                if metadata { verify_storage_metadata(&store, operations)?; }
                 emit(json!({"phase": "nominal-complete", "elapsed_s": started.elapsed().as_secs_f64(), "status": current}));
                 break;
             }
@@ -340,6 +951,9 @@ async fn storage_worker_run(
             storage_counter(&reopened)? == operations,
             "storage baseline counter did not survive reopen"
         );
+        if metadata {
+            verify_storage_metadata(&reopened, operations)?;
+        }
     }
     result
 }
@@ -378,6 +992,7 @@ struct Processes {
     events: Receiver<Event>,
     overflow: Arc<AtomicBool>,
     latest: Vec<watch::Receiver<Value>>,
+    storage_only: bool,
     _directory: tempfile::TempDir,
 }
 
@@ -410,7 +1025,7 @@ fn record_message(
 }
 
 impl Processes {
-    fn spawn(count: usize, storage_only: bool) -> anyhow::Result<Self> {
+    fn spawn(count: usize, storage: Option<StorageWorkload>) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir()?;
         let addresses = (0..count).map(|_| free_addr()).collect::<Vec<_>>();
         let (sender, events) = std::sync::mpsc::sync_channel(512);
@@ -420,6 +1035,7 @@ impl Processes {
             events,
             overflow: Arc::new(AtomicBool::new(false)),
             latest: Vec::new(),
+            storage_only: storage.is_some(),
             _directory: directory,
         };
         for index in 0..count {
@@ -427,14 +1043,21 @@ impl Processes {
                 ._directory
                 .path()
                 .join(format!("worker-{index}.stderr"));
-            let config = json!({"index": index, "addresses": addresses, "storage_only": storage_only,
+            let config = json!({"index": index, "addresses": addresses, "storage_only": storage.is_some(),
+                "storage_metadata": matches!(storage, Some(StorageWorkload::Metadata | StorageWorkload::MetadataBatched)),
+                "metadata_batched": matches!(storage, Some(StorageWorkload::MetadataBatched)),
                 "directory": group._directory.path().join(format!("store-{index}"))});
-            let mut child = Command::new(std::env::current_exe()?)
+            let mut command = Command::new(std::env::current_exe()?);
+            command
                 .args(["--exact", WORKER, "--ignored", "--nocapture"])
                 .env(CONFIG, config.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(std::fs::File::create(&stderr)?)
+                .stderr(std::fs::File::create(&stderr)?);
+            if storage.is_none() {
+                command.env(PROBE_SEED_ENV, DETECTOR_PROBE_SEED.to_string());
+            }
+            let mut child = command
                 .spawn()
                 .with_context(|| format!("cannot spawn detector worker {index}"))?;
             let input = child.stdin.take().context("worker input pipe missing")?;
@@ -570,7 +1193,9 @@ impl Processes {
         {
             ensure!(
                 Instant::now() < deadline,
-                "timed out waiting for detector worker phase {phase}"
+                "timed out waiting for detector worker phase {phase}: {}/{} completed",
+                values.iter().filter(|value| !value.is_null()).count(),
+                values.len() - usize::from(except.is_some())
             );
             while let Some((index, value)) = self.receive()? {
                 if value["phase"] == phase {
@@ -598,15 +1223,18 @@ impl Processes {
             self.children[index].input.take();
         }
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut completed = vec![None; self.children.len()];
         loop {
-            while self.events.try_recv().is_ok() {}
+            self.shutdown_events(&mut completed)?;
             let mut running = false;
-            for process in &mut self.children {
-                match process.child.try_wait()? {
+            for index in 0..self.children.len() {
+                let pid = self.children[index].child.id();
+                match self.children[index].child.try_wait()? {
                     None => running = true,
                     Some(status) => ensure!(
-                        status.success() || Some(process.child.id()) == killed_pid,
-                        "worker shutdown failed: {status}"
+                        status.success() || Some(pid) == killed_pid,
+                        "worker {index} shutdown failed: {status}; stderr={}",
+                        self.diagnostic(index)?
                     ),
                 }
             }
@@ -620,6 +1248,54 @@ impl Processes {
             reader
                 .join()
                 .map_err(|_| anyhow::anyhow!("detector output reader panicked"))?;
+        }
+        self.shutdown_events(&mut completed)?;
+        if !self.storage_only {
+            ensure!(
+                completed
+                    .iter()
+                    .enumerate()
+                    .all(|(index, calls)| Some(index) == killed || calls.is_some()),
+                "worker exited without confirming its durable shutdown"
+            );
+            println!(
+                "DETECTOR_SHUTDOWN_REPORT {}",
+                json!({
+                    "completed_workers": completed.iter().flatten().count(),
+                    "pending_calls": completed.iter().flatten().sum::<u64>(),
+                    "workers_with_pending_calls": completed.iter().flatten().filter(|calls| **calls > 0).count(),
+                    "total_budget_s": 120,
+                })
+            );
+        }
+        Ok(())
+    }
+
+    fn shutdown_events(&mut self, completed: &mut [Option<u64>]) -> anyhow::Result<()> {
+        ensure!(
+            !self.overflow.load(Ordering::Relaxed),
+            "detector event queue overflow during shutdown"
+        );
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                Event::Message(index, value) if value["phase"] == "error" => {
+                    anyhow::bail!(
+                        "worker {index} failed during shutdown: {value}; stderr={}",
+                        self.diagnostic(index)?
+                    );
+                }
+                Event::Message(index, value) if value["phase"] == "shutdown-complete" => {
+                    ensure!(
+                        completed[index].is_none(),
+                        "duplicate worker shutdown completion"
+                    );
+                    completed[index] = Some(number(&value, "pending_calls")?);
+                }
+                Event::Invalid(index, error) => {
+                    anyhow::bail!("invalid worker {index} shutdown output: {error}");
+                }
+                Event::Message(_, _) | Event::Closed(_) => {}
+            }
         }
         Ok(())
     }
@@ -681,7 +1357,15 @@ pub(super) async fn scenario(
     duration: Duration,
     period: Duration,
 ) -> anyhow::Result<()> {
-    run_scenario(count, duration, period, false).await
+    run_scenario(count, duration, period, None, false).await
+}
+
+pub(super) async fn convergence_scenario(
+    count: usize,
+    duration: Duration,
+    period: Duration,
+) -> anyhow::Result<()> {
+    run_scenario(count, duration, period, None, true).await
 }
 
 pub(super) async fn storage_scenario(
@@ -689,15 +1373,59 @@ pub(super) async fn storage_scenario(
     duration: Duration,
     period: Duration,
 ) -> anyhow::Result<()> {
-    run_scenario(count, duration, period, true).await
+    run_scenario(
+        count,
+        duration,
+        period,
+        Some(StorageWorkload::Counter),
+        false,
+    )
+    .await
+}
+
+pub(super) async fn storage_metadata_scenario(
+    count: usize,
+    duration: Duration,
+    period: Duration,
+) -> anyhow::Result<()> {
+    run_scenario(
+        count,
+        duration,
+        period,
+        Some(StorageWorkload::Metadata),
+        false,
+    )
+    .await
+}
+
+pub(super) async fn storage_batched_metadata_scenario(
+    count: usize,
+    duration: Duration,
+    period: Duration,
+) -> anyhow::Result<()> {
+    run_scenario(
+        count,
+        duration,
+        period,
+        Some(StorageWorkload::MetadataBatched),
+        false,
+    )
+    .await
 }
 
 async fn run_scenario(
     count: usize,
     duration: Duration,
     period: Duration,
-    storage_only: bool,
+    storage: Option<StorageWorkload>,
+    verify_convergence: bool,
 ) -> anyhow::Result<()> {
+    let storage_only = storage.is_some();
+    let storage_metadata = matches!(
+        storage,
+        Some(StorageWorkload::Metadata | StorageWorkload::MetadataBatched)
+    );
+    let metadata_batched = matches!(storage, Some(StorageWorkload::MetadataBatched));
     ensure!(
         period.as_secs() > 0 && duration.as_secs().is_multiple_of(period.as_secs()),
         "invalid multiprocess nominal period"
@@ -714,18 +1442,25 @@ async fn run_scenario(
         json!({
             "version": 2, "nodes": count, "worker_processes": count,
             "codec": if storage_only { None } else { Some("Json") },
-            "storage_only": storage_only, "detector_enabled": !storage_only,
-            "storage_workload": if storage_only { Some("one eight-byte counter; atomic increment batch and durable flush per request") } else { None },
+            "storage_only": storage_only, "metadata_traffic": storage_metadata, "metadata_batched": metadata_batched, "detector_enabled": !storage_only,
+            "storage_workload": match storage {
+                Some(StorageWorkload::Counter) => Some("one eight-byte counter; atomic increment batch and durable flush per request"),
+                Some(StorageWorkload::Metadata) => Some("five new 2KiB records plus an eight-byte counter; six atomic batches then durable flush per request"),
+                Some(StorageWorkload::MetadataBatched) => Some("five new 2KiB records plus an eight-byte counter; one atomic batch then durable flush per request"),
+                None => None,
+            },
             "nominal_duration_s": duration.as_secs(), "period_s_per_node": period.as_secs(),
             "offered_ops_per_s": count as f64 / period.as_secs_f64(),
             "max_pending_per_node": 4, "final_drain_limit_s": final_drain.as_secs(),
             "max_data_peers_per_node": if storage_only { None } else { Some(4) },
             "detector_timing": if storage_only { None } else { Some("unmodified production defaults") },
-            "randomness": if storage_only { None } else { Some("production OS seed; no deterministic trace claimed") }
+            "probe_seed": if storage_only { None } else { Some(DETECTOR_PROBE_SEED) },
+            "randomness": if storage_only { None } else { Some("probe choices use a reported fixed test seed; wall-clock scheduling remains nondeterministic") }
         })
     );
-    let mut group = Processes::spawn(count, storage_only)?;
+    let mut group = Processes::spawn(count, storage)?;
     let mut killed = None;
+    let mut completed_nominal_report = None;
     let result = async {
         let ready = group.phase("ready", None, FORMATION_LIMIT).await?;
         if !storage_only {
@@ -823,12 +1558,49 @@ async fn run_scenario(
         });
         if storage_only {
             println!("STORAGE_BASELINE_REPORT {}", json!({
-                "version": 1, "processes": count, "passed_nominal": true, "nominal": nominal,
+                "version": 1, "processes": count, "passed_nominal": true, "metadata_traffic": storage_metadata, "metadata_batched": metadata_batched, "nominal": nominal,
                 "interpretation": "durable storage baseline only; no membership, replication or failure-detector validation"
             }));
             return anyhow::Ok(());
         }
+        completed_nominal_report = Some(nominal.clone());
         println!("DETECTOR_NOMINAL_REPORT {nominal}");
+        if verify_convergence {
+            let started = StdInstant::now();
+            group.broadcast(&json!({"command": "convergence"}), None)?;
+            let converged = match group.phase("converged", None, CONVERGENCE_LIMIT).await {
+                Ok(converged) => converged,
+                Err(error) => {
+                    let samples = group
+                        .rows()
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(worker, row)| {
+                            let sample = row.get("convergence")?;
+                            sample
+                                .is_object()
+                                .then(|| (worker, sample.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "DETECTOR_CONVERGENCE_FAILURE_REPORT {}",
+                        convergence_failure_report(&samples, count)?
+                    );
+                    return Err(error).context("convergence failure with bounded all-worker diagnostics");
+                }
+            };
+            ensure!(started.elapsed() < CONVERGENCE_LIMIT, "cluster convergence exceeded its declared limit");
+            let expected = operations.checked_mul(u64::try_from(count)?).context("convergence total overflow")?;
+            ensure!(converged.iter().all(|value| value["value"] == expected
+                && value["origins"] == count && value["operations_per_origin"] == operations),
+                "incomplete cluster convergence report");
+            println!("DETECTOR_CONVERGENCE_REPORT {}", json!({
+                "nodes": count, "value_per_node": expected, "origins_per_node": count,
+                "operations_per_origin": operations, "elapsed_ms": started.elapsed().as_millis(),
+                "limit_s": CONVERGENCE_LIMIT.as_secs(), "new_writes": false,
+                "checked": ["in_memory", "materialized", "durable_state", "contiguous_receipts"],
+            }));
+        }
         let target = count - 1;
         let target_id = format!("detector-{target}");
         group.broadcast(&json!({"command": "failure", "target": target_id}), Some(target))?;
@@ -888,11 +1660,12 @@ async fn run_scenario(
             .iter()
             .filter(|value| !value.is_null())
             .collect::<Vec<_>>();
+        let nominal_rows = nominal_status_samples(&rows);
         let mut counters = Counts::default();
         let mut accepted = 0u64;
         let mut max_flush = 0u64;
         let mut max_lateness = 0u64;
-        for row in &rows {
+        for row in &nominal_rows {
             if !storage_only {
                 counters.add(&Counts::from_raw(&row["nominal_counters"])?);
             }
@@ -908,10 +1681,21 @@ async fn run_scenario(
                 "DETECTOR_PARTIAL_REPORT"
             },
             json!({
-                "diagnostics": if storage_only { Value::Null } else { diagnostics::aggregate(rows.iter().copied())? },
+                "diagnostics": if storage_only || nominal_rows.is_empty() { Value::Null } else { diagnostics::aggregate(nominal_rows.iter().copied())? },
+                "completed_nominal_report": completed_nominal_report.as_ref().map(|nominal| json!({
+                    "accepted_total": nominal["accepted_total"],
+                    "accepted_within_nominal_window_per_node": nominal["accepted_within_nominal_window_per_node"],
+                    "confirmed_ops_per_s_within_nominal_window": nominal["confirmed_ops_per_s_within_nominal_window"],
+                    "counts": nominal["counts"],
+                    "max_pending_observed_per_node": nominal["max_pending_observed_per_node"]
+                })),
                 "passed": false, "error": format!("{error:#}"), "nodes": count, "storage_only": storage_only,
+                "metadata_traffic": storage_metadata,
+                "metadata_batched": metadata_batched,
                 "worker_processes": count, "requested_nominal_duration_s": duration.as_secs(), "period_s_per_node": period.as_secs(),
                 "status_samples_available": rows.len(), "counts_at_last_worker_samples": if storage_only { Value::Null } else { counters.raw() },
+                "status_samples_with_nominal_counters": nominal_rows.len(),
+                "status_samples_without_nominal_counters": rows.len().saturating_sub(nominal_rows.len()),
                 "accepted_at_last_samples": accepted, "max_flush_us_at_last_samples": max_flush,
                 "max_writer_lateness_us_at_last_samples": max_lateness,
                 "interpretation": "last received asynchronous samples, not a completed nominal window; no success or one-hour rate inferred"
@@ -940,6 +1724,7 @@ fn periodic_status_is_coalesced_without_discarding_critical_events() {
             &overflow
         ));
     }
+
     assert_eq!(view.borrow()["sequence"], 999);
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     assert!(record_message(
@@ -969,4 +1754,55 @@ fn periodic_status_is_coalesced_without_discarding_critical_events() {
         &overflow
     ));
     assert!(overflow.load(Ordering::Relaxed));
+}
+
+#[test]
+fn partial_report_aggregates_only_statuses_with_nominal_counters() {
+    let nominal = json!({"nominal_counters": {"suspect": 0}});
+    let convergence = json!({"convergence": {"value": 173}});
+    let rows = vec![&nominal, &convergence];
+
+    assert_eq!(nominal_status_samples(&rows), vec![&nominal]);
+}
+
+#[test]
+fn recovery_diagnostic_examples_are_bounded_and_counted() {
+    let incomplete_receipts = (0..100).map(|index| {
+        json!({
+            "origin": format!("detector-{index}"),
+            "contiguous": 2,
+            "known_high": 3,
+            "sparse": 0,
+            "source_unavailable": true,
+            "baseline_missing": false,
+            "baseline_unconfirmed": false,
+            "recovery_failure": false,
+        })
+    });
+    let pending_ranges = (0..100).map(|index| {
+        json!({
+            "origin": format!("detector-{index}"),
+            "start": 2,
+            "end": 3,
+            "remaining_ms": 10_000,
+        })
+    });
+    let (incomplete_count, incomplete_samples) = bounded_diagnostic_samples(incomplete_receipts);
+    let (pending_count, pending_samples) = bounded_diagnostic_samples(pending_ranges);
+
+    assert_eq!(incomplete_count, 100);
+    assert_eq!(incomplete_samples.len(), MAX_RECOVERY_DETAIL_SAMPLES);
+    assert_eq!(pending_count, 100);
+    assert_eq!(pending_samples.len(), MAX_RECOVERY_DETAIL_SAMPLES);
+
+    let line = format!(
+        "{PREFIX}{}",
+        json!({
+            "incomplete_receipt_count": incomplete_count,
+            "incomplete_receipts": incomplete_samples,
+            "pending_range_details_count": pending_count,
+            "pending_ranges": pending_samples,
+        })
+    );
+    assert!(line.len() < MAX_WORKER_OUTPUT_LINE_BYTES);
 }

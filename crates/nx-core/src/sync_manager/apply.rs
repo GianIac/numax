@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use anyhow::Context;
 use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
 use tracing::debug;
 
@@ -12,6 +13,26 @@ use super::replication::{
 };
 use super::storage::{persist_remote_ops_batch, remote_sequence_sets};
 use super::types::*;
+
+#[derive(Debug)]
+pub(super) struct RemoteBatchPreparation;
+
+impl std::fmt::Display for RemoteBatchPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote batch preparation failed before CRDT persistence")
+    }
+}
+
+#[cfg(test)]
+fn record_remote_apply_timing(stage: &'static str, started: Instant, success: bool) {
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        message = stage,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success,
+        "bounded remote apply diagnostic"
+    );
+}
 
 #[cfg(test)]
 pub(super) async fn apply_remote_ops(
@@ -54,6 +75,8 @@ async fn apply_ops(
 
     let apply_started = Instant::now();
 
+    #[cfg(test)]
+    let registry_wait_started = Instant::now();
     let mut seen = Arc::clone(context.seen_ops).write_owned().await;
     let mut log = Arc::clone(context.op_log).write_owned().await;
     let mut counters = Arc::clone(context.counters).write_owned().await;
@@ -62,6 +85,13 @@ async fn apply_ops(
     let mut lww_maps = Arc::clone(context.lww_maps).write_owned().await;
     let mut orsets = Arc::clone(context.orsets).write_owned().await;
     let mut rgas = Arc::clone(context.rgas).write_owned().await;
+    #[cfg(test)]
+    record_remote_apply_timing(
+        "remote registry locks acquired",
+        registry_wait_started,
+        true,
+    );
+
     let store = Arc::clone(context.store);
     let metrics = Arc::clone(context.metrics);
     let seen_ops_next_sequence = Arc::clone(context.seen_ops_next_sequence);
@@ -70,9 +100,19 @@ async fn apply_ops(
     // Owned guards serialize this batch with local writes even if its caller is
     // cancelled. The worker must finish persistence and publication together;
     // the synchronous storage lease is acquired and dropped only inside it.
+    #[cfg(test)]
+    let storage_dispatch_started = Instant::now();
     context
         .storage_executor
         .execute(move || {
+            #[cfg(test)]
+            record_remote_apply_timing(
+                "remote storage job started",
+                storage_dispatch_started,
+                true,
+            );
+            #[cfg(test)]
+            let preparation_started = Instant::now();
             let ops = input.as_slice();
             let sequenced = sequenced.as_deref();
             let sequence_lease = if sequenced.is_some() {
@@ -81,7 +121,9 @@ async fn apply_ops(
                 None
             };
             let (accepted_entries, sequence_sets) = match (sequenced, sequence_lease.as_ref()) {
-                (Some(entries), Some(lease)) => remote_sequence_sets(lease, entries)?,
+                (Some(entries), Some(lease)) => {
+                    remote_sequence_sets(lease, entries).context(RemoteBatchPreparation)?
+                }
                 _ => (Vec::new(), Vec::new()),
             };
             let accepted_ops = accepted_entries
@@ -166,6 +208,8 @@ async fn apply_ops(
             }
 
             let duplicate_count = input.len().saturating_sub(inserted_ops.len());
+            #[cfg(test)]
+            record_remote_apply_timing("remote batch prepared", preparation_started, true);
             if let Err(error) = persist_remote_ops_batch(
                 &store,
                 &plans,
@@ -197,6 +241,8 @@ async fn apply_ops(
                 .cloned()
                 .collect::<Vec<_>>();
 
+            #[cfg(test)]
+            let publication_started = Instant::now();
             let applied_count = plans.len();
             apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
             log.extend(inserted_ops);
@@ -221,6 +267,8 @@ async fn apply_ops(
             }
             seen_ops_next_sequence.store(next_seen_sequence, Ordering::Relaxed);
             op_log_next_sequence.store(next_op_log_sequence, Ordering::Relaxed);
+            #[cfg(test)]
+            record_remote_apply_timing("remote registries published", publication_started, true);
 
             if applied_count > 0 {
                 metrics.record_ops(applied_count as u64);

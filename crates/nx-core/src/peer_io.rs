@@ -1,5 +1,6 @@
 //! Internal I/O boundary for the production coordinators and deterministic runner.
-//! Decisions remain in membership/sync_manager; adapters supply observations only.
+//! Decisions remain in membership/sync_manager; adapters supply transport
+//! operations and observations.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,6 +91,7 @@ pub(crate) trait PeerIo: Send + Sync {
     #[cfg(test)]
     fn max_message_size(&self) -> usize;
     async fn connected_peers(&self) -> Vec<(String, NodeId)>;
+    async fn deduplicate_peer_connections(&self) -> usize;
     async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo>;
     async fn connect_to_peer(&self, addr: &str) -> NetResult<()>;
     async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool;
@@ -161,6 +163,9 @@ impl PeerIo for Node {
         // HashMap traversal must not select the first repair/rotation recipient.
         peers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
         peers
+    }
+    async fn deduplicate_peer_connections(&self) -> usize {
+        Node::deduplicate_peer_connections(self).await
     }
     async fn connection_info(&self, addr: &str) -> Option<PeerConnectionInfo> {
         Node::connection_info(self, addr).await

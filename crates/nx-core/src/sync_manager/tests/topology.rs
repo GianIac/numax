@@ -846,6 +846,7 @@ async fn admitted_owner_endpoint_becomes_a_data_neighbor_without_discovery() {
     for manager in [&mut a, &mut b, &mut c] {
         stop_test_reconnect(manager).await;
     }
+
     let owner_a = test_owner_record(&mut a).await;
     let owner_b = test_owner_record(&mut b).await;
     let owner_c = test_owner_record(&mut c).await;
@@ -872,6 +873,7 @@ async fn admitted_owner_endpoint_becomes_a_data_neighbor_without_discovery() {
         local_id: a.node_id.clone(),
         membership: a.membership.as_ref().unwrap().snapshot.clone(),
         rotation_interval: Duration::from_millis(100),
+        recovery_rotation: None,
         node: (a.node.as_ref().unwrap()).clone(),
         candidates_rx,
         max_peers: 1,
@@ -903,4 +905,79 @@ async fn admitted_owner_endpoint_becomes_a_data_neighbor_without_discovery() {
     for manager in [&mut a, &mut b, &mut c] {
         manager.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn recovery_rotation_replaces_the_unavailable_source_with_an_alternative() {
+    let mut local = nx_net::Node::new(nx_net::NodeConfig::new(
+        NodeId::new("recovery-dialer"),
+        "127.0.0.1:0",
+    ));
+    let _local_events = local.take_event_receiver().unwrap();
+    local.start_listener().await.unwrap();
+
+    let mut source = nx_net::Node::new(nx_net::NodeConfig::new(
+        NodeId::new("unavailable-source"),
+        "127.0.0.1:0",
+    ));
+    let _source_events = source.take_event_receiver().unwrap();
+    let source_endpoint = source.start_listener().await.unwrap().to_string();
+
+    let alternative_id = NodeId::new("alternative-source");
+    let mut alternative = nx_net::Node::new(nx_net::NodeConfig::new(
+        alternative_id.clone(),
+        "127.0.0.1:0",
+    ));
+    let _alternative_events = alternative.take_event_receiver().unwrap();
+    let alternative_endpoint = alternative.start_listener().await.unwrap().to_string();
+
+    local.connect_to_peer(&source_endpoint).await.unwrap();
+    let node = Arc::new(local);
+    let (_candidates_tx, candidates_rx) = watch::channel(Arc::new(vec![alternative_endpoint]));
+    let (_membership_tx, membership) =
+        watch::channel(crate::membership::runtime::Snapshot::default());
+    let (rotation_tx, rotation_rx) =
+        watch::channel(crate::sync_manager::types::RecoveryRotation::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = spawn_reconnect_loop(ReconnectLoopContext {
+        local_id: NodeId::new("recovery-dialer"),
+        membership,
+        rotation_interval: Duration::from_secs(3600),
+        recovery_rotation: Some(rotation_rx),
+        node: node.clone(),
+        candidates_rx,
+        max_peers: 1,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(40),
+        peer_dead_after_failures: 1,
+        shutdown_rx,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peer_health: Arc::new(RwLock::new(HashMap::new())),
+    });
+
+    rotation_tx.send_replace(crate::sync_manager::types::RecoveryRotation {
+        generation: 1,
+        source_addr: Some(source_endpoint),
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let connected = node.connected_peers().await;
+            assert!(connected.len() <= 1);
+            if connected.iter().any(|(_, id)| id == &alternative_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery rotation did not connect the alternative source");
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    node.shutdown().await;
+    source.shutdown().await;
+    alternative.shutdown().await;
 }

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -40,6 +41,18 @@ const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 1;
 
 type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalConnectionKey {
+    lower_node_endpoint: SocketAddr,
+    higher_node_endpoint: SocketAddr,
+}
+
+struct PeerDedupCandidate {
+    addr: String,
+    direction: Option<ConnectionDirection>,
+    canonical_key: Option<CanonicalConnectionKey>,
+}
 
 /// Generation identity and cancellation shared by the reader and write snapshots.
 struct ConnectionInstance {
@@ -213,6 +226,7 @@ struct IncomingContext {
     our_node_id: NodeId,
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
     connection_slots: Arc<Semaphore>,
@@ -225,6 +239,7 @@ struct ReadLoopContext {
     peer_node_id: NodeId,
     addr: String,
     event_tx: mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
     writer: PeerWriter,
     serialization_format: SerializationFormat,
     max_message_size: usize,
@@ -394,6 +409,7 @@ pub enum NodeEvent {
 struct PeerConnection {
     info: PeerInfo,
     connection_info: Option<PeerConnectionInfo>,
+    canonical_key: Option<CanonicalConnectionKey>,
     instance: Arc<ConnectionInstance>,
     state: PeerState,
     serialization_format: SerializationFormat,
@@ -446,6 +462,8 @@ pub struct Node {
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Option<mpsc::Receiver<NodeEvent>>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
+    priority_event_rx: Option<mpsc::Receiver<NodeEvent>>,
     shutdown_tx: watch::Sender<bool>,
     connection_slots: Arc<Semaphore>,
     outbound_attempt_slots: Arc<Semaphore>,
@@ -472,6 +490,8 @@ impl Node {
             peers: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             event_rx: Some(event_rx),
+            priority_event_tx: None,
+            priority_event_rx: None,
             shutdown_tx,
             connection_slots: Arc::new(Semaphore::new(max_peers)),
             outbound_attempt_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)),
@@ -506,6 +526,41 @@ impl Node {
     /// Gets the event receiver (can only be called once).
     pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<NodeEvent>> {
         self.event_rx.take()
+    }
+
+    /// Reserve part of the configured event capacity for bounded history-control traffic.
+    ///
+    /// Configure this before taking either receiver or starting network tasks.
+    pub fn enable_priority_event_channel(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), NodeConfigError> {
+        if capacity == 0 || capacity >= self.config.event_channel_capacity {
+            return Err(NodeConfigError::InvalidPriorityEventChannelCapacity {
+                event_channel_capacity: self.config.event_channel_capacity,
+            });
+        }
+        if self.event_rx.is_none()
+            || self.priority_event_tx.is_some()
+            || self.priority_event_rx.is_some()
+            || self.event_tx.strong_count() != 1
+        {
+            return Err(NodeConfigError::PriorityEventChannelAlreadyStarted);
+        }
+
+        let event_capacity = self.config.event_channel_capacity - capacity;
+        let (event_tx, event_rx) = mpsc::channel(event_capacity);
+        let (priority_event_tx, priority_event_rx) = mpsc::channel(capacity);
+        self.event_tx = event_tx;
+        self.event_rx = Some(event_rx);
+        self.priority_event_tx = Some(priority_event_tx);
+        self.priority_event_rx = Some(priority_event_rx);
+        Ok(())
+    }
+
+    /// Gets the optional priority event receiver (can only be called once).
+    pub fn take_priority_event_receiver(&mut self) -> Option<mpsc::Receiver<NodeEvent>> {
+        self.priority_event_rx.take()
     }
 
     pub fn take_control_receiver(&mut self) -> Option<mpsc::Receiver<crate::ControlIncoming>> {
@@ -554,7 +609,7 @@ impl Node {
             if let Some(dispatched) = dispatched {
                 let _ = dispatched.send(());
             }
-            let (stream, _) = connect_transport(addr, self.config.tls.as_ref(), budget).await?;
+            let (stream, _, _) = connect_transport(addr, self.config.tls.as_ref(), budget).await?;
             let certificate = stream.peer_cert_der();
             if self.config.tls.as_ref().is_some_and(|tls| !tls.insecure) {
                 let certificate = certificate
@@ -651,6 +706,7 @@ impl Node {
         let peers = Arc::clone(&self.peers);
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
+        let priority_event_tx = self.priority_event_tx.clone();
         let tls = self.config.tls.clone();
         let connection_slots = Arc::clone(&self.connection_slots);
         let handshake_slots = Arc::clone(&self.handshake_slots);
@@ -692,6 +748,7 @@ impl Node {
                                 let peers = Arc::clone(&peers);
                                 let node_id = node_id.clone();
                                 let event_tx = event_tx.clone();
+                                let priority_event_tx = priority_event_tx.clone();
                                 let tls = tls.clone();
                                 let limits = limits;
                                 let shutdown_rx = shutdown_tx.subscribe();
@@ -705,6 +762,7 @@ impl Node {
                                         our_node_id: node_id,
                                         peers,
                                         event_tx,
+                                        priority_event_tx,
                                         limits,
                                         slot,
                                         connection_slots,
@@ -755,7 +813,7 @@ impl Node {
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
-        let (stream, transport_addr) =
+        let (stream, local_addr, transport_addr) =
             connect_transport(addr, self.config.tls.as_ref(), self.config.socket_timeout).await?;
 
         // Capture the peer certificate (owned) before moving the stream into split().
@@ -837,7 +895,7 @@ impl Node {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     connection_info: Some(PeerConnectionInfo {
-                        transport_addr,
+                        transport_addr: transport_addr.to_string(),
                         dialed_endpoint: Some(addr.to_string()),
                         direction: ConnectionDirection::Outbound,
                         identity: PeerIdentity {
@@ -845,6 +903,12 @@ impl Node {
                             verification: identity_verification(self.config.tls.as_ref()),
                         },
                     }),
+                    canonical_key: Some(canonical_connection_key(
+                        &self.config.node_id,
+                        &peer_node_id,
+                        local_addr,
+                        transport_addr,
+                    )),
                     instance: Arc::clone(&connection_instance),
                     state: PeerState::Connected,
                     serialization_format: negotiated_format,
@@ -859,6 +923,7 @@ impl Node {
         // Keep the peer lock until rejected admission has rolled the insertion back.
         let peers = Arc::clone(&self.peers);
         let event_tx = self.event_tx.clone();
+        let priority_event_tx = self.priority_event_tx.clone();
         let addr_owned = addr.to_string();
         let max_message_size = self.config.max_message_size;
         let socket_timeout = self.config.socket_timeout;
@@ -874,6 +939,7 @@ impl Node {
                 &shutdown_for_events,
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerConnected",
                     NodeEvent::PeerConnected {
@@ -892,6 +958,7 @@ impl Node {
                     peer_node_id: peer_node_id.clone(),
                     addr: addr_owned.clone(),
                     event_tx: event_tx.clone(),
+                    priority_event_tx,
                     writer,
                     serialization_format: negotiated_format,
                     max_message_size,
@@ -924,6 +991,7 @@ impl Node {
             if let Some((node_id, addr, peers_connected)) = disconnected {
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
@@ -1117,6 +1185,7 @@ impl Node {
                     let shutdown_for_events = self.shutdown_tx.subscribe();
                     send_node_event(
                         &self.event_tx,
+                        None,
                         &shutdown_for_events,
                         "PeerDisconnected",
                         NodeEvent::PeerDisconnected {
@@ -1170,6 +1239,7 @@ impl Node {
                 let shutdown_for_events = self.shutdown_tx.subscribe();
                 send_node_event(
                     &self.event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
@@ -1231,6 +1301,100 @@ impl Node {
         connected
     }
 
+    /// Keep a single active transport per handshake identity.
+    ///
+    /// The preferred direction is complementary at both endpoints: the
+    /// lexicographically smaller NodeId keeps its outbound connection, while
+    /// the larger NodeId keeps the corresponding inbound connection.
+    pub async fn deduplicate_peer_connections(&self) -> usize {
+        let disconnected = {
+            let mut peers = self.peers.write().await;
+            let mut by_peer = HashMap::<String, Vec<PeerDedupCandidate>>::new();
+
+            for (addr, connection) in &*peers {
+                if connection.state != PeerState::Connected {
+                    continue;
+                }
+                let Some(node_id) = connection.info.node_id.as_ref() else {
+                    continue;
+                };
+                let direction = connection
+                    .connection_info
+                    .as_ref()
+                    .map(|connection| connection.direction);
+                by_peer
+                    .entry(node_id.to_string())
+                    .or_default()
+                    .push(PeerDedupCandidate {
+                        addr: addr.clone(),
+                        direction,
+                        canonical_key: connection.canonical_key,
+                    });
+            }
+
+            let mut duplicates = Vec::new();
+            for (peer_id, mut connections) in by_peer {
+                let preferred_direction = if self.config.node_id.as_str() < peer_id.as_str() {
+                    ConnectionDirection::Outbound
+                } else {
+                    ConnectionDirection::Inbound
+                };
+                connections.sort_by(|left, right| {
+                    let left_preferred = left.direction == Some(preferred_direction);
+                    let right_preferred = right.direction == Some(preferred_direction);
+                    right_preferred
+                        .cmp(&left_preferred)
+                        .then_with(|| match (left.canonical_key, right.canonical_key) {
+                            (Some(left), Some(right)) => left.cmp(&right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        })
+                        .then_with(|| left.addr.cmp(&right.addr))
+                });
+                duplicates.extend(
+                    connections
+                        .into_iter()
+                        .skip(1)
+                        .map(|candidate| candidate.addr),
+                );
+            }
+            duplicates.sort();
+
+            let mut disconnected = Vec::new();
+            for addr in duplicates {
+                let Some(connection) = peers.remove(&addr) else {
+                    continue;
+                };
+                let node_id = connection.info.node_id.clone();
+                let was_connected = connection.state == PeerState::Connected;
+                drop(connection);
+                if was_connected && let Some(node_id) = node_id {
+                    disconnected.push((node_id, addr, connected_peer_count(&peers)));
+                }
+            }
+            disconnected
+        };
+
+        let removed = disconnected.len();
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        for (node_id, addr, peers_connected) in disconnected {
+            send_node_event(
+                &self.event_tx,
+                None,
+                &shutdown_rx,
+                "PeerDisconnected",
+                NodeEvent::PeerDisconnected {
+                    node_id,
+                    addr,
+                    peers_connected,
+                },
+            )
+            .await;
+        }
+        removed
+    }
+
     /// Release a topology slot only while the address still belongs to the
     /// expected peer. Removal cancels the reader/writer generation before event
     /// delivery, so a saturated event queue cannot retain the admission permit.
@@ -1247,6 +1411,7 @@ impl Node {
         };
         send_node_event(
             &self.event_tx,
+            None,
             &self.shutdown_tx.subscribe(),
             "PeerDisconnected",
             NodeEvent::PeerDisconnected {
@@ -1362,6 +1527,7 @@ async fn handle_incoming(
         our_node_id,
         peers,
         event_tx,
+        priority_event_tx,
         limits,
         slot: handshake_slot,
         connection_slots,
@@ -1370,6 +1536,8 @@ async fn handle_incoming(
         bootstrap_server,
     } = context;
 
+    let local_addr = stream.local_addr()?;
+    let transport_addr = stream.peer_addr()?;
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => timeout(limits.socket_timeout, tls_cfg.accept_stream(stream))
             .await
@@ -1673,7 +1841,7 @@ async fn handle_incoming(
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
     }
 
-    let ack = Message::hello_ack_with_format(our_node_id, negotiated_format);
+    let ack = Message::hello_ack_with_format(our_node_id.clone(), negotiated_format);
     write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
     let writer = Arc::new(Mutex::new(writer));
@@ -1686,7 +1854,7 @@ async fn handle_incoming(
             PeerConnection {
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 connection_info: Some(PeerConnectionInfo {
-                    transport_addr: addr.clone(),
+                    transport_addr: transport_addr.to_string(),
                     dialed_endpoint: None,
                     direction: ConnectionDirection::Inbound,
                     identity: PeerIdentity {
@@ -1694,6 +1862,12 @@ async fn handle_incoming(
                         verification: identity_verification(tls.as_ref()),
                     },
                 }),
+                canonical_key: Some(canonical_connection_key(
+                    &our_node_id,
+                    &peer_node_id,
+                    local_addr,
+                    transport_addr,
+                )),
                 instance: Arc::clone(&connection_instance),
                 state: PeerState::Connected,
                 serialization_format: negotiated_format,
@@ -1713,6 +1887,7 @@ async fn handle_incoming(
         &shutdown_for_events,
         send_node_event(
             &event_tx,
+            None,
             &shutdown_for_events,
             "PeerConnected",
             NodeEvent::PeerConnected {
@@ -1731,6 +1906,7 @@ async fn handle_incoming(
             peer_node_id: peer_node_id.clone(),
             addr: addr.clone(),
             event_tx: event_tx.clone(),
+            priority_event_tx,
             writer,
             serialization_format: negotiated_format,
             max_message_size: limits.max_message_size,
@@ -1759,6 +1935,7 @@ async fn handle_incoming(
     if let Some((node_id, addr, peers_connected)) = disconnected {
         send_node_event(
             &event_tx,
+            None,
             &shutdown_for_events,
             "PeerDisconnected",
             NodeEvent::PeerDisconnected {
@@ -1780,6 +1957,25 @@ fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
         .count()
 }
 
+fn canonical_connection_key(
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> CanonicalConnectionKey {
+    if local_node_id.as_str() < peer_node_id.as_str() {
+        CanonicalConnectionKey {
+            lower_node_endpoint: local_addr,
+            higher_node_endpoint: peer_addr,
+        }
+    } else {
+        CanonicalConnectionKey {
+            lower_node_endpoint: peer_addr,
+            higher_node_endpoint: local_addr,
+        }
+    }
+}
+
 fn remove_connection_if_current(
     peers: &mut HashMap<String, PeerConnection>,
     addr: &str,
@@ -1796,12 +1992,13 @@ pub(crate) async fn connect_transport(
     addr: &str,
     tls: Option<&TlsConfig>,
     socket_timeout: Duration,
-) -> NetResult<(NetStream, String)> {
+) -> NetResult<(NetStream, SocketAddr, SocketAddr)> {
     let tcp = timeout(socket_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| NetError::Timeout)?
         .map_err(|error| NetError::ConnectionFailed(format!("{addr}: {error}")))?;
-    let transport_addr = tcp.peer_addr()?.to_string();
+    let local_addr = tcp.local_addr()?;
+    let transport_addr = tcp.peer_addr()?;
     let stream = if let Some(tls_config) = tls {
         let host = endpoint_host(addr)?;
         let server_name =
@@ -1814,7 +2011,7 @@ pub(crate) async fn connect_transport(
     } else {
         NetStream::Plain(tcp)
     };
-    Ok((stream, transport_addr))
+    Ok((stream, local_addr, transport_addr))
 }
 
 fn endpoint_host(endpoint: &str) -> NetResult<&str> {
@@ -1920,10 +2117,27 @@ fn is_protocol_version_compatible(peer_version: u32) -> bool {
 
 async fn send_node_event(
     event_tx: &mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<&mpsc::Sender<NodeEvent>>,
     shutdown_rx: &watch::Receiver<bool>,
     event_name: &'static str,
     event: NodeEvent,
 ) {
+    let event_tx = match (&event, priority_event_tx) {
+        (
+            NodeEvent::HistoryReceived {
+                message:
+                    nx_sync::HistoryMessage::SummaryRequest { .. }
+                    | nx_sync::HistoryMessage::Summary { .. }
+                    | nx_sync::HistoryMessage::Request { .. }
+                    | nx_sync::HistoryMessage::Unavailable { .. }
+                    | nx_sync::HistoryMessage::BaselineRequest { .. }
+                    | nx_sync::HistoryMessage::BaselineUnavailable { .. },
+                ..
+            },
+            Some(priority_event_tx),
+        ) => priority_event_tx,
+        _ => event_tx,
+    };
     // Keep immediately available shutdown notifications, but never wait for a
     // full queue during shutdown. Disconnect callers release peer resources first.
     let result = match event_tx.try_send(event) {
@@ -1971,6 +2185,7 @@ async fn read_messages(
         peer_node_id,
         addr,
         event_tx,
+        priority_event_tx,
         writer,
         serialization_format,
         max_message_size,
@@ -2011,6 +2226,7 @@ async fn read_messages(
             } => {
                 send_node_event(
                     &event_tx,
+                    priority_event_tx.as_ref(),
                     &shutdown_for_events,
                     "HistoryReceived",
                     NodeEvent::HistoryReceived {
@@ -2029,6 +2245,7 @@ async fn read_messages(
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "OpsReceived",
                     NodeEvent::OpsReceived {
@@ -2042,6 +2259,7 @@ async fn read_messages(
                 debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PullRequested",
                     NodeEvent::PullRequested {
@@ -2430,6 +2648,75 @@ mod tests {
             client.shutdown().await;
             server.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn priority_event_channel_routes_history_control_while_data_queue_is_full() {
+        let mut server = Node::new(
+            NodeConfig::new(NodeId::new("priority-server"), "127.0.0.1:0")
+                .with_event_channel_capacity(2),
+        );
+        server.enable_priority_event_channel(1).unwrap();
+        let mut data_events = server.take_event_receiver().unwrap();
+        let mut priority_events = server.take_priority_event_receiver().unwrap();
+        let address = server.start_listener().await.unwrap().to_string();
+
+        let client = Node::new(
+            NodeConfig::new(NodeId::new("priority-client"), "127.0.0.1:0")
+                .with_event_channel_capacity(2),
+        );
+        client.connect_to_peer(&address).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while data_events.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(data_events.capacity(), 0);
+        assert_eq!(priority_events.capacity(), 1);
+
+        client
+            .send_history_to_addr(
+                &address,
+                nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+            )
+            .await
+            .unwrap();
+        let priority_event = timeout(Duration::from_secs(5), priority_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            priority_event,
+            NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            data_events.try_recv().unwrap(),
+            NodeEvent::PeerConnected { .. }
+        ));
+        client
+            .send_history_to_addr(&address, nx_sync::HistoryMessage::Push { ops: Vec::new() })
+            .await
+            .unwrap();
+        let data_event = timeout(Duration::from_secs(5), data_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            data_event,
+            NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::Push { .. },
+                ..
+            }
+        ));
+
+        client.shutdown().await;
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2926,6 +3213,7 @@ mod tests {
                     peer_node_id: NodeId::new("peer"),
                     addr: "peer".into(),
                     event_tx,
+                    priority_event_tx: None,
                     writer: Arc::clone(&writer),
                     serialization_format: SerializationFormat::Bincode,
                     max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -3021,6 +3309,7 @@ mod tests {
                 peer_node_id: NodeId::new("control-experiment-peer"),
                 addr: "control-experiment-peer".into(),
                 event_tx,
+                priority_event_tx: None,
                 writer: Arc::new(Mutex::new(writer)),
                 serialization_format: format,
                 max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -3186,6 +3475,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -3207,6 +3497,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -3228,6 +3519,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new(addr),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::clone(&current),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -3252,6 +3544,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -3264,6 +3557,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -3518,6 +3812,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new("old")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -3541,6 +3836,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new("replacement")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::clone(&replacement),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -3581,6 +3877,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -3593,6 +3890,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Failed,
                     serialization_format: SerializationFormat::Bincode,
@@ -3620,6 +3918,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new(addr)),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state,
                     serialization_format: SerializationFormat::Bincode,
@@ -3950,6 +4249,99 @@ mod tests {
         );
 
         node_a.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_dials_keep_one_canonical_connection_per_identity() {
+        let mut node_a =
+            Node::new(NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0").with_max_peers(2));
+        let mut node_b =
+            Node::new(NodeConfig::new(NodeId::new("node-b"), "127.0.0.1:0").with_max_peers(2));
+        let mut events_a = node_a.take_event_receiver().unwrap();
+        let mut events_b = node_b.take_event_receiver().unwrap();
+        let addr_a = node_a.start_listener().await.unwrap().to_string();
+        let addr_b = node_b.start_listener().await.unwrap().to_string();
+
+        let (connected_a, connected_b) = tokio::join!(
+            node_a.connect_to_peer(&addr_b),
+            node_b.connect_to_peer(&addr_a)
+        );
+        assert!(
+            connected_a.is_ok(),
+            "node-a failed to connect: {connected_a:?}"
+        );
+        assert!(
+            connected_b.is_ok(),
+            "node-b failed to connect: {connected_b:?}"
+        );
+
+        timeout(Duration::from_secs(1), async {
+            while node_a.connected_peer_count().await != 2
+                || node_b.connected_peer_count().await != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("simultaneous dials did not establish both transports");
+
+        assert_eq!(node_a.connection_slots.available_permits(), 0);
+        assert_eq!(node_b.connection_slots.available_permits(), 0);
+        assert_eq!(node_a.deduplicate_peer_connections().await, 1);
+        assert_eq!(node_b.deduplicate_peer_connections().await, 1);
+
+        let peers_a = node_a.connected_peers().await;
+        let peers_b = node_b.connected_peers().await;
+        assert_eq!(peers_a.len(), 1);
+        assert_eq!(peers_b.len(), 1);
+        assert_eq!(
+            node_a
+                .connection_info(&peers_a[0].0)
+                .await
+                .unwrap()
+                .direction,
+            ConnectionDirection::Outbound
+        );
+        assert_eq!(
+            node_b
+                .connection_info(&peers_b[0].0)
+                .await
+                .unwrap()
+                .direction,
+            ConnectionDirection::Inbound
+        );
+        assert_eq!(node_a.connection_slots.available_permits(), 1);
+        assert_eq!(node_b.connection_slots.available_permits(), 1);
+
+        let disconnected_a = std::iter::from_fn(|| events_a.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    NodeEvent::PeerDisconnected {
+                        node_id,
+                        peers_connected: 1,
+                        ..
+                    } if node_id == &NodeId::new("node-b")
+                )
+            })
+            .count();
+        let disconnected_b = std::iter::from_fn(|| events_b.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    NodeEvent::PeerDisconnected {
+                        node_id,
+                        peers_connected: 1,
+                        ..
+                    } if node_id == &NodeId::new("node-a")
+                )
+            })
+            .count();
+        assert_eq!(disconnected_a, 1);
+        assert_eq!(disconnected_b, 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
     }
 
     #[tokio::test]

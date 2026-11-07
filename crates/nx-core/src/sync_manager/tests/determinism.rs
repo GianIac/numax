@@ -147,6 +147,7 @@ impl Runner {
             );
             let context = Arc::new(NodeEventContext {
                 repair_budget: repair_budget.clone(),
+                recovery_rotation: None,
                 history_cursors: manager.history_cursors.clone(),
                 history_requests: manager.history_requests.clone(),
                 history_request_timeout: manager.config.socket_timeout,
@@ -213,6 +214,7 @@ impl Runner {
                 membership: snapshot,
                 node: io.clone(),
                 rotation_interval: crate::sync_manager::neighbors::NEIGHBOR_ROTATION_INTERVAL,
+                recovery_rotation: None,
                 candidates_rx,
                 max_peers,
                 initial_delay: manager.config.reconnect_initial_delay,
@@ -1043,6 +1045,7 @@ async fn repeated_codec_replay(format: nx_net::SerializationFormat) {
     let stage = std::env::var_os(STAGE);
     let repeat = match stage.as_deref() {
         None => {
+            let _scenario = process_scenario_io();
             let started = StdInstant::now();
             let lifetime = Duration::from_secs(180);
             let output = isolated_test_output(&test_name, STAGE, "repeat", lifetime);

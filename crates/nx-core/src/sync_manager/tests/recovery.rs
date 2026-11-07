@@ -309,6 +309,124 @@ async fn cancelled_remote_apply_finishes_persistence_and_publication() {
 }
 
 #[tokio::test]
+async fn remote_flush_failure_fences_writes_and_recovers_all_families() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = manager(
+        "flush-target",
+        Arc::new(NxStore::open(directory.path()).unwrap()),
+    );
+    let source = manager("flush-source", temp_store());
+    seed(&source).await;
+    let flushes = target.store.completed_flushes();
+    target.store.inject_disk_full_on_flush(true);
+    assert!(
+        apply_sequenced_ops_and_collect(&operations(), &remote_apply_context(&target))
+            .await
+            .is_err()
+    );
+    assert_eq!(target.store.completed_flushes(), flushes);
+    assert!(target.counters.read().await.is_empty());
+    assert!(target.pncounters.read().await.is_empty());
+    assert!(target.lww_registers.read().await.is_empty());
+    assert!(target.lww_maps.read().await.is_empty());
+    assert!(target.orsets.read().await.is_empty());
+    assert!(target.rgas.read().await.is_empty());
+    assert!(target.seen_ops.read().await.ids.is_empty());
+    assert!(target.op_log.read().await.is_empty());
+    // The batch can survive an uncertain flush, but cannot be published or
+    // followed by new mutations until reopening restores coherent registries.
+    assert_durable_equal(&source.store, &target.store);
+    target.store.inject_disk_full_on_flush(false);
+    let mut next = operations().pop().unwrap();
+    next.position.sequence += 1;
+    next.op.id = nx_sync::OpId::new("after-uncertain-flush");
+    let error = apply_sequenced_ops_and_collect(&[next], &remote_apply_context(&target))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("durability is uncertain"));
+    assert_durable_equal(&source.store, &target.store);
+    drop(target);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    let reopened = manager(
+        "flush-target",
+        Arc::new(NxStore::open(directory.path()).unwrap()),
+    );
+    assert_durable_equal(&source.store, &reopened.store);
+    assert_eq!(reopened.get_counter_value("counter").await, 10);
+    assert_eq!(reopened.get_pncounter_value("pn").await, 5);
+    assert_eq!(
+        reopened.get_lww_register_value("register").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(reopened.get_lww_map_entries("map").await.is_empty());
+    assert!(reopened.get_orset_elements("set").await.is_empty());
+    assert_eq!(reopened.get_rga_values("rga").await, vec![vec![2]]);
+    let progress = reopened.handle().replication_progress().unwrap();
+    assert_eq!(progress[0].contiguous_sequence, operations().len() as u64);
+    assert_eq!(progress[0].sparse_positions, 0);
+    let flushes = reopened.store.completed_flushes();
+    assert!(
+        apply_sequenced_ops_and_collect(&operations(), &remote_apply_context(&reopened))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened.store.completed_flushes(),
+        flushes,
+        "duplicates must not flush"
+    );
+    assert_durable_equal(&source.store, &reopened.store);
+}
+
+#[tokio::test]
+async fn remote_flush_retains_publication_guards_after_cancellation() {
+    let target = Arc::new(manager("paused-target", temp_store()));
+    let flushes = target.store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    target.store.pause_next_flush(reached_tx, resume_rx);
+    let worker = Arc::clone(&target);
+    let processing = tokio::spawn(async move {
+        apply_sequenced_ops_and_collect(&operations(), &remote_apply_context(&worker)).await
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!processing.is_finished());
+    assert_eq!(target.store.completed_flushes(), flushes);
+    processing.abort();
+    assert!(processing.await.unwrap_err().is_cancelled());
+    assert!(target.seen_ops.try_read().is_err());
+    assert!(target.op_log.try_read().is_err());
+    assert!(target.counters.try_read().is_err());
+    assert!(target.pncounters.try_read().is_err());
+    assert!(target.lww_registers.try_read().is_err());
+    assert!(target.lww_maps.try_read().is_err());
+    assert!(target.orsets.try_read().is_err());
+    assert!(target.rgas.try_read().is_err());
+    resume_tx.send(()).unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), target.seen_ops.read())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(target.store.completed_flushes(), flushes + 1);
+    assert_eq!(target.get_counter_value("counter").await, 10);
+    assert_eq!(
+        target.handle().replication_progress().unwrap()[0].contiguous_sequence,
+        12
+    );
+    assert!(
+        apply_sequenced_ops_and_collect(&operations(), &remote_apply_context(&target))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn cancelled_baseline_import_finishes_persistence_and_publication() {
     cancelled_storage_work_finishes_publication(true).await;
 }

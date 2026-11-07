@@ -71,6 +71,62 @@ fn history_summary_changes_preserve_validation_and_recovery_metadata() {
     assert!(record_summary(&store, &summary).is_err());
 }
 
+#[test]
+fn history_summary_page_records_all_origins_in_one_atomic_batch() {
+    let store = temp_store();
+    let summaries = ["summary-origin-a", "summary-origin-b"].map(|origin| HistorySummary {
+        baseline_required: false,
+        origin: NodeId::new(origin),
+        high_sequence: 3,
+    });
+    let before_batches = store.completed_batch_work().0;
+
+    let repairs = record_summaries(&store, &summaries).unwrap();
+
+    assert_eq!(
+        repairs
+            .iter()
+            .map(|repair| (repair.origin.as_str(), repair.missing, repair.baseline))
+            .collect::<Vec<_>>(),
+        vec![
+            ("summary-origin-a", Some((1, 3)), false),
+            ("summary-origin-b", Some((1, 3)), false),
+        ]
+    );
+    assert_eq!(store.completed_batch_work().0 - before_batches, 1);
+    assert_eq!(
+        replication_progress(&store)
+            .unwrap()
+            .iter()
+            .map(|progress| (
+                progress.origin.as_str().to_owned(),
+                progress.known_high_sequence
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("summary-origin-a".to_owned(), 3),
+            ("summary-origin-b".to_owned(), 3),
+        ]
+    );
+}
+
+#[test]
+fn history_summary_page_storage_failure_does_not_persist_a_prefix() {
+    let store = temp_store();
+    let summaries = ["summary-origin-a", "summary-origin-b"].map(|origin| HistorySummary {
+        baseline_required: false,
+        origin: NodeId::new(origin),
+        high_sequence: 3,
+    });
+    store.inject_disk_full_on_writes(true);
+
+    let result = record_summaries(&store, &summaries);
+
+    store.inject_disk_full_on_writes(false);
+    assert!(result.is_err());
+    assert!(replication_progress(&store).unwrap().is_empty());
+}
+
 fn transport_replay(entry: SequencedOp) -> nx_sync::HistoryMessage {
     nx_sync::HistoryMessage::Replay {
         request_id: nx_sync::OpId::new("\0".repeat(128)),
@@ -498,7 +554,7 @@ async fn sequenced_unavailable_evidence_survives_reopen_and_clears_only_its_inte
             },
         )
         .unwrap();
-        record_unavailable(&store, &origin, evidence.clone()).unwrap();
+        record_unavailable_and_previous(&store, &origin, evidence.clone()).unwrap();
         store.flush().unwrap();
     }
     let store = Arc::new(NxStore::open(directory.path()).unwrap());
@@ -537,6 +593,8 @@ async fn sequenced_remote_crash_child() {
     let checkpoint = match std::env::var("NUMAX_D2_CRASH_POINT").unwrap().as_str() {
         "before" => CrashCheckpoint::BeforeBatch,
         "after" => CrashCheckpoint::AfterBatch,
+        "before_flush" => CrashCheckpoint::BeforeFlush,
+        "after_flush" => CrashCheckpoint::AfterFlush,
         _ => panic!("unknown remote crash checkpoint"),
     };
     store.inject_crash_checkpoint(
@@ -551,7 +609,7 @@ async fn sequenced_remote_crash_child() {
 
 #[test]
 fn sequenced_remote_crash_keeps_state_position_and_receipt_atomic() {
-    for checkpoint in ["before", "after"] {
+    for checkpoint in ["before", "after", "before_flush", "after_flush"] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store");
         let marker = directory.path().join("marker");
@@ -587,6 +645,9 @@ fn sequenced_remote_crash_keeps_state_position_and_receipt_atomic() {
             .is_some();
         if checkpoint == "before" {
             assert!(!survived);
+        }
+        if checkpoint == "after_flush" {
+            assert!(survived, "flush-confirmed remote operation was lost");
         }
         assert_eq!(
             store
