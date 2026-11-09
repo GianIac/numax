@@ -25,6 +25,9 @@ pub use message::{
     Message, MessageKind, PROTOCOL_VERSION, SerializationFormat, WireError, WireRetryPolicy,
     history_frame_len,
 };
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use node::HistoryTrace;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use node::read_wire_message_for_fuzzing;

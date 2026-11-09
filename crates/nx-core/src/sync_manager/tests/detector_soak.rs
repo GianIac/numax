@@ -60,6 +60,70 @@ async fn detector_100_nodes_preflight_json() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled 1/100-process remote apply comparison without networking"]
+async fn remote_history_1_vs_100_processes() {
+    let name = "sync_manager::manager::tests::detector_soak::remote_history_1_vs_100_processes";
+    if child(name, Duration::from_secs(1200)) {
+        return;
+    }
+    process::remote_history_comparison().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "three paired 100-process diagnostic comparisons; not a production setting"]
+async fn periodic_flush_100_processes_ab() {
+    let name = "sync_manager::manager::tests::detector_soak::periodic_flush_100_processes_ab";
+    if child(name, Duration::from_secs(1200)) {
+        return;
+    }
+    let directory = std::env::var_os("NUMAX_DETECTOR_TRACE_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("periodic A/B requires an existing artifact directory");
+    process::periodic_flush_comparison(100, 3, &directory)
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn periodic_flush_three_process_smoke() {
+    let name = "sync_manager::manager::tests::detector_soak::periodic_flush_three_process_smoke";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        process::periodic_flush_comparison(101, 1, directory.path())
+            .await
+            .is_err()
+    );
+    let report = process::periodic_flush_comparison(3, 1, directory.path())
+        .await
+        .unwrap();
+    assert_eq!(report["pairs"][0]["a_periodic_flush_ms"], 500);
+    assert!(report["pairs"][0]["b_periodic_flush_ms"].is_null());
+    assert_eq!(report["pairs"][0]["reopen_verified_workers_per_case"], 3);
+    assert!(
+        directory
+            .path()
+            .join("pair-1-a-default/case-report.json")
+            .is_file()
+    );
+    assert!(
+        directory
+            .path()
+            .join("pair-1-b-disabled/host-iostat.stdout")
+            .is_file()
+    );
+    assert!(
+        process::periodic_flush_comparison(3, 1, directory.path())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detector_convergence_smoke_json() {
     let name = "sync_manager::manager::tests::detector_soak::detector_convergence_smoke_json";
     if child(name, Duration::from_secs(180)) {
@@ -92,6 +156,76 @@ async fn detector_100_nodes_one_hour_json() {
     process::scenario(100, Duration::from_secs(3600), Duration::from_secs(10))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "100 real TCP nodes, one real hour, post-load replica health, then transport failure"]
+async fn detector_100_nodes_one_hour_with_replication_health_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_100_nodes_one_hour_with_replication_health_json";
+    if child(name, Duration::from_secs(4500)) {
+        return;
+    }
+    process::convergence_scenario(100, Duration::from_secs(3600), Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "100 real processes; stop at first native stall capture, not a nominal certification"]
+async fn detector_100_nodes_nominal_stall_capture_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_100_nodes_nominal_stall_capture_json";
+    if child(name, Duration::from_secs(4500)) {
+        return;
+    }
+    process::nominal_stall_scenario().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_stall_capture_process_smoke_json() {
+    let name =
+        "sync_manager::manager::tests::detector_soak::native_stall_capture_process_smoke_json";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    process::native_stall_capture_smoke().await.unwrap();
+}
+
+#[test]
+fn soak_output_keeps_real_result_after_long_progress() {
+    let name = "sync_manager::manager::tests::detector_soak::soak_output_keeps_real_result_after_long_progress";
+    if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) {
+        for minute in 1..=800 {
+            println!(
+                "DETECTOR_PROGRESS {}",
+                serde_json::json!({
+                    "elapsed_s": minute * 60, "nodes": 100, "completed": 0,
+                    "rss_sum_sampled_peak_bytes": 4_064_145_408u64,
+                })
+            );
+        }
+        println!("SOAK_CAPTURE_TAIL");
+        return;
+    }
+    let _scenario = process_scenario_io();
+    let first = isolated_test_output(name, MARKER, name, Duration::from_secs(30));
+    assert_eq!(first.len(), 64 * 1024);
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_none() {
+        assert!(!String::from_utf8_lossy(&first).contains("SOAK_CAPTURE_TAIL"));
+    }
+    let output = isolated_test_output_tail(name, MARKER, name, Duration::from_secs(30));
+    assert_eq!(output.len(), 64 * 1024);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"))
+    );
+    assert!(text.contains("SOAK_CAPTURE_TAIL"));
+    println!(
+        "SOAK_OUTPUT_CAPTURE_REGRESSION captured_bytes={} real_footer_verified=true",
+        output.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -154,7 +288,7 @@ fn child(name: &str, lifetime: Duration) -> bool {
         return false;
     }
     let _scenario = process_scenario_io();
-    let output = isolated_test_output(name, MARKER, name, lifetime);
+    let output = isolated_test_output_tail(name, MARKER, name, lifetime);
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.lines()
@@ -384,6 +518,148 @@ struct Writer {
     max_pending: AtomicU64,
     max_flush_us: AtomicU64,
     max_start_lateness_us: AtomicU64,
+    pending: std::sync::Mutex<BTreeMap<u64, StdInstant>>,
+}
+
+struct PendingSubmission {
+    stats: Arc<Writer>,
+    sequence: u64,
+}
+
+impl Drop for PendingSubmission {
+    fn drop(&mut self) {
+        self.stats
+            .pending
+            .lock()
+            .expect("test pending submissions lock")
+            .remove(&self.sequence);
+    }
+}
+
+impl Writer {
+    fn pending_sample(&self) -> anyhow::Result<serde_json::Value> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending submissions diagnostic lock poisoned"))?;
+        let oldest = pending.iter().min_by_key(|(_, started)| **started);
+        Ok(serde_json::json!({
+            "count": pending.len(),
+            "oldest_sequence": oldest.map(|(sequence, _)| *sequence),
+            "oldest_elapsed_us": oldest
+                .map(|(_, started)| u64::try_from(started.elapsed().as_micros()))
+                .transpose()?,
+        }))
+    }
+}
+
+#[test]
+fn live_flush_snapshot_does_not_wait_for_write_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    store.set(b"live-flush", b"value").unwrap();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+    let flushing = store.clone();
+    let worker = std::thread::spawn(move || flushing.flush());
+    reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let observed = store.clone();
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        snapshot_tx.send(observed.active_flush()).unwrap();
+    });
+    let snapshot = snapshot_rx.recv_timeout(Duration::from_secs(1));
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    observer.join().unwrap();
+    let (sequence, _) = snapshot.unwrap().expect("paused flush must be observable");
+    assert!(store.active_flush().is_none());
+    store.flush().unwrap();
+    assert!(store.active_flush().is_none());
+    assert_eq!(store.completed_flushes(), 2);
+    store.inject_disk_full_on_flush(true);
+    assert!(store.flush().is_err());
+    assert!(store.active_flush().is_none());
+    assert!(store.flush().is_err());
+    assert!(store.active_flush().is_none());
+    assert_eq!(sequence, 0);
+}
+
+#[test]
+fn periodic_flush_disabled_preserves_explicit_flush_and_error_barrier() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open_without_periodic_flush(directory.path()).unwrap());
+    assert!(store.periodic_flush_interval_ms().is_none());
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+    let flushing = store.clone();
+    let worker = std::thread::spawn(move || {
+        let lease = flushing.acquire_write_lease().unwrap();
+        lease
+            .apply_batch(&[(b"periodic-control", b"value")], &[])
+            .unwrap();
+        done_tx.send(lease.flush()).unwrap();
+    });
+    reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let unfinished = done_rx.try_recv();
+    let completed_flushes = store.completed_flushes();
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        unfinished,
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(completed_flushes, 0);
+    done_rx.recv().unwrap().unwrap();
+    assert_eq!(store.completed_flushes(), 1);
+    store.inject_disk_full_on_flush(true);
+    assert!(matches!(
+        store.flush(),
+        Err(nx_store::StoreError::InjectedFlushFailure)
+    ));
+    assert!(matches!(
+        store.set(b"next", b"value"),
+        Err(nx_store::StoreError::DurabilityUncertain)
+    ));
+    drop(store);
+    let reopened = NxStore::open(directory.path()).unwrap();
+    assert_eq!(reopened.periodic_flush_interval_ms(), Some(500));
+    assert_eq!(
+        reopened.get(b"periodic-control").unwrap(),
+        Some(b"value".to_vec())
+    );
+    let not_directory = directory.path().join("not-directory");
+    std::fs::write(&not_directory, b"existing file").unwrap();
+    assert!(matches!(
+        NxStore::open_without_periodic_flush(&not_directory),
+        Err(nx_store::StoreError::NotADirectory(_))
+    ));
+}
+#[tokio::test]
+async fn pending_submission_diagnostics_reset_after_cancellation() {
+    let stats = Arc::new(Writer::default());
+    stats.pending.lock().unwrap().insert(7, StdInstant::now());
+    let submission = PendingSubmission {
+        stats: stats.clone(),
+        sequence: 7,
+    };
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _submission = submission;
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    ready.await.unwrap();
+    let snapshot = stats.pending_sample().unwrap();
+    assert_eq!(snapshot["count"], 1);
+    assert_eq!(snapshot["oldest_sequence"], 7);
+    assert!(snapshot["oldest_elapsed_us"].is_u64());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(stats.pending_sample().unwrap()["count"], 0);
 }
 
 fn drain_limit(period: Duration) -> anyhow::Result<Duration> {
@@ -594,7 +870,23 @@ async fn write_load(
                 .fetch_max(u64::try_from(pending.len() + 1)?, Ordering::Relaxed);
             let target = target.clone();
             let stats = stats.clone();
+            {
+                let mut active = stats
+                    .pending
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pending submissions diagnostic lock poisoned"))?;
+                ensure!(active.len() < 4, "pending diagnostic exceeded writer limit");
+                ensure!(
+                    active.insert(step, StdInstant::now()).is_none(),
+                    "duplicate pending submission diagnostic identity"
+                );
+            }
+            let submission = PendingSubmission {
+                stats: stats.clone(),
+                sequence: step,
+            };
             pending.spawn(async move {
+                let _submission = submission;
                 let flush_started = StdInstant::now();
                 target.submit().await?;
                 stats.accepted.fetch_add(1, Ordering::Relaxed);

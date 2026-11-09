@@ -216,35 +216,63 @@ impl SyncHandle {
         + Send
         + 'static,
     ) -> anyhow::Result<T> {
+        #[cfg(test)]
+        let trace = super::storage::critical_trace::Job::new("local")?;
         let started = std::time::Instant::now();
+        #[cfg(test)]
+        let admission_wait = trace.span("wait", "admission");
         let admission = Arc::clone(&self.local_writes.gate).read_owned().await;
+        #[cfg(test)]
+        trace.acquired("admission", admission_wait);
         if self.local_writes.stopped.load(Ordering::Acquire) {
             anyhow::bail!("local operation acceptance is shut down");
         }
         // Acquire async guards before dispatch; the owned job retains them through publication.
+        #[cfg(test)]
+        let seen_wait = trace.span("wait", "seen");
         let mut seen = Arc::clone(&self.seen_ops).write_owned().await;
+        #[cfg(test)]
+        trace.acquired("seen", seen_wait);
+        #[cfg(test)]
+        let log_wait = trace.span("wait", "log");
         let mut log = Arc::clone(&self.op_log).write_owned().await;
+        #[cfg(test)]
+        trace.acquired("log", log_wait);
+        #[cfg(test)]
+        let registry_wait = trace.span("wait", "registry");
         let mut state = registry.write_owned().await;
+        #[cfg(test)]
+        trace.acquired("registry", registry_wait);
         debug!(
             elapsed_us = started.elapsed().as_micros() as u64,
             "local registry locks acquired"
         );
         let dispatched = std::time::Instant::now();
         let handle = self.clone();
-        self.storage_executor
-            .execute(move || {
-                let _admission = admission;
-                debug!(
-                    elapsed_us = dispatched.elapsed().as_micros() as u64,
-                    "local storage job started"
-                );
-                let result = work(&handle, &mut seen, &mut log, &mut state);
-                if let Err(error) = &result {
-                    warn!(error = %error, "local operation acceptance failed");
-                }
-                result
-            })
-            .await
+        #[cfg(test)]
+        let dispatch_wait = trace.span("wait", "dispatch");
+        #[cfg(test)]
+        let marker_job = trace.clone();
+        let work = move || {
+            let _admission = admission;
+            #[cfg(test)]
+            let _release = marker_job.release_marker();
+            debug!(
+                elapsed_us = dispatched.elapsed().as_micros() as u64,
+                "local storage job started"
+            );
+            let result = work(&handle, &mut seen, &mut log, &mut state);
+            if let Err(error) = &result {
+                warn!(error = %error, "local operation acceptance failed");
+            }
+            result
+        };
+        #[cfg(test)]
+        let work = move || {
+            dispatch_wait.finish("started");
+            trace.run(work)
+        };
+        self.storage_executor.execute(work).await
     }
 
     fn local_op(&self, kind: OpKind) -> Op {
@@ -1599,6 +1627,16 @@ impl SyncManager {
                             .saturating_add(priority_queue_depth_before);
                         #[cfg(test)]
                         let event_started = std::time::Instant::now();
+                        #[cfg(test)]
+                        {
+                            super::replication::trace_dequeued_history(&event);
+                            debug!(
+                                target: "nx_core::sync_manager::replication",
+                                recovery_trace_stage = "turn_begin",
+                                kind = event_kind,
+                                "test recovery timeline"
+                            );
+                        }
                         let pending_priority_event = if is_priority {
                             handle_node_event(event, &event_context).await;
                             None

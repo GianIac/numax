@@ -665,6 +665,25 @@ pub(super) fn isolated_test_output(
     value: &str,
     lifetime: std::time::Duration,
 ) -> Vec<u8> {
+    isolated_test_output_with_capture(test_name, marker, value, lifetime, false)
+}
+
+pub(super) fn isolated_test_output_tail(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+) -> Vec<u8> {
+    isolated_test_output_with_capture(test_name, marker, value, lifetime, true)
+}
+
+fn isolated_test_output_with_capture(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+    capture_tail: bool,
+) -> Vec<u8> {
     use std::io::{Read, Seek};
     use std::process::{Command, Stdio};
 
@@ -705,7 +724,7 @@ pub(super) fn isolated_test_output(
     let cleanup = result.is_err().then(|| (child.kill(), child.wait()));
     output.rewind().unwrap();
     let mut bytes = Vec::new();
-    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+    if capture_tail || std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
         let length = output.metadata().unwrap().len();
         output
             .seek(std::io::SeekFrom::Start(length.saturating_sub(64 * 1024)))

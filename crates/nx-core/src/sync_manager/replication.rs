@@ -1137,6 +1137,12 @@ async fn send_repair_history(
     turn: Option<&mut super::delivery::Turn>,
 ) -> nx_net::NetResult<()> {
     #[cfg(test)]
+    let trace = nx_net::HistoryTrace::from_message(addr, &message);
+    #[cfg(test)]
+    if let Some(trace) = &trace {
+        trace.emit("send_begin");
+    }
+    #[cfg(test)]
     let budget_event = match &message {
         HistoryMessage::SummaryRequest { .. } => "summary_send_budget_deferred",
         HistoryMessage::Request { .. } => "range_send_budget_deferred",
@@ -1148,7 +1154,16 @@ async fn send_repair_history(
         | HistoryMessage::Baseline { .. }
         | HistoryMessage::BaselineUnavailable { .. } => "response_send_budget_deferred",
     };
-    let prepared = node.clone().prepare_history_to_addr(addr, message).await?;
+    let preparation = node.clone().prepare_history_to_addr(addr, message).await;
+    #[cfg(test)]
+    if let Some(trace) = &trace {
+        trace.emit(if preparation.is_ok() {
+            "send_prepared"
+        } else {
+            "send_prepare_failed"
+        });
+    }
+    let prepared = preparation?;
     let bytes = prepared.encoded_len();
     if turn.is_some_and(|turn| !turn.admit(bytes))
         || !budget
@@ -1158,14 +1173,28 @@ async fn send_repair_history(
     {
         #[cfg(test)]
         trace_recovery_event(budget_event, 0);
+        #[cfg(test)]
+        if let Some(trace) = &trace {
+            trace.emit("send_budget_denied");
+        }
         return Err(NetError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "recovery budget exhausted; periodic repair will retry",
         )));
     }
-    node.send_prepared_history_with_timeout(prepared, super::delivery::SEND_TIMEOUT)
+    let result = node
+        .send_prepared_history_with_timeout(prepared, super::delivery::SEND_TIMEOUT)
         .await
-        .map(|_| ())
+        .map(|_| ());
+    #[cfg(test)]
+    if let Some(trace) = &trace {
+        trace.emit(if result.is_ok() {
+            "send_completed"
+        } else {
+            "send_failed"
+        });
+    }
+    result
 }
 
 async fn send_paced_history(
@@ -1822,6 +1851,15 @@ pub(super) fn trace_remote_history_batch(
     );
 }
 
+#[cfg(test)]
+pub(super) fn trace_dequeued_history(event: &NodeEvent) {
+    if let NodeEvent::HistoryReceived { from, message, .. } = event
+        && let Some(trace) = nx_net::HistoryTrace::from_message(from.as_str(), message)
+    {
+        trace.emit("dequeued");
+    }
+}
+
 async fn collect_remote_history(
     first: NodeEvent,
     event_rx: &mut mpsc::Receiver<NodeEvent>,
@@ -1856,6 +1894,8 @@ async fn collect_remote_history(
         {
             match priority_rx.try_recv() {
                 Ok(event) => {
+                    #[cfg(test)]
+                    trace_dequeued_history(&event);
                     pending_priority = Some(event);
                     #[cfg(test)]
                     {
@@ -1869,6 +1909,8 @@ async fn collect_remote_history(
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
         }
+        #[cfg(test)]
+        let from_pending = pending.is_some();
         let event = match pending.take() {
             Some(event) => Some(event),
             None => match event_rx.try_recv() {
@@ -1907,6 +1949,8 @@ async fn collect_remote_history(
                                 break;
                             }
                             BatchRead::Priority(Some(event)) => {
+                                #[cfg(test)]
+                                trace_dequeued_history(&event);
                                 pending_priority = Some(event);
                                 #[cfg(test)]
                                 {
@@ -1939,6 +1983,10 @@ async fn collect_remote_history(
             }
             break;
         };
+        #[cfg(test)]
+        if !from_pending {
+            trace_dequeued_history(&event);
+        }
         let Some((count, size)) = remote_history_work(&event) else {
             #[cfg(test)]
             {
@@ -2305,6 +2353,9 @@ async fn request_history_or_baseline_inner(
                 deadline,
             },
         );
+        #[cfg(test)]
+        nx_net::HistoryTrace::new("request", addr, &origin, &request_id, start, end)
+            .emit("request_created");
     }
     if let Err(error) = send_repair_history(
         &context.node,
@@ -2358,7 +2409,13 @@ async fn complete_history_request(
     end: u64,
     context: &NodeEventContext,
 ) -> Option<PendingHistoryRequest> {
+    #[cfg(test)]
+    let trace = nx_net::HistoryTrace::new("response", addr, origin, request_id, start, end);
+    #[cfg(test)]
+    trace.emit("request_lock_begin");
     let mut requests = context.history_requests.write().await;
+    #[cfg(test)]
+    trace.emit("request_lock_acquired");
     if let Some(pending) = requests.get_mut(addr)
         && let Some(request) = pending.get(origin.as_str())
         && request.request_id == *request_id
@@ -2367,7 +2424,36 @@ async fn complete_history_request(
         && end >= start
         && end <= request.end
     {
+        #[cfg(test)]
+        debug!(
+            target: "nx_core::sync_manager::replication",
+            recovery_trace_stage = "request_lookup",
+            peer = addr, origin = %origin, request_id = %request_id,
+            start, end, decision = "matched",
+            "test recovery timeline"
+        );
         return pending.remove(origin.as_str());
+    }
+    #[cfg(test)]
+    {
+        let request = requests
+            .get(addr)
+            .and_then(|pending| pending.get(origin.as_str()));
+        let decision = match request {
+            None => "missing",
+            Some(request) if request.request_id != *request_id => "superseded",
+            Some(request) if request.start != start || end < start || end > request.end => {
+                "invalid_interval"
+            }
+            Some(_) => "expired",
+        };
+        debug!(
+            target: "nx_core::sync_manager::replication",
+            recovery_trace_stage = "request_lookup",
+            peer = addr, origin = %origin, request_id = %request_id,
+            start, end, decision,
+            "test recovery timeline"
+        );
     }
     None
 }
@@ -2404,6 +2490,8 @@ async fn complete_replay_request(
     };
     #[cfg(test)]
     {
+        nx_net::HistoryTrace::new("replay", addr, origin, request_id, start, end)
+            .emit("replay_admitted");
         let items = u64::try_from(ops.len()).unwrap_or(u64::MAX);
         trace_recovery_event("range_replay_received", items);
         trace_recovery_latency(
@@ -2586,17 +2674,22 @@ async fn apply_prepared_replay(
     replay: &IncomingReplay,
     context: &NodeEventContext,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    let trace = nx_net::HistoryTrace::new(
+        "replay",
+        &replay.addr,
+        &replay.origin,
+        &replay.request_id,
+        replay.start,
+        replay.end,
+    );
+    #[cfg(test)]
+    trace.emit("replay_apply_begin");
     let accepted =
         apply_sequenced_ops_and_collect(&replay.ops, &history_apply_context(context)).await?;
+    #[cfg(test)]
+    trace.emit("replay_published");
     finish_replay_after_apply(&replay.addr, replay.origin.clone(), accepted, context).await
-}
-
-fn remote_history_batch_has_duplicate_ids(history: &[IncomingHistory]) -> bool {
-    let mut ids = HashMap::new();
-    history
-        .iter()
-        .flat_map(IncomingHistory::ops)
-        .any(|entry| ids.insert(entry.op.id.as_str(), ()).is_some())
 }
 
 async fn apply_remote_history_individually(
@@ -2680,20 +2773,33 @@ async fn handle_remote_history_batch(history: Vec<IncomingHistory>, context: &No
     if admitted.is_empty() {
         return;
     }
-    if remote_history_batch_has_duplicate_ids(&admitted) {
-        debug!(
-            "queued remote history batch contains duplicate operation ids; handling envelopes individually"
-        );
-        apply_remote_history_individually(admitted, context).await;
-        return;
-    }
-
     let ops = admitted
         .iter()
         .flat_map(|envelope| envelope.ops().iter().cloned())
         .collect::<Vec<_>>();
+    #[cfg(test)]
+    debug!(
+        target: "nx_core::sync_manager::replication",
+        recovery_trace_stage = "batch_apply_begin",
+        envelopes = admitted.len() as u64, operations = ops.len() as u64,
+        "test recovery timeline"
+    );
     match apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await {
         Ok(accepted) => {
+            #[cfg(test)]
+            for envelope in &admitted {
+                if let IncomingHistory::Replay(replay) = envelope {
+                    nx_net::HistoryTrace::new(
+                        "replay",
+                        &replay.addr,
+                        &replay.origin,
+                        &replay.request_id,
+                        replay.start,
+                        replay.end,
+                    )
+                    .emit("replay_published");
+                }
+            }
             let mut accepted = accepted
                 .into_iter()
                 .map(|entry| (entry.op.id.as_str().to_owned(), entry))
@@ -2754,6 +2860,14 @@ async fn handle_remote_history_batch(history: Vec<IncomingHistory>, context: &No
             }
         }
         Err(error) if error.is::<super::apply::RemoteBatchPreparation>() => {
+            #[cfg(test)]
+            debug!(
+                target: "nx_core::sync_manager::replication",
+                recovery_trace_stage = "preparation_fallback",
+                envelopes = admitted.len() as u64,
+                operations = ops.len() as u64,
+                "test recovery timeline"
+            );
             debug!(%error, "queued remote history batch rejected before persistence; handling envelopes individually");
             apply_remote_history_individually(admitted, context).await;
         }
@@ -3103,8 +3217,14 @@ async fn handle_history_message(
             {
                 return Ok(());
             }
+            #[cfg(test)]
+            let trace = nx_net::HistoryTrace::new("replay", addr, &origin, &request_id, start, end);
+            #[cfg(test)]
+            trace.emit("replay_apply_begin");
             let accepted =
                 apply_sequenced_ops_and_collect(&ops, &history_apply_context(context)).await?;
+            #[cfg(test)]
+            trace.emit("replay_published");
             finish_replay_after_apply(addr, origin, accepted, context).await?;
         }
         HistoryMessage::Unavailable {
@@ -4140,6 +4260,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_benign_copies_preserve_six_families_and_first_forward_owner() {
+        for persisted_prefix in [false, true] {
+            let mut context = baseline_test_context();
+            let reference = baseline_test_context();
+            let entries = queued_entries();
+            let first = usize::from(persisted_prefix);
+            if persisted_prefix {
+                for target in [&context, &reference] {
+                    handle_node_event(queued_event(vec![entries[0].clone()], 0), target).await;
+                }
+            }
+            let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+                64,
+                super::super::delivery::QUEUE_BYTES,
+                context.metrics.clone(),
+                true,
+            );
+            context.forward_tx = Some(forward_tx);
+            let before_batches = context.store.completed_batch_work().0;
+            let before_flushes = context.store.completed_flushes();
+            let (sender, mut events) = mpsc::channel(64);
+            for (index, entry) in entries.iter().enumerate().skip(first) {
+                let ops = vec![entry.clone(), entry.clone(), entries[0].clone()];
+                sender.try_send(queued_event(ops.clone(), index)).unwrap();
+                handle_node_event(queued_event(ops, index), &reference).await;
+            }
+
+            drain_node_events(&mut events, &context).await;
+
+            assert_eq!(context.store.completed_batch_work().0 - before_batches, 1);
+            assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+            assert_eq!(
+                queued_memory(&context).await,
+                queued_memory(&reference).await
+            );
+            assert_eq!(
+                context.store.scan_prefix(b"__nx/").unwrap(),
+                reference.store.scan_prefix(b"__nx/").unwrap()
+            );
+            for (index, entry) in entries.iter().enumerate().skip(first) {
+                let actual = forwarded.try_recv().unwrap();
+                assert_eq!(actual.entry, *entry);
+                assert_eq!(actual.source_addr, format!("source-{}", index % 2));
+            }
+            assert!(forwarded.try_recv().is_err());
+
+            let before_duplicates = context.store.completed_flushes();
+            for (index, entry) in entries.iter().enumerate() {
+                sender
+                    .try_send(queued_event(vec![entry.clone(), entry.clone()], index))
+                    .unwrap();
+            }
+            drain_node_events(&mut events, &context).await;
+            assert_eq!(context.store.completed_flushes(), before_duplicates);
+            assert!(forwarded.try_recv().is_err());
+            assert_eq!(
+                queued_memory(&context).await,
+                queued_memory(&reference).await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_conflicting_copies_do_not_discard_valid_neighbors() {
+        for conflict in ["payload", "origin", "generation", "sequence", "position"] {
+            let mut context = baseline_test_context();
+            let mut reference = baseline_test_context();
+            let entries = queued_entries();
+            let mut invalid = entries[0].clone();
+            match conflict {
+                "payload" => {
+                    invalid.op.kind = nx_sync::OpKind::GCounterIncrement {
+                        key: "det-g".into(),
+                        increment: 8,
+                    };
+                }
+                "origin" => invalid.op.origin = NodeId::new("conflicting-origin"),
+                "generation" => invalid.position.generation = 2,
+                "sequence" => invalid.position.sequence = 2,
+                "position" => invalid.op.id = nx_sync::OpId::new("conflicting-position"),
+                _ => unreachable!(),
+            }
+            let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
+                64,
+                super::super::delivery::QUEUE_BYTES,
+                context.metrics.clone(),
+                true,
+            );
+            context.forward_tx = Some(forward_tx);
+            let (reference_tx, mut reference_forwarded) = super::super::delivery::named_channel(
+                64,
+                super::super::delivery::QUEUE_BYTES,
+                reference.metrics.clone(),
+                true,
+            );
+            reference.forward_tx = Some(reference_tx);
+            let (sender, mut events) = mpsc::channel(8);
+            for (index, ops) in [
+                vec![entries[0].clone()],
+                vec![invalid, entries[1].clone()],
+                vec![entries[1].clone()],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                sender.try_send(queued_event(ops.clone(), index)).unwrap();
+                handle_node_event(queued_event(ops, index), &reference).await;
+            }
+
+            drain_node_events(&mut events, &context).await;
+
+            assert_eq!(
+                context.store.scan_prefix(b"__nx/").unwrap(),
+                reference.store.scan_prefix(b"__nx/").unwrap(),
+                "{conflict}"
+            );
+            assert_eq!(context.store.completed_batch_work().0, 2, "{conflict}");
+            assert_eq!(context.store.completed_flushes(), 2, "{conflict}");
+            assert_eq!(context.counters.read().await["det-g"].value(), 7);
+            assert_eq!(context.pncounters.read().await["det-p"].value(), 9);
+            for entry in &entries[..2] {
+                let actual = forwarded.try_recv().unwrap();
+                let expected = reference_forwarded.try_recv().unwrap();
+                assert_eq!(actual.entry, *entry);
+                assert_eq!(actual.entry, expected.entry, "{conflict}");
+                assert_eq!(actual.source_addr, expected.source_addr, "{conflict}");
+            }
+            assert!(forwarded.try_recv().is_err());
+            assert!(reference_forwarded.try_recv().is_err());
+            assert_eq!(
+                context
+                    .metrics
+                    .render_for_test(&context.store)
+                    .contains("numax_sync_errors_total 1\n"),
+                conflict != "position",
+                "{conflict}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn queued_pushes_wait_for_flush_before_forwarding() {
         let mut context = baseline_test_context();
         let (forward_tx, mut forwarded) = super::super::delivery::named_channel(
@@ -4154,7 +4415,7 @@ mod tests {
         let (sender, mut events) = mpsc::channel(64);
         for (index, entry) in entries.iter().enumerate() {
             sender
-                .try_send(queued_event(vec![entry.clone()], index))
+                .try_send(queued_event(vec![entry.clone(), entry.clone()], index))
                 .unwrap();
         }
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
@@ -4197,7 +4458,9 @@ mod tests {
         context.forward_tx = Some(forward_tx);
         let (sender, mut events) = mpsc::channel(64);
         for (index, entry) in queued_entries().into_iter().enumerate() {
-            sender.try_send(queued_event(vec![entry], index)).unwrap();
+            sender
+                .try_send(queued_event(vec![entry.clone(), entry], index))
+                .unwrap();
         }
         context.store.inject_disk_full_on_flush(true);
         drain_node_events(&mut events, &context).await;
@@ -4253,7 +4516,7 @@ mod tests {
         {
             for (index, entry) in [left, right].into_iter().enumerate() {
                 sender
-                    .try_send(queued_event(vec![entry.clone()], index))
+                    .try_send(queued_event(vec![entry.clone(), entry.clone()], index))
                     .unwrap();
                 handle_node_event(queued_event(vec![entry], index), &reference).await;
             }

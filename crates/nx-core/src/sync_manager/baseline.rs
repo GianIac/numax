@@ -17,6 +17,17 @@ pub(super) const MAX_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 const MAX_KEY_BYTES: usize = 4096;
 
+macro_rules! acquire_baseline_guard {
+    ($trace:ident, $resource:literal, $acquire:expr) => {{
+        #[cfg(test)]
+        let wait = $trace.span("wait", $resource);
+        let guard = $acquire.await;
+        #[cfg(test)]
+        $trace.acquired($resource, wait);
+        guard
+    }};
+}
+
 #[derive(Debug)]
 pub(super) struct Rejected(pub BaselineFailure);
 impl std::fmt::Display for Rejected {
@@ -42,21 +53,44 @@ impl Write for BoundedBytes {
 
 /// All async locks precede the synchronous write lease, matching apply/local writes.
 pub(super) async fn export(context: &RemoteOpApplyContext<'_>) -> anyhow::Result<Vec<u8>> {
-    let _seen = Arc::clone(context.seen_ops).read_owned().await;
-    let _log = Arc::clone(context.op_log).read_owned().await;
-    let counters = Arc::clone(context.counters).read_owned().await;
-    let pncounters = Arc::clone(context.pncounters).read_owned().await;
-    let registers = Arc::clone(context.lww_registers).read_owned().await;
-    let maps = Arc::clone(context.lww_maps).read_owned().await;
-    let sets = Arc::clone(context.orsets).read_owned().await;
-    let rgas = Arc::clone(context.rgas).read_owned().await;
+    #[cfg(test)]
+    let trace = critical_trace::Job::new("baseline_export")?;
+    let _seen = acquire_baseline_guard!(trace, "seen", Arc::clone(context.seen_ops).read_owned());
+    let _log = acquire_baseline_guard!(trace, "log", Arc::clone(context.op_log).read_owned());
+    let counters =
+        acquire_baseline_guard!(trace, "gcounter", Arc::clone(context.counters).read_owned());
+    let pncounters = acquire_baseline_guard!(
+        trace,
+        "pncounter",
+        Arc::clone(context.pncounters).read_owned()
+    );
+    let registers = acquire_baseline_guard!(
+        trace,
+        "lww_register",
+        Arc::clone(context.lww_registers).read_owned()
+    );
+    let maps = acquire_baseline_guard!(trace, "lww_map", Arc::clone(context.lww_maps).read_owned());
+    let sets = acquire_baseline_guard!(trace, "orset", Arc::clone(context.orsets).read_owned());
+    let rgas = acquire_baseline_guard!(trace, "rga", Arc::clone(context.rgas).read_owned());
     let store = Arc::clone(context.store);
-    context
-        .storage_executor
-        .execute(move || {
-            // Keep receipt and replay guards through the complete cut, including flush.
-            let _guards = (_seen, _log);
-            let lease = store.acquire_write_lease()?;
+    #[cfg(test)]
+    let dispatch = trace.span("wait", "dispatch");
+    #[cfg(test)]
+    let marker = trace.clone();
+    let work = move || {
+        // Keep receipt and replay guards through the complete cut, including flush.
+        let _guards = (_seen, _log);
+        #[cfg(test)]
+        let _release = marker.release_marker();
+        #[cfg(test)]
+        let wait = critical_trace::phase("lease_wait");
+        let lease = store.acquire_write_lease();
+        #[cfg(test)]
+        wait.finish_result(&lease);
+        let lease = lease?;
+        #[cfg(test)]
+        let snapshot = critical_trace::phase("snapshot");
+        let payload = (|| -> anyhow::Result<Vec<u8>> {
             let origins = baseline_origins(lease.store())?;
             let mut baseline = CrdtBaseline {
                 origins,
@@ -96,11 +130,26 @@ pub(super) async fn export(context: &RemoteOpApplyContext<'_>) -> anyhow::Result
             let mut payload = BoundedBytes(Vec::new());
             serde_json::to_writer(&mut payload, &baseline)
                 .map_err(|_| Rejected(BaselineFailure::BudgetExceeded))?;
-            // Freeze the cut only after a covering flush. This is not a remote write acknowledgement.
-            lease.flush()?;
             Ok(payload.0)
-        })
-        .await
+        })();
+        #[cfg(test)]
+        snapshot.finish_result(&payload);
+        let payload = payload?;
+        // Freeze the cut only after a covering flush. This is not a remote write acknowledgement.
+        #[cfg(test)]
+        let flush = critical_trace::phase("flush");
+        let flushed = lease.flush();
+        #[cfg(test)]
+        flush.finish_result(&flushed);
+        flushed?;
+        Ok(payload)
+    };
+    #[cfg(test)]
+    let work = move || {
+        dispatch.finish("started");
+        trace.run(work)
+    };
+    context.storage_executor.execute(work).await
 }
 
 #[derive(Default)]
@@ -283,73 +332,111 @@ async fn install(
     decoded: Decoded,
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
-    let _seen = Arc::clone(context.seen_ops).write_owned().await;
-    let _log = Arc::clone(context.op_log).write_owned().await;
-    let mut counters = Arc::clone(context.counters).write_owned().await;
-    let mut pncounters = Arc::clone(context.pncounters).write_owned().await;
-    let mut registers = Arc::clone(context.lww_registers).write_owned().await;
-    let mut maps = Arc::clone(context.lww_maps).write_owned().await;
-    let mut sets = Arc::clone(context.orsets).write_owned().await;
-    let mut rgas = Arc::clone(context.rgas).write_owned().await;
+    #[cfg(test)]
+    let trace = critical_trace::Job::new("baseline_install")?;
+    let _seen = acquire_baseline_guard!(trace, "seen", Arc::clone(context.seen_ops).write_owned());
+    let _log = acquire_baseline_guard!(trace, "log", Arc::clone(context.op_log).write_owned());
+    let mut counters = acquire_baseline_guard!(
+        trace,
+        "gcounter",
+        Arc::clone(context.counters).write_owned()
+    );
+    let mut pncounters = acquire_baseline_guard!(
+        trace,
+        "pncounter",
+        Arc::clone(context.pncounters).write_owned()
+    );
+    let mut registers = acquire_baseline_guard!(
+        trace,
+        "lww_register",
+        Arc::clone(context.lww_registers).write_owned()
+    );
+    let mut maps =
+        acquire_baseline_guard!(trace, "lww_map", Arc::clone(context.lww_maps).write_owned());
+    let mut sets =
+        acquire_baseline_guard!(trace, "orset", Arc::clone(context.orsets).write_owned());
+    let mut rgas = acquire_baseline_guard!(trace, "rga", Arc::clone(context.rgas).write_owned());
     let store = Arc::clone(context.store);
-    context
-        .storage_executor
-        .execute(move || {
-            // Keep receipt and replay guards through the complete cut, including flush.
-            let _guards = (_seen, _log);
-            let lease = store.acquire_write_lease()?;
-            let sequence_sets =
-                baseline_sequence_sets(&lease, &baseline.origins).map_err(|error| {
-                    if error
-                        .downcast_ref::<super::sequence::TrackingLimit>()
-                        .is_some()
-                    {
-                        error.context(Rejected(BaselineFailure::BudgetExceeded))
-                    } else {
-                        error
-                    }
-                })?;
-            // Also check state inclusion: a cut alone cannot justify silently dropping an existing key,
-            // a tombstone, or state from a legacy store. Compare canonical JSON values for counters too.
-            macro_rules! check_inclusion {
-                ($old:expr, $new:expr) => {
-                    for (key, state) in $old.iter() {
-                        let offered = $new
-                            .get(key)
-                            .ok_or(Rejected(BaselineFailure::CoverageConflict))?;
-                        let merged = offered.merged_with(state);
-                        if serde_json::to_value(&merged)? != serde_json::to_value(offered)? {
-                            return Err(Rejected(BaselineFailure::CoverageConflict).into());
-                        }
-                    }
-                };
+    #[cfg(test)]
+    let dispatch = trace.span("wait", "dispatch");
+    #[cfg(test)]
+    let marker = trace.clone();
+    let work = move || {
+        // Keep receipt and replay guards through the complete cut, including flush.
+        let _guards = (_seen, _log);
+        #[cfg(test)]
+        let _release = marker.release_marker();
+        #[cfg(test)]
+        let wait = critical_trace::phase("lease_wait");
+        let lease = store.acquire_write_lease();
+        #[cfg(test)]
+        wait.finish_result(&lease);
+        let lease = lease?;
+        let sequence_sets = baseline_sequence_sets(&lease, &baseline.origins).map_err(|error| {
+            if error
+                .downcast_ref::<super::sequence::TrackingLimit>()
+                .is_some()
+            {
+                error.context(Rejected(BaselineFailure::BudgetExceeded))
+            } else {
+                error
             }
-            check_inclusion!(counters, decoded.counters);
-            check_inclusion!(pncounters, decoded.pncounters);
-            check_inclusion!(registers, decoded.registers);
-            check_inclusion!(maps, decoded.maps);
-            check_inclusion!(sets, decoded.sets);
-            check_inclusion!(rgas, decoded.rgas);
-            let writes = decoded
-                .writes
-                .iter()
-                .chain(sequence_sets.iter())
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                .collect::<Vec<_>>();
-            lease.apply_batch(&writes, &[])?;
-            // A flush failure is an uncertain outcome: the whole batch may already survive.
-            // Publish that accepted batch coherently in memory, but retain the confirmation marker
-            // and return an error until a retry/restart confirms a covering flush.
-            let flushed = lease.flush();
-            *counters = decoded.counters;
-            *pncounters = decoded.pncounters;
-            *registers = decoded.registers;
-            *maps = decoded.maps;
-            *sets = decoded.sets;
-            *rgas = decoded.rgas;
-            flushed?;
-            lease.delete(BASELINE_UNCONFIRMED)?;
-            Ok(())
-        })
-        .await
+        })?;
+        // Also check state inclusion: a cut alone cannot justify silently dropping an existing key,
+        // a tombstone, or state from a legacy store. Compare canonical JSON values for counters too.
+        macro_rules! check_inclusion {
+            ($old:expr, $new:expr) => {
+                for (key, state) in $old.iter() {
+                    let offered = $new
+                        .get(key)
+                        .ok_or(Rejected(BaselineFailure::CoverageConflict))?;
+                    let merged = offered.merged_with(state);
+                    if serde_json::to_value(&merged)? != serde_json::to_value(offered)? {
+                        return Err(Rejected(BaselineFailure::CoverageConflict).into());
+                    }
+                }
+            };
+        }
+        check_inclusion!(counters, decoded.counters);
+        check_inclusion!(pncounters, decoded.pncounters);
+        check_inclusion!(registers, decoded.registers);
+        check_inclusion!(maps, decoded.maps);
+        check_inclusion!(sets, decoded.sets);
+        check_inclusion!(rgas, decoded.rgas);
+        let writes = decoded
+            .writes
+            .iter()
+            .chain(sequence_sets.iter())
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let batch = critical_trace::phase("batch");
+        let applied = lease.apply_batch(&writes, &[]);
+        #[cfg(test)]
+        batch.finish_result(&applied);
+        applied?;
+        // A flush failure is an uncertain outcome: the whole batch may already survive.
+        // Publish that accepted batch coherently in memory, but retain the confirmation marker
+        // and return an error until a retry/restart confirms a covering flush.
+        #[cfg(test)]
+        let flush = critical_trace::phase("flush");
+        let flushed = lease.flush();
+        #[cfg(test)]
+        flush.finish_result(&flushed);
+        *counters = decoded.counters;
+        *pncounters = decoded.pncounters;
+        *registers = decoded.registers;
+        *maps = decoded.maps;
+        *sets = decoded.sets;
+        *rgas = decoded.rgas;
+        flushed?;
+        lease.delete(BASELINE_UNCONFIRMED)?;
+        Ok(())
+    };
+    #[cfg(test)]
+    let work = move || {
+        dispatch.finish("started");
+        trace.run(work)
+    };
+    context.storage_executor.execute(work).await
 }

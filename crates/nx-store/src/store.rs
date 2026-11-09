@@ -29,17 +29,37 @@ pub struct Store {
     #[cfg(feature = "test-utils")]
     completed_flushes: Arc<AtomicU64>,
     #[cfg(feature = "test-utils")]
+    flush_sequence: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    active_flush: Arc<Mutex<Option<(u64, std::time::Instant)>>>,
+    #[cfg(feature = "test-utils")]
     completed_batches: Arc<AtomicU64>,
     #[cfg(feature = "test-utils")]
     completed_batch_bytes: Arc<AtomicU64>,
     #[cfg(feature = "test-utils")]
     completed_single_mutation_batches: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    periodic_flush_ms: Option<u64>,
 }
 
 #[cfg(feature = "test-utils")]
 struct FlushPause {
     reached: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
+}
+
+#[cfg(feature = "test-utils")]
+struct FlushActivityGuard<'a>(&'a Store);
+
+#[cfg(feature = "test-utils")]
+impl Drop for FlushActivityGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .active_flush
+            .lock()
+            .expect("test flush activity lock") = None;
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -64,6 +84,24 @@ pub struct StoreStats {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_config(path, sled::Config::default())
+    }
+
+    /// Disable Sled's periodic flush/GC service for controlled diagnostic comparisons.
+    /// Explicit covering flushes are unchanged.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn open_without_periodic_flush(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_config(path, sled::Config::default().flush_every_ms(None))
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn periodic_flush_interval_ms(&self) -> Option<u64> {
+        self.periodic_flush_ms
+    }
+
+    fn open_with_config(path: impl AsRef<Path>, config: sled::Config) -> Result<Self, StoreError> {
         let path = path.as_ref();
 
         // if exists and error if not a dir
@@ -76,8 +114,9 @@ impl Store {
             fs::create_dir_all(path)?;
         }
 
-        // open sled in a specific dir
-        let db = sled::open(path)?;
+        #[cfg(feature = "test-utils")]
+        let periodic_flush_ms = config.flush_every_ms;
+        let db = config.path(path).open()?;
         Ok(Self {
             db,
             write_lock: Arc::new(RwLock::new(())),
@@ -93,11 +132,17 @@ impl Store {
             #[cfg(feature = "test-utils")]
             completed_flushes: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "test-utils")]
+            flush_sequence: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            active_flush: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
             completed_batches: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "test-utils")]
             completed_batch_bytes: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "test-utils")]
             completed_single_mutation_batches: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            periodic_flush_ms,
         })
     }
 
@@ -194,6 +239,16 @@ impl Store {
         self.completed_flushes.load(Ordering::Acquire)
     }
 
+    /// Live covering-flush identity and age, including test pauses, without the write lease.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn active_flush(&self) -> Option<(u64, std::time::Duration)> {
+        self.active_flush
+            .lock()
+            .expect("test flush activity lock")
+            .map(|(sequence, started)| (sequence, started.elapsed()))
+    }
+
     /// Successful batches and logical key/value bytes, not physical disk writes.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
@@ -274,6 +329,13 @@ impl Store {
     }
 
     fn flush_unlocked(&self) -> Result<(), StoreError> {
+        #[cfg(feature = "test-utils")]
+        let _activity = {
+            let sequence = self.flush_sequence.fetch_add(1, Ordering::Relaxed);
+            *self.active_flush.lock().expect("test flush activity lock") =
+                Some((sequence, std::time::Instant::now()));
+            FlushActivityGuard(self)
+        };
         self.check_durability()?;
         let result = self.check_injected_write_failure().and_then(|_| {
             self.check_injected_flush_failure()?;

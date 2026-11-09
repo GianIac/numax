@@ -2115,6 +2115,75 @@ fn is_protocol_version_compatible(peer_version: u32) -> bool {
     peer_version == PROTOCOL_VERSION
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub struct HistoryTrace {
+    kind: &'static str,
+    peer: String,
+    origin: nx_sync::NodeId,
+    request_id: nx_sync::OpId,
+    start: u64,
+    end: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl HistoryTrace {
+    pub fn new(
+        kind: &'static str,
+        peer: &str,
+        origin: &nx_sync::NodeId,
+        request_id: &nx_sync::OpId,
+        start: u64,
+        end: u64,
+    ) -> Self {
+        Self {
+            kind,
+            peer: peer.to_owned(),
+            origin: origin.clone(),
+            request_id: request_id.clone(),
+            start,
+            end,
+        }
+    }
+
+    pub fn from_message(peer: &str, message: &nx_sync::HistoryMessage) -> Option<Self> {
+        use nx_sync::HistoryMessage;
+        let (kind, request_id, origin, start, end) = match message {
+            HistoryMessage::Request {
+                request_id,
+                origin,
+                start,
+                end,
+            } => ("request", request_id, origin, *start, *end),
+            HistoryMessage::Replay {
+                request_id,
+                origin,
+                start,
+                end,
+                ..
+            } => ("replay", request_id, origin, *start, *end),
+            HistoryMessage::Unavailable {
+                request_id,
+                origin,
+                start,
+                end,
+            } => ("unavailable", request_id, origin, *start, *end),
+            _ => return None,
+        };
+        Some(Self::new(kind, peer, origin, request_id, start, end))
+    }
+
+    pub fn emit(&self, stage: &'static str) {
+        debug!(
+            target: "nx_net::recovery_trace",
+            recovery_trace_stage = stage, kind = self.kind, peer = %self.peer,
+            origin = %self.origin, request_id = %self.request_id,
+            start = self.start, end = self.end,
+            "test recovery timeline"
+        );
+    }
+}
+
 async fn send_node_event(
     event_tx: &mpsc::Sender<NodeEvent>,
     priority_event_tx: Option<&mpsc::Sender<NodeEvent>>,
@@ -2122,6 +2191,17 @@ async fn send_node_event(
     event_name: &'static str,
     event: NodeEvent,
 ) {
+    #[cfg(any(test, feature = "test-utils"))]
+    let trace = match &event {
+        NodeEvent::HistoryReceived { from, message, .. } => {
+            HistoryTrace::from_message(from.as_str(), message)
+        }
+        _ => None,
+    };
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(trace) = &trace {
+        trace.emit("queue_offer");
+    }
     let event_tx = match (&event, priority_event_tx) {
         (
             NodeEvent::HistoryReceived {
@@ -2141,16 +2221,40 @@ async fn send_node_event(
     // Keep immediately available shutdown notifications, but never wait for a
     // full queue during shutdown. Disconnect callers release peer resources first.
     let result = match event_tx.try_send(event) {
-        Ok(()) => return,
+        Ok(()) => {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some(trace) = &trace {
+                trace.emit("queue_admitted");
+            }
+            return;
+        }
         Err(mpsc::error::TrySendError::Closed(event)) => Err(mpsc::error::SendError(event)),
         Err(mpsc::error::TrySendError::Full(event)) => {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some(trace) = &trace {
+                trace.emit("queue_wait_begin");
+            }
             tokio::select! {
                 biased;
-                _ = wait_for_stop(shutdown_rx.clone()) => return,
+                _ = wait_for_stop(shutdown_rx.clone()) => {
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(trace) = &trace {
+                        trace.emit("queue_cancelled");
+                    }
+                    return;
+                },
                 result = event_tx.send(event) => result,
             }
         }
     };
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(trace) = &trace {
+        trace.emit(if result.is_ok() {
+            "queue_admitted"
+        } else {
+            "queue_closed"
+        });
+    }
     if let Err(e) = result {
         if *shutdown_rx.borrow() {
             debug!(

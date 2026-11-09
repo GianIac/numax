@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use std::io::{Seek, Write};
 use std::sync::Mutex;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -22,6 +23,9 @@ const REMOTE_STAGES: [(&str, &str); 7] = [
     ("push_summary", "remote push summaries recorded"),
 ];
 const REPAIR_TRACE_EVENT_LIMIT: usize = 64;
+const TIMELINE_EVENT_LIMIT: usize = 4096;
+const CRITICAL_SPAN_LIMIT: usize = 64;
+const CRITICAL_SNAPSHOT_BYTES: usize = 32 * 1024;
 const EVENT_LOOP_KINDS: [&str; 9] = [
     "push",
     "summary",
@@ -168,6 +172,8 @@ impl EventLoopTiming {
 
 #[derive(Clone, Default)]
 pub(super) struct Diagnostics {
+    timeline: Option<Arc<RecoveryTimeline>>,
+    critical: Option<Arc<Mutex<CriticalPath>>>,
     timings: Arc<[Timing; STAGES.len()]>,
     remote_timings: Arc<Mutex<[TimingSnapshot; REMOTE_STAGES.len()]>>,
     events: Arc<Mutex<BTreeMap<String, u64>>>,
@@ -179,10 +185,408 @@ pub(super) struct Diagnostics {
     event_errors: Arc<AtomicU64>,
 }
 
+#[derive(Default)]
+struct CriticalPath {
+    active: BTreeMap<(u64, String, String), Value>,
+    completed: std::collections::VecDeque<Value>,
+    overwritten: u64,
+    unix_anchor_us: u64,
+}
+
+impl CriticalPath {
+    fn record(&mut self, fields: serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        let number = |key| {
+            fields
+                .get(key)
+                .and_then(Value::as_u64)
+                .with_context(|| format!("critical span missing {key}"))
+        };
+        let text = |key| {
+            fields
+                .get(key)
+                .and_then(Value::as_str)
+                .with_context(|| format!("critical span missing {key}"))
+        };
+        let id = number("job_id")?;
+        let kind = text("span_kind")?.to_owned();
+        let resource = text("resource")?.to_owned();
+        let time = number("event_us")?;
+        ensure!(
+            matches!(kind.as_str(), "job" | "wait" | "hold" | "phase"),
+            "invalid critical span kind"
+        );
+        ensure!(
+            resource.len() <= 32 && text("thread_id")?.len() <= 64,
+            "critical span metadata exceeds string bound"
+        );
+        ensure!(
+            matches!(
+                text("job_kind")?,
+                "local" | "remote" | "baseline_export" | "baseline_install"
+            ) && matches!(
+                text("status")?,
+                "open" | "acquired" | "started" | "success" | "error" | "cancelled"
+            ),
+            "invalid critical job metadata"
+        );
+        let key = (id, kind.clone(), resource);
+        match text("critical_event")? {
+            "begin" => {
+                ensure!(
+                    !self.active.contains_key(&key),
+                    "duplicate critical span begin"
+                );
+                ensure!(
+                    self.active.len() < CRITICAL_SPAN_LIMIT,
+                    "critical active span budget exhausted"
+                );
+                if self.active.len() + self.completed.len() == CRITICAL_SPAN_LIMIT {
+                    self.completed
+                        .pop_front()
+                        .context("critical completed eviction missing")?;
+                    self.overwritten = self
+                        .overwritten
+                        .checked_add(1)
+                        .context("critical overwrite count overflow")?;
+                }
+                let mut record = fields.clone();
+                record.remove("critical_event");
+                record.remove("critical_trace");
+                record.remove("event_us");
+                record.remove("release_begin_us");
+                record.insert("start_us".into(), json!(time));
+                self.active.insert(key, Value::Object(record));
+            }
+            "end" => {
+                let mut record = self
+                    .active
+                    .remove(&key)
+                    .context("critical span end without begin")?;
+                ensure!(
+                    time >= record["start_us"]
+                        .as_u64()
+                        .context("critical start missing")?,
+                    "critical span time regressed"
+                );
+                record["end_us"] = json!(time);
+                record["status"] = json!(text("status")?);
+                record["end_thread_id"] = json!(text("thread_id")?);
+                if kind == "hold" {
+                    let lower = number("release_begin_us")?;
+                    ensure!(lower <= time, "critical release interval regressed");
+                    record["release_begin_us"] = json!(lower);
+                    record["release_confirmed"] = fields
+                        .get("release_confirmed")
+                        .and_then(Value::as_bool)
+                        .context("critical release confirmation missing")?
+                        .into();
+                }
+                self.completed.push_back(record);
+            }
+            _ => anyhow::bail!("invalid critical span event"),
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self, full: bool) -> anyhow::Result<Value> {
+        let snapshot = json!({
+            "captured_us": u64::try_from(crate::sync_manager::storage::critical_trace::clock().elapsed().as_micros())?,
+            "unix_anchor_us": self.unix_anchor_us,
+            "active": self.active.values().collect::<Vec<_>>(),
+            "completed": if full { self.completed.iter().collect::<Vec<_>>() } else { Vec::new() },
+            "completed_count": self.completed.len(),
+            "overwritten_spans": self.overwritten, "span_limit": CRITICAL_SPAN_LIMIT,
+            "interpretation": "source monotonic timestamps; confirmed owned-job release lies between release_begin_us and end_us, not at logger delivery; cancelled pre-dispatch release timing is unconfirmed; completed history intentionally rolls",
+        });
+        ensure!(
+            serde_json::to_vec(&snapshot)?.len() <= CRITICAL_SNAPSHOT_BYTES,
+            "critical snapshot exceeded its 32 KiB bound"
+        );
+        Ok(snapshot)
+    }
+}
+
+#[test]
+fn critical_path_ring_is_bounded_and_reports_overwrites() {
+    let fields = |id, event, time| {
+        serde_json::from_value(json!({
+            "job_id": id, "job_kind": "local", "span_kind": "job", "resource": "job",
+            "event_us": time, "critical_event": event, "status": "success", "thread_id": "test",
+        }))
+        .unwrap()
+    };
+    let mut ring = CriticalPath::default();
+    for id in 0..65u64 {
+        ring.record(fields(id, "begin", id * 2)).unwrap();
+        ring.record(fields(id, "end", id * 2 + 1)).unwrap();
+    }
+    assert_eq!(ring.completed.len(), 64);
+    assert_eq!(ring.overwritten, 1);
+    assert_eq!(ring.snapshot(false).unwrap()["completed"], json!([]));
+    assert_eq!(
+        ring.snapshot(true).unwrap()["completed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(ring.record(fields(66, "end", 140)).is_err());
+    ring.record(fields(66, "begin", 140)).unwrap();
+    assert!(ring.record(fields(66, "begin", 141)).is_err());
+    assert!(ring.record(fields(66, "end", 139)).is_err());
+    let mut active = CriticalPath::default();
+    for id in 0..64u64 {
+        active.record(fields(id, "begin", id)).unwrap();
+    }
+    assert!(active.record(fields(64, "begin", 64)).is_err());
+    assert_eq!(active.active.len(), 64);
+}
+
+struct RecoveryTimeline {
+    origin: String,
+    started: StdInstant,
+    unix_anchor_us: u64,
+    buffer: Mutex<TimelineBuffer>,
+}
+
+struct TimelineBuffer {
+    file: std::fs::File,
+    events: Vec<Value>,
+    dropped: u64,
+}
+
+impl RecoveryTimeline {
+    fn record(&self, mut fields: serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        let captured_us = u64::try_from(self.started.elapsed().as_micros())?;
+        let mut buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery timeline lock poisoned"))?;
+        if buffer.events.len() == TIMELINE_EVENT_LIMIT {
+            buffer.dropped = buffer
+                .dropped
+                .checked_add(1)
+                .context("recovery timeline dropped counter overflow")?;
+        } else {
+            fields.insert("captured_us".into(), json!(captured_us));
+            buffer.events.push(Value::Object(fields));
+        }
+        Ok(())
+    }
+}
+
+fn write_timeline_snapshot(writer: &mut impl Write, report: &Value) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(report).context("cannot encode recovery timeline")?;
+    writer
+        .write_all(&bytes)
+        .context("cannot save recovery timeline")
+}
+
+#[derive(Default)]
+struct TimelineFields(serde_json::Map<String, Value>);
+
+impl TimelineFields {
+    fn accepts(field: &Field) -> bool {
+        matches!(
+            field.name(),
+            "recovery_trace_stage"
+                | "kind"
+                | "peer"
+                | "origin"
+                | "request_id"
+                | "start"
+                | "end"
+                | "decision"
+                | "elapsed_us"
+                | "success"
+                | "event_handler_kind"
+                | "message"
+                | "envelopes"
+                | "operations"
+                | "critical_trace"
+                | "critical_trace_error"
+                | "critical_event"
+                | "job_id"
+                | "job_kind"
+                | "span_kind"
+                | "resource"
+                | "event_us"
+                | "release_begin_us"
+                | "status"
+                | "thread_id"
+                | "release_confirmed"
+                | "critical_error_detail"
+        )
+    }
+}
+
+impl Visit for TimelineFields {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if Self::accepts(field) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if Self::accepts(field) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if Self::accepts(field) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if Self::accepts(field) {
+            self.0.insert(
+                field.name().into(),
+                json!(format!("{value:?}").trim_matches('"')),
+            );
+        }
+    }
+}
+
 impl Diagnostics {
+    pub(super) fn with_critical_path() -> anyhow::Result<Self> {
+        let clock = crate::sync_manager::storage::critical_trace::clock();
+        let unix_anchor_us =
+            u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?
+                .checked_sub(u64::try_from(clock.elapsed().as_micros())?)
+                .context("critical clock anchor underflow")?;
+        Ok(Self {
+            critical: Some(Arc::new(Mutex::new(CriticalPath {
+                unix_anchor_us,
+                ..CriticalPath::default()
+            }))),
+            ..Self::default()
+        })
+    }
+
+    pub(super) fn critical_snapshot(&self, full: bool) -> anyhow::Result<Option<Value>> {
+        let Some(critical) = &self.critical else {
+            return Ok(None);
+        };
+        ensure!(
+            self.event_errors.load(Ordering::Relaxed) == 0,
+            "critical diagnostic recording failed"
+        );
+        Ok(Some(
+            critical
+                .lock()
+                .map_err(|_| anyhow::anyhow!("critical path lock poisoned"))?
+                .snapshot(full)?,
+        ))
+    }
+
+    pub(super) fn with_timeline(path: &std::path::Path) -> anyhow::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("cannot create recovery timeline {}", path.display()))?;
+        Ok(Self {
+            timeline: Some(Arc::new(RecoveryTimeline {
+                origin: "detector-0".into(),
+                started: StdInstant::now(),
+                unix_anchor_us: u64::try_from(
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros(),
+                )?,
+                buffer: Mutex::new(TimelineBuffer {
+                    file,
+                    events: Vec::new(),
+                    dropped: 0,
+                }),
+            })),
+            ..Self::default()
+        })
+    }
+
+    pub(super) fn timeline_phase(&self, phase: &str) -> anyhow::Result<()> {
+        if let Some(timeline) = &self.timeline {
+            timeline.record(
+                json!({"recovery_trace_stage": "phase", "phase": phase})
+                    .as_object()
+                    .context("invalid timeline phase")?
+                    .clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn timeline_receipt(
+        &self,
+        progress: &[crate::sync_manager::ReplicationProgress],
+    ) -> anyhow::Result<()> {
+        if let Some(timeline) = &self.timeline {
+            let receipt = progress
+                .iter()
+                .find(|entry| entry.origin.as_str() == timeline.origin);
+            timeline.record(
+                json!({
+                    "recovery_trace_stage": "receipt_sample", "origin": timeline.origin,
+                    "known": receipt.is_some(),
+                    "contiguous": receipt.map(|entry| entry.contiguous_sequence),
+                    "known_high": receipt.map(|entry| entry.known_high_sequence),
+                    "sparse": receipt.map(|entry| entry.sparse_positions),
+                    "recovery_failure": receipt.map(|entry| entry.recovery_failure.is_some()),
+                })
+                .as_object()
+                .context("invalid timeline receipt")?
+                .clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_timeline(&self) -> anyhow::Result<()> {
+        if let Some(timeline) = &self.timeline {
+            ensure!(
+                self.event_errors.load(Ordering::Relaxed) == 0,
+                "cannot certify recovery timeline: diagnostic errors"
+            );
+            let mut buffer = timeline
+                .buffer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recovery timeline lock poisoned"))?;
+            let report = json!({
+                "version": 1, "origin": timeline.origin, "unix_anchor_us": timeline.unix_anchor_us,
+                "clock": "captured_us is process-local monotonic; Unix anchor is approximate, not a synchronized clock",
+                "limit": TIMELINE_EVENT_LIMIT, "dropped": buffer.dropped,
+                "complete": buffer.dropped == 0, "events": buffer.events,
+                "captured_through_us": u64::try_from(timeline.started.elapsed().as_micros())?,
+                "queue_boundary": "queue_offer precedes send; queue_admitted follows send and may occur after dequeue",
+            });
+            buffer
+                .file
+                .rewind()
+                .context("cannot rewind recovery timeline output")?;
+            write_timeline_snapshot(&mut buffer.file, &report)?;
+            let length = buffer
+                .file
+                .stream_position()
+                .context("cannot measure recovery timeline output")?;
+            buffer
+                .file
+                .set_len(length)
+                .context("cannot finish recovery timeline output")?;
+            buffer
+                .file
+                .flush()
+                .context("cannot flush recovery timeline output")?;
+        }
+        Ok(())
+    }
+
     pub(super) fn install(&self) -> anyhow::Result<()> {
         tracing::subscriber::set_global_default(self.clone())
-            .context("cannot install worker diagnostic subscriber")
+            .context("cannot install worker diagnostic subscriber")?;
+        if self.critical.is_some() {
+            crate::sync_manager::storage::critical_trace::enable();
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> Value {
@@ -513,6 +917,139 @@ impl Visit for Fields {
     }
 }
 
+#[test]
+fn recovery_timeline_preserves_queue_bounds_and_filters_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.json");
+    let diagnostics = Diagnostics::with_timeline(&path).unwrap();
+    diagnostics.timeline_phase("convergence").unwrap();
+    tracing::subscriber::with_default(diagnostics.clone(), || {
+        let message = nx_sync::HistoryMessage::Request {
+            request_id: nx_sync::OpId::new("trace-request"),
+            origin: NodeId::new("detector-0"),
+            start: 1,
+            end: 3,
+        };
+        let trace = nx_net::HistoryTrace::from_message("detector-1", &message).unwrap();
+        trace.emit("queue_offer");
+        trace.emit("dequeued");
+        trace.emit("queue_admitted");
+        tracing::debug!(
+            target: "nx_core::sync_manager::replication",
+            recovery_trace_stage = "request_lookup",
+            origin = "detector-0", request_id = "trace-request",
+            decision = "expired", payload = "ignored_payload",
+            "test recovery timeline"
+        );
+        tracing::debug!(
+            target: "nx_net::recovery_trace",
+            recovery_trace_stage = "queue_offer", origin = "other-origin",
+            "test recovery timeline"
+        );
+        tracing::debug!(
+            target: "nx_core::sync_manager::storage",
+            message = "remote storage flush completed", elapsed_us = 123u64, success = true,
+            "phase timing"
+        );
+    });
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "trace performed measurement-time file writes"
+    );
+    diagnostics.save_timeline().unwrap();
+    let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["dropped"], 0);
+    let events = report["events"].as_array().unwrap();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[1]["recovery_trace_stage"], "queue_offer");
+    assert_eq!(events[2]["recovery_trace_stage"], "dequeued");
+    assert_eq!(events[3]["recovery_trace_stage"], "queue_admitted");
+    assert_eq!(events[4]["decision"], "expired");
+    assert_eq!(events[5]["recovery_trace_stage"], "flush");
+    assert_eq!(events[5]["elapsed_us"], 123);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["captured_us"].as_u64().is_some())
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0]["captured_us"].as_u64() <= pair[1]["captured_us"].as_u64())
+    );
+    assert!(!report.to_string().contains("ignored_payload"));
+    assert!(!report.to_string().contains("other-origin"));
+    diagnostics.timeline_phase("measurement_end").unwrap();
+    diagnostics.save_timeline().unwrap();
+    let updated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(updated["events"].as_array().unwrap().len(), 7);
+}
+
+#[test]
+fn recovery_timeline_reports_overflow_without_overwriting_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.json");
+    let diagnostics = Diagnostics::with_timeline(&path).unwrap();
+    assert!(Diagnostics::with_timeline(&path).is_err());
+    for _ in 0..TIMELINE_EVENT_LIMIT + 3 {
+        diagnostics.timeline_phase("convergence").unwrap();
+    }
+    diagnostics.save_timeline().unwrap();
+    let report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["dropped"], 3);
+    assert_eq!(
+        report["events"].as_array().unwrap().len(),
+        TIMELINE_EVENT_LIMIT
+    );
+}
+
+#[test]
+fn recovery_timeline_snapshot_uses_one_write_and_propagates_errors() {
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+        fail: bool,
+    }
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                return Err(std::io::Error::other("fixture output failure"));
+            }
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let report = json!({"events": (0..TIMELINE_EVENT_LIMIT).map(|index| json!({
+        "captured_us": index, "recovery_trace_stage": "queue_offer",
+        "origin": "detector-0", "request_id": "fixture-request", "start": 1, "end": 3,
+    })).collect::<Vec<_>>()});
+    let mut writer = CountingWriter::default();
+    write_timeline_snapshot(&mut writer, &report).unwrap();
+    eprintln!(
+        "TIMELINE_SNAPSHOT_WRITES calls={} bytes={}",
+        writer.writes,
+        writer.bytes.len()
+    );
+    assert_eq!(
+        writer.writes, 1,
+        "snapshot serialization amplifies file write calls"
+    );
+    assert_eq!(writer.bytes, serde_json::to_vec(&report).unwrap());
+    let mut failing = CountingWriter {
+        fail: true,
+        ..CountingWriter::default()
+    };
+    assert!(write_timeline_snapshot(&mut failing, &report).is_err());
+}
+
 fn network_error_class(error: &str) -> &'static str {
     let error = error.trim_matches('"');
     if error.starts_with("peer connection limit reached:") {
@@ -528,6 +1065,12 @@ fn network_error_class(error: &str) -> &'static str {
 
 impl Subscriber for Diagnostics {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        if metadata.target() == crate::sync_manager::storage::critical_trace::TARGET {
+            return self.critical.is_some();
+        }
+        if metadata.fields().field("recovery_trace_stage").is_some() {
+            return self.timeline.is_some();
+        }
         metadata.is_event()
             && ((*metadata.level() == tracing::Level::DEBUG
                 && matches!(
@@ -556,6 +1099,56 @@ impl Subscriber for Diagnostics {
 
     fn event(&self, event: &Event<'_>) {
         let metadata = event.metadata();
+        if metadata.target() == crate::sync_manager::storage::critical_trace::TARGET {
+            let mut fields = TimelineFields::default();
+            event.record(&mut fields);
+            let recorded = self
+                .critical
+                .as_ref()
+                .context("critical recorder missing")
+                .and_then(|critical| {
+                    if fields.0.get("critical_trace_error") == Some(&json!(true)) {
+                        anyhow::bail!(
+                            "critical producer failed: {:?}",
+                            fields.0.get("critical_error_detail")
+                        );
+                    }
+                    critical
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("critical path lock poisoned"))?
+                        .record(fields.0)
+                });
+            if let Err(error) = recorded {
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("critical path diagnostic failed: {error:#}");
+            }
+            return;
+        }
+        if let Some(timeline) = &self.timeline {
+            let mut fields = TimelineFields::default();
+            event.record(&mut fields);
+            let remote_stage = fields
+                .0
+                .get("message")
+                .and_then(Value::as_str)
+                .and_then(|message| REMOTE_STAGES.iter().find(|(_, text)| *text == message));
+            if let Some((stage, _)) = remote_stage {
+                fields.0.insert("recovery_trace_stage".into(), json!(stage));
+            }
+            let selected = match fields.0.get("origin").and_then(Value::as_str) {
+                Some(origin) => origin == timeline.origin,
+                None => {
+                    fields.0.contains_key("recovery_trace_stage")
+                        || fields.0.contains_key("event_handler_kind")
+                }
+            };
+            if selected && timeline.record(fields.0).is_err() {
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if metadata.fields().field("recovery_trace_stage").is_some() {
+            return;
+        }
         if metadata.target() == "nx_core::sync_manager::replication" {
             let mut fields = Fields::default();
             event.record(&mut fields);
@@ -763,12 +1356,23 @@ impl Baseline {
         )?;
         let event_loop = event_loop_delta(diagnostics.event_loop_snapshot()?, &self.event_loop)?;
         let (batches, bytes) = node.store.completed_batch_work();
-        Ok(json!({
+        let active_flush = node
+            .store
+            .active_flush()
+            .map(|(sequence, elapsed)| {
+                Ok::<_, anyhow::Error>(json!({
+                    "sequence": sequence,
+                    "elapsed_us": u64::try_from(elapsed.as_micros())?,
+                }))
+            })
+            .transpose()?;
+        let mut sample = json!({
             "local_stages": diagnostics.snapshot(),
             "remote_apply_stages": diagnostics.remote_snapshot()?,
             "replication_work": work,
             "explicit_flushes_completed": node.store.completed_flushes()
                 .checked_sub(self.flushes).context("flush counter regressed")?,
+            "active_covering_flush": active_flush,
             "store_batches": batches.checked_sub(self.batch_work.0).context("batch counter regressed")?,
             "store_logical_bytes": bytes.checked_sub(self.batch_work.1).context("batch byte counter regressed")?,
             "store_single_mutation_batches": node.store.completed_single_mutation_batches()
@@ -780,7 +1384,11 @@ impl Baseline {
             "repair_trace_events": repair_trace_events.events,
             "repair_trace_items": repair_trace_events.items,
             "event_loop": event_loop,
-        }))
+        });
+        if let Some(critical) = diagnostics.critical_snapshot(false)? {
+            sample["critical_path"] = critical;
+        }
+        Ok(sample)
     }
 }
 

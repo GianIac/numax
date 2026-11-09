@@ -13,12 +13,1397 @@ const MAX_RECOVERY_DETAIL_SAMPLES: usize = 8;
 const MAX_CONVERGENCE_DETAIL_WORKERS: usize = 4;
 const DETECTOR_PROBE_SEED: u64 = 0x4e55_4d41_5801_0001;
 const PROBE_SEED_ENV: &str = "NUMAX_TEST_PROBE_SEED";
+const TIMELINE_DIR_ENV: &str = "NUMAX_DETECTOR_TRACE_DIR";
+const STALL_DIR_ENV: &str = "NUMAX_DETECTOR_STALL_DIR";
+const STALL_TRIGGER_US: u64 = 10_000_000;
+const MAX_NATIVE_OUTPUT_BYTES: usize = 1024 * 1024;
+const NATIVE_COMMAND_LIMIT: Duration = Duration::from_secs(10);
+
+struct NativeCommand {
+    child: Child,
+    readers: Vec<std::thread::JoinHandle<anyhow::Result<Vec<u8>>>>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl Drop for NativeCommand {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    eprintln!("native diagnostic kill failed: {error}");
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("native diagnostic reap failed: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("native diagnostic status failed: {error}");
+                if let Err(error) = self.child.kill() {
+                    eprintln!("native diagnostic kill failed: {error}");
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("native diagnostic reap failed: {error}");
+                }
+            }
+        }
+        for reader in self.readers.drain(..) {
+            match reader.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("native diagnostic output cleanup failed: {error:#}"),
+                Err(_) => eprintln!("native diagnostic output reader panicked"),
+            }
+        }
+    }
+}
+
+fn native_reader(
+    input: impl Read + Send + 'static,
+    overflow: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<anyhow::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        input
+            .take(u64::try_from(MAX_NATIVE_OUTPUT_BYTES + 1)?)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_NATIVE_OUTPUT_BYTES {
+            overflow.store(true, Ordering::Release);
+            anyhow::bail!("native diagnostic output exceeded its byte cap");
+        }
+        Ok(bytes)
+    })
+}
+
+async fn native_output(
+    mut command: Command,
+    limit: Duration,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot start native diagnostic command")?;
+    let mut owned = NativeCommand {
+        child,
+        readers: Vec::new(),
+        overflow: Arc::new(AtomicBool::new(false)),
+    };
+    let stdout = owned.child.stdout.take().context("native stdout missing")?;
+    let stderr = owned.child.stderr.take().context("native stderr missing")?;
+    owned
+        .readers
+        .push(native_reader(stdout, owned.overflow.clone()));
+    owned
+        .readers
+        .push(native_reader(stderr, owned.overflow.clone()));
+    let deadline = Instant::now() + limit;
+    let exit = loop {
+        ensure!(
+            !owned.overflow.load(Ordering::Acquire),
+            "native diagnostic output exceeded its byte cap; pid={}",
+            owned.child.id()
+        );
+        if let Some(exit) = owned.child.try_wait()? {
+            break exit;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "native diagnostic timeout; pid={}",
+            owned.child.id()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    for reader in owned.readers.drain(..) {
+        match reader.join() {
+            Ok(Ok(bytes)) => output.push(bytes),
+            Ok(Err(error)) => errors.push(format!("{error:#}")),
+            Err(_) => errors.push("native output reader panicked".into()),
+        }
+    }
+    ensure!(
+        errors.is_empty(),
+        "native diagnostic output errors: {errors:?}"
+    );
+    let stderr = output.pop().context("native stderr result missing")?;
+    let stdout = output.pop().context("native stdout result missing")?;
+    ensure!(
+        exit.success(),
+        "native diagnostic exited {exit}; stderr_bytes={}: {}",
+        stderr.len(),
+        String::from_utf8_lossy(&stderr[..stderr.len().min(4096)])
+    );
+    Ok((stdout, stderr))
+}
+
+fn save_native_output(
+    directory: &std::path::Path,
+    name: &str,
+    output: &(Vec<u8>, Vec<u8>),
+) -> anyhow::Result<()> {
+    for (suffix, bytes) in [("stdout", &output.0), ("stderr", &output.1)] {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.join(format!("{name}.{suffix}")))?;
+        file.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+fn stall_targets(rows: &[Value]) -> anyhow::Result<Vec<usize>> {
+    let mut pending = Vec::new();
+    for (index, row) in rows.iter().enumerate().filter(|(_, row)| !row.is_null()) {
+        let sample = &row["pending_submissions"];
+        if sample.is_null() {
+            continue;
+        }
+        let count = number(sample, "count")?;
+        ensure!(
+            count <= 4,
+            "pending submission sample exceeded writer limit"
+        );
+        if count > 0 {
+            let age = number(sample, "oldest_elapsed_us")?;
+            if age >= STALL_TRIGGER_US {
+                pending.push((index, age));
+            }
+        }
+    }
+    pending
+        .sort_by(|(index_a, age_a), (index_b, age_b)| age_b.cmp(age_a).then(index_a.cmp(index_b)));
+    Ok(pending
+        .into_iter()
+        .take(3)
+        .map(|(index, _)| index)
+        .collect())
+}
+
+async fn capture_stall(
+    group: &mut Processes,
+    directory: &std::path::Path,
+    elapsed: Duration,
+    critical: bool,
+    fail_native: bool,
+    capture: &mut NativeCapture,
+) -> anyhow::Result<()> {
+    let before = group.rows();
+    let targets = stall_targets(&before)?;
+    ensure!(
+        !targets.is_empty(),
+        "stall disappeared before capture selection"
+    );
+    let capture_started = StdInstant::now();
+    capture.report = Some(json!({
+        "outcome": "capture_in_progress", "nominal_complete": false,
+        "critical_path_enabled": critical, "injected_native_failure": fail_native,
+        "elapsed_before_capture_us": u64::try_from(elapsed.as_micros())?,
+        "trigger_oldest_submission_us": STALL_TRIGGER_US,
+        "workers": targets.iter().map(|&index| json!({
+            "index": index, "pid": group.children[index].child.id(), "before": before[index],
+        })).collect::<Vec<_>>(),
+        "status_samples_before": before,
+        "interpretation": "asynchronous samples; source intervals are not logger delivery order; partial captures never certify nominal success",
+    }));
+    if critical {
+        capture
+            .critical_snapshots(group, &targets, 1, "critical_before")
+            .await?;
+    }
+    let mut commands = JoinSet::new();
+    for &index in &targets {
+        let pid = group.children[index].child.id();
+        commands.spawn(async move {
+            let program = if fail_native {
+                "/usr/bin/false"
+            } else {
+                "/usr/bin/sample"
+            };
+            let mut command = Command::new(program);
+            command.args([
+                pid.to_string(),
+                "1".into(),
+                "-file".into(),
+                "/dev/stdout".into(),
+            ]);
+            (
+                format!("worker-{index}.sample"),
+                native_output(command, NATIVE_COMMAND_LIMIT)
+                    .await
+                    .with_context(|| {
+                        format!("native program={program}, target_worker={index}, target_pid={pid}")
+                    }),
+            )
+        });
+    }
+    for (name, program, args) in [
+        ("host-vm-stat", "/usr/bin/vm_stat", vec![]),
+        (
+            "host-iostat",
+            "/usr/sbin/iostat",
+            vec!["-w", "1", "-c", "2"],
+        ),
+    ] {
+        commands.spawn(async move {
+            let mut command = Command::new(program);
+            command.args(args);
+            (
+                name.to_owned(),
+                native_output(command, NATIVE_COMMAND_LIMIT)
+                    .await
+                    .with_context(|| format!("native program={program}, command={name}")),
+            )
+        });
+    }
+    let mut errors = Vec::new();
+    while let Some(output) = commands.join_next().await {
+        match output {
+            Ok((name, Ok(output))) => {
+                if critical {
+                    capture.outputs.push(NamedNativeOutput { name, output });
+                } else if let Err(error) = save_native_output(directory, &name, &output) {
+                    errors.push(format!("native export {name}: {error:#}"));
+                }
+            }
+            Ok((name, Err(error))) => errors.push(format!("{name}: {error:#}")),
+            Err(error) => errors.push(format!("native task failed: {error}")),
+        }
+    }
+    commands.shutdown().await;
+    capture.report.as_mut().context("capture report missing")?["native_command_errors"] =
+        json!(errors);
+    if critical {
+        let result = capture
+            .critical_snapshots(group, &targets, 2, "critical_after")
+            .await;
+        if let Err(error) = result {
+            errors.push(format!("post-capture snapshots: {error:#}"));
+        }
+    }
+    let after = group.rows();
+    let report = capture.report.as_mut().context("capture report missing")?;
+    report["capture_duration_us"] = json!(u64::try_from(capture_started.elapsed().as_micros())?);
+    report["status_samples_after"] = json!(after);
+    for worker in report["workers"]
+        .as_array_mut()
+        .context("capture workers missing")?
+    {
+        let index = usize::try_from(number(worker, "index")?)?;
+        worker["after"] = after[index].clone();
+        worker["same_flush_at_last_samples"] = json!(
+            !worker["before"]["diagnostics"]["active_covering_flush"].is_null()
+                && worker["before"]["diagnostics"]["active_covering_flush"]["sequence"]
+                    == worker["after"]["diagnostics"]["active_covering_flush"]["sequence"]
+        );
+    }
+    ensure!(errors.is_empty(), "native capture failed: {errors:?}");
+    report["outcome"] = json!("diagnostic_interrupted");
+    Ok(())
+}
+
+#[derive(Default)]
+struct NativeCapture {
+    report: Option<Value>,
+    outputs: Vec<NamedNativeOutput>,
+}
+
+impl NativeCapture {
+    async fn critical_snapshots(
+        &mut self,
+        group: &mut Processes,
+        targets: &[usize],
+        id: u64,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut snapshots = BTreeMap::new();
+        let result = group.critical_snapshots(targets, id, &mut snapshots).await;
+        for worker in self.report.as_mut().context("capture report missing")?["workers"]
+            .as_array_mut()
+            .context("capture workers missing")?
+        {
+            let index = usize::try_from(number(worker, "index")?)?;
+            if let Some(snapshot) = snapshots.remove(&index) {
+                worker[field] = snapshot;
+            }
+        }
+        result
+    }
+}
+
+struct NamedNativeOutput {
+    name: String,
+    output: (Vec<u8>, Vec<u8>),
+}
+
+#[test]
+fn live_stall_trigger_is_bounded_and_uses_pending_not_completed_latency() {
+    assert_eq!(
+        stall_targets(&[json!({
+            "pending_submissions": {"count": 1, "oldest_elapsed_us": STALL_TRIGGER_US},
+        })])
+        .unwrap(),
+        [0]
+    );
+    assert_eq!(
+        stall_targets(&[
+            json!({"pending_submissions": {"count": 1, "oldest_elapsed_us": STALL_TRIGGER_US}}),
+            json!({"pending_submissions": {"count": 1, "oldest_elapsed_us": STALL_TRIGGER_US}}),
+        ])
+        .unwrap(),
+        [0, 1]
+    );
+    let rows = (0..100)
+        .map(|index| {
+            json!({
+                "pending_submissions": {"count": 4, "oldest_elapsed_us": STALL_TRIGGER_US + index},
+                "max_flush_us": 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stall_targets(&rows).unwrap(), [99, 98, 97]);
+    assert!(
+        stall_targets(&[json!({
+            "pending_submissions": {"count": 0, "oldest_elapsed_us": null},
+            "max_flush_us": 999_999_999,
+        })])
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        stall_targets(&[json!({
+            "pending_submissions": {"count": 1, "oldest_elapsed_us": STALL_TRIGGER_US - 1},
+        })])
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        stall_targets(&[json!({
+            "pending_submissions": {"count": 5, "oldest_elapsed_us": STALL_TRIGGER_US},
+        })])
+        .is_err()
+    );
+}
+
+#[test]
+#[ignore = "internal native-command ownership fixture"]
+fn native_command_child() {
+    let mode = std::env::var("NUMAX_NATIVE_COMMAND_MODE").unwrap();
+    std::fs::write(
+        std::env::var_os("NUMAX_NATIVE_PID_FILE").unwrap(),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    match mode.as_str() {
+        "timeout" => loop {
+            std::thread::park();
+        },
+        "cap" => {
+            let bytes = vec![b'x'; MAX_NATIVE_OUTPUT_BYTES + 4096];
+            std::io::stdout().write_all(&bytes).unwrap();
+        }
+        "failure" => panic!("deliberate native command failure"),
+        _ => panic!("invalid internal native command mode"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_commands_report_failure_timeout_cap_and_reap() {
+    let directory = tempfile::tempdir().unwrap();
+    let name = "sync_manager::manager::tests::detector_soak::process::native_command_child";
+    for (mode, expected) in [
+        ("failure", "exited"),
+        ("timeout", "timeout"),
+        ("cap", "byte cap"),
+    ] {
+        let pid_file = directory.path().join(mode);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .env("NUMAX_NATIVE_COMMAND_MODE", mode)
+            .env("NUMAX_NATIVE_PID_FILE", &pid_file);
+        let error = native_output(command, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_sample_resolves_real_store_flush_pause() {
+    let name = "sync_manager::manager::tests::detector_soak::process::native_sample_resolves_real_store_flush_pause";
+    if child(name, Duration::from_secs(60)) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    store.set(b"native-sample", b"value").unwrap();
+    let (reached, ready) = std::sync::mpsc::channel();
+    let (resume, continue_flush) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached, continue_flush);
+    let flushing = store.clone();
+    let worker = std::thread::spawn(move || flushing.flush());
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut command = Command::new("/usr/bin/sample");
+    command.args([
+        std::process::id().to_string(),
+        "1".into(),
+        "-file".into(),
+        "/dev/stdout".into(),
+    ]);
+    let captured = native_output(command, NATIVE_COMMAND_LIMIT).await;
+    resume.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    let captured = captured.unwrap();
+    if let Some(directory) = std::env::var_os(STALL_DIR_ENV) {
+        save_native_output(
+            std::path::Path::new(&directory),
+            "native-smoke.sample",
+            &captured,
+        )
+        .unwrap();
+    }
+    let text = String::from_utf8_lossy(&captured.0);
+    // Release inlines the pause helper; check its blocking receive below the real flush.
+    let branch = text
+        .lines()
+        .skip_while(|line| !(line.contains("nx_store") && line.contains("flush_unlocked")))
+        .take_while(|line| !line.contains("Thread_"))
+        .take(48)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        branch.contains("flush_unlocked"),
+        "Rust flush symbols unavailable"
+    );
+    assert!(
+        branch.contains("mpmc") && branch.contains("recv"),
+        "flush receive boundary not resolved"
+    );
+    assert!(
+        branch.contains("__psynch_cvwait")
+            || branch.contains("__ulock_wait")
+            || branch.contains("semaphore_wait_trap"),
+        "flush receive kernel wait not resolved"
+    );
+    println!(
+        "NATIVE_SAMPLE_SMOKE bytes={} real_flush_pause_resolved=true",
+        captured.0.len()
+    );
+}
 
 #[derive(Clone, Copy)]
 enum StorageWorkload {
     Counter,
     Metadata,
     MetadataBatched,
+    RemoteHistory,
+    RemoteHistoryWithoutPeriodicFlush,
+}
+
+const REMOTE_IO_ORIGINS: usize = 100;
+const REMOTE_IO_NEW_OPS: usize = 37;
+const REMOTE_IO_SEED: u64 = 0x4e55_4d41_5849_4f01;
+
+struct RemoteHistoryFixture {
+    prefix: Vec<nx_sync::SequencedOp>,
+    envelopes: Vec<Vec<nx_sync::SequencedOp>>,
+    expected: Vec<nx_sync::SequencedOp>,
+    digest: String,
+}
+
+fn remote_history_fixture() -> anyhow::Result<RemoteHistoryFixture> {
+    let entry = |origin: usize, sequence: u64| nx_sync::SequencedOp {
+        op: Op {
+            id: nx_sync::OpId::new(format!("{REMOTE_IO_SEED:016x}-{origin:03}-{sequence}")),
+            origin: NodeId::new(format!("detector-{origin}")),
+            kind: nx_sync::OpKind::GCounterIncrement {
+                key: KEY.into(),
+                increment: 1,
+            },
+        },
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence,
+        },
+    };
+    let prefix = (0..REMOTE_IO_ORIGINS)
+        .flat_map(|origin| [entry(origin, 1), entry(origin, 2)])
+        .collect::<Vec<_>>();
+    let new = (0..REMOTE_IO_NEW_OPS)
+        .map(|origin| entry(origin, 3))
+        .collect::<Vec<_>>();
+    let mut envelopes = new
+        .iter()
+        .map(|op| vec![op.clone(), prefix[1].clone()])
+        .collect::<Vec<_>>();
+    envelopes.extend((0..10).map(|_| vec![prefix[1].clone(), prefix[3].clone()]));
+    envelopes.extend((0..17).map(|_| vec![prefix[1].clone()]));
+    ensure!(
+        envelopes.len() == 64 && envelopes.iter().map(Vec::len).sum::<usize>() == 111,
+        "remote history fixture dimensions changed"
+    );
+    let digest = blake3::hash(&serde_json::to_vec(&(&prefix, &envelopes))?)
+        .to_hex()
+        .to_string();
+    let mut expected = prefix.clone();
+    expected.extend(new);
+    Ok(RemoteHistoryFixture {
+        prefix,
+        envelopes,
+        expected,
+        digest,
+    })
+}
+
+fn remote_history_context(store: Arc<NxStore>) -> NodeEventContext {
+    test_event_context(
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(SeenOps::new(1024))),
+        Arc::new(RwLock::new(Vec::new())),
+        store,
+        metrics(),
+        Arc::new(RwLock::new(HashMap::new())),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn critical_baseline_export_identifies_reader_waiting_for_store_lease() -> anyhow::Result<()>
+{
+    let name = "sync_manager::manager::tests::detector_soak::process::critical_baseline_export_identifies_reader_waiting_for_store_lease";
+    if child(name, Duration::from_secs(120)) {
+        return Ok(());
+    }
+    let diagnostics = diagnostics::Diagnostics::with_critical_path()?;
+    diagnostics.install()?;
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(NxStore::open(directory.path())?);
+    let node = Arc::new(SyncManager::try_new(
+        NodeId::new("baseline-reader"),
+        SyncConfig::new(),
+        store.clone(),
+        metrics(),
+    )?);
+    let fixture = remote_history_fixture()?;
+    crate::sync_manager::apply::apply_sequenced_ops(&fixture.prefix, &remote_apply_context(&node))
+        .await?;
+    let (ready, reached) = std::sync::mpsc::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    let blocked_store = store.clone();
+    let holder = std::thread::spawn(move || -> anyhow::Result<()> {
+        let _lease = blocked_store.acquire_write_lease()?;
+        ready.send(())?;
+        release.recv()?;
+        Ok(())
+    });
+    reached.recv_timeout(Duration::from_secs(5))?;
+    let exporting_node = node.clone();
+    let exporting = tokio::spawn(async move {
+        crate::sync_manager::baseline::export(&remote_apply_context(&exporting_node)).await
+    });
+    let before = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = diagnostics
+                .critical_snapshot(true)?
+                .context("critical recorder inactive")?;
+            if snapshot["active"]
+                .as_array()
+                .context("active spans missing")?
+                .iter()
+                .any(|span| {
+                    span["job_kind"] == "baseline_export"
+                        && span["span_kind"] == "phase"
+                        && span["resource"] == "lease_wait"
+                })
+            {
+                break anyhow::Ok(snapshot);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let handle = node.handle();
+    let mut local = Box::pin(handle.submit_gcounter_increment(KEY, 1));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(local.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let queued = diagnostics
+        .critical_snapshot(true)?
+        .context("critical recorder inactive")?;
+    let active = queued["active"]
+        .as_array()
+        .context("active spans missing")?;
+    let reader = active
+        .iter()
+        .find(|span| {
+            span["job_kind"] == "baseline_export"
+                && span["span_kind"] == "hold"
+                && span["resource"] == "seen"
+        })
+        .context("baseline read owner missing")?;
+    let reader_id = reader["job_id"].clone();
+    ensure!(
+        active.iter().any(|span| span["job_kind"] == "local"
+            && span["span_kind"] == "wait"
+            && span["resource"] == "seen"),
+        "local seen wait missing"
+    );
+    ensure!(
+        store.active_flush().is_none(),
+        "lease wait incorrectly reported as foreground flush"
+    );
+    ensure!(
+        node.seen_ops.try_write().is_err(),
+        "baseline reader released its cut early"
+    );
+    resume.send(())?;
+    holder
+        .join()
+        .map_err(|_| anyhow::anyhow!("lease holder panicked"))??;
+    let payload = tokio::time::timeout(Duration::from_secs(5), exporting).await???;
+    tokio::time::timeout(Duration::from_secs(5), local.as_mut()).await??;
+    ensure!(
+        node.get_counter_value(KEY).await == 201
+            && read_materialized(&store, KEY) == 201
+            && read_durable_gcounter_state(&store, KEY).value() == 201,
+        "queued local write did not become durable"
+    );
+    let after = diagnostics
+        .critical_snapshot(true)?
+        .context("critical recorder inactive")?;
+    ensure!(
+        after["completed"]
+            .as_array()
+            .context("completed spans missing")?
+            .iter()
+            .any(|span| span["job_id"] == reader_id
+                && span["resource"] == "seen"
+                && span["span_kind"] == "hold"
+                && span["release_confirmed"] == true
+                && span["status"] == "success"),
+        "baseline release not confirmed"
+    );
+    // Exercise the real installer without changing its complete-cut/confirmation contract.
+    let receiving_store = temp_store();
+    let receiving = SyncManager::try_new(
+        NodeId::new("baseline-receiver"),
+        SyncConfig::new(),
+        receiving_store.clone(),
+        metrics(),
+    )?;
+    crate::sync_manager::baseline::import(
+        crate::sync_manager::baseline::VERSION,
+        &payload,
+        blake3::hash(&payload).as_bytes(),
+        &fixture.prefix[0].op.origin,
+        &remote_apply_context(&receiving),
+    )
+    .await?;
+    ensure!(
+        receiving.get_counter_value(KEY).await == 200
+            && read_durable_gcounter_state(&receiving_store, KEY).value() == 200,
+        "baseline cut included a later local write"
+    );
+    let installed = diagnostics
+        .critical_snapshot(true)?
+        .context("critical recorder inactive")?;
+    ensure!(
+        installed["completed"]
+            .as_array()
+            .context("completed spans missing")?
+            .iter()
+            .any(|span| span["job_kind"] == "baseline_install"
+                && span["span_kind"] == "hold"
+                && span["resource"] == "seen"
+                && span["release_confirmed"] == true),
+        "installer write owner not traced"
+    );
+    println!(
+        "CRITICAL_BASELINE_OWNER_REGRESSION {}",
+        json!({
+            "reader_job": reader_id, "queued_without_foreground_flush": true,
+            "source_capture_us": before["captured_us"], "export_cut": 200, "local_durable": 201,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn critical_path_tracks_real_remote_holder_and_owned_job_lifetime() -> anyhow::Result<()> {
+    let name = "sync_manager::manager::tests::detector_soak::process::critical_path_tracks_real_remote_holder_and_owned_job_lifetime";
+    if child(name, Duration::from_secs(120)) {
+        return Ok(());
+    }
+    let diagnostics = diagnostics::Diagnostics::with_critical_path()?;
+    diagnostics.install()?;
+    let fixture = remote_history_fixture()?;
+    for (cancel_remote, cancel_local) in [(false, false), (true, false), (false, true)] {
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(NxStore::open(directory.path())?);
+        let node = Arc::new(SyncManager::try_new(
+            NodeId::new("critical-local"),
+            SyncConfig::new(),
+            store.clone(),
+            metrics(),
+        )?);
+        crate::sync_manager::apply::apply_sequenced_ops(
+            &fixture.prefix,
+            &remote_apply_context(&node),
+        )
+        .await?;
+        verify_remote_history_store(&store, &fixture.prefix)?;
+        let (reached, ready) = std::sync::mpsc::channel();
+        let (resume, proceed) = std::sync::mpsc::channel();
+        store.pause_next_flush(reached, proceed);
+        let remote_node = node.clone();
+        let ops = fixture
+            .envelopes
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut remote = Some(tokio::spawn(async move {
+            crate::sync_manager::apply::apply_sequenced_ops(
+                &ops,
+                &remote_apply_context(&remote_node),
+            )
+            .await
+        }));
+        tokio::task::spawn_blocking(move || ready.recv_timeout(Duration::from_secs(5))).await??;
+        let handle = node.handle();
+        let mut local = Some(Box::pin(handle.submit_gcounter_increment(KEY, 1)));
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(local.as_mut().unwrap().as_mut(), cx).is_pending(),
+                "local writer did not queue behind the real remote holder"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let before = diagnostics
+            .critical_snapshot(true)?
+            .context("critical recorder inactive")?;
+        let active = before["active"]
+            .as_array()
+            .context("critical active spans missing")?;
+        let remote_id = active
+            .iter()
+            .find(|span| {
+                span["job_kind"] == "remote"
+                    && span["span_kind"] == "phase"
+                    && span["resource"] == "flush"
+            })
+            .context("real remote covering flush not traced")?["job_id"]
+            .clone();
+        let local_id = active
+            .iter()
+            .find(|span| {
+                span["job_kind"] == "local"
+                    && span["span_kind"] == "wait"
+                    && span["resource"] == "seen"
+            })
+            .context("queued local seen wait not traced")?["job_id"]
+            .clone();
+        ensure!(
+            active.iter().any(|span| span["job_id"] == remote_id
+                && span["span_kind"] == "hold"
+                && span["resource"] == "seen"),
+            "remote seen holder missing"
+        );
+        ensure!(
+            node.counters.try_read().is_err(),
+            "paused flush released publication registry early"
+        );
+        if cancel_remote {
+            let remote = remote.take().context("remote caller handle missing")?;
+            remote.abort();
+            ensure!(
+                remote.await.unwrap_err().is_cancelled(),
+                "remote caller did not cancel"
+            );
+            let snapshot = diagnostics
+                .critical_snapshot(true)?
+                .context("critical recorder inactive")?;
+            ensure!(
+                snapshot["active"]
+                    .as_array()
+                    .context("active spans missing")?
+                    .iter()
+                    .any(|span| span["job_id"] == remote_id && span["resource"] == "flush"),
+                "caller cancellation falsely ended its owned storage job"
+            );
+        }
+        if cancel_local {
+            drop(local.take());
+        }
+        resume.send(()).context("flush pause receiver closed")?;
+        if let Some(remote) = remote {
+            let result = tokio::time::timeout(Duration::from_secs(5), remote).await??;
+            result?;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = diagnostics
+                    .critical_snapshot(true)?
+                    .context("critical recorder inactive")?;
+                if snapshot["completed"]
+                    .as_array()
+                    .context("completed spans missing")?
+                    .iter()
+                    .any(|span| span["job_id"] == remote_id && span["span_kind"] == "job")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        if let Some(local) = &mut local {
+            let result = tokio::time::timeout(Duration::from_secs(5), local.as_mut()).await?;
+            result?;
+        }
+        let after = diagnostics
+            .critical_snapshot(true)?
+            .context("critical recorder inactive")?;
+        let completed = after["completed"]
+            .as_array()
+            .context("critical completed spans missing")?;
+        let held = completed
+            .iter()
+            .find(|span| {
+                span["job_id"] == remote_id
+                    && span["span_kind"] == "hold"
+                    && span["resource"] == "seen"
+            })
+            .context("remote holder release missing")?;
+        ensure!(
+            held["release_confirmed"] == true
+                && number(held, "release_begin_us")? <= number(held, "end_us")?,
+            "owned callback did not confirm its release interval"
+        );
+        ensure!(held["status"] == "success", "remote outcome misreported");
+        if cancel_local {
+            let partial = completed
+                .iter()
+                .find(|span| {
+                    span["job_id"] == local_id
+                        && span["span_kind"] == "hold"
+                        && span["resource"] == "admission"
+                })
+                .context("cancelled admission hold missing")?;
+            ensure!(
+                partial["status"] == "cancelled" && partial["release_confirmed"] == false,
+                "pre-dispatch cancellation falsely certified release timing"
+            );
+        } else {
+            let wait = completed
+                .iter()
+                .find(|span| {
+                    span["job_id"] == local_id
+                        && span["span_kind"] == "wait"
+                        && span["resource"] == "seen"
+                })
+                .context("completed local wait missing")?;
+            ensure!(
+                number(wait, "start_us")? < number(held, "release_begin_us")?
+                    && number(held, "end_us")? <= number(wait, "end_us")?,
+                "source timestamps do not correlate the actual holder and waiter"
+            );
+        }
+        let expected = if cancel_local { 237 } else { 238 };
+        ensure!(
+            node.get_counter_value(KEY).await == expected,
+            "publication result differs from storage outcome"
+        );
+        ensure!(
+            read_materialized(&store, KEY) == expected
+                && read_durable_gcounter_state(&store, KEY).value() == expected,
+            "durable state differs"
+        );
+        println!(
+            "CRITICAL_PATH_REGRESSION {}",
+            json!({
+                "cancel_remote": cancel_remote, "fail_flush": false, "cancel_local": cancel_local,
+                "remote_job": remote_id, "local_job": local_id, "state": expected,
+            })
+        );
+    }
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(NxStore::open(directory.path())?);
+    let node = SyncManager::try_new(
+        NodeId::new("critical-error"),
+        SyncConfig::new(),
+        store.clone(),
+        metrics(),
+    )?;
+    crate::sync_manager::apply::apply_sequenced_ops(&fixture.prefix, &remote_apply_context(&node))
+        .await?;
+    let start = diagnostics
+        .critical_snapshot(false)?
+        .context("critical recorder inactive")?;
+    // The existing injection is checked before the pause hook, so arm it
+    // before this separate error attempt rather than after a paused flush.
+    store.inject_disk_full_on_flush(true);
+    let ops = fixture
+        .envelopes
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        crate::sync_manager::apply::apply_sequenced_ops(&ops, &remote_apply_context(&node))
+            .await
+            .is_err(),
+        "remote flush failure was accepted"
+    );
+    ensure!(
+        node.handle()
+            .submit_gcounter_increment(KEY, 1)
+            .await
+            .is_err(),
+        "uncertain durability was accepted locally"
+    );
+    ensure!(
+        node.get_counter_value(KEY).await == 200,
+        "failed flush published state"
+    );
+    let snapshot = diagnostics
+        .critical_snapshot(true)?
+        .context("critical recorder inactive")?;
+    let completed = snapshot["completed"]
+        .as_array()
+        .context("completed spans missing")?;
+    let failed = completed
+        .iter()
+        .find(|span| {
+            span["job_kind"] == "remote"
+                && span["span_kind"] == "job"
+                && span["status"] == "error"
+                && span["start_us"]
+                    .as_u64()
+                    .is_some_and(|time| time >= start["captured_us"].as_u64().unwrap())
+        })
+        .context("failed remote owned job missing")?;
+    ensure!(
+        completed
+            .iter()
+            .any(|span| span["job_id"] == failed["job_id"]
+                && span["span_kind"] == "phase"
+                && span["resource"] == "flush"
+                && span["status"] == "error"),
+        "failed flush phase missing"
+    );
+    ensure!(
+        completed
+            .iter()
+            .any(|span| span["job_id"] == failed["job_id"]
+                && span["span_kind"] == "hold"
+                && span["resource"] == "seen"
+                && span["release_confirmed"] == true
+                && span["status"] == "error"),
+        "error release missing"
+    );
+    println!(
+        "CRITICAL_PATH_REGRESSION {}",
+        json!({"fail_flush": true, "state": 200, "owned_job": failed["job_id"]})
+    );
+    Ok(())
+}
+
+async fn apply_profile_envelopes(
+    context: &NodeEventContext,
+    envelopes: &[Vec<nx_sync::SequencedOp>],
+) -> anyhow::Result<()> {
+    ensure!(
+        !envelopes.is_empty() && envelopes.len() <= 64,
+        "invalid remote profile envelope count"
+    );
+    let (sender, mut events) = mpsc::channel(64);
+    for ops in envelopes {
+        sender
+            .try_send(NodeEvent::HistoryReceived {
+                from: NodeId::new("remote-io-source"),
+                addr: "remote-io-source".into(),
+                message: nx_sync::HistoryMessage::Push { ops: ops.clone() },
+            })
+            .context("remote profile event queue rejected input")?;
+    }
+    drop(sender);
+    let first = events
+        .recv()
+        .await
+        .context("remote profile input missing")?;
+    let pending = handle_node_events(
+        first,
+        &mut events,
+        &mut None,
+        false,
+        context,
+        Some(REMOTE_HISTORY_COALESCE_WINDOW),
+    )
+    .await;
+    ensure!(
+        pending.is_none()
+            && matches!(
+                events.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+        "remote profile did not consume exactly the supplied envelopes"
+    );
+    Ok(())
+}
+
+fn verify_remote_history_store(
+    store: &NxStore,
+    expected: &[nx_sync::SequencedOp],
+) -> anyhow::Result<()> {
+    let target = u64::try_from(expected.len())?;
+    let bytes = store
+        .get(&materialized_gcounter_key(KEY))?
+        .context("remote profile materialized counter missing")?;
+    ensure!(
+        u64::from_le_bytes(
+            bytes.try_into().map_err(|_| anyhow::anyhow!(
+                "invalid remote profile materialized counter length"
+            ))?
+        ) == target,
+        "remote profile materialized counter mismatch"
+    );
+    let state = store
+        .get(&durable_gcounter_state_key(KEY))?
+        .context("remote profile durable counter missing")?;
+    ensure!(
+        parse_durable_gcounter_state(&state)?.value() == target,
+        "remote profile durable counter mismatch"
+    );
+    let expected_ids = expected
+        .iter()
+        .map(|entry| entry.op.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let (seen, seen_sequence) = hydrate_seen_ops(store, 1024)?;
+    let (log, log_sequence) = hydrate_op_log(store, 1024)?;
+    ensure!(
+        seen_sequence == target
+            && log_sequence == target
+            && seen.ids.len() == expected.len()
+            && log.len() == expected.len()
+            && log
+                .iter()
+                .map(|op| op.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                == expected_ids,
+        "remote profile replay/dedup metadata mismatch"
+    );
+    for entry in expected {
+        ensure!(
+            store.exists(&seen_op_store_key(entry.op.id.as_str()))?,
+            "remote profile lost a seen operation"
+        );
+        ensure!(
+            log.iter().find(|op| op.id == entry.op.id) == Some(&entry.op)
+                && crate::sync_manager::storage::sequenced_op(store, &entry.op)?.as_ref()
+                    == Some(entry),
+            "remote profile retained operation identity or payload mismatch"
+        );
+    }
+    let mut sequences = BTreeMap::<&str, u64>::new();
+    for entry in expected {
+        sequences
+            .entry(entry.op.origin.as_str())
+            .and_modify(|sequence| *sequence = (*sequence).max(entry.position.sequence))
+            .or_insert(entry.position.sequence);
+    }
+    let progress = replication_progress(store)?;
+    ensure!(
+        progress.len() == sequences.len(),
+        "remote profile receipt origin count mismatch"
+    );
+    for receipt in progress {
+        let sequence = *sequences
+            .get(receipt.origin.as_str())
+            .context("unexpected remote profile receipt origin")?;
+        ensure!(
+            receipt.contiguous_sequence == sequence
+                && receipt.known_high_sequence == sequence
+                && receipt.sparse_positions == 0
+                && !receipt.source_unavailable
+                && !receipt.baseline_missing
+                && !receipt.baseline_unconfirmed
+                && receipt.recovery_failure.is_none(),
+            "remote profile incomplete receipt for {}",
+            receipt.origin
+        );
+    }
+    Ok(())
+}
+
+async fn remote_history_work(
+    context: &NodeEventContext,
+    fixture: &RemoteHistoryFixture,
+    diagnostics: &diagnostics::Diagnostics,
+) -> anyhow::Result<Value> {
+    let before = context.store.completed_batch_work();
+    let flushes = context.store.completed_flushes();
+    diagnostics.timeline_phase("remote_io")?;
+    let started = StdInstant::now();
+    apply_profile_envelopes(context, &fixture.envelopes).await?;
+    let elapsed = started.elapsed().as_secs_f64();
+    diagnostics.timeline_phase("remote_io_complete")?;
+    let after = context.store.completed_batch_work();
+    let batches = after
+        .0
+        .checked_sub(before.0)
+        .context("batch counter regressed")?;
+    let bytes = after
+        .1
+        .checked_sub(before.1)
+        .context("batch byte counter regressed")?;
+    let flushes = context
+        .store
+        .completed_flushes()
+        .checked_sub(flushes)
+        .context("flush counter regressed")?;
+    ensure!(
+        flushes == 1,
+        "remote profile covering flushes: expected 1, got {flushes}"
+    );
+    ensure!(
+        batches == 1 && bytes > 0,
+        "remote profile persistence work changed"
+    );
+    verify_remote_history_store(&context.store, &fixture.expected)?;
+    ensure!(
+        context
+            .counters
+            .read()
+            .await
+            .get(KEY)
+            .context("remote profile counter missing")?
+            .value()
+            == u64::try_from(fixture.expected.len())?,
+        "remote profile registry counter mismatch"
+    );
+    Ok(json!({
+        "elapsed_s": elapsed, "batches": batches, "logical_batch_bytes": bytes,
+        "flushes": flushes, "input_digest": fixture.digest, "new_ops": REMOTE_IO_NEW_OPS,
+        "durable_ops": fixture.expected.len(), "origins": REMOTE_IO_ORIGINS,
+    }))
+}
+
+fn remote_profile_timings(path: &std::path::Path) -> anyhow::Result<Value> {
+    let snapshot: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(
+        snapshot["complete"] == true && number(&snapshot, "dropped")? == 0,
+        "remote profile timeline incomplete"
+    );
+    let events = snapshot["events"]
+        .as_array()
+        .context("remote profile events missing")?;
+    let phase = |name| -> anyhow::Result<u64> {
+        let matches = events
+            .iter()
+            .filter(|event| event["phase"] == name)
+            .collect::<Vec<_>>();
+        ensure!(matches.len() == 1, "remote profile phase {name} not unique");
+        number(matches[0], "captured_us")
+    };
+    let begin = phase("remote_io")?;
+    let end = phase("remote_io_complete")?;
+    let mut samples = BTreeMap::<String, Vec<u64>>::new();
+    for event in events {
+        let captured = number(event, "captured_us")?;
+        if captured < begin || captured > end {
+            continue;
+        }
+        if let Some(
+            stage @ ("registry_wait" | "storage_dispatch" | "preparation" | "batch" | "flush"
+            | "publication" | "push_summary"),
+        ) = event["recovery_trace_stage"].as_str()
+        {
+            ensure!(
+                event["success"] != false,
+                "remote profile stage {stage} failed"
+            );
+            samples
+                .entry(stage.into())
+                .or_default()
+                .push(number(event, "elapsed_us")?);
+        }
+    }
+    ensure!(
+        samples.get("flush").map(Vec::len) == Some(1),
+        "remote profile did not capture the single covering flush duration"
+    );
+    Ok(serde_json::to_value(samples)?)
+}
+
+async fn remote_history_worker(
+    directory: &str,
+    store: Arc<NxStore>,
+    trace_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let diagnostics = diagnostics::Diagnostics::with_timeline(trace_path)?;
+    diagnostics.install()?;
+    let fixture = remote_history_fixture()?;
+    let context = remote_history_context(store.clone());
+    let (mut commands, input) = command_input();
+    let result = async {
+        apply_profile_envelopes(&context, std::slice::from_ref(&fixture.prefix)).await?;
+        verify_remote_history_store(&store, &fixture.prefix)?;
+        emit(json!({"phase": "ready", "input_digest": fixture.digest,
+            "periodic_flush_ms": store.periodic_flush_interval_ms()}));
+        let command = commands
+            .recv()
+            .await
+            .context("remote profile coordinator closed input")??;
+        ensure!(
+            command["command"] == "remote-io",
+            "remote profile expected start command"
+        );
+        let wait = number(&command, "start_epoch_ms")?
+            .checked_sub(epoch_ms()?)
+            .context("remote profile start command arrived late")?;
+        emit(json!({"phase": "remote-armed"}));
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        let work = remote_history_work(&context, &fixture, &diagnostics).await?;
+        emit(json!({"phase": "remote-processed", "work": work}));
+        let command = commands
+            .recv()
+            .await
+            .context("remote profile coordinator closed input")??;
+        ensure!(
+            command["command"] == "report",
+            "remote profile expected report barrier"
+        );
+        diagnostics.timeline_phase("measurement_end")?;
+        diagnostics.save_timeline()?;
+        emit(json!({"phase": "remote-report", "timings_us": remote_profile_timings(trace_path)?}));
+        let command = commands
+            .recv()
+            .await
+            .context("remote profile coordinator closed input")??;
+        ensure!(
+            command["command"] == "stop",
+            "remote profile expected stop command"
+        );
+        anyhow::Ok(())
+    }
+    .await;
+    diagnostics.save_timeline()?;
+    drop(context);
+    drop(store);
+    if result.is_ok() {
+        input
+            .join()
+            .map_err(|_| anyhow::anyhow!("remote profile input reader panicked"))?;
+        let reopened = NxStore::open(directory)?;
+        verify_remote_history_store(&reopened, &fixture.expected)?;
+    }
+    result
+}
+
+#[tokio::test]
+async fn remote_history_benign_duplicates_share_one_flush() {
+    let context = remote_history_context(temp_store());
+    let reference = remote_history_context(temp_store());
+    let fixture = remote_history_fixture().unwrap();
+    for target in [&context, &reference] {
+        apply_profile_envelopes(target, std::slice::from_ref(&fixture.prefix))
+            .await
+            .unwrap();
+    }
+    let before = context.store.completed_batch_work();
+    let before_flushes = context.store.completed_flushes();
+    let reference_before = reference.store.completed_batch_work();
+    let reference_flushes = reference.store.completed_flushes();
+
+    apply_profile_envelopes(&context, &fixture.envelopes)
+        .await
+        .unwrap();
+    for envelope in &fixture.envelopes {
+        apply_profile_envelopes(&reference, std::slice::from_ref(envelope))
+            .await
+            .unwrap();
+    }
+
+    verify_remote_history_store(&context.store, &fixture.expected).unwrap();
+    verify_remote_history_store(&reference.store, &fixture.expected).unwrap();
+    assert_eq!(context.counters.read().await[KEY].value(), 237);
+    assert_eq!(context.store.completed_flushes() - before_flushes, 1);
+    let after = context.store.completed_batch_work();
+    let reference_after = reference.store.completed_batch_work();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(reference_after.0 - reference_before.0, 37);
+    assert_eq!(reference.store.completed_flushes() - reference_flushes, 37);
+    println!(
+        "REMOTE_HISTORY_DUPLICATE_REGRESSION {}",
+        json!({
+            "input_digest": fixture.digest, "envelopes": 64, "input_entries": 111,
+            "new_ops": 37, "persisted_copies": 74, "durable_ops": 237,
+            "grouped_batches": after.0 - before.0,
+            "grouped_flushes": context.store.completed_flushes() - before_flushes,
+            "grouped_logical_bytes": after.1 - before.1,
+            "individual_batches": reference_after.0 - reference_before.0,
+            "individual_flushes": reference.store.completed_flushes() - reference_flushes,
+            "individual_logical_bytes": reference_after.1 - reference_before.1,
+        })
+    );
+}
+
+#[tokio::test]
+async fn remote_history_fixture_preserves_exact_work_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let context = remote_history_context(store.clone());
+    let fixture = remote_history_fixture().unwrap();
+    assert_eq!(
+        fixture.digest,
+        "bf1baaa4554b1231b12cecd015ebd76b71868d067858ff6080fd39b804d14cbe"
+    );
+    apply_profile_envelopes(&context, std::slice::from_ref(&fixture.prefix))
+        .await
+        .unwrap();
+    verify_remote_history_store(&store, &fixture.prefix).unwrap();
+    let work = remote_history_work(&context, &fixture, &diagnostics::Diagnostics::default())
+        .await
+        .unwrap();
+    assert_eq!(work["flushes"], 1);
+    assert_eq!(work["durable_ops"], 237);
+    drop(context);
+    drop(store);
+    let reopened = NxStore::open(directory.path()).unwrap();
+    verify_remote_history_store(&reopened, &fixture.expected).unwrap();
+}
+
+#[tokio::test]
+async fn remote_history_fixture_reports_storage_failure() {
+    let context = remote_history_context(temp_store());
+    let fixture = remote_history_fixture().unwrap();
+    apply_profile_envelopes(&context, std::slice::from_ref(&fixture.prefix))
+        .await
+        .unwrap();
+    context.store.inject_disk_full_on_flush(true);
+    let error = remote_history_work(&context, &fixture, &diagnostics::Diagnostics::default())
+        .await
+        .expect_err("failed persistence was reported as success");
+    assert!(error.to_string().contains("covering flushes"));
+    assert_eq!(context.counters.read().await[KEY].value(), 200);
 }
 
 pub(super) fn number(value: &Value, key: &str) -> anyhow::Result<u64> {
@@ -89,6 +1474,7 @@ fn status(
         "offered": stats.offered.load(Ordering::Relaxed),
         "accepted_in_window": stats.accepted_in_window.load(Ordering::Relaxed),
         "max_pending": stats.max_pending.load(Ordering::Relaxed),
+        "pending_submissions": stats.pending_sample()?,
         "max_flush_us": stats.max_flush_us.load(Ordering::Relaxed),
         "max_lateness_us": stats.max_start_lateness_us.load(Ordering::Relaxed)
     }))
@@ -98,6 +1484,8 @@ struct RecoveryProgressInputs<'a> {
     expected_origins: &'a std::collections::HashSet<String>,
     operations: u64,
     progress: &'a [crate::sync_manager::ReplicationProgress],
+    // Test-only scheduling seam: queue a writer while the sampler holds its read guard.
+    after_requests_read: Option<Box<dyn FnOnce() + Send + 'a>>,
 }
 
 async fn recovery_progress_sample(
@@ -215,46 +1603,62 @@ async fn recovery_progress_sample(
         .collect::<Vec<_>>();
     drop(cursors);
 
-    let requests = node.history_requests.read().await;
-    let requests = requests
-        .values()
-        .flat_map(|origins| origins.values())
-        .collect::<Vec<_>>();
-    let pending_ranges = requests
-        .iter()
-        .filter(|request| request.deadline > now)
-        .count();
-    let expired_ranges = requests
-        .iter()
-        .filter(|request| request.deadline <= now)
-        .count();
-    let pending_range_age_ms = requests
-        .iter()
-        .filter(|request| request.deadline > now)
-        .map(|request| {
-            node.config
-                .socket_timeout
-                .saturating_sub(request.deadline.duration_since(now))
-                .as_millis()
-        })
-        .max()
-        .unwrap_or_default();
-    let (pending_range_detail_count, pending_range_details) = bounded_diagnostic_samples(
-        node.history_requests
-            .read()
-            .await
+    let (
+        pending_ranges,
+        expired_ranges,
+        pending_range_age_ms,
+        pending_range_detail_count,
+        pending_range_details,
+    ) = {
+        let requests_guard = node.history_requests.read().await;
+        if let Some(after_read) = inputs.after_requests_read {
+            after_read();
+        }
+        let requests = requests_guard
             .values()
-            .flat_map(|origins| origins.iter())
-            .filter(|(_, request)| request.deadline > now)
-            .map(|(origin, request)| {
-                json!({
-                    "origin": origin,
-                    "start": request.start,
-                    "end": request.end,
-                    "remaining_ms": request.deadline.saturating_duration_since(now).as_millis(),
-                })
-            }),
-    );
+            .flat_map(|origins| origins.values())
+            .collect::<Vec<_>>();
+        let pending_ranges = requests
+            .iter()
+            .filter(|request| request.deadline > now)
+            .count();
+        let expired_ranges = requests
+            .iter()
+            .filter(|request| request.deadline <= now)
+            .count();
+        let pending_range_age_ms = requests
+            .iter()
+            .filter(|request| request.deadline > now)
+            .map(|request| {
+                node.config
+                    .socket_timeout
+                    .saturating_sub(request.deadline.duration_since(now))
+                    .as_millis()
+            })
+            .max()
+            .unwrap_or_default();
+        let (pending_range_detail_count, pending_range_details) = bounded_diagnostic_samples(
+            requests_guard
+                .values()
+                .flat_map(|origins| origins.iter())
+                .filter(|(_, request)| request.deadline > now)
+                .map(|(origin, request)| {
+                    json!({
+                        "origin": origin,
+                        "start": request.start,
+                        "end": request.end,
+                        "remaining_ms": request.deadline.saturating_duration_since(now).as_millis(),
+                    })
+                }),
+        );
+        (
+            pending_ranges,
+            expired_ranges,
+            pending_range_age_ms,
+            pending_range_detail_count,
+            pending_range_details,
+        )
+    };
     let diagnostics = diagnostic_baseline.sample(node, diagnostics)?;
 
     Ok(json!({
@@ -521,13 +1925,30 @@ async fn worker_run() -> anyhow::Result<()> {
     let addresses: Vec<String> = serde_json::from_value(config["addresses"].clone())?;
     let count = addresses.len();
     ensure!(
-        count > 1 && index < count,
+        (count > 1 || (count == 1 && config["remote_history_profile"] == true)) && index < count,
         "invalid detector worker configuration"
     );
     let directory = config["directory"]
         .as_str()
         .context("worker datastore path missing")?;
-    let store = Arc::new(NxStore::open(directory)?);
+    let disable_periodic_flush = config["disable_periodic_flush"]
+        .as_bool()
+        .context("worker periodic-flush control missing or invalid")?;
+    ensure!(
+        !disable_periodic_flush || config["remote_history_profile"] == true,
+        "periodic-flush control is only valid for the remote diagnostic"
+    );
+    let store = Arc::new(if disable_periodic_flush {
+        NxStore::open_without_periodic_flush(directory)?
+    } else {
+        NxStore::open(directory)?
+    });
+    if config["remote_history_profile"] == true {
+        let trace_path = config["trace_path"]
+            .as_str()
+            .context("remote profile trace path missing")?;
+        return remote_history_worker(directory, store, std::path::Path::new(trace_path)).await;
+    }
     if config["storage_only"] == true {
         return storage_worker_run(
             index,
@@ -539,7 +1960,23 @@ async fn worker_run() -> anyhow::Result<()> {
         )
         .await;
     }
-    let diagnostics = diagnostics::Diagnostics::default();
+    let critical = config["critical_path"]
+        .as_bool()
+        .context("critical path control missing")?;
+    let diagnostics = if critical {
+        ensure!(
+            config["trace_path"].is_null(),
+            "critical path and legacy file timeline are separate modes"
+        );
+        diagnostics::Diagnostics::with_critical_path()?
+    } else {
+        match config.get("trace_path").filter(|value| !value.is_null()) {
+            Some(path) => diagnostics::Diagnostics::with_timeline(std::path::Path::new(
+                path.as_str().context("invalid recovery trace path")?,
+            ))?,
+            None => diagnostics::Diagnostics::default(),
+        }
+    };
     diagnostics.install()?;
     let node_config = SyncConfig::new()
         .with_listen_addr(addresses[index].clone())
@@ -556,6 +1993,7 @@ async fn worker_run() -> anyhow::Result<()> {
     node.start().await?;
     let (mut commands, input) = command_input();
     let stats = Arc::new(Writer::default());
+    let mut _controlled_pause = None;
     let mut writer: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
     let result = async {
         let mut view = node.membership.as_ref().unwrap().snapshot.clone();
@@ -597,6 +2035,7 @@ async fn worker_run() -> anyhow::Result<()> {
                             emit(json!({"phase": "bootstrapped"}));
                         }
                         "nominal" => {
+                            diagnostics.timeline_phase("nominal_armed")?;
                             ensure!(writer.is_none() && nominal_end.is_none(), "duplicate nominal command");
                             duration = Duration::from_secs(number(&command, "duration_s")?);
                             let period = Duration::from_secs(number(&command, "period_s")?);
@@ -608,6 +2047,12 @@ async fn worker_run() -> anyhow::Result<()> {
                             tokio::time::sleep(Duration::from_millis(wait)).await;
                             before = observe(std::slice::from_ref(&node))?.0;
                             work_before = diagnostics::Baseline::new(&node, &diagnostics)?;
+                            if config["pause_first_nominal_flush"] == true {
+                                let (reached, ready) = std::sync::mpsc::channel();
+                                let (resume, continue_flush) = std::sync::mpsc::channel();
+                                node.store.pause_next_flush(reached, continue_flush);
+                                _controlled_pause = Some((ready, resume));
+                            }
                             let start = Instant::now();
                             nominal_started = Some(StdInstant::now());
                             nominal_end = Some(start + duration);
@@ -630,6 +2075,7 @@ async fn worker_run() -> anyhow::Result<()> {
                             let started = StdInstant::now();
                             let deadline = Instant::now() + CONVERGENCE_LIMIT;
                             let convergence_diagnostics = diagnostics::Baseline::new(&node, &diagnostics)?;
+                            diagnostics.timeline_phase("convergence")?;
                             let mut next_diagnostic = Duration::from_secs(5);
                             let mut progress_samples = Vec::new();
                             loop {
@@ -648,6 +2094,7 @@ async fn worker_run() -> anyhow::Result<()> {
                                 let receipts_complete = progress.len() == count && progress.iter().all(complete_receipt);
                                 let elapsed = started.elapsed();
                                 if elapsed >= next_diagnostic || elapsed >= CONVERGENCE_LIMIT {
+                                    diagnostics.timeline_receipt(&progress)?;
                                     let sample = recovery_progress_sample(
                                         &node,
                                         &diagnostics,
@@ -659,6 +2106,7 @@ async fn worker_run() -> anyhow::Result<()> {
                                             expected_origins: &expected_origins,
                                             operations,
                                             progress: &progress,
+                                            after_requests_read: None,
                                         },
                                     ).await?;
                                     progress_samples.push(sample.clone());
@@ -666,12 +2114,15 @@ async fn worker_run() -> anyhow::Result<()> {
                                     next_diagnostic = elapsed.saturating_add(Duration::from_secs(5));
                                 }
                                 if value == expected && receipts_complete {
+                                    diagnostics.timeline_receipt(&progress)?;
                                     let verified_at = elapsed;
                                     ensure!(read_materialized(&node.store, KEY) == expected, "convergence materialized value mismatch");
                                     ensure!(read_durable_gcounter_state(&node.store, KEY).value() == expected, "convergence durable state mismatch");
                                     ensure!(Instant::now() < deadline,
                                         "convergence exceeded its declared limit: value={value}/{expected}, complete_origins={}, receipt_check_ms={}, durable_check_ms={}",
                                         progress.len(), verified_at.as_millis(), started.elapsed().saturating_sub(verified_at).as_millis());
+                                    diagnostics.timeline_phase("convergence_verified")?;
+                                    diagnostics.save_timeline()?;
                                     emit(json!({"phase": "converged", "value": expected, "origins": progress.len(),
                                         "operations_per_origin": operations, "elapsed_ms": started.elapsed().as_millis()}));
                                     break;
@@ -684,6 +2135,12 @@ async fn worker_run() -> anyhow::Result<()> {
                                     serde_json::to_string(&progress_samples)?);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
+                        }
+                        "critical-snapshot" => {
+                            let snapshot = diagnostics.critical_snapshot(true)?
+                                .context("critical snapshot requested for an inactive recorder")?;
+                            emit(json!({"phase": "critical-snapshot",
+                                "request_id": number(&command, "request_id")?, "snapshot": snapshot}));
                         }
                         "stop" => break,
                         other => anyhow::bail!("unknown worker command {other}"),
@@ -745,6 +2202,9 @@ async fn worker_run() -> anyhow::Result<()> {
             Ok(result) => result?,
         }
     }
+    let trace_save = diagnostics
+        .timeline_phase("measurement_end")
+        .and_then(|()| diagnostics.save_timeline());
     let shutdown = finish_shutdown(&mut node, Instant::now() + Duration::from_secs(120)).await;
     if let Ok(pending_calls) = &shutdown {
         emit(json!({"phase": "shutdown-complete", "pending_calls": pending_calls}));
@@ -756,8 +2216,8 @@ async fn worker_run() -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("worker input reader panicked"))?;
     }
     ensure!(
-        result.is_ok() && shutdown.is_ok(),
-        "worker={result:?}; shutdown={shutdown:?}"
+        result.is_ok() && shutdown.is_ok() && trace_save.is_ok(),
+        "worker={result:?}; shutdown={shutdown:?}; timeline={trace_save:?}"
     );
     Ok(())
 }
@@ -993,6 +2453,8 @@ struct Processes {
     overflow: Arc<AtomicBool>,
     latest: Vec<watch::Receiver<Value>>,
     storage_only: bool,
+    trace_directory: Option<std::path::PathBuf>,
+    shutdown_failures: Vec<BTreeMap<&'static str, String>>,
     _directory: tempfile::TempDir,
 }
 
@@ -1024,8 +2486,192 @@ fn record_message(
     send_event(events, overflow, Event::Message(index, value))
 }
 
+#[test]
+fn diagnostic_shutdown_collects_completions_after_worker_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut children = Vec::new();
+    for index in 0..2 {
+        let stderr = directory.path().join(format!("worker-{index}.stderr"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        children.push(Process {
+            child,
+            input: None,
+            stderr,
+        });
+    }
+    let (sender, events) = std::sync::mpsc::sync_channel(512);
+    for (index, value) in [
+        (0, json!({"phase": "shutdown-complete", "pending_calls": 0})),
+        (
+            0,
+            json!({"phase": "error", "error": "deliberate worker failure"}),
+        ),
+        (1, json!({"phase": "shutdown-complete", "pending_calls": 0})),
+    ] {
+        sender.send(Event::Message(index, value)).unwrap();
+    }
+    let mut group = Processes {
+        children,
+        readers: Vec::new(),
+        events,
+        overflow: Arc::new(AtomicBool::new(false)),
+        latest: Vec::new(),
+        storage_only: false,
+        trace_directory: Some(directory.path().to_owned()),
+        shutdown_failures: vec![BTreeMap::new(); 2],
+        _directory: directory,
+    };
+    let mut completed = vec![None; 2];
+    group
+        .shutdown_events(&mut completed)
+        .expect("diagnostic cleanup discarded later worker completions");
+    assert_eq!(completed, [Some(0), Some(0)]);
+    assert!(group.shutdown_failures[0]["reported"].contains("deliberate worker failure"));
+    assert!(group.shutdown_failures[1].is_empty());
+
+    group.trace_directory = None;
+    sender
+        .send(Event::Message(
+            0,
+            json!({"phase": "error", "error": "ordinary failure"}),
+        ))
+        .unwrap();
+    assert!(
+        group.shutdown_events(&mut completed).is_err(),
+        "ordinary cleanup must remain fail-fast"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostic_failure_preserves_three_process_timelines() {
+    let name = "sync_manager::manager::tests::detector_soak::process::diagnostic_failure_preserves_three_process_timelines";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut group =
+        Processes::spawn_with_trace(3, None, Some(directory.path().to_owned())).unwrap();
+    group
+        .phase("ready", None, Duration::from_secs(20))
+        .await
+        .unwrap();
+    group
+        .command(0, &json!({"command": "deliberate-diagnostic-error"}))
+        .unwrap();
+    let error = group
+        .stop(None)
+        .await
+        .expect_err("failed worker was reported as successful");
+    assert!(error.to_string().contains("collected failures"));
+    drop(group);
+    for index in 0..3 {
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join(format!("worker-{index}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["dropped"], 0);
+        assert!(
+            report["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["phase"] == "measurement_end")
+        );
+    }
+    let failures: Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("shutdown-failures.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failures["failed_workers"], json!([0]));
+    assert_eq!(failures["completed_workers"], 3);
+    assert_eq!(failures["total_budget_s"], 120);
+    assert!(
+        failures["errors"][0]
+            .to_string()
+            .contains("deliberate-diagnostic-error")
+    );
+}
+
 impl Processes {
+    async fn force_stop_diagnostic(&mut self) -> anyhow::Result<()> {
+        for worker in &mut self.children {
+            worker.input.take();
+            if worker.child.try_wait()?.is_none() {
+                worker
+                    .child
+                    .kill()
+                    .context("cannot terminate diagnostic worker")?;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut running = false;
+            for worker in &mut self.children {
+                running |= worker.child.try_wait()?.is_none();
+            }
+            if !running {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "diagnostic worker reap exceeded existing shutdown budget"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for reader in self.readers.drain(..) {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("diagnostic worker output reader panicked"))?;
+        }
+        Ok(())
+    }
+
     fn spawn(count: usize, storage: Option<StorageWorkload>) -> anyhow::Result<Self> {
+        let trace_directory = std::env::var_os(TIMELINE_DIR_ENV).map(std::path::PathBuf::from);
+        Self::spawn_with_trace(count, storage, trace_directory)
+    }
+
+    fn spawn_with_trace(
+        count: usize,
+        storage: Option<StorageWorkload>,
+        trace_directory: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_options(count, storage, trace_directory, false, false)
+    }
+
+    fn spawn_with_options(
+        count: usize,
+        storage: Option<StorageWorkload>,
+        trace_directory: Option<std::path::PathBuf>,
+        controlled_pause: bool,
+        critical_path: bool,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            !critical_path || (storage.is_none() && trace_directory.is_none()),
+            "critical path is restricted to a network diagnostic without file timeline"
+        );
+        let remote_history = matches!(
+            storage,
+            Some(
+                StorageWorkload::RemoteHistory | StorageWorkload::RemoteHistoryWithoutPeriodicFlush
+            )
+        );
+        if let Some(path) = &trace_directory {
+            path.to_str()
+                .context("recovery trace directory is not valid UTF-8")?;
+            ensure!(
+                (storage.is_none() || remote_history) && path.is_dir(),
+                "recovery trace requires a network or remote-history scenario and an existing artifact directory"
+            );
+            eprintln!("DETECTOR_TIMELINE_DIR {}", path.display());
+        }
         let directory = tempfile::tempdir()?;
         let addresses = (0..count).map(|_| free_addr()).collect::<Vec<_>>();
         let (sender, events) = std::sync::mpsc::sync_channel(512);
@@ -1036,6 +2682,8 @@ impl Processes {
             overflow: Arc::new(AtomicBool::new(false)),
             latest: Vec::new(),
             storage_only: storage.is_some(),
+            trace_directory: trace_directory.clone(),
+            shutdown_failures: vec![BTreeMap::new(); count],
             _directory: directory,
         };
         for index in 0..count {
@@ -1044,9 +2692,16 @@ impl Processes {
                 .path()
                 .join(format!("worker-{index}.stderr"));
             let config = json!({"index": index, "addresses": addresses, "storage_only": storage.is_some(),
+                "critical_path": critical_path,
+                "pause_first_nominal_flush": controlled_pause && index == 0,
                 "storage_metadata": matches!(storage, Some(StorageWorkload::Metadata | StorageWorkload::MetadataBatched)),
                 "metadata_batched": matches!(storage, Some(StorageWorkload::MetadataBatched)),
-                "directory": group._directory.path().join(format!("store-{index}"))});
+                "directory": group._directory.path().join(format!("store-{index}")),
+                "remote_history_profile": remote_history,
+                "disable_periodic_flush": matches!(storage, Some(StorageWorkload::RemoteHistoryWithoutPeriodicFlush)),
+                "trace_path": trace_directory.as_ref().map(|path| path.join(format!("worker-{index}.json")))
+                    .or_else(|| remote_history
+                        .then(|| group._directory.path().join(format!("worker-{index}.json"))))});
             let mut command = Command::new(std::env::current_exe()?);
             command
                 .args(["--exact", WORKER, "--ignored", "--nocapture"])
@@ -1143,6 +2798,53 @@ impl Processes {
         Ok(())
     }
 
+    async fn critical_snapshots(
+        &mut self,
+        targets: &[usize],
+        request_id: u64,
+        snapshots: &mut BTreeMap<usize, Value>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !targets.is_empty() && targets.len() <= 3,
+            "critical snapshot selection exceeds bound"
+        );
+        for &index in targets {
+            ensure!(
+                index < self.children.len(),
+                "critical snapshot worker out of range"
+            );
+            self.command(
+                index,
+                &json!({"command": "critical-snapshot", "request_id": request_id}),
+            )?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while snapshots.len() != targets.len() {
+            ensure!(
+                Instant::now() < deadline,
+                "critical snapshot response timeout"
+            );
+            while let Some((index, value)) = self.receive()? {
+                if value["phase"] == "critical-snapshot" {
+                    ensure!(
+                        targets.contains(&index) && value["request_id"] == request_id,
+                        "unexpected critical snapshot response"
+                    );
+                    ensure!(
+                        value["snapshot"].is_object(),
+                        "critical snapshot response missing body"
+                    );
+                    ensure!(
+                        snapshots.insert(index, value["snapshot"].clone()).is_none(),
+                        "duplicate critical snapshot response"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
     fn diagnostic(&self, index: usize) -> anyhow::Result<String> {
         use std::io::{Seek, SeekFrom};
         let mut file = std::fs::File::open(&self.children[index].stderr)?;
@@ -1217,8 +2919,14 @@ impl Processes {
     async fn stop(&mut self, killed: Option<usize>) -> anyhow::Result<()> {
         let killed_pid = killed.map(|index| self.children[index].child.id());
         for index in 0..self.children.len() {
-            if Some(index) != killed && self.children[index].input.is_some() {
-                self.command(index, &json!({"command": "stop"}))?;
+            if Some(index) != killed
+                && self.children[index].input.is_some()
+                && let Err(error) = self.command(index, &json!({"command": "stop"}))
+            {
+                if self.trace_directory.is_none() {
+                    return Err(error);
+                }
+                self.shutdown_failures[index].insert("command", format!("{error:#}"));
             }
             self.children[index].input.take();
         }
@@ -1231,11 +2939,22 @@ impl Processes {
                 let pid = self.children[index].child.id();
                 match self.children[index].child.try_wait()? {
                     None => running = true,
-                    Some(status) => ensure!(
-                        status.success() || Some(pid) == killed_pid,
-                        "worker {index} shutdown failed: {status}; stderr={}",
-                        self.diagnostic(index)?
-                    ),
+                    Some(status) if !status.success() && Some(pid) != killed_pid => {
+                        if self.trace_directory.is_none() {
+                            anyhow::bail!(
+                                "worker {index} shutdown failed: {status}; stderr={}",
+                                self.diagnostic(index)?
+                            );
+                        }
+                        if !self.shutdown_failures[index].contains_key("exit") {
+                            let error = format!(
+                                "worker {index} shutdown failed: {status}; stderr={}",
+                                self.diagnostic(index)?
+                            );
+                            self.shutdown_failures[index].insert("exit", error);
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
             if !running {
@@ -1250,6 +2969,40 @@ impl Processes {
                 .map_err(|_| anyhow::anyhow!("detector output reader panicked"))?;
         }
         self.shutdown_events(&mut completed)?;
+        let failed_workers = self
+            .shutdown_failures
+            .iter()
+            .enumerate()
+            .filter(|(_, errors)| !errors.is_empty())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if !failed_workers.is_empty() {
+            let path = self
+                .trace_directory
+                .as_ref()
+                .context("diagnostic error directory missing")?
+                .join("shutdown-failures.json");
+            let report = json!({
+                "failed_workers": failed_workers, "errors": self.shutdown_failures,
+                "completed_workers": completed.iter().flatten().count(), "total_budget_s": 120,
+            });
+            let bytes = serde_json::to_vec(&report)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| {
+                    format!("cannot create diagnostic failure report {}", path.display())
+                })?;
+            file.write_all(&bytes)
+                .context("cannot save diagnostic failure report")?;
+            file.flush()
+                .context("cannot flush diagnostic failure report")?;
+            anyhow::bail!(
+                "diagnostic cleanup collected failures from workers {failed_workers:?}; details={}",
+                path.display()
+            );
+        }
         if !self.storage_only {
             ensure!(
                 completed
@@ -1279,10 +3032,16 @@ impl Processes {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Message(index, value) if value["phase"] == "error" => {
-                    anyhow::bail!(
+                    let error = format!(
                         "worker {index} failed during shutdown: {value}; stderr={}",
                         self.diagnostic(index)?
                     );
+                    if self.trace_directory.is_none() {
+                        anyhow::bail!("{error}");
+                    }
+                    self.shutdown_failures[index]
+                        .entry("reported")
+                        .or_insert(error);
                 }
                 Event::Message(index, value) if value["phase"] == "shutdown-complete" => {
                     ensure!(
@@ -1352,6 +3111,503 @@ impl Processes {
     }
 }
 
+fn remote_timing_summary(mut values: Vec<u64>) -> anyhow::Result<Value> {
+    ensure!(!values.is_empty(), "remote profile timing sample missing");
+    values.sort_unstable();
+    let mut summary = numeric_summary(values.clone());
+    summary["count"] = json!(values.len());
+    summary["total_us"] = json!(values.iter().sum::<u64>());
+    summary["p95"] = json!(values[(values.len() * 95).div_ceil(100) - 1]);
+    Ok(summary)
+}
+
+async fn remote_history_scenario(
+    count: usize,
+    trace_directory: Option<std::path::PathBuf>,
+) -> anyhow::Result<Value> {
+    remote_history_scenario_with_periodic_flush(count, trace_directory, true, false).await
+}
+
+async fn remote_history_scenario_with_periodic_flush(
+    count: usize,
+    trace_directory: Option<std::path::PathBuf>,
+    periodic_flush: bool,
+    collect_host: bool,
+) -> anyhow::Result<Value> {
+    ensure!(
+        (1..=100).contains(&count),
+        "invalid remote profile process count"
+    );
+    ensure!(
+        !collect_host || (cfg!(target_os = "macos") && trace_directory.is_some()),
+        "remote host sampling requires macOS and an artifact directory"
+    );
+    let fixture = remote_history_fixture()?;
+    let storage = if periodic_flush {
+        StorageWorkload::RemoteHistory
+    } else {
+        StorageWorkload::RemoteHistoryWithoutPeriodicFlush
+    };
+    let mut group = Processes::spawn_with_trace(count, Some(storage), trace_directory.clone())?;
+    let mut host_tasks = JoinSet::new();
+    let result = async {
+        let ready = group.phase("ready", None, FORMATION_LIMIT).await?;
+        ensure!(ready.iter().all(|row| row["input_digest"] == fixture.digest),
+            "remote profile workers have different inputs");
+        let periodic_flush_ms = ready[0]["periodic_flush_ms"].clone();
+        ensure!(
+            ready.iter().all(|row| row["periodic_flush_ms"] == periodic_flush_ms)
+                && if periodic_flush {
+                    periodic_flush_ms == 500
+                } else {
+                    periodic_flush_ms.is_null()
+                },
+            "remote profile actual Sled periodic-flush configuration mismatch"
+        );
+        if collect_host {
+            let output = native_output(Command::new("/usr/bin/vm_stat"), NATIVE_COMMAND_LIMIT).await?;
+            save_native_output(
+                trace_directory.as_ref().context("remote host directory missing")?,
+                "host-vm-stat-before", &output,
+            )?;
+        }
+        let (rss_start, cpu_start) = group.usage().await?;
+        let started = StdInstant::now();
+        let work_start_epoch_ms = epoch_ms()? + 3000;
+        if collect_host {
+            host_tasks.spawn(async move {
+                let wait = work_start_epoch_ms.checked_sub(epoch_ms()?)
+                    .context("remote IO sampler missed scheduled start")?;
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let sample_start_epoch_ms = epoch_ms()?;
+                let mut command = Command::new("/usr/sbin/iostat");
+                command.args(["-w", "1", "-c", "2"]);
+                let output = native_output(command, NATIVE_COMMAND_LIMIT).await?;
+                anyhow::Ok((output, json!({
+                    "start_epoch_ms": sample_start_epoch_ms,
+                    "end_epoch_ms": epoch_ms()?,
+                    "interpretation": "first frame since boot; second interval includes profiler/host activity and may extend beyond short data work; not syscall latency or per-worker IO"
+                })))
+            });
+        }
+        group.broadcast(&json!({"command": "remote-io", "start_epoch_ms": work_start_epoch_ms}), None)?;
+        group.phase("remote-armed", None, Duration::from_secs(3)).await?;
+        let mut completed = vec![Value::Null; count];
+        let mut rss_peak = rss_start;
+        let mut rss_samples = 1;
+        let mut last_sample = 0;
+        while completed.iter().any(Value::is_null) {
+            while let Some((index, row)) = group.receive()? {
+                if row["phase"] == "remote-processed" {
+                    completed[index] = row;
+                }
+            }
+            ensure!(started.elapsed() < Duration::from_secs(120),
+                "remote profile exceeded its separate 120-second diagnostic work budget");
+            let tick = started.elapsed().as_secs() / 10;
+            if tick > last_sample {
+                last_sample = tick;
+                rss_peak = rss_peak.max(group.usage().await?.0);
+                rss_samples += 1;
+            }
+            if completed.iter().any(Value::is_null) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let (rss_end, cpu_end) = group.usage().await?;
+        let measured_s = started.elapsed().as_secs_f64();
+        let work_complete_epoch_ms = epoch_ms()?;
+        ensure!(cpu_end >= cpu_start, "remote profile worker CPU time regressed");
+        let bytes = number(&completed[0]["work"], "logical_batch_bytes")?;
+        for row in &completed {
+            let work = &row["work"];
+            ensure!(
+                work["input_digest"] == fixture.digest
+                    && number(work, "batches")? == 1
+                    && number(work, "flushes")? == 1
+                    && number(work, "logical_batch_bytes")? == bytes
+                    && number(work, "durable_ops")? == 237,
+                "remote profile persistence quantities are not equivalent per worker"
+            );
+        }
+        // No worker exports while another worker is still measuring storage.
+        group.broadcast(&json!({"command": "report"}), None)?;
+        let reports = group.phase("remote-report", None, DETECTION_LIMIT).await?;
+        let mut all = BTreeMap::<String, Vec<u64>>::new();
+        let mut workers = Vec::new();
+        for (index, row) in reports.iter().enumerate() {
+            let mut timings = BTreeMap::<String, Value>::new();
+            for (stage, values) in row["timings_us"].as_object()
+                .context("remote profile timing report missing")? {
+                let values = values.as_array().context("invalid remote profile timing array")?
+                    .iter().map(|value| value.as_u64().context("invalid remote profile timing"))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                all.entry(stage.clone()).or_default().extend(&values);
+                timings.insert(stage.clone(), remote_timing_summary(values)?);
+            }
+            workers.push(json!({"worker": index, "work": completed[index]["work"],
+                "timings_us": timings}));
+        }
+        let timings = all.into_iter().map(|(stage, values)| {
+            Ok((stage, remote_timing_summary(values)?))
+        }).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        Ok(json!({
+            "version": 1, "processes": count, "network": false, "detector_enabled": false,
+            "seed": REMOTE_IO_SEED, "input_digest": fixture.digest,
+            "prefix_ops_per_worker": 200, "origins_per_worker": 100,
+            "envelopes_per_worker": 64, "input_entries_per_worker": 111,
+            "new_ops_per_worker": 37, "already_persisted_copies_per_worker": 74,
+            "batches_per_worker": 1, "logical_batch_bytes_per_worker": bytes,
+            "flushes_per_worker": 1, "timings_us": timings, "workers": workers,
+            "periodic_flush_ms": periodic_flush_ms,
+            "work_start_epoch_ms": work_start_epoch_ms,
+            "work_complete_epoch_ms": work_complete_epoch_ms,
+            "resources": {"scope": "worker processes only; includes coordinated start waiting and verification, excludes prefix setup, timeline export and coordinator; RSS double-counts shared pages",
+                "cpu_seconds": cpu_end - cpu_start, "cpu_measurement_window_s": measured_s,
+                "cpu_percent_one_core": (cpu_end - cpu_start) / measured_s * 100.0,
+                "rss_sum_start_bytes": rss_start, "rss_sum_end_bytes": rss_end,
+                "rss_sum_sampled_peak_bytes": rss_peak.max(rss_end), "rss_samples": rss_samples + 1,
+                "sampling_s": 10},
+            "interpretation": "controlled real remote apply/storage fixture; not detector accuracy, a nominal campaign, or byte-for-byte replay of historical worker 14"
+        }))
+    }.await;
+    let host_result = async {
+        let mut samples = Vec::new();
+        while let Some(output) = host_tasks.join_next().await {
+            let (output, sample) = output.context("remote host sampler task failed")??;
+            save_native_output(
+                trace_directory
+                    .as_ref()
+                    .context("remote host directory missing")?,
+                "host-iostat",
+                &output,
+            )?;
+            samples.push(sample);
+        }
+        if collect_host {
+            let output =
+                native_output(Command::new("/usr/bin/vm_stat"), NATIVE_COMMAND_LIMIT).await?;
+            save_native_output(
+                trace_directory
+                    .as_ref()
+                    .context("remote host directory missing")?,
+                "host-vm-stat-after",
+                &output,
+            )?;
+        }
+        anyhow::Ok(samples)
+    }
+    .await;
+    let cleanup = group.stop(None).await;
+    match (result, host_result, cleanup) {
+        (Ok(mut report), Ok(host), Ok(())) => {
+            if collect_host {
+                report["host_sampling"] = json!(host);
+            }
+            report["reopen_verified_workers"] = json!(count);
+            Ok(report)
+        }
+        (result, host, cleanup) => anyhow::bail!(
+            "remote profile result: {:#?}; host sampling: {:#?}; durable shutdown/reopen: {:#?}",
+            result.err(),
+            host.err(),
+            cleanup.err()
+        ),
+    }
+}
+
+fn remote_profile_console(report: &Value) -> anyhow::Result<String> {
+    let compact = report
+        .as_object()
+        .context("remote profile console report is not an object")?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "workers")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let output = serde_json::to_string(&compact)?;
+    ensure!(
+        output.len() <= 16 * 1024,
+        "remote profile console summary exceeds its 16 KiB budget"
+    );
+    Ok(output)
+}
+
+fn ensure_remote_history_equivalent(left: &Value, right: &Value) -> anyhow::Result<()> {
+    for field in [
+        "seed",
+        "input_digest",
+        "prefix_ops_per_worker",
+        "origins_per_worker",
+        "envelopes_per_worker",
+        "input_entries_per_worker",
+        "new_ops_per_worker",
+        "already_persisted_copies_per_worker",
+        "batches_per_worker",
+        "logical_batch_bytes_per_worker",
+        "flushes_per_worker",
+    ] {
+        let left = left
+            .get(field)
+            .with_context(|| format!("left remote case missing {field}"))?;
+        let right = right
+            .get(field)
+            .with_context(|| format!("right remote case missing {field}"))?;
+        ensure!(left == right, "remote cases differ in {field}");
+    }
+    Ok(())
+}
+
+#[test]
+fn periodic_flush_equivalence_rejects_changed_or_missing_quantities() {
+    let report = json!({
+        "seed": REMOTE_IO_SEED, "input_digest": "same",
+        "prefix_ops_per_worker": 200, "origins_per_worker": 100,
+        "envelopes_per_worker": 64, "input_entries_per_worker": 111,
+        "new_ops_per_worker": 37, "already_persisted_copies_per_worker": 74,
+        "batches_per_worker": 1, "logical_batch_bytes_per_worker": 14346,
+        "flushes_per_worker": 1,
+    });
+    ensure_remote_history_equivalent(&report, &report).unwrap();
+    for field in report.as_object().unwrap().keys() {
+        let mut changed = report.clone();
+        changed[field] = Value::Null;
+        assert!(ensure_remote_history_equivalent(&report, &changed).is_err());
+        changed.as_object_mut().unwrap().remove(field);
+        assert!(ensure_remote_history_equivalent(&report, &changed).is_err());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_remote_case(path: &std::path::Path, report: &Value) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(report)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn periodic_flush_comparison(
+    count: usize,
+    pairs: usize,
+    directory: &std::path::Path,
+) -> anyhow::Result<Value> {
+    ensure!(
+        matches!(count, 3 | 100) && (1..=3).contains(&pairs) && directory.is_dir(),
+        "periodic-flush comparison requires 3/100 workers, 1..3 pairs and an existing directory"
+    );
+    let mut pair_reports = Vec::new();
+    for pair in 0..pairs {
+        let mut reports = BTreeMap::new();
+        let order = if pair % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for periodic_flush in order {
+            let mode = if periodic_flush {
+                "a-default"
+            } else {
+                "b-disabled"
+            };
+            let path = directory.join(format!("pair-{}-{mode}", pair + 1));
+            std::fs::create_dir(&path)
+                .context("cannot exclusively create periodic-flush case directory")?;
+            let result = remote_history_scenario_with_periodic_flush(
+                count,
+                Some(path.clone()),
+                periodic_flush,
+                true,
+            )
+            .await;
+            let report = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    save_remote_case(
+                        &path.join("case-failure.json"),
+                        &json!({
+                            "pair": pair + 1, "mode": mode, "processes": count,
+                            "error": format!("{error:#}"), "nominal_detector_requirement_closed": false,
+                        }),
+                    )?;
+                    return Err(error)
+                        .with_context(|| format!("periodic-flush pair {} mode {mode}", pair + 1));
+                }
+            };
+            save_remote_case(&path.join("case-report.json"), &report)?;
+            reports.insert(periodic_flush, report);
+        }
+        let a = reports
+            .get(&true)
+            .context("periodic-flush A report missing")?;
+        let b = reports
+            .get(&false)
+            .context("periodic-flush B report missing")?;
+        ensure_remote_history_equivalent(a, b)?;
+        ensure!(
+            a["processes"] == b["processes"]
+                && a["reopen_verified_workers"] == count
+                && b["reopen_verified_workers"] == count,
+            "periodic-flush pair count or durable reopen mismatch"
+        );
+        pair_reports.push(json!({
+            "pair": pair + 1, "order": if pair % 2 == 0 { "A/B" } else { "B/A" },
+            "processes_per_case": count, "input_digest": a["input_digest"],
+            "logical_batch_bytes_per_worker": a["logical_batch_bytes_per_worker"],
+            "a_periodic_flush_ms": a["periodic_flush_ms"],
+            "b_periodic_flush_ms": b["periodic_flush_ms"],
+            "a_timings_us": a["timings_us"], "b_timings_us": b["timings_us"],
+            "reopen_verified_workers_per_case": count,
+        }));
+    }
+    let report = json!({
+        "version": 1, "processes_per_case": count, "pairs": pair_reports,
+        "seed": REMOTE_IO_SEED, "fixture_and_durable_equivalence_passed": true,
+        "nominal_detector_requirement_closed": false,
+        "interpretation": "diagnostic A/B of the whole periodic flush/GC service; explicit foreground flushes unchanged; no speedup assertion or production setting change; short host intervals may extend beyond data work",
+    });
+    save_remote_case(&directory.join("periodic-flush-comparison.json"), &report)?;
+    println!(
+        "PERIODIC_FLUSH_AB_REPORT {}",
+        remote_profile_console(&report)?
+    );
+    Ok(report)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn periodic_flush_explicit_ack_survives_process_crash() {
+    let name = "sync_manager::manager::tests::detector_soak::process::periodic_flush_explicit_ack_survives_process_crash";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    let fixture = remote_history_fixture().unwrap();
+    for storage in [
+        StorageWorkload::RemoteHistory,
+        StorageWorkload::RemoteHistoryWithoutPeriodicFlush,
+    ] {
+        let mut group = Processes::spawn_with_trace(1, Some(storage), None).unwrap();
+        let result = async {
+            let ready = group.phase("ready", None, FORMATION_LIMIT).await?;
+            let expected = if matches!(storage, StorageWorkload::RemoteHistory) {
+                json!(500)
+            } else {
+                Value::Null
+            };
+            ensure!(
+                ready[0]["periodic_flush_ms"] == expected,
+                "crash worker actual periodic mode mismatch"
+            );
+            group.broadcast(
+                &json!({"command": "remote-io", "start_epoch_ms": epoch_ms()? + 3000}),
+                None,
+            )?;
+            group
+                .phase("remote-armed", None, Duration::from_secs(3))
+                .await?;
+            let completed = group
+                .phase("remote-processed", None, DETECTION_LIMIT)
+                .await?;
+            ensure!(
+                completed[0]["work"]["flushes"] == 1,
+                "crash worker explicit flush acknowledgement missing"
+            );
+            group.children[0].child.kill()?;
+            group.children[0].child.wait()?;
+            let reopened = NxStore::open(group._directory.path().join("store-0"))?;
+            verify_remote_history_store(&reopened, &fixture.expected)?;
+            anyhow::Ok(())
+        }
+        .await;
+        let cleanup = group.stop(Some(0)).await;
+        result.unwrap();
+        cleanup.unwrap();
+    }
+}
+
+#[test]
+fn remote_profile_output_keeps_isolated_result_within_capture_limit() {
+    let name = "sync_manager::manager::tests::detector_soak::process::remote_profile_output_keeps_isolated_result_within_capture_limit";
+    if child(name, Duration::from_secs(30)) {
+        return;
+    }
+    let report = |count| {
+        json!({
+            "processes": count, "timings_us": {"flush": {"count": count, "median": 123}},
+            "workers": (0..count).map(|index| json!({"worker": index, "detail": "x".repeat(1024)}))
+                .collect::<Vec<_>>(),
+        })
+    };
+    assert!(serde_json::to_vec(&report(100)).unwrap().len() > 64 * 1024);
+    let marker = "test result: ok. 1 passed; 0 failed;";
+    let reports = format!(
+        "REMOTE_HISTORY_PROFILE_REPORT {}\nREMOTE_HISTORY_PROFILE_REPORT {}\n",
+        remote_profile_console(&report(1)).unwrap(),
+        remote_profile_console(&report(100)).unwrap(),
+    );
+    let output = format!("{reports}{marker}\n");
+    let captured = String::from_utf8_lossy(&output.as_bytes()[..output.len().min(64 * 1024)]);
+    assert!(
+        output.len() < 64 * 1024 && captured.lines().any(|line| line == marker),
+        "remote profile output hides the isolated test result: {} bytes",
+        output.len()
+    );
+    let compact: Value =
+        serde_json::from_str(&remote_profile_console(&report(100)).unwrap()).unwrap();
+    assert_eq!(compact["processes"], 100);
+    assert!(compact.get("workers").is_none());
+    assert!(remote_profile_console(&Value::Null).is_err());
+    print!("{reports}");
+}
+
+pub(super) async fn remote_history_comparison() -> anyhow::Result<()> {
+    let directory = std::env::var_os(TIMELINE_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .context("remote comparison requires NUMAX_DETECTOR_TRACE_DIR")?;
+    ensure!(
+        directory.is_dir(),
+        "remote comparison artifact directory does not exist"
+    );
+    let mut reports = Vec::new();
+    for count in [1, 100] {
+        let path = directory.join(format!("processes-{count}"));
+        std::fs::create_dir(&path)
+            .context("cannot exclusively create remote comparison case directory")?;
+        let report = remote_history_scenario(count, Some(path)).await?;
+        println!(
+            "REMOTE_HISTORY_PROFILE_REPORT {}",
+            remote_profile_console(&report)?
+        );
+        reports.push(report);
+    }
+    ensure_remote_history_equivalent(&reports[0], &reports[1])?;
+    println!(
+        "REMOTE_HISTORY_COMPARISON {}",
+        json!({
+            "passed_fixture_and_equivalence": true,
+            "flush_median_us_1": reports[0]["timings_us"]["flush"]["median"],
+            "flush_median_us_100": reports[1]["timings_us"]["flush"]["median"],
+            "logical_batch_bytes_per_worker": reports[0]["logical_batch_bytes_per_worker"],
+            "input_digest": reports[0]["input_digest"],
+            "nominal_detector_requirement_closed": false,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_history_three_process_fixture() {
+    let name = "sync_manager::manager::tests::detector_soak::process::remote_history_three_process_fixture";
+    if child(name, Duration::from_secs(180)) {
+        return;
+    }
+    let report = remote_history_scenario(3, None).await.unwrap();
+    assert_eq!(report["processes"], 3);
+    assert_eq!(report["timings_us"]["flush"]["count"], 3);
+    println!("REMOTE_HISTORY_SMOKE_REPORT {report}");
+}
+
 pub(super) async fn scenario(
     count: usize,
     duration: Duration,
@@ -1366,6 +3622,178 @@ pub(super) async fn convergence_scenario(
     period: Duration,
 ) -> anyhow::Result<()> {
     run_scenario(count, duration, period, None, true).await
+}
+
+pub(super) async fn nominal_stall_scenario() -> anyhow::Result<()> {
+    let directory = std::env::var_os(STALL_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .context("NUMAX_DETECTOR_STALL_DIR must name an existing artifact directory")?;
+    ensure!(
+        cfg!(target_os = "macos") && directory.is_dir(),
+        "native stall capture requires macOS and an existing artifact directory"
+    );
+    run_scenario_with_stall_capture(
+        100,
+        Duration::from_secs(3600),
+        Duration::from_secs(10),
+        None,
+        false,
+        Some(StallCaptureOptions {
+            directory: &directory,
+            controlled_pause: false,
+            critical_path: false,
+            fail_native: false,
+        }),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn native_stall_capture_smoke() -> anyhow::Result<()> {
+    for (controlled_pause, critical_path) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
+        let directory = tempfile::tempdir()?;
+        run_scenario_with_stall_capture(
+            3,
+            if controlled_pause {
+                Duration::from_secs(40)
+            } else {
+                Duration::from_secs(8)
+            },
+            if controlled_pause {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(1)
+            },
+            None,
+            false,
+            Some(StallCaptureOptions {
+                directory: directory.path(),
+                controlled_pause,
+                critical_path,
+                fail_native: false,
+            }),
+        )
+        .await?;
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("stall-report.json"))?)?;
+        if controlled_pause {
+            ensure!(
+                report["outcome"] == "diagnostic_interrupted"
+                    && report["nominal_complete"] == false,
+                "controlled pause incorrectly certified the nominal load"
+            );
+            let workers = report["workers"]
+                .as_array()
+                .context("native smoke workers missing")?;
+            ensure!(
+                !workers.is_empty() && workers.len() <= 3,
+                "native smoke capture cardinality"
+            );
+            if critical_path {
+                ensure!(
+                    workers
+                        .iter()
+                        .all(|worker| worker["critical_before"].is_object()
+                            && worker["critical_after"].is_object()
+                            && worker["critical_before"]["span_limit"] == 64),
+                    "bounded on-demand critical snapshots missing"
+                );
+                ensure!(
+                    report["native_export_error"].is_null(),
+                    "deferred native export failed"
+                );
+            }
+            ensure!(
+                workers
+                    .iter()
+                    .any(|worker| worker["index"] == 0
+                        && worker["same_flush_at_last_samples"] == true),
+                "paused live flush not correlated"
+            );
+            let stack = std::fs::read_to_string(directory.path().join("worker-0.sample.stdout"))?;
+            ensure!(
+                stack.contains("flush_unlocked") && stack.contains("mpmc"),
+                "real worker flush wait not visible"
+            );
+        } else {
+            ensure!(
+                report["outcome"] == "no_stall_observed"
+                    && report["nominal_complete"] == !critical_path,
+                "no-stall diagnostic outcome incorrect"
+            );
+        }
+    }
+    println!(
+        "NATIVE_CAPTURE_PROCESS_SMOKE controlled_pause=true no_stall=true critical_path=true forced_reap_complete=true"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn critical_capture_preserves_snapshots_and_completed_outputs_on_native_failure()
+-> anyhow::Result<()> {
+    let name = "sync_manager::manager::tests::detector_soak::process::critical_capture_preserves_snapshots_and_completed_outputs_on_native_failure";
+    if child(name, Duration::from_secs(120)) {
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let result = run_scenario_with_stall_capture(
+        3,
+        Duration::from_secs(40),
+        Duration::from_secs(10),
+        None,
+        false,
+        Some(StallCaptureOptions {
+            directory: directory.path(),
+            controlled_pause: true,
+            critical_path: true,
+            fail_native: true,
+        }),
+    )
+    .await;
+    ensure!(result.is_err(), "failed native command incorrectly passed");
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("stall-report.json"))?)?;
+    ensure!(
+        report["outcome"] == "diagnostic_failed"
+            && report["nominal_complete"] == false
+            && report["cleanup_error"].is_null()
+            && report["native_export_error"].is_null(),
+        "failed capture lifecycle/result misreported"
+    );
+    let workers = report["workers"]
+        .as_array()
+        .context("failed capture dropped workers")?;
+    ensure!(
+        !workers.is_empty()
+            && workers.len() <= 3
+            && workers
+                .iter()
+                .all(|worker| worker["critical_before"].is_object()
+                    && worker["critical_after"].is_object()),
+        "native failure discarded already collected snapshots"
+    );
+    let error = report["execution_error"]
+        .as_str()
+        .context("capture error missing")?;
+    ensure!(
+        error.contains("/usr/bin/false")
+            && error.contains("target_worker=0")
+            && error.contains("target_pid="),
+        "failing native command identity missing"
+    );
+    ensure!(
+        !std::fs::read(directory.path().join("host-vm-stat.stdout"))?.is_empty()
+            && !std::fs::read(directory.path().join("host-iostat.stdout"))?.is_empty(),
+        "native failure discarded completed bounded outputs"
+    );
+    println!(
+        "CRITICAL_CAPTURE_FAILURE_REGRESSION snapshots_retained=true completed_outputs_retained=true command_identified=true reaped=true"
+    );
+    Ok(())
 }
 
 pub(super) async fn storage_scenario(
@@ -1420,6 +3848,75 @@ async fn run_scenario(
     storage: Option<StorageWorkload>,
     verify_convergence: bool,
 ) -> anyhow::Result<()> {
+    run_scenario_with_stall_capture(count, duration, period, storage, verify_convergence, None)
+        .await
+}
+
+struct StallCaptureOptions<'a> {
+    directory: &'a std::path::Path,
+    controlled_pause: bool,
+    critical_path: bool,
+    fail_native: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bounded real 100-process diagnostic; requires NUMAX_DETECTOR_STALL_DIR"]
+async fn critical_path_100_processes() {
+    let name = "sync_manager::manager::tests::detector_soak::process::critical_path_100_processes";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    let directory = std::env::var_os(STALL_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("NUMAX_DETECTOR_STALL_DIR must name an existing artifact directory");
+    assert!(directory.is_dir());
+    run_scenario_with_stall_capture(
+        100,
+        Duration::from_secs(300),
+        Duration::from_secs(10),
+        None,
+        false,
+        Some(StallCaptureOptions {
+            directory: &directory,
+            controlled_pause: false,
+            critical_path: true,
+            fail_native: false,
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+async fn run_scenario_with_stall_capture(
+    count: usize,
+    duration: Duration,
+    period: Duration,
+    storage: Option<StorageWorkload>,
+    verify_convergence: bool,
+    capture: Option<StallCaptureOptions<'_>>,
+) -> anyhow::Result<()> {
+    let capture_directory = capture.as_ref().map(|options| options.directory);
+    let controlled_pause = capture
+        .as_ref()
+        .is_some_and(|options| options.controlled_pause);
+    let critical_path = capture
+        .as_ref()
+        .is_some_and(|options| options.critical_path);
+    let fail_native = capture.as_ref().is_some_and(|options| options.fail_native);
+    ensure!(
+        !fail_native || (critical_path && controlled_pause && count == 3),
+        "native failure injection is restricted to the controlled three-worker regression"
+    );
+    ensure!(
+        !critical_path
+            || (storage.is_none() && !verify_convergence && duration <= Duration::from_secs(300)),
+        "critical path must remain a bounded diagnostic, not a nominal certification"
+    );
+    ensure!(
+        !controlled_pause || (capture_directory.is_some() && count == 3 && storage.is_none()),
+        "controlled flush pause is restricted to the three-worker native smoke"
+    );
     let storage_only = storage.is_some();
     let storage_metadata = matches!(
         storage,
@@ -1447,9 +3944,14 @@ async fn run_scenario(
                 Some(StorageWorkload::Counter) => Some("one eight-byte counter; atomic increment batch and durable flush per request"),
                 Some(StorageWorkload::Metadata) => Some("five new 2KiB records plus an eight-byte counter; six atomic batches then durable flush per request"),
                 Some(StorageWorkload::MetadataBatched) => Some("five new 2KiB records plus an eight-byte counter; one atomic batch then durable flush per request"),
+                Some(StorageWorkload::RemoteHistory | StorageWorkload::RemoteHistoryWithoutPeriodicFlush) => anyhow::bail!("remote history requires its dedicated comparison scenario"),
                 None => None,
             },
             "nominal_duration_s": duration.as_secs(), "period_s_per_node": period.as_secs(),
+            "native_stall_diagnostic": capture_directory.is_some(),
+            "native_stall_trigger_us": capture_directory.map(|_| STALL_TRIGGER_US),
+            "controlled_flush_pause": controlled_pause,
+            "critical_path_enabled": critical_path, "critical_span_limit": if critical_path { Some(64) } else { None },
             "offered_ops_per_s": count as f64 / period.as_secs_f64(),
             "max_pending_per_node": 4, "final_drain_limit_s": final_drain.as_secs(),
             "max_data_peers_per_node": if storage_only { None } else { Some(4) },
@@ -1458,9 +3960,14 @@ async fn run_scenario(
             "randomness": if storage_only { None } else { Some("probe choices use a reported fixed test seed; wall-clock scheduling remains nondeterministic") }
         })
     );
-    let mut group = Processes::spawn(count, storage)?;
+    let mut group = if controlled_pause || critical_path {
+        Processes::spawn_with_options(count, storage, None, controlled_pause, critical_path)?
+    } else {
+        Processes::spawn(count, storage)?
+    };
     let mut killed = None;
     let mut completed_nominal_report = None;
+    let mut native_capture = NativeCapture::default();
     let result = async {
         let ready = group.phase("ready", None, FORMATION_LIMIT).await?;
         if !storage_only {
@@ -1477,6 +3984,10 @@ async fn run_scenario(
         }
         eprintln!("DETECTOR_PHASE nodes={count} processes={count} phase={} nominal_s={}",
             if storage_only { "storage-ready" } else { "formed" }, duration.as_secs());
+        if let Some(directory) = capture_directory {
+            let output = native_output(Command::new("/usr/bin/vm_stat"), NATIVE_COMMAND_LIMIT).await?;
+            save_native_output(directory, "host-vm-stat-before-nominal", &output)?;
+        }
         let (rss_start, cpu_start) = group.usage().await?;
         let started = StdInstant::now();
         group.broadcast(&json!({"command": "nominal", "duration_s": duration.as_secs(), "period_s": period.as_secs(), "start_epoch_ms": epoch_ms()? + 3000}), None)?;
@@ -1492,6 +4003,23 @@ async fn run_scenario(
                 if value["phase"] == "nominal-complete" { completed[index] = value; }
             }
             if completed.iter().all(|value| !value.is_null()) { break; }
+            if critical_path && started.elapsed() >= duration {
+                native_capture.report = Some(json!({
+                    "outcome": "no_stall_observed", "nominal_complete": false,
+                    "diagnostic_window_complete": true, "diagnostic_window_s": duration.as_secs(),
+                    "critical_path_enabled": true, "trigger_oldest_submission_us": STALL_TRIGGER_US,
+                    "status_samples": group.rows(),
+                    "interpretation": "bounded diagnostic stopped at its ceiling; no final drain, replica health, true-failure phase or one-hour certification",
+                }));
+                return anyhow::Ok(());
+            }
+            if let Some(directory) = capture_directory
+                && !stall_targets(&group.rows())?.is_empty()
+            {
+                capture_stall(&mut group, directory, started.elapsed(), critical_path, fail_native, &mut native_capture).await?;
+                while group.receive()?.is_some() {}
+                return anyhow::Ok(());
+            }
             ensure!(started.elapsed() < duration + final_drain + Duration::from_secs(5), "nominal workers exceeded observation window");
             let mut queues = BTreeMap::<String, u64>::new();
             for status in group.rows().iter().filter(|value| !value.is_null()) {
@@ -1565,6 +4093,16 @@ async fn run_scenario(
         }
         completed_nominal_report = Some(nominal.clone());
         println!("DETECTOR_NOMINAL_REPORT {nominal}");
+        if capture_directory.is_some() {
+            native_capture.report = Some(json!({
+                "outcome": "no_stall_observed", "nominal_complete": !critical_path,
+                "diagnostic_window_complete": critical_path, "critical_path_enabled": critical_path,
+                "trigger_oldest_submission_us": STALL_TRIGGER_US,
+                "nominal": nominal,
+                "interpretation": "no qualifying stall observed; the stall hypothesis remains indeterminate; no post-load health or true-failure phase was executed",
+            }));
+            return anyhow::Ok(());
+        }
         if verify_convergence {
             let started = StdInstant::now();
             group.broadcast(&json!({"command": "convergence"}), None)?;
@@ -1654,6 +4192,57 @@ async fn run_scenario(
             "nominal": nominal, "true_failure": failure}));
         anyhow::Ok(())
     }.await;
+    if let Some(directory) = capture_directory {
+        let last_samples = group.rows();
+        let cleanup = group.force_stop_diagnostic().await;
+        let mut report = match native_capture.report {
+            Some(report) => report,
+            None => {
+                let error = result.as_ref().err().context(
+                    "diagnostic returned success without a capture or explicit no-stall report",
+                )?;
+                json!({
+                    "outcome": "diagnostic_failed",
+                    "nominal_complete": !critical_path && completed_nominal_report.is_some(),
+                    "error": format!("{error:#}"),
+                    "status_samples": last_samples,
+                    "interpretation": "diagnostic execution failed; no nominal success or one-hour rate inferred",
+                })
+            }
+        };
+        if let Err(error) = &result {
+            report["outcome"] = json!("diagnostic_failed");
+            report["error"] = json!(format!("{error:#}"));
+            report["status_samples"] = json!(last_samples);
+        }
+        report["execution_error"] = json!(result.as_ref().err().map(|error| format!("{error:#}")));
+        report["cleanup_error"] = json!(cleanup.as_ref().err().map(|error| format!("{error:#}")));
+        let export = native_capture
+            .outputs
+            .iter()
+            .try_for_each(|output| save_native_output(directory, &output.name, &output.output));
+        report["native_export_error"] =
+            json!(export.as_ref().err().map(|error| format!("{error:#}")));
+        let bytes = serde_json::to_vec(&report)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("stall-report.json"))?;
+        file.write_all(&bytes)?;
+        println!(
+            "DETECTOR_STALL_REPORT {}",
+            json!({
+                "outcome": report["outcome"], "nominal_complete": report["nominal_complete"],
+                "directory": directory, "workers_captured": report["workers"].as_array().map(Vec::len),
+                "forced_stop": true, "cleanup_ok": cleanup.is_ok(),
+            })
+        );
+        ensure!(
+            result.is_ok() && cleanup.is_ok() && export.is_ok(),
+            "native stall diagnostic={result:?}; cleanup={cleanup:?}; export={export:?}"
+        );
+        return Ok(());
+    }
     if let Err(error) = &result {
         let samples = group.rows();
         let rows = samples
@@ -1805,4 +4394,98 @@ fn recovery_diagnostic_examples_are_bounded_and_counted() {
         })
     );
     assert!(line.len() < MAX_WORKER_OUTPUT_LINE_BYTES);
+}
+
+#[tokio::test]
+async fn recovery_sample_releases_requests_for_queued_writer() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let (mut node, _) = started_manager_with_store(
+        NodeId::new("diagnostic-reader"),
+        SyncConfig::new().with_listen_addr(free_addr()),
+        store,
+    )
+    .await;
+    let now = node.clock.now();
+    let pending_count = MAX_RECOVERY_DETAIL_SAMPLES + 2;
+    let mut entries = HashMap::new();
+    for index in 0..=pending_count {
+        entries.insert(
+            format!("origin-{index}"),
+            crate::sync_manager::types::PendingHistoryRequest {
+                request_id: nx_sync::OpId::new(format!("request-{index}")),
+                start: 1,
+                end: 3,
+                baseline_revision: None,
+                deadline: if index == pending_count {
+                    now
+                } else {
+                    now + node.config.socket_timeout
+                },
+            },
+        );
+    }
+    node.history_requests
+        .write()
+        .await
+        .insert("source".into(), entries);
+    let diagnostics = diagnostics::Diagnostics::default();
+    let baseline = diagnostics::Baseline::new(&node, &diagnostics).unwrap();
+    let origins = std::collections::HashSet::new();
+    let mut writer = Box::pin(node.history_requests.write());
+    let mut queued = false;
+    let sample = tokio::time::timeout(
+        Duration::from_secs(2),
+        recovery_progress_sample(
+            &node,
+            &diagnostics,
+            &baseline,
+            Duration::ZERO,
+            0,
+            0,
+            RecoveryProgressInputs {
+                expected_origins: &origins,
+                operations: 0,
+                progress: &[],
+                after_requests_read: Some(Box::new(|| {
+                    // Polling registers this writer in Tokio's FIFO lock queue.
+                    // No scheduler timing or sleep is needed to force the interleaving.
+                    assert!(
+                        writer
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    queued = true;
+                })),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        queued,
+        "writer was not queued under the sampler's read guard"
+    );
+    let mut guard = tokio::time::timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("sampler retained its read guard");
+    guard.clear();
+    drop(guard);
+    node.shutdown().await.unwrap();
+    let sample = sample
+        .expect("sampler blocked behind its own queued writer")
+        .unwrap();
+    assert_eq!(sample["range_requests_pending"], pending_count);
+    assert_eq!(sample["range_requests_expired"], 1);
+    assert_eq!(sample["pending_range_details_count"], pending_count);
+    let details = sample["pending_ranges"].as_array().unwrap();
+    assert_eq!(details.len(), MAX_RECOVERY_DETAIL_SAMPLES);
+    assert!(
+        details
+            .iter()
+            .all(|entry| entry["start"] == 1 && entry["end"] == 3)
+    );
 }

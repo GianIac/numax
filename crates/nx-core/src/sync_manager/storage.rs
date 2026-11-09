@@ -23,6 +23,229 @@ fn record_remote_storage_timing(stage: &'static str, started: std::time::Instant
     );
 }
 
+#[cfg(test)]
+pub(super) mod critical_trace {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+
+    pub(in crate::sync_manager) const TARGET: &str = "nx_core::sync_manager::critical_path";
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    thread_local! { static CURRENT: RefCell<Option<Job>> = const { RefCell::new(None) }; }
+
+    pub(in crate::sync_manager) fn clock() -> Instant {
+        *CLOCK.get_or_init(Instant::now)
+    }
+
+    pub(in crate::sync_manager) fn enable() {
+        clock();
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    fn stamp() -> Option<u64> {
+        match u64::try_from(clock().elapsed().as_micros()) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                None
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(in crate::sync_manager) struct Job(Option<Arc<JobState>>);
+
+    struct JobState {
+        id: u64,
+        kind: &'static str,
+        held: Mutex<Vec<&'static str>>,
+        release_begin: AtomicU64,
+        ended: AtomicBool,
+    }
+
+    impl JobState {
+        fn emit(&self, kind: &str, resource: &str, event: &str, status: &str, lower: u64) {
+            if let Some(event_us) = stamp() {
+                tracing::debug!(target: TARGET, critical_trace = true,
+                    job_id = self.id, job_kind = self.kind, span_kind = kind,
+                    resource, critical_event = event, event_us,
+                    release_begin_us = lower,
+                    release_confirmed = kind == "hold" && event == "end" && status != "cancelled",
+                    status, thread_id = ?std::thread::current().id());
+            }
+        }
+
+        fn release_all(&self, status: &str) {
+            let held = match self.held.lock() {
+                Ok(mut held) => std::mem::take(&mut *held),
+                Err(error) => {
+                    tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                    return;
+                }
+            };
+            for resource in held {
+                self.emit(
+                    "hold",
+                    resource,
+                    "end",
+                    status,
+                    self.release_begin.load(Ordering::Acquire),
+                );
+            }
+        }
+
+        fn end(&self, status: &str) {
+            if !self.ended.swap(true, Ordering::AcqRel) {
+                self.release_all(status);
+                self.emit(
+                    "job",
+                    "job",
+                    "end",
+                    status,
+                    self.release_begin.load(Ordering::Acquire),
+                );
+            }
+        }
+    }
+
+    impl Drop for JobState {
+        fn drop(&mut self) {
+            self.end("cancelled");
+        }
+    }
+
+    impl Job {
+        pub(in crate::sync_manager) fn new(kind: &'static str) -> anyhow::Result<Self> {
+            if !ENABLED.load(Ordering::Acquire) {
+                return Ok(Self(None));
+            }
+            let id = NEXT_JOB
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| anyhow::anyhow!("critical trace job ID exhausted"))?;
+            let started = u64::try_from(clock().elapsed().as_micros())?;
+            let state = Arc::new(JobState {
+                id,
+                kind,
+                held: Mutex::new(Vec::new()),
+                release_begin: AtomicU64::new(started),
+                ended: AtomicBool::new(false),
+            });
+            state.emit("job", "job", "begin", "open", started);
+            Ok(Self(Some(state)))
+        }
+
+        pub(in crate::sync_manager) fn span(
+            &self,
+            kind: &'static str,
+            resource: &'static str,
+        ) -> Span {
+            if let Some(state) = &self.0 {
+                state.emit(kind, resource, "begin", "open", 0);
+            }
+            Span {
+                job: self.clone(),
+                kind,
+                resource,
+                finished: false,
+            }
+        }
+
+        pub(in crate::sync_manager) fn acquired(&self, resource: &'static str, wait: Span) {
+            wait.finish("acquired");
+            if let Some(state) = &self.0 {
+                match state.held.lock() {
+                    Ok(mut held) => held.push(resource),
+                    Err(error) => {
+                        tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                        return;
+                    }
+                }
+                state.emit("hold", resource, "begin", "open", 0);
+            }
+        }
+
+        pub(in crate::sync_manager) fn release_marker(&self) -> ReleaseMarker {
+            ReleaseMarker(self.clone())
+        }
+
+        pub(in crate::sync_manager) fn run<T>(
+            &self,
+            work: impl FnOnce() -> anyhow::Result<T>,
+        ) -> anyhow::Result<T> {
+            if self.0.is_none() {
+                return work();
+            }
+            let _current = Current(CURRENT.with(|current| current.replace(Some(self.clone()))));
+            let running = self.span("phase", "storage_job");
+            // FnOnce consumes the owned closure: its captured publication guards
+            // have been dropped when the call returns, including on an error.
+            let result = work();
+            let status = if result.is_ok() { "success" } else { "error" };
+            running.finish(status);
+            if let Some(state) = &self.0 {
+                state.end(status);
+            }
+            result
+        }
+    }
+
+    pub(in crate::sync_manager) struct Span {
+        job: Job,
+        kind: &'static str,
+        resource: &'static str,
+        finished: bool,
+    }
+
+    impl Span {
+        pub(in crate::sync_manager) fn finish(mut self, status: &str) {
+            self.finished = true;
+            if let Some(state) = &self.job.0 {
+                state.emit(self.kind, self.resource, "end", status, 0);
+            }
+        }
+
+        pub(in crate::sync_manager) fn finish_result<T, E>(self, result: &Result<T, E>) {
+            self.finish(if result.is_ok() { "success" } else { "error" });
+        }
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if !self.finished
+                && let Some(state) = &self.job.0
+            {
+                state.emit(self.kind, self.resource, "end", "cancelled", 0);
+            }
+        }
+    }
+
+    pub(in crate::sync_manager) struct ReleaseMarker(Job);
+    impl Drop for ReleaseMarker {
+        fn drop(&mut self) {
+            if let Some(state) = &self.0.0
+                && let Some(before_release) = stamp()
+            {
+                state.release_begin.store(before_release, Ordering::Release);
+            }
+        }
+    }
+
+    struct Current(Option<Job>);
+    impl Drop for Current {
+        fn drop(&mut self) {
+            CURRENT.with(|current| current.replace(self.0.take()));
+        }
+    }
+
+    pub(in crate::sync_manager) fn phase(resource: &'static str) -> Span {
+        let job = CURRENT.with(|current| current.borrow().clone());
+        job.unwrap_or(Job(None)).span("phase", resource)
+    }
+}
+
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::Materialized, key)
 }
@@ -1235,7 +1458,11 @@ pub(super) fn persist_remote_ops_batch(
     if let Some(lease) = lease {
         #[cfg(test)]
         let batch_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("batch");
         let batch_result = lease.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        phase.finish_result(&batch_result);
         #[cfg(test)]
         record_remote_storage_timing(
             "remote storage batch completed",
@@ -1248,7 +1475,11 @@ pub(super) fn persist_remote_ops_batch(
         // lease until the covering flush succeeds, including on cancellation.
         #[cfg(test)]
         let flush_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("flush");
         let flush_result = lease.flush();
+        #[cfg(test)]
+        phase.finish_result(&flush_result);
         #[cfg(test)]
         record_remote_storage_timing(
             "remote storage flush completed",
@@ -1259,7 +1490,11 @@ pub(super) fn persist_remote_ops_batch(
     } else {
         #[cfg(test)]
         let batch_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("batch");
         let batch_result = store.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        phase.finish_result(&batch_result);
         #[cfg(test)]
         record_remote_storage_timing(
             "remote storage batch completed",
@@ -1269,7 +1504,11 @@ pub(super) fn persist_remote_ops_batch(
         batch_result?;
         #[cfg(test)]
         let flush_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("flush");
         let flush_result = store.flush();
+        #[cfg(test)]
+        phase.finish_result(&flush_result);
         #[cfg(test)]
         record_remote_storage_timing(
             "remote storage flush completed",
@@ -1289,7 +1528,12 @@ fn persist_local_sequence_batch(
     deletes: &[&[u8]],
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let lease = store.acquire_write_lease()?;
+    #[cfg(test)]
+    let phase = critical_trace::phase("lease_wait");
+    let lease = store.acquire_write_lease();
+    #[cfg(test)]
+    phase.finish_result(&lease);
+    let lease = lease?;
     debug!(
         elapsed_us = started.elapsed().as_micros() as u64,
         "local storage lease acquired"
@@ -1302,7 +1546,11 @@ fn persist_local_sequence_batch(
             .map(|(k, v)| (k.as_slice(), v.as_slice())),
     );
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    let phase = critical_trace::phase("batch");
     let batch = lease.apply_batch(&sets, deletes);
+    #[cfg(test)]
+    phase.finish_result(&batch);
     debug!(
         elapsed_us = started.elapsed().as_micros() as u64,
         success = batch.is_ok(),
@@ -1310,7 +1558,11 @@ fn persist_local_sequence_batch(
     );
     batch?;
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    let phase = critical_trace::phase("flush");
     let flush = lease.flush();
+    #[cfg(test)]
+    phase.finish_result(&flush);
     debug!(
         elapsed_us = started.elapsed().as_micros() as u64,
         success = flush.is_ok(),
