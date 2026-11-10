@@ -127,10 +127,14 @@ These are internal runtime settings, not CLI options or a universal detection
 latency guarantee. Storage failure fences terminal publication and is exposed
 through service errors. Membership shutdown allows two seconds for leave
 dissemination and five seconds for adapter completion. If that budget expires
-before the terminal leave is durably confirmed, shutdown returns an error but
-keeps the adapter running: retrying `SyncManager::shutdown` resumes waiting for
-the same outcome instead of reporting success, and node data loops are joined
-before the leave is written. Dropping the manager is the terminal abort: an
+before the terminal leave is durably confirmed, shutdown returns the typed
+`ShutdownPending::DurabilityUnconfirmed` error and retains the adapter, discovery
+and transport. A confirmation first observed after the call's deadline returns
+`ShutdownPending::DurableLeaveConfirmedLate`. Retrying `SyncManager::shutdown`
+resumes the same outcome instead of repeating the leave commit or reporting
+premature success. Callers can downcast the error; they must distinguish it
+from definitive storage errors, which remain errors on retry. Node data loops
+are joined before the leave is written. Dropping the manager is the terminal abort: an
 in-flight filesystem operation may still finish, but cannot publish through the
 stopped adapter.
 
@@ -191,7 +195,7 @@ write can precede every peer connection.
 | Atomic batch applied | Its records were accepted together; no covering flush is implied. |
 | Local mutation succeeded | Its acceptance batch has a confirmed covering flush. |
 | Transport send succeeded | The local stream write completed; remote apply or storage durability is not confirmed. |
-| Remote operation applied | State and receipt metadata were persisted before publication and forwarding; this path does not explicitly await a covering flush. |
+| Remote operation applied | A nonempty batch atomically persists state and receipt metadata and awaits a covering flush before publication and forwarding (experimental backpressure). |
 | Baseline installed successfully | The complete replacement and receipt cut were atomically installed and flushed. |
 
 The replication path does not wait for a replica count, quorum or per-operation
@@ -356,11 +360,12 @@ connections no longer present in discovery. Its default interval is 30 seconds.
 It exchanges per-origin summaries, compares advertised history with durable
 receipt coverage and requests missing ranges.
 
-Between periodic turns, a **catch-up session** walks one peer's summary pages
-back to back instead of one page per interval. It starts when a data session
-connects and when a membership record returns to `Alive` at a newer version,
-because a partition can heal without the transport ever dropping that session.
-A periodic page that reveals missing history also continues the walk. A walk
+Each periodic turn starts a bounded **catch-up session** that walks one peer's
+summary pages back to back, even when an aligned first page reveals no gap.
+A session also starts when a data session connects and when a membership record
+returns to `Alive` at a newer version, because a partition can heal without the
+transport ever dropping that session. Starting a periodic walk does not reset
+an outstanding summary deadline, cursor or rewalk backoff. A walk
 that found gaps is repeated after 2, 4, 8 and 16 seconds at most, then the
 periodic cadence takes over; a walk without gaps ends the session. A summary
 request is considered unanswered after `min(socket timeout, 2 s)` and is
@@ -368,12 +373,6 @@ retried by the session; range and baseline requests keep the socket timeout.
 An origin already requested from another peer within the last 2 seconds is not
 requested again, so a reconnecting cluster does not ask every peer for the
 same history while a lost request is still hedged by later walks.
-
-Summary pages contain at most 16 origins. A replay request covers at most 128
-positions; replay pages are limited to 8 MiB and reserve space under the
-configured wire-message limit. Replies must match the source, origin, request
-ID, unexpired deadline and requested interval. Fresh attempts get fresh IDs;
-late replies cannot complete newer work.
 
 ### Retention window
 

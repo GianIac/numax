@@ -69,6 +69,25 @@ async fn remote_history_1_vs_100_processes() {
     process::remote_history_comparison().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "replay an existing bounded remote trace without networking"]
+async fn remote_history_replay_captured_trace() {
+    let name = "sync_manager::manager::tests::detector_soak::remote_history_replay_captured_trace";
+    if child(name, Duration::from_secs(1200)) {
+        return;
+    }
+    let trace_path = std::env::var_os("NUMAX_DETECTOR_REPLAY_TRACE")
+        .map(std::path::PathBuf::from)
+        .expect("remote history replay requires NUMAX_DETECTOR_REPLAY_TRACE");
+    let result_path = std::env::var_os("NUMAX_DETECTOR_REPLAY_RESULT")
+        .map(std::path::PathBuf::from)
+        .expect("remote history replay requires NUMAX_DETECTOR_REPLAY_RESULT");
+    let report = process::replay_remote_history_trace(&trace_path, &result_path)
+        .await
+        .unwrap();
+    println!("REMOTE_HISTORY_REPLAY {}", report);
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "three paired 100-process diagnostic comparisons; not a production setting"]

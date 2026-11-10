@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::io::{Seek, Write};
 use std::sync::Mutex;
 use tracing::field::{Field, Visit};
@@ -26,6 +27,8 @@ const REPAIR_TRACE_EVENT_LIMIT: usize = 64;
 const TIMELINE_EVENT_LIMIT: usize = 4096;
 const CRITICAL_SPAN_LIMIT: usize = 64;
 const CRITICAL_SNAPSHOT_BYTES: usize = 32 * 1024;
+const REMOTE_REPLAY_BATCH_LIMIT: usize = 512;
+const REMOTE_REPLAY_OPERATION_LIMIT: usize = 4096;
 const EVENT_LOOP_KINDS: [&str; 9] = [
     "push",
     "summary",
@@ -174,6 +177,7 @@ impl EventLoopTiming {
 pub(super) struct Diagnostics {
     timeline: Option<Arc<RecoveryTimeline>>,
     critical: Option<Arc<Mutex<CriticalPath>>>,
+    remote_replay: Option<Arc<Mutex<RemoteReplayTrace>>>,
     timings: Arc<[Timing; STAGES.len()]>,
     remote_timings: Arc<Mutex<[TimingSnapshot; REMOTE_STAGES.len()]>>,
     events: Arc<Mutex<BTreeMap<String, u64>>>,
@@ -191,6 +195,16 @@ struct CriticalPath {
     completed: std::collections::VecDeque<Value>,
     overwritten: u64,
     unix_anchor_us: u64,
+}
+
+#[derive(Default)]
+struct RemoteReplayTrace {
+    started: Option<StdInstant>,
+    batches: VecDeque<Value>,
+    operations: usize,
+    dropped_batches: u64,
+    dropped_operations: u64,
+    overflowed: bool,
 }
 
 impl CriticalPath {
@@ -457,6 +471,7 @@ impl Diagnostics {
                 .checked_sub(u64::try_from(clock.elapsed().as_micros())?)
                 .context("critical clock anchor underflow")?;
         Ok(Self {
+            remote_replay: Some(Arc::new(Mutex::new(RemoteReplayTrace::default()))),
             critical: Some(Arc::new(Mutex::new(CriticalPath {
                 unix_anchor_us,
                 ..CriticalPath::default()
@@ -479,6 +494,302 @@ impl Diagnostics {
                 .map_err(|_| anyhow::anyhow!("critical path lock poisoned"))?
                 .snapshot(full)?,
         ))
+    }
+
+    pub(super) fn begin_remote_replay_capture(&self) -> anyhow::Result<()> {
+        let trace = self
+            .remote_replay
+            .as_ref()
+            .context("remote replay recorder is inactive")?;
+        let mut trace = trace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote replay trace lock poisoned"))?;
+        *trace = RemoteReplayTrace {
+            started: Some(StdInstant::now()),
+            ..RemoteReplayTrace::default()
+        };
+        crate::sync_manager::apply::set_remote_replay_trace_enabled(true);
+        Ok(())
+    }
+
+    pub(super) fn remote_replay_snapshot(&self) -> anyhow::Result<Value> {
+        crate::sync_manager::apply::set_remote_replay_trace_enabled(false);
+        let trace = self
+            .remote_replay
+            .as_ref()
+            .context("remote replay recorder is inactive")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote replay trace lock poisoned"))?;
+        ensure!(
+            trace.started.is_some(),
+            "remote replay capture was not started"
+        );
+        ensure!(!trace.overflowed, "remote replay trace exceeded its bound");
+        ensure!(
+            trace
+                .batches
+                .iter()
+                .all(|batch| batch["applied_ops"].is_u64()
+                    && batch["duplicate_ops"].is_u64()
+                    && batch["applied_ids"].is_array()
+                    && batch["duplicate_ids"].is_array()
+                    && batch["success"] == true),
+            "remote replay trace has an unpaired or failed apply batch"
+        );
+        for batch in &trace.batches {
+            let entries = batch["entries"]
+                .as_array()
+                .context("remote replay batch entries missing")?;
+            ensure!(
+                entries
+                    .iter()
+                    .all(|entry| entry["expected_workload"] == true),
+                "remote replay trace contains an operation outside the nominal GCounter workload"
+            );
+            let mut input_ids = entries
+                .iter()
+                .map(|entry| {
+                    entry["id"]
+                        .as_str()
+                        .context("remote replay operation ID missing")
+                        .map(str::to_owned)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut classified_ids = batch["applied_ids"]
+                .as_array()
+                .context("remote replay applied IDs missing")?
+                .iter()
+                .chain(
+                    batch["duplicate_ids"]
+                        .as_array()
+                        .context("remote replay duplicate IDs missing")?,
+                )
+                .map(|id| {
+                    id.as_str()
+                        .context("remote replay classified ID invalid")
+                        .map(str::to_owned)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            input_ids.sort_unstable();
+            classified_ids.sort_unstable();
+            ensure!(
+                input_ids == classified_ids,
+                "remote replay apply IDs do not match the collected batch"
+            );
+        }
+        Ok(json!({
+            "version": 1,
+            "complete": true,
+            "operation_count": trace.operations,
+            "batch_count": trace.batches.len(),
+            "window_complete": trace.dropped_batches == 0,
+            "dropped_batch_count": trace.dropped_batches,
+            "dropped_operation_count": trace.dropped_operations,
+            "batches": trace.batches,
+            "interpretation": "bounded rolling suffix of complete GCounter remote apply batches; operation IDs and positions are retained, arbitrary CRDT payloads are not; offsets are worker-local from nominal start",
+        }))
+    }
+
+    fn record_remote_replay_batch(&self, fields: &Fields) {
+        let Some(trace) = &self.remote_replay else {
+            return;
+        };
+        let mut trace = match trace.lock() {
+            Ok(trace) => trace,
+            Err(_) => {
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(started) = trace.started else {
+            return;
+        };
+        let (Some(operations), Some(entries)) = (
+            fields.remote_apply_batch_operations,
+            fields.remote_apply_batch_entries.as_ref(),
+        ) else {
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if operations == 0 {
+            return;
+        }
+        if !fields.remote_apply_batch_trace_complete
+            || usize::try_from(operations).ok() != Some(entries.len())
+            || entries.iter().any(|entry| {
+                !entry["id"].is_string()
+                    || !entry["origin"].is_string()
+                    || !entry["generation"].is_u64()
+                    || !entry["sequence"].is_u64()
+                    || !entry["size"].is_u64()
+                    || !entry["expected_workload"].is_boolean()
+            })
+            || trace.batches.len() >= REMOTE_REPLAY_BATCH_LIMIT
+        {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if entries.len() > REMOTE_REPLAY_OPERATION_LIMIT {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        while trace.batches.len() >= REMOTE_REPLAY_BATCH_LIMIT
+            || trace
+                .operations
+                .checked_add(entries.len())
+                .is_none_or(|total| total > REMOTE_REPLAY_OPERATION_LIMIT)
+        {
+            let Some(oldest) = trace.batches.front() else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if oldest["applied_ops"].is_null() {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let Some(oldest_operations) = oldest["operations"].as_u64() else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let Ok(oldest_operations_usize) = usize::try_from(oldest_operations) else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let Some(_) = trace.batches.pop_front() else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let Some(retained_operations) = trace.operations.checked_sub(oldest_operations_usize)
+            else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let (Some(dropped_batches), Some(dropped_operations)) = (
+                trace.dropped_batches.checked_add(1),
+                trace.dropped_operations.checked_add(oldest_operations),
+            ) else {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            trace.operations = retained_operations;
+            trace.dropped_batches = dropped_batches;
+            trace.dropped_operations = dropped_operations;
+        }
+        let Some(total_operations) = trace.operations.checked_add(entries.len()) else {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let at_us = match u64::try_from(started.elapsed().as_micros()) {
+            Ok(at_us) => at_us,
+            Err(_) => {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(serialized_entry_bytes) = entries.iter().try_fold(0u64, |total, entry| {
+            total.checked_add(entry["size"].as_u64()?)
+        }) else {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        trace.operations = total_operations;
+        trace.batches.push_back(json!({
+            "at_us": at_us,
+            "operations": operations,
+            "serialized_entry_bytes": serialized_entry_bytes,
+            "entries": entries,
+            "applied_ops": null,
+            "duplicate_ops": null,
+            "applied_ids": null,
+            "duplicate_ids": null,
+            "success": null,
+        }));
+    }
+
+    fn record_remote_replay_apply(&self, fields: &Fields) {
+        let Some(trace) = &self.remote_replay else {
+            return;
+        };
+        let mut trace = match trace.lock() {
+            Ok(trace) => trace,
+            Err(_) => {
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(started) = trace.started else {
+            return;
+        };
+        let (
+            Some(input),
+            Some(applied),
+            Some(duplicates),
+            Some(applied_ids),
+            Some(duplicate_ids),
+            Some(trace_complete),
+            Some(success),
+        ) = (
+            fields.remote_apply_input_ops,
+            fields.remote_apply_applied_ops,
+            fields.remote_apply_duplicate_ops,
+            fields.remote_apply_applied_ids.as_ref(),
+            fields.remote_apply_duplicate_ids.as_ref(),
+            fields.remote_apply_trace_complete,
+            fields.remote_apply_success,
+        )
+        else {
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let Some(batch) = trace
+            .batches
+            .iter_mut()
+            .rev()
+            .find(|batch| batch["applied_ops"].is_null())
+        else {
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if !trace_complete
+            || batch["operations"].as_u64() != Some(input)
+            || applied.checked_add(duplicates) != Some(input)
+            || usize::try_from(applied).ok() != Some(applied_ids.len())
+            || usize::try_from(duplicates).ok() != Some(duplicate_ids.len())
+        {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let applied_at_us = match u64::try_from(started.elapsed().as_micros()) {
+            Ok(at_us) => at_us,
+            Err(_) => {
+                trace.overflowed = true;
+                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        batch["applied_at_us"] = json!(applied_at_us);
+        batch["applied_ops"] = json!(applied);
+        batch["duplicate_ops"] = json!(duplicates);
+        batch["applied_ids"] = json!(applied_ids);
+        batch["duplicate_ids"] = json!(duplicate_ids);
+        batch["success"] = json!(success);
+        if !success {
+            trace.overflowed = true;
+            self.event_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn with_timeline(path: &std::path::Path) -> anyhow::Result<Self> {
@@ -837,6 +1148,16 @@ struct Fields {
     history_batch_replays: Option<u64>,
     history_batch_operations: Option<u64>,
     history_batch_estimated_bytes: Option<u64>,
+    remote_apply_input_ops: Option<u64>,
+    remote_apply_applied_ops: Option<u64>,
+    remote_apply_duplicate_ops: Option<u64>,
+    remote_apply_applied_ids: Option<Vec<String>>,
+    remote_apply_duplicate_ids: Option<Vec<String>>,
+    remote_apply_trace_complete: Option<bool>,
+    remote_apply_batch_operations: Option<u64>,
+    remote_apply_batch_entries: Option<Vec<Value>>,
+    remote_apply_batch_trace_complete: bool,
+    remote_apply_success: Option<bool>,
     failed: bool,
 }
 
@@ -856,13 +1177,21 @@ impl Visit for Fields {
             "history_batch_replays" => self.history_batch_replays = Some(value),
             "history_batch_operations" => self.history_batch_operations = Some(value),
             "history_batch_estimated_bytes" => self.history_batch_estimated_bytes = Some(value),
+            "remote_apply_input_ops" => self.remote_apply_input_ops = Some(value),
+            "remote_apply_applied_ops" => self.remote_apply_applied_ops = Some(value),
+            "remote_apply_duplicate_ops" => self.remote_apply_duplicate_ops = Some(value),
+            "remote_apply_batch_operations" => self.remote_apply_batch_operations = Some(value),
             _ => {}
         }
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if field.name() == "success" {
-            self.failed = !value;
+        match field.name() {
+            "success" => self.failed = !value,
+            "remote_apply_success" => self.remote_apply_success = Some(value),
+            "remote_apply_batch_trace_complete" => self.remote_apply_batch_trace_complete = value,
+            "remote_apply_trace_complete" => self.remote_apply_trace_complete = Some(value),
+            _ => {}
         }
     }
 
@@ -881,6 +1210,15 @@ impl Visit for Fields {
             "event_handler_kind" => self.event_handler_kind = Some(value.to_owned()),
             "history_batch_kind" => self.history_batch_kind = Some(value.to_owned()),
             "history_batch_stop" => self.history_batch_stop = Some(value.to_owned()),
+            "remote_apply_batch_entries" => {
+                self.remote_apply_batch_entries = serde_json::from_str(value).ok();
+            }
+            "remote_apply_applied_ids" => {
+                self.remote_apply_applied_ids = serde_json::from_str(value).ok();
+            }
+            "remote_apply_duplicate_ids" => {
+                self.remote_apply_duplicate_ids = serde_json::from_str(value).ok();
+            }
             _ => {}
         }
     }
@@ -1083,6 +1421,14 @@ impl Subscriber for Diagnostics {
                 || (*metadata.level() == tracing::Level::DEBUG
                     && metadata.target() == "nx_core::sync_manager::manager"
                     && metadata.fields().field("event_handler_kind").is_some())
+                || (*metadata.level() == tracing::Level::DEBUG
+                    && metadata.target() == "nx_core::sync_manager::apply"
+                    && (self.remote_replay.is_some()
+                        || metadata.fields().field("remote_apply_input_ops").is_some()
+                        || metadata
+                            .fields()
+                            .field("remote_apply_batch_operations")
+                            .is_some()))
                 || metadata.target() == "nx_core::sync_manager::replication"
                 || metadata.target().starts_with("nx_net::node"))
     }
@@ -1198,6 +1544,17 @@ impl Subscriber for Diagnostics {
             }
             if fields.history_batch_kind.is_some() || fields.history_batch_stop.is_some() {
                 self.record_history_batch(&fields);
+            }
+            return;
+        }
+        if metadata.target() == "nx_core::sync_manager::apply" {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if fields.remote_apply_batch_operations.is_some() {
+                self.record_remote_replay_batch(&fields);
+            }
+            if fields.remote_apply_input_ops.is_some() {
+                self.record_remote_replay_apply(&fields);
             }
             return;
         }
@@ -1934,6 +2291,56 @@ fn diagnostics_report_phase_local_remote_timings_and_batch_deltas() {
     assert_eq!(sample["history_batches"]["stop.control_summary"], 1);
     assert_eq!(sample["history_batches"]["stop.coalesce_timeout"], 1);
     assert_eq!(sample["history_batches"]["stop.control_priority"], 1);
+}
+
+#[test]
+fn remote_replay_capture_pairs_operation_ids_and_classification() -> anyhow::Result<()> {
+    let diagnostics = Diagnostics::with_critical_path()?;
+    diagnostics.begin_remote_replay_capture()?;
+    let entries = [
+        ("duplicate-op", "detector-1", 4),
+        ("new-op", "detector-2", 8),
+    ]
+    .map(|(id, origin, sequence)| nx_sync::SequencedOp {
+        op: Op {
+            id: nx_sync::OpId::new(id),
+            origin: NodeId::new(origin),
+            kind: nx_sync::OpKind::GCounterIncrement {
+                key: "detector-nominal".into(),
+                increment: 1,
+            },
+        },
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence,
+        },
+    });
+    tracing::subscriber::with_default(diagnostics.clone(), || {
+        crate::sync_manager::apply::trace_remote_apply_batch(&entries);
+        tracing::debug!(
+            target: "nx_core::sync_manager::apply",
+            remote_apply_input_ops = 2u64,
+            remote_apply_applied_ops = 1u64,
+            remote_apply_duplicate_ops = 1u64,
+            remote_apply_applied_ids = r#"["new-op"]"#,
+            remote_apply_duplicate_ids = r#"["duplicate-op"]"#,
+            remote_apply_trace_complete = true,
+            remote_apply_success = true,
+            "bounded remote apply work"
+        );
+    });
+
+    let snapshot = diagnostics.remote_replay_snapshot()?;
+
+    assert_eq!(snapshot["complete"], true);
+    assert_eq!(snapshot["batch_count"], 1);
+    assert_eq!(snapshot["operation_count"], 2);
+    assert_eq!(snapshot["batches"][0]["applied_ids"], json!(["new-op"]));
+    assert_eq!(
+        snapshot["batches"][0]["duplicate_ids"],
+        json!(["duplicate-op"])
+    );
+    Ok(())
 }
 
 #[test]

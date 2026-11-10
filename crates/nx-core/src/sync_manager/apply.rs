@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -13,6 +15,14 @@ use super::replication::{
 };
 use super::storage::{persist_remote_ops_batch, remote_sequence_sets};
 use super::types::*;
+
+#[cfg(test)]
+static REMOTE_REPLAY_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn set_remote_replay_trace_enabled(enabled: bool) {
+    REMOTE_REPLAY_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Debug)]
 pub(super) struct RemoteBatchPreparation;
@@ -31,6 +41,66 @@ fn record_remote_apply_timing(stage: &'static str, started: Instant, success: bo
         elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         success,
         "bounded remote apply diagnostic"
+    );
+}
+
+#[cfg(test)]
+fn trace_remote_apply_work(
+    input: usize,
+    applied: usize,
+    duplicates: usize,
+    applied_ids: &[String],
+    duplicate_ids: &[String],
+    success: bool,
+) {
+    let applied_ids = serde_json::to_string(applied_ids).ok();
+    let duplicate_ids = serde_json::to_string(duplicate_ids).ok();
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        remote_apply_input_ops = input as u64,
+        remote_apply_applied_ops = applied as u64,
+        remote_apply_duplicate_ops = duplicates as u64,
+        remote_apply_applied_ids = applied_ids.as_deref().unwrap_or(""),
+        remote_apply_duplicate_ids = duplicate_ids.as_deref().unwrap_or(""),
+        remote_apply_trace_complete = applied_ids.is_some() && duplicate_ids.is_some(),
+        remote_apply_success = success,
+        "bounded remote apply work"
+    );
+}
+
+#[cfg(test)]
+pub(super) fn trace_remote_apply_batch(ops: &[nx_sync::SequencedOp]) {
+    if ops.is_empty() || !REMOTE_REPLAY_TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let entries = ops
+        .iter()
+        .map(|entry| {
+            let size = super::delivery::entry_bytes(&entry.op, &entry.position)?;
+            Some(serde_json::json!({
+                "id": entry.op.id.as_str(),
+                "origin": entry.op.origin.as_str(),
+                "generation": entry.position.generation,
+                "sequence": entry.position.sequence,
+                "size": size,
+                "expected_workload": matches!(
+                    &entry.op.kind,
+                    OpKind::GCounterIncrement { key, increment }
+                        if key == "detector-nominal" && *increment == 1
+                ),
+            }))
+        })
+        .collect::<Option<Vec<_>>>();
+    let encoded_entries = entries
+        .as_ref()
+        .filter(|entries| entries.len() == ops.len())
+        .and_then(|entries| serde_json::to_string(entries).ok());
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        remote_apply_batch_operations = ops.len() as u64,
+        remote_apply_batch_entries = encoded_entries.as_deref().unwrap_or(""),
+        remote_apply_batch_trace_complete = encoded_entries.is_some(),
+        "bounded sequenced remote apply batch"
     );
 }
 
@@ -60,6 +130,8 @@ pub(super) async fn apply_sequenced_ops_and_collect(
         ops.len() <= 1024,
         "sequenced batch exceeds operation budget"
     );
+    #[cfg(test)]
+    trace_remote_apply_batch(ops);
     let raw = ops.iter().map(|entry| entry.op.clone()).collect::<Vec<_>>();
     apply_ops(raw, Some(ops.to_vec()), context).await
 }
@@ -76,6 +148,8 @@ async fn apply_ops(
     let apply_started = Instant::now();
     #[cfg(test)]
     let trace = super::storage::critical_trace::Job::new("remote")?;
+    #[cfg(test)]
+    let trace_sequenced_batch = sequenced.is_some();
 
     #[cfg(test)]
     let registry_wait_started = Instant::now();
@@ -178,6 +252,7 @@ async fn apply_ops(
         let mut next_op_log_sequence = op_log_next_sequence.load(Ordering::Relaxed);
         let mut inserted_ids = Vec::new();
         let mut inserted_ops = Vec::new();
+        let mut duplicate_ids = Vec::new();
         let mut plans = Vec::new();
         let mut counter_updates = HashMap::new();
         let mut pncounter_updates = HashMap::new();
@@ -196,6 +271,7 @@ async fn apply_ops(
             }
             if seen.ids.contains(op_id) || inserted_ids.iter().any(|id| id == op_id) {
                 debug!(op_id = %op.id, "skipping duplicate op");
+                duplicate_ids.push(op_id.to_owned());
                 continue;
             }
 
@@ -270,9 +346,39 @@ async fn apply_ops(
                 apply_started.elapsed(),
                 true,
             );
+            #[cfg(test)]
+            if trace_sequenced_batch {
+                trace_remote_apply_work(
+                    input.len(),
+                    0,
+                    duplicate_count,
+                    &[],
+                    &duplicate_ids,
+                    false,
+                );
+            }
             return Err(error);
         }
 
+        #[cfg(test)]
+        let trace_duplicate_ids = if let Some(entries) = sequenced.as_ref() {
+            let mut remaining_applied = inserted_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    if remaining_applied.remove(entry.op.id.as_str()) {
+                        None
+                    } else {
+                        Some(entry.op.id.as_str().to_owned())
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            duplicate_ids.clone()
+        };
         let forward_entries = sequenced
             .into_iter()
             .flatten()
@@ -320,6 +426,17 @@ async fn apply_ops(
             apply_started.elapsed(),
             false,
         );
+        #[cfg(test)]
+        if trace_sequenced_batch {
+            trace_remote_apply_work(
+                input.len(),
+                applied_count,
+                duplicate_count,
+                &inserted_ids,
+                &trace_duplicate_ids,
+                true,
+            );
+        }
 
         Ok(forward_entries)
     };

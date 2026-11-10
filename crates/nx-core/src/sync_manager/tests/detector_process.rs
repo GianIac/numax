@@ -281,6 +281,42 @@ async fn capture_stall(
         if let Err(error) = result {
             errors.push(format!("post-capture snapshots: {error:#}"));
         }
+        let mut replay_traces = BTreeMap::new();
+        if let Err(error) = group.remote_replay_snapshots(3, &mut replay_traces).await {
+            errors.push(format!("remote replay trace snapshots: {error:#}"));
+        } else {
+            let workers = replay_traces
+                .into_iter()
+                .map(|(index, trace)| json!({"index": index, "trace": trace}))
+                .collect::<Vec<_>>();
+            let batch_count = workers.iter().try_fold(0u64, |total, worker| {
+                total
+                    .checked_add(number(&worker["trace"], "batch_count")?)
+                    .context("remote replay batch count overflow")
+            })?;
+            let operation_count = workers.iter().try_fold(0u64, |total, worker| {
+                total
+                    .checked_add(number(&worker["trace"], "operation_count")?)
+                    .context("remote replay operation count overflow")
+            })?;
+            let bytes = serde_json::to_vec(&json!({"version": 1, "workers": workers}))?;
+            let path = directory.join("remote-replay-trace.json");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("cannot create {}", path.display()))?;
+            file.write_all(&bytes)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            capture.report.as_mut().context("capture report missing")?["remote_replay_trace"] = json!({
+                "file": "remote-replay-trace.json",
+                "workers": workers.len(),
+                "batches": batch_count,
+                "operations": operation_count,
+                "bytes": bytes.len(),
+                "blake3": blake3::hash(&bytes).to_hex().to_string(),
+            });
+        }
     }
     let after = group.rows();
     let report = capture.report.as_mut().context("capture report missing")?;
@@ -567,6 +603,552 @@ fn remote_history_fixture() -> anyhow::Result<RemoteHistoryFixture> {
         expected,
         digest,
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedRemoteEntry {
+    id: String,
+    origin: String,
+    generation: u64,
+    sequence: u64,
+    size: u64,
+}
+
+impl RecordedRemoteEntry {
+    fn parse(value: &Value) -> anyhow::Result<Self> {
+        ensure!(
+            value["expected_workload"] == true,
+            "replay trace contains an operation outside the nominal GCounter workload"
+        );
+        Ok(Self {
+            id: value["id"]
+                .as_str()
+                .context("replay trace operation ID missing")?
+                .to_owned(),
+            origin: value["origin"]
+                .as_str()
+                .context("replay trace operation origin missing")?
+                .to_owned(),
+            generation: number(value, "generation")?,
+            sequence: number(value, "sequence")?,
+            size: number(value, "size")?,
+        })
+    }
+
+    fn sequenced_op(&self) -> nx_sync::SequencedOp {
+        nx_sync::SequencedOp {
+            op: Op {
+                id: nx_sync::OpId::new(self.id.clone()),
+                origin: NodeId::new(self.origin.clone()),
+                kind: nx_sync::OpKind::GCounterIncrement {
+                    key: KEY.into(),
+                    increment: 1,
+                },
+            },
+            position: nx_sync::OpPosition {
+                generation: self.generation,
+                sequence: self.sequence,
+            },
+        }
+    }
+}
+
+struct RecordedRemoteBatch {
+    at_us: u64,
+    applied_ids: Vec<String>,
+    duplicate_ids: Vec<String>,
+    entries: Vec<RecordedRemoteEntry>,
+    live_completion_us: u64,
+}
+
+struct RecordedRemoteTrace {
+    batches: Vec<RecordedRemoteBatch>,
+    source_window_start_us: u64,
+    source_window_complete: bool,
+    dropped_batches: u64,
+    dropped_operations: u64,
+}
+
+fn replay_ids(value: &Value, key: &str) -> anyhow::Result<Vec<String>> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("replay trace {key} missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .context("replay trace operation classification contains invalid ID")
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn parse_remote_replay_batches(trace: &Value) -> anyhow::Result<RecordedRemoteTrace> {
+    ensure!(
+        trace["complete"] == true,
+        "remote replay trace is incomplete"
+    );
+    let source_window_complete = trace["window_complete"]
+        .as_bool()
+        .context("remote replay trace window completeness missing")?;
+    let dropped_batches = number(trace, "dropped_batch_count")?;
+    let dropped_operations = number(trace, "dropped_operation_count")?;
+    ensure!(
+        source_window_complete == (dropped_batches == 0 && dropped_operations == 0),
+        "remote replay trace window truncation metadata is inconsistent"
+    );
+    let batches = trace["batches"]
+        .as_array()
+        .context("remote replay trace batches missing")?;
+    ensure!(
+        usize::try_from(number(trace, "batch_count")?)? == batches.len(),
+        "remote replay trace batch count mismatch"
+    );
+    let mut result = Vec::with_capacity(batches.len());
+    let mut operation_count = 0usize;
+    let mut previous_at_us = 0;
+    for batch in batches {
+        let at_us = number(batch, "at_us")?;
+        let applied_at_us = number(batch, "applied_at_us")?;
+        ensure!(
+            at_us >= previous_at_us && applied_at_us >= at_us,
+            "remote replay trace timestamps are not monotonic"
+        );
+        previous_at_us = at_us;
+        let entries = batch["entries"]
+            .as_array()
+            .context("remote replay trace operation entries missing")?
+            .iter()
+            .map(RecordedRemoteEntry::parse)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let applied_ids = replay_ids(batch, "applied_ids")?;
+        let duplicate_ids = replay_ids(batch, "duplicate_ids")?;
+        ensure!(
+            usize::try_from(number(batch, "operations")?)? == entries.len()
+                && usize::try_from(number(batch, "applied_ops")?)? == applied_ids.len()
+                && usize::try_from(number(batch, "duplicate_ops")?)? == duplicate_ids.len()
+                && entries.len() == applied_ids.len() + duplicate_ids.len()
+                && batch["success"] == true,
+            "remote replay batch counts or status are inconsistent"
+        );
+        operation_count = operation_count
+            .checked_add(entries.len())
+            .context("remote replay operation count overflow")?;
+        result.push(RecordedRemoteBatch {
+            at_us,
+            applied_ids,
+            duplicate_ids,
+            entries,
+            live_completion_us: applied_at_us - at_us,
+        });
+    }
+    ensure!(
+        operation_count == usize::try_from(number(trace, "operation_count")?)?,
+        "remote replay trace operation count mismatch"
+    );
+    let source_window_start_us = result.first().map_or(0, |batch| batch.at_us);
+    for batch in &mut result {
+        batch.at_us = batch
+            .at_us
+            .checked_sub(source_window_start_us)
+            .context("remote replay trace timestamp precedes retained window")?;
+    }
+    Ok(RecordedRemoteTrace {
+        batches: result,
+        source_window_start_us,
+        source_window_complete,
+        dropped_batches,
+        dropped_operations,
+    })
+}
+
+fn initial_replay_duplicates(
+    batches: &[RecordedRemoteBatch],
+) -> anyhow::Result<Vec<RecordedRemoteEntry>> {
+    let mut applied_before = std::collections::HashSet::new();
+    let mut initial = BTreeMap::<String, RecordedRemoteEntry>::new();
+    let mut known_entries = BTreeMap::<String, RecordedRemoteEntry>::new();
+    for batch in batches {
+        for entry in &batch.entries {
+            if let Some(previous) = known_entries.insert(entry.id.clone(), entry.clone()) {
+                ensure!(
+                    previous == *entry,
+                    "replay trace reuses an operation ID with different content"
+                );
+            }
+        }
+        let applied_in_batch = batch
+            .applied_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for id in &batch.duplicate_ids {
+            if !applied_before.contains(id) && !applied_in_batch.contains(id) {
+                let entry = known_entries
+                    .get(id)
+                    .with_context(|| format!("duplicate operation {id} missing from trace"))?;
+                initial.entry(id.clone()).or_insert_with(|| entry.clone());
+            }
+        }
+        applied_before.extend(batch.applied_ids.iter().cloned());
+    }
+    let mut entries = initial.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        (&left.origin, left.sequence, &left.id).cmp(&(&right.origin, right.sequence, &right.id))
+    });
+    Ok(entries)
+}
+
+fn distribution(values: &mut [u64]) -> anyhow::Result<Value> {
+    ensure!(
+        !values.is_empty(),
+        "cannot summarize an empty replay distribution"
+    );
+    values.sort_unstable();
+    let percentile = |numerator: usize, denominator: usize| {
+        let rank = values
+            .len()
+            .saturating_mul(numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1);
+        values[rank]
+    };
+    Ok(json!({
+        "count": values.len(),
+        "min": values[0],
+        "median": percentile(1, 2),
+        "p95": percentile(95, 100),
+        "max": values[values.len() - 1],
+    }))
+}
+
+async fn replay_remote_history_worker(
+    index: usize,
+    trace: RecordedRemoteTrace,
+    directory: std::path::PathBuf,
+) -> anyhow::Result<Value> {
+    let store = Arc::new(NxStore::open(&directory)?);
+    let manager = Arc::new(SyncManager::try_new(
+        NodeId::new(format!("remote-replay-{index}")),
+        SyncConfig::new(),
+        store.clone(),
+        metrics(),
+    )?);
+    let batches = trace.batches;
+    let seeds = initial_replay_duplicates(&batches)?;
+    if !seeds.is_empty() {
+        let seed_ops = seeds
+            .iter()
+            .map(RecordedRemoteEntry::sequenced_op)
+            .collect::<Vec<_>>();
+        let applied = crate::sync_manager::apply::apply_sequenced_ops_and_collect(
+            &seed_ops,
+            &remote_apply_context(&manager),
+        )
+        .await?;
+        ensure!(
+            applied.len() == seed_ops.len(),
+            "replay baseline contained duplicate seed operations"
+        );
+    }
+
+    let started = Instant::now();
+    let schedule_start = Instant::now();
+    let mut apply_durations = Vec::with_capacity(batches.len());
+    let mut lateness = Vec::with_capacity(batches.len());
+    let mut live_completion = Vec::with_capacity(batches.len());
+    let mut applied_count = 0usize;
+    let mut duplicate_count = 0usize;
+    let mut observed_applied = std::collections::HashSet::new();
+    for batch in &batches {
+        let deadline = schedule_start + Duration::from_micros(batch.at_us);
+        tokio::time::sleep_until(deadline).await;
+        let ops = batch
+            .entries
+            .iter()
+            .map(RecordedRemoteEntry::sequenced_op)
+            .collect::<Vec<_>>();
+        for (entry, op) in batch.entries.iter().zip(&ops) {
+            ensure!(
+                crate::sync_manager::delivery::entry_bytes(&op.op, &op.position)
+                    == usize::try_from(entry.size).ok(),
+                "replayed operation {} does not preserve its recorded byte size",
+                entry.id
+            );
+        }
+        let apply_started = Instant::now();
+        let applied = crate::sync_manager::apply::apply_sequenced_ops_and_collect(
+            &ops,
+            &remote_apply_context(&manager),
+        )
+        .await?;
+        let elapsed_us = u64::try_from(apply_started.elapsed().as_micros())?;
+        let applied_ids = applied
+            .iter()
+            .map(|entry| entry.op.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let mut remaining_applied = applied_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut actual_applied_ids = Vec::with_capacity(applied_ids.len());
+        let mut actual_duplicate_ids = Vec::with_capacity(ops.len() - applied_ids.len());
+        for entry in &batch.entries {
+            if remaining_applied.remove(&entry.id) {
+                actual_applied_ids.push(entry.id.clone());
+            } else {
+                actual_duplicate_ids.push(entry.id.clone());
+            }
+        }
+        ensure!(
+            actual_applied_ids == batch.applied_ids && actual_duplicate_ids == batch.duplicate_ids,
+            "replay changed applied/duplicate classification for worker {index}"
+        );
+        observed_applied.extend(actual_applied_ids.iter().cloned());
+        applied_count = applied_count
+            .checked_add(actual_applied_ids.len())
+            .context("replay applied operation count overflow")?;
+        duplicate_count = duplicate_count
+            .checked_add(actual_duplicate_ids.len())
+            .context("replay duplicate operation count overflow")?;
+        apply_durations.push(elapsed_us);
+        lateness.push(u64::try_from(
+            Instant::now()
+                .saturating_duration_since(deadline)
+                .as_micros(),
+        )?);
+        live_completion.push(batch.live_completion_us);
+    }
+    let elapsed_us = u64::try_from(started.elapsed().as_micros())?;
+    let expected_value = u64::try_from(seeds.len() + observed_applied.len())?;
+    ensure!(
+        manager.get_counter_value(KEY).await == expected_value,
+        "remote replay in-memory counter mismatch for worker {index}"
+    );
+    drop(manager);
+    drop(store);
+
+    let reopened_store = Arc::new(NxStore::open(&directory)?);
+    let reopened = SyncManager::try_new(
+        NodeId::new(format!("remote-replay-{index}")),
+        SyncConfig::new(),
+        reopened_store,
+        metrics(),
+    )?;
+    ensure!(
+        reopened.get_counter_value(KEY).await == expected_value,
+        "remote replay durable counter mismatch for worker {index}"
+    );
+    Ok(json!({
+        "index": index,
+        "batches": batches.len(),
+        "input_operations": applied_count + duplicate_count,
+        "applied_operations": applied_count,
+        "duplicate_operations": duplicate_count,
+        "initial_duplicate_seeds": seeds.len(),
+        "source_window_complete": trace.source_window_complete,
+        "source_window_start_us": trace.source_window_start_us,
+        "dropped_batches": trace.dropped_batches,
+        "dropped_operations": trace.dropped_operations,
+        "counter_after_reopen": expected_value,
+        "elapsed_us": elapsed_us,
+        "batch_apply_us": apply_durations,
+        "batch_lateness_us": lateness,
+        "live_batch_to_apply_completion_us": live_completion,
+    }))
+}
+
+pub(super) async fn replay_remote_history_trace(
+    trace_path: &std::path::Path,
+    result_path: &std::path::Path,
+) -> anyhow::Result<Value> {
+    let trace_bytes = std::fs::read(trace_path)
+        .with_context(|| format!("cannot read replay trace {}", trace_path.display()))?;
+    let source_trace: Value = serde_json::from_slice(&trace_bytes)?;
+    ensure!(
+        source_trace["version"] == 1,
+        "unsupported remote replay trace"
+    );
+    let workers = source_trace["workers"]
+        .as_array()
+        .context("remote replay trace workers missing")?;
+    ensure!(
+        !workers.is_empty() && workers.len() <= 100,
+        "remote replay worker count outside supported bounds"
+    );
+    let directory = tempfile::tempdir()?;
+    let started = StdInstant::now();
+    let mut tasks = JoinSet::new();
+    let mut seen_indices = std::collections::HashSet::new();
+    let mut total_batches = 0usize;
+    let mut total_operations = 0usize;
+    let mut total_dropped_batches = 0u64;
+    let mut total_dropped_operations = 0u64;
+    let mut all_windows_complete = true;
+    let mut live_batch_to_apply = Vec::new();
+    for worker in workers {
+        let index = usize::try_from(number(worker, "index")?)?;
+        ensure!(
+            seen_indices.insert(index),
+            "duplicate remote replay worker index"
+        );
+        let trace = parse_remote_replay_batches(&worker["trace"])?;
+        ensure!(
+            trace.batches.len() <= 512
+                && trace
+                    .batches
+                    .iter()
+                    .map(|batch| batch.entries.len())
+                    .sum::<usize>()
+                    <= 4096,
+            "remote replay trace exceeds per-worker bounds"
+        );
+        for batch in &trace.batches {
+            live_batch_to_apply.push(batch.live_completion_us);
+            total_operations = total_operations
+                .checked_add(batch.entries.len())
+                .context("remote replay total operation count overflow")?;
+        }
+        total_batches = total_batches
+            .checked_add(trace.batches.len())
+            .context("remote replay total batch count overflow")?;
+        total_dropped_batches = total_dropped_batches
+            .checked_add(trace.dropped_batches)
+            .context("remote replay dropped batch count overflow")?;
+        total_dropped_operations = total_dropped_operations
+            .checked_add(trace.dropped_operations)
+            .context("remote replay dropped operation count overflow")?;
+        all_windows_complete &= trace.source_window_complete;
+        let worker_directory = directory.path().join(format!("worker-{index}"));
+        std::fs::create_dir(&worker_directory)?;
+        tasks.spawn(replay_remote_history_worker(index, trace, worker_directory));
+    }
+    ensure!(
+        total_operations > 0,
+        "remote replay trace has no operations"
+    );
+    let mut worker_results = Vec::with_capacity(workers.len());
+    while let Some(result) = tasks.join_next().await {
+        worker_results.push(result??);
+    }
+    worker_results.sort_by_key(|worker| worker["index"].as_u64().unwrap_or(u64::MAX));
+    let mut replay_batch_apply = worker_results
+        .iter()
+        .flat_map(|worker| worker["batch_apply_us"].as_array().into_iter().flatten())
+        .map(|value| value.as_u64().context("invalid replay apply duration"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut replay_batch_lateness = worker_results
+        .iter()
+        .flat_map(|worker| worker["batch_lateness_us"].as_array().into_iter().flatten())
+        .map(|value| value.as_u64().context("invalid replay lateness"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let report = json!({
+        "version": 1,
+        "experiment": "captured remote GCounter apply batches replayed through the real persistence path without networking",
+        "source_trace_blake3": blake3::hash(&trace_bytes).to_hex().to_string(),
+        "workers": worker_results,
+        "worker_count": workers.len(),
+        "batch_count": total_batches,
+        "operation_count": total_operations,
+        "source_windows_complete": all_windows_complete,
+        "dropped_batch_count": total_dropped_batches,
+        "dropped_operation_count": total_dropped_operations,
+        "replay_elapsed_us": u64::try_from(started.elapsed().as_micros())?,
+        "live_batch_to_apply_completion_us": distribution(&mut live_batch_to_apply)?,
+        "replay_batch_apply_us": distribution(&mut replay_batch_apply)?,
+        "replay_batch_lateness_us": distribution(&mut replay_batch_lateness)?,
+        "interpretation": "reuses captured operation IDs, origins, positions, payload kind, per-entry byte sizes, duplicate classification, and batch offsets; excludes TCP, detector probes, connection queues, and event arrival before batch collection; each worker is a concurrent store in this process",
+    });
+    let bytes = serde_json::to_vec(&report)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(result_path)
+        .with_context(|| format!("cannot create replay report {}", result_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("cannot write replay report {}", result_path.display()))?;
+    Ok(report)
+}
+
+#[tokio::test]
+async fn captured_remote_history_replay_preserves_duplicates_and_durability() -> anyhow::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let trace_path = directory.path().join("trace.json");
+    let result_path = directory.path().join("result.json");
+    let entry = |id: &str, origin: &str, sequence| {
+        let recorded = RecordedRemoteEntry {
+            id: id.into(),
+            origin: origin.into(),
+            generation: 1,
+            sequence,
+            size: 0,
+        };
+        let op = recorded.sequenced_op();
+        json!({
+            "id": recorded.id,
+            "origin": recorded.origin,
+            "generation": recorded.generation,
+            "sequence": recorded.sequence,
+            "size": crate::sync_manager::delivery::entry_bytes(&op.op, &op.position).unwrap(),
+            "expected_workload": true,
+        })
+    };
+    let old = entry("old-op", "origin-1", 1);
+    let new = entry("new-op", "origin-1", 2);
+    let trace = json!({
+        "version": 1,
+        "workers": [{
+            "index": 0,
+            "trace": {
+                "version": 1,
+                "complete": true,
+                "window_complete": true,
+                "dropped_batch_count": 0,
+                "dropped_operation_count": 0,
+                "operation_count": 3,
+                "batch_count": 2,
+                "batches": [
+                    {
+                        "at_us": 0,
+                        "applied_at_us": 10,
+                        "operations": 1,
+                        "entries": [old],
+                        "applied_ops": 0,
+                        "duplicate_ops": 1,
+                        "applied_ids": [],
+                        "duplicate_ids": ["old-op"],
+                        "success": true,
+                    },
+                    {
+                        "at_us": 100,
+                        "applied_at_us": 120,
+                        "operations": 2,
+                        "entries": [old, new],
+                        "applied_ops": 1,
+                        "duplicate_ops": 1,
+                        "applied_ids": ["new-op"],
+                        "duplicate_ids": ["old-op"],
+                        "success": true,
+                    },
+                ],
+            },
+        }],
+    });
+    std::fs::write(&trace_path, serde_json::to_vec(&trace)?)?;
+
+    let report = replay_remote_history_trace(&trace_path, &result_path).await?;
+
+    assert_eq!(report["worker_count"], 1);
+    assert_eq!(report["batch_count"], 2);
+    assert_eq!(report["operation_count"], 3);
+    assert_eq!(report["workers"][0]["initial_duplicate_seeds"], 1);
+    assert_eq!(report["workers"][0]["applied_operations"], 1);
+    assert_eq!(report["workers"][0]["duplicate_operations"], 2);
+    assert_eq!(report["workers"][0]["counter_after_reopen"], 2);
+    assert!(result_path.is_file());
+    Ok(())
 }
 
 fn remote_history_context(store: Arc<NxStore>) -> NodeEventContext {
@@ -2047,6 +2629,9 @@ async fn worker_run() -> anyhow::Result<()> {
                             tokio::time::sleep(Duration::from_millis(wait)).await;
                             before = observe(std::slice::from_ref(&node))?.0;
                             work_before = diagnostics::Baseline::new(&node, &diagnostics)?;
+                            if config["critical_path"] == true {
+                                diagnostics.begin_remote_replay_capture()?;
+                            }
                             if config["pause_first_nominal_flush"] == true {
                                 let (reached, ready) = std::sync::mpsc::channel();
                                 let (resume, continue_flush) = std::sync::mpsc::channel();
@@ -2141,6 +2726,11 @@ async fn worker_run() -> anyhow::Result<()> {
                                 .context("critical snapshot requested for an inactive recorder")?;
                             emit(json!({"phase": "critical-snapshot",
                                 "request_id": number(&command, "request_id")?, "snapshot": snapshot}));
+                        }
+                        "remote-replay-snapshot" => {
+                            let trace = diagnostics.remote_replay_snapshot()?;
+                            emit(json!({"phase": "remote-replay-snapshot",
+                                "request_id": number(&command, "request_id")?, "trace": trace}));
                         }
                         "stop" => break,
                         other => anyhow::bail!("unknown worker command {other}"),
@@ -2837,6 +3427,45 @@ impl Processes {
                     ensure!(
                         snapshots.insert(index, value["snapshot"].clone()).is_none(),
                         "duplicate critical snapshot response"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    async fn remote_replay_snapshots(
+        &mut self,
+        request_id: u64,
+        snapshots: &mut BTreeMap<usize, Value>,
+    ) -> anyhow::Result<()> {
+        let targets = (0..self.children.len()).collect::<Vec<_>>();
+        for &index in &targets {
+            self.command(
+                index,
+                &json!({"command": "remote-replay-snapshot", "request_id": request_id}),
+            )?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while snapshots.len() != targets.len() {
+            ensure!(
+                Instant::now() < deadline,
+                "remote replay snapshot response timeout"
+            );
+            while let Some((index, value)) = self.receive()? {
+                if value["phase"] == "remote-replay-snapshot" {
+                    ensure!(
+                        targets.contains(&index) && value["request_id"] == request_id,
+                        "unexpected remote replay snapshot response"
+                    );
+                    ensure!(
+                        value["trace"].is_object(),
+                        "remote replay snapshot response missing body"
+                    );
+                    ensure!(
+                        snapshots.insert(index, value["trace"].clone()).is_none(),
+                        "duplicate remote replay snapshot response"
                     );
                 }
             }
