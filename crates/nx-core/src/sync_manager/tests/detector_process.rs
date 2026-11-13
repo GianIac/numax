@@ -1996,7 +1996,7 @@ pub(super) fn number(value: &Value, key: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("missing worker field {key}"))
 }
 
-fn emit(value: Value) {
+pub(super) fn emit(value: Value) {
     let line = format!("{PREFIX}{value}");
     assert!(
         line.len().saturating_add(1) <= MAX_WORKER_OUTPUT_LINE_BYTES,
@@ -2543,6 +2543,10 @@ async fn worker_run() -> anyhow::Result<()> {
         )
         .await;
     }
+    #[cfg(target_os = "linux")]
+    if config["packet_loss"] == true {
+        return super::packet_loss::worker(&config, store).await;
+    }
     let critical = config["critical_path"]
         .as_bool()
         .context("critical path control missing")?;
@@ -2813,7 +2817,10 @@ async fn worker_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn finish_shutdown(node: &mut SyncManager, deadline: Instant) -> anyhow::Result<u64> {
+pub(super) async fn finish_shutdown(
+    node: &mut SyncManager,
+    deadline: Instant,
+) -> anyhow::Result<u64> {
     tokio::time::timeout_at(deadline, async {
         let mut pending_calls = 0u64;
         loop {
@@ -2905,7 +2912,7 @@ async fn pending_shutdown_retains_services_and_propagates_durable_outcome() {
     }
 }
 
-fn command_input() -> (
+pub(super) fn command_input() -> (
     tokio::sync::mpsc::Receiver<anyhow::Result<Value>>,
     std::thread::JoinHandle<()>,
 ) {
@@ -3037,7 +3044,7 @@ impl Drop for Process {
     }
 }
 
-struct Processes {
+pub(super) struct Processes {
     children: Vec<Process>,
     readers: Vec<std::thread::JoinHandle<()>>,
     events: Receiver<Event>,
@@ -3244,6 +3251,29 @@ impl Processes {
         controlled_pause: bool,
         critical_path: bool,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_packet_options(
+            count,
+            storage,
+            trace_directory,
+            controlled_pause,
+            critical_path,
+            None,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn spawn_packet_loss(count: usize, options: &Value) -> anyhow::Result<Self> {
+        Self::spawn_with_packet_options(count, None, None, false, false, Some(options))
+    }
+
+    fn spawn_with_packet_options(
+        count: usize,
+        storage: Option<StorageWorkload>,
+        trace_directory: Option<std::path::PathBuf>,
+        controlled_pause: bool,
+        critical_path: bool,
+        packet: Option<&Value>,
+    ) -> anyhow::Result<Self> {
         ensure!(
             !critical_path || (storage.is_none() && trace_directory.is_none()),
             "critical path is restricted to a network diagnostic without file timeline"
@@ -3264,7 +3294,16 @@ impl Processes {
             eprintln!("DETECTOR_TIMELINE_DIR {}", path.display());
         }
         let directory = tempfile::tempdir()?;
-        let addresses = (0..count).map(|_| free_addr()).collect::<Vec<_>>();
+        let addresses = if let Some(packet) = packet {
+            let addresses: Vec<String> = serde_json::from_value(packet["addresses"].clone())?;
+            ensure!(
+                addresses.len() == count,
+                "packet worker address count mismatch"
+            );
+            addresses
+        } else {
+            (0..count).map(|_| free_addr()).collect::<Vec<_>>()
+        };
         let (sender, events) = std::sync::mpsc::sync_channel(512);
         let mut group = Self {
             children: Vec::new(),
@@ -3283,6 +3322,7 @@ impl Processes {
                 .path()
                 .join(format!("worker-{index}.stderr"));
             let config = json!({"index": index, "addresses": addresses, "storage_only": storage.is_some(),
+                "packet_loss": packet.is_some(), "codec": packet.map(|options| options["codec"].clone()),
                 "critical_path": critical_path,
                 "pause_first_nominal_flush": controlled_pause && index == 0,
                 "storage_metadata": matches!(storage, Some(StorageWorkload::Metadata | StorageWorkload::MetadataBatched)),
@@ -3293,7 +3333,21 @@ impl Processes {
                 "trace_path": trace_directory.as_ref().map(|path| path.join(format!("worker-{index}.json")))
                     .or_else(|| remote_history
                         .then(|| group._directory.path().join(format!("worker-{index}.json"))))});
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = if let Some(packet) = packet {
+                let paths: Vec<String> = serde_json::from_value(packet["namespaces"].clone())?;
+                ensure!(
+                    paths.len() == 2 && count.is_multiple_of(2),
+                    "invalid packet worker groups"
+                );
+                let mut command = Command::new("nsenter");
+                command
+                    .arg(format!("--net={}", paths[index / (count / 2)]))
+                    .arg("--")
+                    .arg(std::env::current_exe()?);
+                command
+            } else {
+                Command::new(std::env::current_exe()?)
+            };
             command
                 .args(["--exact", WORKER, "--ignored", "--nocapture"])
                 .env(CONFIG, config.to_string())
@@ -3380,7 +3434,7 @@ impl Processes {
         Ok(())
     }
 
-    fn broadcast(&mut self, value: &Value, except: Option<usize>) -> anyhow::Result<()> {
+    pub(super) fn broadcast(&mut self, value: &Value, except: Option<usize>) -> anyhow::Result<()> {
         for index in 0..self.children.len() {
             if Some(index) != except {
                 self.command(index, value)?;
@@ -3510,7 +3564,7 @@ impl Processes {
         }
     }
 
-    async fn phase(
+    pub(super) async fn phase(
         &mut self,
         phase: &str,
         except: Option<usize>,
@@ -3546,7 +3600,7 @@ impl Processes {
             .collect()
     }
 
-    async fn stop(&mut self, killed: Option<usize>) -> anyhow::Result<()> {
+    pub(super) async fn stop(&mut self, killed: Option<usize>) -> anyhow::Result<()> {
         let killed_pid = killed.map(|index| self.children[index].child.id());
         for index in 0..self.children.len() {
             if Some(index) != killed

@@ -12,6 +12,9 @@ const CONVERGENCE_LIMIT: Duration = Duration::from_secs(30);
 const MARKER: &str = "NUMAX_DETECTOR_SOAK_CHILD";
 #[path = "detector_diagnostics.rs"]
 mod diagnostics;
+#[cfg(target_os = "linux")]
+#[path = "packet_loss.rs"]
+mod packet_loss;
 #[path = "detector_process.rs"]
 mod process;
 
