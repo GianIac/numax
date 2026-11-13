@@ -247,7 +247,7 @@ continues replication across the version boundary.
 Historical fixtures are immutable release-generated records. Their original
 encoders, source tags and payload bytes are preserved; migration does not
 regenerate them using the current format. Reproduction procedures are in the
-[contributor validation notes](https://github.com/GianIac/numax/blob/v0.1.6/docs/development/peer-discovery-validation.md#storage-compatibility-verification).
+[storage and wire compatibility test guide](https://github.com/GianIac/numax/blob/v0.1.6/crates/nx-core/src/sync_manager/tests/README.md#storage-and-wire-compatibility).
 
 ## Startup validation
 

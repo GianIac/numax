@@ -476,4 +476,4 @@ See [Wire Versioning](/numax/design/wire-versioning/) for deployment rules.
 Release-wide loss/partition, rolling-restart and sustained detector criteria
 remain in the [roadmap](/numax/roadmap/). They are separate from these runtime
 contracts. Test procedures and recorded experiments are maintained in the
-[contributor validation notes](https://github.com/GianIac/numax/blob/v0.1.6/docs/development/peer-discovery-validation.md).
+[sync manager test guide](https://github.com/GianIac/numax/blob/v0.1.6/crates/nx-core/src/sync_manager/tests/README.md).

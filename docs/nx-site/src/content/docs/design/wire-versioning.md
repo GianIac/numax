@@ -218,7 +218,7 @@ compatibility references. They describe their encoded layouts and do not grant
 mixed-version admission.
 
 Compatibility checks use frozen codec/store fixtures and a pinned v0.1.5 binary.
-The [validation notes](https://github.com/GianIac/numax/blob/v0.1.6/docs/development/peer-discovery-validation.md#storage-compatibility-verification)
+The [storage and wire compatibility test guide](https://github.com/GianIac/numax/blob/v0.1.6/crates/nx-core/src/sync_manager/tests/README.md#storage-and-wire-compatibility)
 contain reproduction procedures and prerequisites.
 
 Exact matching interrupts replication between old and upgraded nodes during
