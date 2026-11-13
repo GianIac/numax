@@ -62,7 +62,11 @@ if [[ "${1:-}" == "--groups" ]]; then
     exit
   fi
   test_suffix=groups_smoke
-  if [[ "$profile" == cluster ]]; then test_suffix=partition_50_nodes; fi
+  case "$profile" in
+    cluster) test_suffix=partition_50_nodes ;;
+    cluster-load-smoke) test_suffix=groups_load_smoke ;;
+    cluster-load) test_suffix=partition_50_nodes_with_load ;;
+  esac
   test_name="sync_manager::manager::tests::detector_soak::packet_loss::$test_suffix"
   export NUMAX_PACKET_LOSS_GROUPS
   NUMAX_PACKET_LOSS_GROUPS="$(jq -c . "$directory/groups.json")"
@@ -172,12 +176,13 @@ if [[ "${1:-}" == "--namespace" ]]; then
 fi
 
 profile=two-nodes
-if [[ "${1:-}" == --cluster-smoke || "${1:-}" == --cluster ]]; then
+if [[ "${1:-}" == --cluster-smoke || "${1:-}" == --cluster \
+  || "${1:-}" == --cluster-load-smoke || "${1:-}" == --cluster-load ]]; then
   profile="${1#--}"
   shift
 fi
 if [[ "$#" != 1 ]]; then
-  echo "usage: bash scripts/check-real-packet-loss.sh [--cluster-smoke|--cluster] NEW_ARTIFACT_DIRECTORY" >&2
+  echo "usage: bash scripts/check-real-packet-loss.sh [--cluster-smoke|--cluster|--cluster-load-smoke|--cluster-load] NEW_ARTIFACT_DIRECTORY" >&2
   exit 2
 fi
 for tool in cargo ip tc unshare jq nstat timeout readlink tar sha256sum; do

@@ -4,6 +4,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GROUP_CONFIG: &str = "NUMAX_PACKET_LOSS_GROUPS";
+const LOAD_ROUNDS: usize = 3;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "four real workers writing during recovery; packet-loss runner required"]
+async fn groups_load_smoke() {
+    let name = "sync_manager::manager::tests::detector_soak::packet_loss::groups_load_smoke";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    scenario_with_load(4, Duration::from_secs(3), Some(Duration::from_secs(1)))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "50 real workers writing for 30 seconds during recovery; packet-loss runner required"]
+async fn partition_50_nodes_with_load() {
+    let name =
+        "sync_manager::manager::tests::detector_soak::packet_loss::partition_50_nodes_with_load";
+    if child(name, Duration::from_secs(900)) {
+        return;
+    }
+    scenario_with_load(50, Duration::from_secs(60), Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "four real workers in private namespaces; packet-loss runner required"]
@@ -93,6 +119,14 @@ fn snapshot(paths: &[String], directory: &Path, phase: &str) -> anyhow::Result<(
 }
 
 async fn scenario(count: usize, partition_duration: Duration) -> anyhow::Result<()> {
+    scenario_with_load(count, partition_duration, None).await
+}
+
+async fn scenario_with_load(
+    count: usize,
+    partition_duration: Duration,
+    load_period: Option<Duration>,
+) -> anyhow::Result<()> {
     let mut config: Value = serde_json::from_str(
         &std::env::var(GROUP_CONFIG).context("packet-loss runner configuration required")?,
     )?;
@@ -146,18 +180,53 @@ async fn scenario(count: usize, partition_duration: Duration) -> anyhow::Result<
         let recovery = StdInstant::now();
         set_loss(&paths, loss)?;
         snapshot(&paths, &directory, "after-rejoin")?;
+        let mut backlog_elapsed_ms = None;
+        let mut accepted_at_backlog_samples = 0u64;
+        let mut load_reports = Vec::new();
+        let mut final_recovery = None;
+        if let Some(period) = load_period {
+            processes.broadcast(&json!({"command": "load", "period_ms": period.as_millis()}), None)?;
+            processes.phase("load-started", None, Duration::from_secs(10)).await?;
+            processes.broadcast(&json!({"command": "backlog"}), None)?;
+            let backlog = processes.phase("backlog-recovered", None, CONVERGENCE_LIMIT).await?;
+            ensure!(recovery.elapsed() < CONVERGENCE_LIMIT, "initial backlog recovery exceeded 30 seconds from rejoin");
+            ensure!(backlog.iter().all(|row| row["writer_active"] == true), "initial backlog was not verified while writers were active");
+            for row in &backlog {
+                accepted_at_backlog_samples += row["load_accepted"].as_u64().context("backlog load count missing")?;
+            }
+            ensure!(accepted_at_backlog_samples > 0, "no new flush-confirmed writes overlapped backlog observation");
+            backlog_elapsed_ms = Some(recovery.elapsed().as_millis());
+            snapshot(&paths, &directory, "after-backlog")?;
+            processes.broadcast(&json!({"command": "finish-load"}), None)?;
+            load_reports = processes.phase("loaded", None, period * LOAD_ROUNDS as u32 + CONVERGENCE_LIMIT).await?;
+            final_recovery = Some(StdInstant::now());
+            ensure!(load_reports.iter().all(|row| row["accepted"] == LOAD_ROUNDS * 12), "incomplete recovery-load workload");
+            snapshot(&paths, &directory, "after-load")?;
+        }
         processes.broadcast(&json!({"command": "verify"}), None)?;
         let converged = processes.phase("converged", None, CONVERGENCE_LIMIT).await?;
-        ensure!(converged.iter().all(|row| row["states"] == converged[0]["states"]), "durable six-family states diverged");
-        let recovery_elapsed = recovery.elapsed();
-        ensure!(recovery_elapsed < CONVERGENCE_LIMIT, "recovery exceeded 30 seconds from rejoin");
+        let state_field = if load_period.is_some() { "state_digest" } else { "states" };
+        ensure!(converged.iter().all(|row| if load_period.is_some() { row[state_field].is_string() } else { row[state_field].is_array() }), "durable verification evidence missing");
+        ensure!(converged.iter().all(|row| row[state_field] == converged[0][state_field]), "durable six-family states diverged");
+        let recovery_elapsed = final_recovery.as_ref().unwrap_or(&recovery).elapsed();
+        ensure!(recovery_elapsed < CONVERGENCE_LIMIT, "recovery exceeded its 30-second verification limit");
         snapshot(&paths, &directory, "after-recovery")?;
+        let rounds = if load_period.is_some() { 1 + LOAD_ROUNDS } else { 1 };
         let report = json!({"version": 1, "nodes": count, "groups": [count / 2, count / 2],
-            "codec": config["codec"], "accepted_operations": count * 12, "families": 6,
+            "codec": config["codec"], "accepted_operations": count * 12 * rounds, "families": 6,
+            "initial_operations": count * 12, "load_operations": count * 12 * (rounds - 1),
             "partition_duration_ms": actual_partition_ms,
             "recovery_elapsed_ms": recovery_elapsed.as_millis(), "recovery_limit_s": 30,
+            "recovery_clock": if load_period.is_some() { "final verification after writer completion" } else { "first rejoin command" },
+            "backlog_recovery_elapsed_ms": backlog_elapsed_ms, "backlog_recovery_limit_s": 30,
+            "load_period_ms": load_period.map(|period| period.as_millis()),
+            "load_window_ms": load_period.map(|period| (period * LOAD_ROUNDS as u32).as_millis()),
+            "load_target_operations_per_second": load_period.map(|period| count as f64 * 12.0 / period.as_secs_f64()),
+            "durable_state_digest": converged[0]["state_digest"],
+            "accepted_at_backlog_samples": accepted_at_backlog_samples,
+            "load_reports": load_reports,
             "loss_percent": loss, "probe_seed": 5644502651023458305u64, "packet_loss_seed": null,
-            "writes_after_rejoin": false, "verified": ["in_memory", "materialized", "durable_state", "contiguous_receipts"],
+            "writes_after_rejoin": load_period.is_some(), "verified": ["in_memory", "materialized", "durable_state", "contiguous_receipts"],
             "worker_receipts": converged.iter().map(|row| row["receipt_summary"].clone()).collect::<Vec<_>>(), "passed": true});
         std::fs::write(directory.join("cluster-report.json"), serde_json::to_vec_pretty(&report)?)?;
         println!("PACKET_LOSS_CLUSTER_REPORT {report}");
@@ -194,6 +263,9 @@ pub(super) async fn worker(config: &Value, store: Arc<NxStore>) -> anyhow::Resul
     )?;
     node.start().await?;
     let (mut commands, input) = process::command_input();
+    let mut writer = None;
+    let load_accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut workload_rounds = 1usize;
     let result = async {
         let mut view = node.membership.as_ref().context("membership missing")?.snapshot.clone();
         let snapshot = view.wait_for(|snapshot| snapshot.records.iter().any(|record| record.member == node.node_id.as_str())).await?;
@@ -232,36 +304,79 @@ pub(super) async fn worker(config: &Value, store: Arc<NxStore>) -> anyhow::Resul
                     local_six_family_workload(&node.handle(), index as u64).await;
                     process::emit(json!({"phase": "written", "accepted": 12}));
                 }
+                Some("load") => {
+                    ensure!(writer.is_none() && workload_rounds == 1, "writer already started");
+                    let period = Duration::from_millis(command["period_ms"].as_u64().context("load period missing")?);
+                    ensure!(period == Duration::from_secs(1) || period == Duration::from_secs(10), "unsupported load period");
+                    writer = Some(tokio::spawn(write_during_recovery(node.handle(), index, count, period, load_accepted.clone())));
+                    process::emit(json!({"phase": "load-started"}));
+                }
+                Some("backlog") => {
+                    let started = StdInstant::now();
+                    let mut poll = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        let task = writer.as_ref().context("backlog observation requires active writer")?;
+                        if task.is_finished() {
+                            let completed = writer.take().context("writer missing")?.await.context("recovery writer failed")?;
+                            anyhow::bail!("writer ended before backlog recovery: {completed:?}");
+                        }
+                        let progress = node.handle().replication_progress()?;
+                        if progress.len() == count && progress.iter().all(|entry| {
+                            (0..count).any(|origin| entry.origin.as_str() == format!("detector-{origin}"))
+                                && entry.contiguous_sequence >= 12 && !entry.source_unavailable
+                                && !entry.baseline_missing && !entry.baseline_unconfirmed && entry.recovery_failure.is_none()
+                        }) {
+                            ensure!(started.elapsed() < CONVERGENCE_LIMIT, "initial backlog verification exceeded limit");
+                            process::emit(json!({"phase": "backlog-recovered", "writer_active": true,
+                                "load_accepted": load_accepted.load(std::sync::atomic::Ordering::Relaxed)}));
+                            break;
+                        }
+                        ensure!(started.elapsed() < CONVERGENCE_LIMIT, "worker {index} initial backlog recovery timed out: {progress:?}");
+                        poll.tick().await;
+                    }
+                }
+                Some("finish-load") => {
+                    let report = writer.take().context("writer missing")?.await.context("recovery writer failed")??;
+                    workload_rounds += LOAD_ROUNDS;
+                    process::emit(report);
+                }
                 Some("verify") => {
+                    ensure!(writer.is_none(), "final verification requires stopped writer");
                     let started = StdInstant::now();
                     let mut poll = tokio::time::interval(Duration::from_millis(50));
                     loop {
                         let progress = node.handle().replication_progress()?;
                         let covered = progress.len() == count && progress.iter().all(|entry| {
                             (0..count).any(|origin| entry.origin.as_str() == format!("detector-{origin}"))
-                                && entry.contiguous_sequence == 12 && entry.known_high_sequence == 12
+                                && entry.contiguous_sequence == (workload_rounds * 12) as u64 && entry.known_high_sequence == (workload_rounds * 12) as u64
                                 && entry.sparse_positions == 0 && !entry.source_unavailable
                                 && !entry.baseline_missing && !entry.baseline_unconfirmed && entry.recovery_failure.is_none()
                         });
-                        let expected = count as u64;
-                        let expected_pncounter = i64::try_from(count)? * 5;
+                        let expected = (count * workload_rounds) as u64;
+                        let expected_pncounter = i64::try_from(count * workload_rounds)? * 5;
                         if covered && node.get_counter_value("det-g").await == expected * 7
                             && node.get_pncounter_value("det-p").await == expected_pncounter
                             && node.get_lww_register_value("det-r").await == Some(b"winner".to_vec())
                             && node.get_lww_map_entries("det-m").await.is_empty()
                             && node.get_orset_elements("det-o").await == vec!["present"]
-                            && node.get_rga_values("det-a").await == vec![b"present".to_vec(); count] {
+                            && node.get_rga_values("det-a").await == vec![b"present".to_vec(); count * workload_rounds] {
                             ensure!(read_materialized(&node.store, "det-g") == expected * 7
                                 && read_materialized_pncounter(&node.store, "det-p") == expected_pncounter
                                 && read_materialized_lww_register(&node.store, "det-r") == b"winner"
                                 && read_materialized_lww_map(&node.store, "det-m").is_empty()
                                 && read_materialized_orset(&node.store, "det-o") == vec!["present"]
-                                && read_materialized_rga(&node.store, "det-a") == vec![b"present".to_vec(); count], "materialized state mismatch");
+                                && read_materialized_rga(&node.store, "det-a") == vec![b"present".to_vec(); count * workload_rounds], "materialized state mismatch");
                             let states = six_family_states(&node.store);
                             ensure!(started.elapsed() < CONVERGENCE_LIMIT, "durable verification exceeded recovery limit");
-                            process::emit(json!({"phase": "converged", "states": states,
-                                "receipt_summary": {"node": index, "origins": count, "sequence_per_origin": 12, "sparse_positions": 0},
-                                "elapsed_ms": started.elapsed().as_millis()}));
+                            let mut report = json!({"phase": "converged",
+                                "receipt_summary": {"node": index, "origins": count, "sequence_per_origin": workload_rounds * 12, "sparse_positions": 0},
+                                "elapsed_ms": started.elapsed().as_millis()});
+                            if workload_rounds == 1 {
+                                report["states"] = json!(states);
+                            } else {
+                                report["state_digest"] = json!(blake3::hash(&serde_json::to_vec(&states)?).to_hex().to_string());
+                            }
+                            process::emit(report);
                             break;
                         }
                         ensure!(started.elapsed() < CONVERGENCE_LIMIT, "worker {index} recovery timed out: {progress:?}");
@@ -274,6 +389,10 @@ pub(super) async fn worker(config: &Value, store: Arc<NxStore>) -> anyhow::Resul
         }
         anyhow::Ok(())
     }.await;
+    if let Some(task) = writer.take() {
+        task.abort();
+        let _ = task.await;
+    }
     let shutdown =
         process::finish_shutdown(&mut node, Instant::now() + Duration::from_secs(120)).await;
     if let Ok(pending_calls) = shutdown {
@@ -289,4 +408,50 @@ pub(super) async fn worker(config: &Value, store: Arc<NxStore>) -> anyhow::Resul
         "packet worker={result:?}; shutdown={shutdown:?}"
     );
     Ok(())
+}
+
+async fn write_during_recovery(
+    handle: SyncHandle,
+    index: usize,
+    count: usize,
+    period: Duration,
+    accepted: Arc<std::sync::atomic::AtomicU64>,
+) -> anyhow::Result<Value> {
+    let started = Instant::now();
+    let wall = StdInstant::now();
+    let window = period * LOAD_ROUNDS as u32;
+    let offset = period.mul_f64(index as f64 / count as f64);
+    let mut maximum_lateness_us = 0u128;
+    let mut maximum_batch_us = 0u128;
+    for round in 0..LOAD_ROUNDS {
+        let scheduled = started + offset + period * round as u32;
+        tokio::time::sleep_until(scheduled).await;
+        let lateness = Instant::now().saturating_duration_since(scheduled);
+        ensure!(
+            lateness < period,
+            "worker {index} missed load generation period"
+        );
+        maximum_lateness_us = maximum_lateness_us.max(lateness.as_micros());
+        let batch = StdInstant::now();
+        tokio::time::timeout(
+            period,
+            local_six_family_workload(&handle, (index + count * (round + 1)) as u64),
+        )
+        .await
+        .context("recovery writer batch exceeded one period")?;
+        accepted.fetch_add(12, std::sync::atomic::Ordering::Relaxed);
+        maximum_batch_us = maximum_batch_us.max(batch.elapsed().as_micros());
+        ensure!(
+            Instant::now() <= started + window,
+            "worker {index} load confirmation exceeded active window"
+        );
+    }
+    tokio::time::sleep_until(started + window).await;
+    ensure!(wall.elapsed() >= window, "writer window ended early");
+    Ok(
+        json!({"phase": "loaded", "node": index, "offered": LOAD_ROUNDS * 12,
+        "accepted": accepted.load(std::sync::atomic::Ordering::Relaxed),
+        "window_elapsed_ms": wall.elapsed().as_millis(), "maximum_lateness_us": maximum_lateness_us,
+        "maximum_batch_us": maximum_batch_us, "pending_batch_limit": 1}),
+    )
 }
