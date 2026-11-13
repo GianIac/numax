@@ -365,6 +365,11 @@ time = true
 **Storage**:
 - [ ] `KvBackend` abstraction to decouple from sled (preparation for a possible switch to redb/fjall)
 
+**Scalability and performance**:
+- [ ] Diagnose the stalls and performance limits encountered in earlier 100-node experiments, including macOS preflights; distinguish storage, replicated application, networking and scheduling bottlenecks
+- [ ] Implement measured bottleneck fixes while preserving flush-confirmed acceptance, recovery guarantees, bounded queues and detector behavior; a storage-backend change is not an assumed solution
+- [ ] Repeat 100-node preflight and nominal one-hour scenarios on Linux and macOS with declared workloads and comparable baselines, tracking throughput, latency, resource use and false failure declarations
+
 **Closing criterion**:
 > A cluster operating for 7 days with active compaction keeps the op-log within a configured budget. Restore from snapshot in < 60s for a 10GB datastore.
 

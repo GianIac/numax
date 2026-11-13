@@ -51,8 +51,9 @@ actor over real loopback TCP on macOS and Linux. Long-running scenarios are
 ignored by default and require permission to spawn workers and open sockets.
 
 Earlier 100-node experiments, including macOS preflights, did not meet the
-expected performance goals. Performance and scalability at that size remain
-areas for future optimization, not capabilities established by the 50-node workflow below.
+expected performance goals. Performance and scalability work is tracked under
+v0.1.11 in the [roadmap](../../../../../docs/nx-site/src/content/docs/roadmap/index.md).
+The 50-node workflow below does not establish 100-node capacity.
 
 Run the preflight before the full-hour scenario:
 
