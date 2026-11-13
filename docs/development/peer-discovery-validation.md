@@ -78,6 +78,172 @@ are listed under
 
 ## Scheduling observations
 
+### 50-process detector preflight on Linux
+
+On 2026-11-13, at base commit
+`2ec0f41ed4448d570496288f1c395de9252f6edd` with the local 50-process test
+entry points, the following release-profile check passed:
+
+```sh
+cargo test --release --locked -p nx-core --lib \
+  sync_manager::manager::tests::detector_soak::detector_50_nodes_preflight_json \
+  -- --ignored --exact --nocapture
+```
+
+The host runs Linux 7.0.0-38-generic on an Intel Core i7-1165G7 (four cores,
+eight logical CPUs), with 16,492,240,896 bytes of RAM. Toolchain: rustc 1.98.1
+and Cargo 1.98.1. The test reported one passed, zero failed in 57.45 seconds,
+excluding the initial release build. No storage baseline or workspace test was
+run concurrently by this validation session.
+
+The declared envelope uses 50 independent worker processes and on-disk
+datastores, real unauthenticated loopback TCP and JSON, ring candidates followed
+by bounded owner Exchange setup for full membership, and at most four data
+peers per node. Detector timing and 10,000-operation retention retain production
+defaults. Probe seed is 5644502651023458305; wall-clock scheduling remains
+nondeterministic. There is no injected packet loss, TLS or WASM guest.
+
+| Measurement | Preflight observation |
+| --- | --- |
+| Nominal workload | One GCounter increment per node every ten seconds on `detector-nominal`; five offered writes/s total for 30 seconds |
+| Flush-confirmed writes | 150/150, all within the nominal window; three per node |
+| Nominal detector | 777 successful probes; zero failed/degraded probes, suspect observations, refuted observations, local Dead declarations and learned Dead observations |
+| Observed exposure | 0.4292959469861112 observer-hours; all reported nominal suspicion, refutation and local-declaration rates zero |
+| Local submission | Maximum 16.567 ms; maximum generator lateness 3.683 ms; one pending request observed per node, limit four |
+| True failure | Kill and reap `detector-49` without graceful leave, after stopping writes; confirmed process exit after 2 ms |
+| Failure observation | All 49 survivors observed Dead after 14.281-21.180 s; four local declarations and 45 learned verdicts; 100 ms sampling, 120 s limit |
+| Resources | Worker CPU 50 s over 33.991991332 s (147.093% of one core); sampled summed RSS peak 1,178,890,240 bytes; ten-second sampling |
+| Queue rejection counters | Zero for sampled local/forward rejection counters |
+| Other network diagnostics | 712 peer-limit connection errors, 712 unexpected-EOF classifications and 713 `sync_errors_total`; these do not establish false detector declarations or an error-free data path |
+| Shutdown | All 49 surviving workers completed, with zero pending calls |
+
+Failure latency is measured from the fault request to coordinator receipt of
+sampled state, including IPC/collection delay. Counts are observer-level events,
+not distinct cluster-wide incidents. Summed RSS can double-count shared pages;
+resource and queue peaks are sampled, not continuous maxima. The test does not
+assert replica convergence or complete recovery of its accepted operations.
+
+The 50-process profile is a declared nominal envelope, not proof that the earlier
+100-process Mac stalls are resolved. The preflight alone cannot close the
+one-hour detector roadmap criterion. The release build also
+reported two existing Linux dead-code warnings for `STALL_DIR_ENV` and
+`nominal_stall_scenario`; they were not suppressed or changed.
+
+### Completed one-hour detector campaign on Linux
+
+On 2026-11-13, the same checkout, host and 50-process envelope described above
+passed the actual one-hour campaign:
+
+```sh
+cargo test --release --locked -p nx-core --lib \
+  sync_manager::manager::tests::detector_soak::detector_50_nodes_one_hour_json \
+  -- --ignored --exact --nocapture
+```
+
+The test reported one passed, zero failed in 3,623.15 seconds. Each worker
+observed at least 3,600 real seconds (reported range 3,601.140793939 to
+3,601.952147883 seconds). The same fixed probe seed, production detector
+timings, retention, bounded setup, four-data-peer limit and per-node workload
+were used. No workspace test or storage baseline was run concurrently by this
+session. Observer exposure includes the final drain, not formation.
+
+| Measurement | Completed campaign observation |
+| --- | --- |
+| Offered and flush-confirmed writes | 18,000/18,000; 360 per node |
+| Confirmed within nominal window | 17,999; one final confirmation in the permitted drain; 4.999722222222222 confirmed writes/s within the window |
+| Exposure | 50.01624463839417 observer-hours |
+| Nominal suspicions and refutations | Zero suspect observations and zero refuted observations, both reported separately at zero per observer-hour |
+| Nominal false declarations | Zero local Dead declarations and zero learned Dead observations; local declaration rate zero per observer-hour |
+| Probes | 89,492 successful, zero failed, eight locally degraded; local degradation is not a remote failure verdict |
+| Submission and scheduling | Maximum submission 63.404 ms; maximum generator lateness 1.350527 s; one pending request observed per node, limit four |
+| True failure | Kill and reap `detector-49` after stopping new writes; confirmed process exit after 6 ms |
+| Failure observation | All 49 survivors observed Dead after 9.475-15.479 s; two local declarations and 47 learned verdicts; 100 ms sampling, 120 s limit |
+| Worker CPU | 7,754 CPU seconds over 3,604.990062217 seconds; 215.09074549934928% of one core |
+| Summed RSS | Start 1,039,015,936 bytes; end 2,232,877,056; sampled peak 2,246,078,464; 362 samples, ten-second interval |
+| Sampled queues | Forward peak two items/800 bytes; control-ingress peak one item; zero local/forward rejection counters |
+| Network diagnostics | 64,338 peer-limit connection events, seven I/O-error events, 64,336 unexpected-EOF classifications and 64,346 `sync_errors_total` |
+| Storage/apply diagnostics | Zero reported failed local batch/flush stages and zero remote-op application errors; one push event reached 1.560225 s |
+| Shutdown | All 49 surviving workers completed with zero pending calls |
+
+This establishes the defined nominal one-hour detector observation, not a
+universal zero-false-positive guarantee. The rates count observations at nodes,
+not deduplicated cluster incidents. True-failure latency includes IPC and
+collection delay; learned verdicts are not independent local detections.
+Resource peaks are sampled and summed RSS may double-count shared pages. The
+RSS growth and connection churn remain visible observations, not a claim of
+stable long-term memory or an error-free data path. No causal diagnosis is
+inferred from their coexistence with successful detector measurements.
+
+The campaign is JSON over unauthenticated loopback TCP on one Linux host with
+GCounter load. It does not certify packet-loss behavior, TLS performance,
+CPU-bound WASM, replica convergence, other CRDT workload performance, 100-process
+capacity or resolution of the earlier Mac stalls. The separate real packet-loss
+roadmap item remains open.
+
+Post-campaign checks at the same checkout:
+
+| Check | Result |
+| --- | --- |
+| `git diff --check` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed with the two existing Linux dead-code warnings |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Failed on unused `STALL_DIR_ENV` and `nominal_stall_scenario` in `detector_process.rs` |
+| `cargo test --workspace --verbose` | Failed in nx-core: 662 passed, two failed, 22 ignored in 178.58 seconds; subsequent workspace test binaries were not established as passing |
+| Exact `timing_subscriber_aggregates_remote_apply_stages` rerun | Failed again in isolation: expected stage count one, observed zero |
+
+The two failing tests are
+`detector_soak::diagnostics::timing_subscriber_aggregates_remote_apply_stages`
+and `detector_soak::diagnostics::diagnostics_report_phase_local_remote_timings_and_batch_deltas`.
+They assert synthetic diagnostic stage counts, not membership verdicts. The
+first failure reproduces without concurrent tests, so no parallelism-only
+explanation is established. Remote-stage zero counts must not be interpreted
+as proof of zero production work; the campaign's membership counters and
+resource observations remain separate evidence. No assertions, timeouts or
+warnings were weakened. At that stage the detector roadmap checkbox remained
+open pending the separately approved correction below.
+
+### Diagnostic gate correction and final verification
+
+With the owner's approval, the test-only subscriber now records remote timing
+events in its `nx_core::sync_manager::apply` branch before returning. That branch
+previously handled replay diagnostics and returned without recording its timing
+stages. The existing two failing tests pass with their original assertions;
+the complete diagnostic group passes 11 tests. The macOS-only
+`STALL_DIR_ENV` and `nominal_stall_scenario` now carry matching macOS compilation
+guards instead of suppressing unused-code warnings on Linux.
+
+No production source, detector parameters, acceptance semantics, timeouts or
+test assertions changed. The one-hour evidence was collected before this
+subscriber correction and was not rerun afterwards. Missing apply-stage timing
+counts in that historical report remain missing; they are not reconstructed
+or interpreted as zero work. Membership counts, CPU/RSS and failure latency
+are separately collected observations from the completed hour.
+
+| Final check | Result |
+| --- | --- |
+| Both previously failing diagnostic tests, exact commands | Passed individually |
+| Complete `detector_soak::diagnostics::` group | 11 passed, zero failed |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed without the earlier dead-code warnings |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| First post-correction `cargo test --workspace --verbose` | nx-core passed: 664 passed, zero failed, 22 ignored; nx-net failed in `simultaneous_dials_keep_one_canonical_connection_per_identity` (expected one connection, observed zero) |
+| Exact isolated nx-net rerun | Passed without changing code, workload or timeout |
+| Second post-correction `cargo test --workspace --verbose` | Passed, including doc-tests; nx-core 664 passed, zero failed, 22 ignored; nx-net 107 passed, zero failed, one ignored |
+
+The isolated success and final full-suite success do not establish the cause
+or resolution of the earlier nx-net failure. It remains an observed intermittent
+validation risk outside this diagnostic correction; no nx-net source was
+changed. The final workspace command retains normal parallelism.
+
+The detector roadmap item is now checked for the completed, explicitly bounded
+50-process Linux nominal hour, separate true-crash observation and reported
+resource use. This does not close the separate packet-loss criterion or the
+release as a whole. Ignored campaigns, optional profiling features, excluded
+guest/example builds, macOS execution and multiprocess previous-binary checks
+were not newly executed by these final workspace gates.
+
+### Short CPU and storage scheduling observations
+
 The production adapter now records test-only tick lateness in a bounded sample
 buffer. On macOS, one CPU-bound WASM run collected 80 tick samples over 1.745 s:
 p50 15.821 ms, p95 21.376 ms and max 22.265 ms; one probe succeeded, none

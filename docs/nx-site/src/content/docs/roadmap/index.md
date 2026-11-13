@@ -223,7 +223,7 @@ Release-scale loss, partition and detector criteria remain separate below.
 - [x] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
 - [x] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
 - [x] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
-- [ ] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use
+- [x] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use: `detector_50_nodes_one_hour_json` (50 real Linux processes, nominal 1h, zero false declarations; separate crash observation and sampled resource use)
 
 **Closing criterion**:
 > A reproducible 50-node test with a declared 10% loss model converges in < 30s after a 60s partition into two groups of 25, with no loss of accepted operations within the specified recovery contract. The primary recovery test stops new writes at rejoin; a separate test continues writing under recovery load. Validate the real transport under packet loss as well. A defined nominal 1h run records no false failure declarations and reports refuted suspicions separately. Publish workloads, seeds and results; this observation is not a universal zero-failure guarantee.

@@ -1556,6 +1556,13 @@ impl Subscriber for Diagnostics {
             if fields.remote_apply_input_ops.is_some() {
                 self.record_remote_replay_apply(&fields);
             }
+            if let Some(stage) = fields.remote_stage {
+                if let Some(elapsed_us) = fields.elapsed_us {
+                    self.record_remote_timing(stage, elapsed_us, fields.failed);
+                } else {
+                    self.event_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             return;
         }
         if metadata.target().starts_with("nx_net::node") {

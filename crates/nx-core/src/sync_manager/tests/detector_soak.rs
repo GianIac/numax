@@ -178,6 +178,30 @@ async fn detector_100_nodes_one_hour_json() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "50 real TCP processes, short preflight before the one-hour campaign"]
+async fn detector_50_nodes_preflight_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_50_nodes_preflight_json";
+    if child(name, Duration::from_secs(600)) {
+        return;
+    }
+    process::scenario(50, Duration::from_secs(30), Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "50 real TCP processes, one real hour of nominal load, then process crash"]
+async fn detector_50_nodes_one_hour_json() {
+    let name = "sync_manager::manager::tests::detector_soak::detector_50_nodes_one_hour_json";
+    if child(name, Duration::from_secs(4500)) {
+        return;
+    }
+    process::scenario(50, Duration::from_secs(3600), Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "100 real TCP nodes, one real hour, post-load replica health, then transport failure"]
 async fn detector_100_nodes_one_hour_with_replication_health_json() {
     let name = "sync_manager::manager::tests::detector_soak::detector_100_nodes_one_hour_with_replication_health_json";

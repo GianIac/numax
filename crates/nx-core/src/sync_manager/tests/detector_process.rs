@@ -14,6 +14,7 @@ const MAX_CONVERGENCE_DETAIL_WORKERS: usize = 4;
 const DETECTOR_PROBE_SEED: u64 = 0x4e55_4d41_5801_0001;
 const PROBE_SEED_ENV: &str = "NUMAX_TEST_PROBE_SEED";
 const TIMELINE_DIR_ENV: &str = "NUMAX_DETECTOR_TRACE_DIR";
+#[cfg(target_os = "macos")]
 const STALL_DIR_ENV: &str = "NUMAX_DETECTOR_STALL_DIR";
 const STALL_TRIGGER_US: u64 = 10_000_000;
 const MAX_NATIVE_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -4253,6 +4254,7 @@ pub(super) async fn convergence_scenario(
     run_scenario(count, duration, period, None, true).await
 }
 
+#[cfg(target_os = "macos")]
 pub(super) async fn nominal_stall_scenario() -> anyhow::Result<()> {
     let directory = std::env::var_os(STALL_DIR_ENV)
         .map(std::path::PathBuf::from)
