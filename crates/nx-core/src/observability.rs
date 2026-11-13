@@ -56,6 +56,9 @@ impl ObservabilityConfig {
 
 #[derive(Default)]
 pub struct RuntimeMetrics {
+    pub(crate) peers: crate::peer_metrics::PeerMetrics,
+    recovery_sample: Mutex<Option<std::time::Instant>>,
+    gossip_pacing: GossipPacingMetrics,
     ops_total: AtomicU64,
     peers_connected: AtomicUsize,
     sync_latency_ms: AtomicU64,
@@ -74,6 +77,21 @@ pub struct RuntimeMetrics {
     remote_op_batch_apply_duration: DurationHistogram,
     wasm_modules: Mutex<BTreeMap<String, WasmModuleMetrics>>,
     ready: AtomicBool,
+}
+
+#[derive(Default)]
+struct GossipPacingMetrics {
+    deferred: AtomicU64,
+    admitted_bytes: AtomicU64,
+    last_rate: AtomicU64,
+    last_rtt_ns: AtomicU64,
+}
+#[derive(Default)]
+struct GossipPacingSnapshot {
+    deferred: u64,
+    admitted_bytes: u64,
+    last_rate: u64,
+    last_rtt_ns: u64,
 }
 
 #[derive(Clone, Default)]
@@ -131,12 +149,90 @@ struct DurationHistogramSnapshot {
 }
 
 impl RuntimeMetrics {
+    pub(crate) async fn refresh_recovery(self: &Arc<Self>, store: Arc<NxStore>) {
+        {
+            let Ok(mut last) = self.recovery_sample.lock() else {
+                tracing::error!("recovery metrics sampling lock poisoned");
+                self.record_sync_error();
+                return;
+            };
+            if last.is_some_and(|last| last.elapsed() < Duration::from_secs(1)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let progress =
+            tokio::task::spawn_blocking(move || crate::sync_manager::storage_progress(&store))
+                .await;
+        match progress {
+            Ok(Ok(progress)) => {
+                self.observe_recovery(progress);
+            }
+            result => {
+                self.record_sync_error();
+                tracing::error!(?result, "recovery metrics sampling failed");
+            }
+        }
+    }
+
+    pub(crate) fn observe_recovery(&self, progress: Vec<crate::sync_manager::ReplicationProgress>) {
+        use crate::peer_metrics::Gauge;
+        let mut pending = 0u64;
+        let mut unconfirmed = 0u64;
+        let mut failed = 0u64;
+        let mut complete = 0u64;
+        let mut gaps = 0u64;
+        for origin in progress {
+            let missing = origin
+                .known_high_sequence
+                .saturating_sub(origin.contiguous_sequence)
+                .saturating_sub(origin.sparse_positions as u64);
+            gaps = gaps.saturating_add(missing);
+            if missing > 0 || origin.baseline_missing {
+                pending += 1;
+            } else {
+                complete += 1;
+            }
+            unconfirmed += u64::from(origin.baseline_unconfirmed);
+            failed += u64::from(origin.recovery_failure.is_some());
+        }
+        for (gauge, value) in [
+            (Gauge::PendingOrigins, pending),
+            (Gauge::BaselineUnconfirmed, unconfirmed),
+            (Gauge::FailedOrigins, failed),
+            (Gauge::KnownCompleteOrigins, complete),
+            (Gauge::GapPositions, gaps),
+        ] {
+            self.peers.set(gauge, value);
+        }
+    }
+
     pub fn record_ops(&self, count: u64) {
         self.ops_total.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn set_peers_connected(&self, count: usize) {
         self.peers_connected.store(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_gossip_pacing(
+        &self,
+        allowed: bool,
+        bytes: usize,
+        rate: u64,
+        rtt: Option<Duration>,
+    ) {
+        if allowed {
+            self.gossip_pacing
+                .admitted_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        } else {
+            self.gossip_pacing.deferred.fetch_add(1, Ordering::Relaxed);
+        }
+        self.gossip_pacing.last_rate.store(rate, Ordering::Relaxed);
+        self.gossip_pacing
+            .last_rtt_ns
+            .store(rtt.map_or(0, duration_ns), Ordering::Relaxed);
     }
 
     pub fn record_sync_latency(&self, duration: Duration) {
@@ -293,6 +389,17 @@ impl RuntimeMetrics {
             .clone();
 
         MetricsSnapshot {
+            peer_metrics: {
+                let mut rendered = String::new();
+                self.peers.render(&mut rendered);
+                rendered
+            },
+            gossip_pacing: GossipPacingSnapshot {
+                deferred: self.gossip_pacing.deferred.load(Ordering::Relaxed),
+                admitted_bytes: self.gossip_pacing.admitted_bytes.load(Ordering::Relaxed),
+                last_rate: self.gossip_pacing.last_rate.load(Ordering::Relaxed),
+                last_rtt_ns: self.gossip_pacing.last_rtt_ns.load(Ordering::Relaxed),
+            },
             ops_total: self.ops_total.load(Ordering::Relaxed),
             peers_connected: self.peers_connected.load(Ordering::Relaxed),
             sync_latency_ms: self.sync_latency_ms.load(Ordering::Relaxed),
@@ -319,6 +426,39 @@ impl RuntimeMetrics {
         self.ready.load(Ordering::Relaxed)
     }
 
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn replication_work_for_test(&self) -> BTreeMap<&'static str, u64> {
+        [
+            ("peer_connects_total", &self.peer_connects_total),
+            ("peer_disconnects_total", &self.peer_disconnects_total),
+            ("broadcast_batches_total", &self.broadcast_batches_total),
+            ("broadcast_ops_total", &self.broadcast_ops_total),
+            ("remote_ops_received_total", &self.remote_ops_received_total),
+            ("remote_ops_applied_total", &self.remote_ops_applied_total),
+            (
+                "remote_ops_duplicate_total",
+                &self.remote_ops_duplicate_total,
+            ),
+            ("remote_op_batches_total", &self.remote_op_batches_total),
+            (
+                "remote_op_apply_errors_total",
+                &self.remote_op_apply_errors_total,
+            ),
+            (
+                "remote_op_batch_apply_sum_ns",
+                &self.remote_op_batch_apply_duration.sum_ns,
+            ),
+            (
+                "remote_op_batch_apply_count",
+                &self.remote_op_batch_apply_duration.count,
+            ),
+            ("sync_errors_total", &self.sync_errors_total),
+        ]
+        .into_iter()
+        .map(|(name, counter)| (name, counter.load(Ordering::Relaxed)))
+        .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn render_for_test(&self, store: &NxStore) -> String {
         render_metrics(self.snapshot(store))
@@ -330,6 +470,8 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 struct MetricsSnapshot {
+    peer_metrics: String,
+    gossip_pacing: GossipPacingSnapshot,
     ops_total: u64,
     peers_connected: usize,
     sync_latency_ms: u64,
@@ -537,6 +679,17 @@ fn render_metrics(snapshot: MetricsSnapshot) -> String {
         snapshot.store_bytes
     );
 
+    rendered.push_str(&snapshot.peer_metrics);
+    rendered.push_str(&format!(
+        "# HELP numax_gossip_rate_limited_total Fast-path attempts deferred to durable repair\n# TYPE numax_gossip_rate_limited_total counter\nnumax_gossip_rate_limited_total {}\n\
+         # HELP numax_gossip_admitted_bytes_total Framed bytes admitted for gossip attempts\n# TYPE numax_gossip_admitted_bytes_total counter\nnumax_gossip_admitted_bytes_total {}\n\
+         # HELP numax_gossip_rate_bytes_per_second Last per-peer pacing decision, not a node total\n# TYPE numax_gossip_rate_bytes_per_second gauge\nnumax_gossip_rate_bytes_per_second {}\n",
+        snapshot.gossip_pacing.deferred, snapshot.gossip_pacing.admitted_bytes, snapshot.gossip_pacing.last_rate,
+    ));
+    if snapshot.gossip_pacing.last_rtt_ns > 0 {
+        rendered.push_str(&format!("# HELP numax_gossip_control_rtt_seconds Last control round-trip estimate used by pacing, excluding connection setup\n# TYPE numax_gossip_control_rtt_seconds gauge\nnumax_gossip_control_rtt_seconds {}\n", snapshot.gossip_pacing.last_rtt_ns as f64 / 1_000_000_000.0));
+    }
+
     render_duration_histogram(
         &mut rendered,
         "numax_remote_op_batch_apply_duration_seconds",
@@ -640,8 +793,34 @@ mod tests {
     }
 
     #[test]
+    fn gossip_pacing_metrics_distinguish_unknown_rtt_and_count_attempts_without_peer_labels() {
+        let metrics = RuntimeMetrics::default();
+        let store = temp_store();
+        metrics.record_gossip_pacing(true, 100, 4096, None);
+        metrics.record_gossip_pacing(false, 200, 2048, None);
+        let rendered = metrics.render_for_test(&store);
+        assert!(rendered.contains("numax_gossip_admitted_bytes_total 100\n"));
+        assert!(rendered.contains("numax_gossip_rate_limited_total 1\n"));
+        assert!(!rendered.contains("numax_gossip_control_rtt_seconds"));
+        metrics.record_gossip_pacing(true, 50, 2048, Some(Duration::from_millis(10)));
+        assert!(
+            metrics
+                .render_for_test(&store)
+                .contains("numax_gossip_control_rtt_seconds 0.01\n")
+        );
+        metrics.record_gossip_pacing(false, 200, 1024, None);
+        assert!(
+            !metrics
+                .render_for_test(&store)
+                .contains("numax_gossip_control_rtt_seconds")
+        );
+    }
+
+    #[test]
     fn metrics_are_rendered_in_prometheus_format() {
         let snapshot = MetricsSnapshot {
+            peer_metrics: String::new(),
+            gossip_pacing: GossipPacingSnapshot::default(),
             ops_total: 7,
             peers_connected: 2,
             sync_latency_ms: 15,

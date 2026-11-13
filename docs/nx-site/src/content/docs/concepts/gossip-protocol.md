@@ -1,308 +1,154 @@
 ---
 title: Gossip Protocol
-description: How Numax moves operations between peers.
+description: How Numax discovers peers, spreads CRDT operations and repairs missing state.
 ---
 
-This page explains what gossip means in Numax, what the current sync layer already does, and what will arrive in the peer-discovery releases.
+Numax spreads CRDT operations through a bounded selection of peers. Each receiver
+persists a new operation before forwarding it. Periodic anti-entropy repairs
+updates missed because of disconnection, backpressure or partitions.
 
-The short version: **Numax discovers connection candidates, broadcasts directly
-to active peers, and repairs missed operations through periodic anti-entropy.**
-Discovery is dynamic in `v0.1.5`; SWIM-style membership and K-fanout data gossip
-remain future work.
+## From endpoint to replica
 
----
+A node first needs an endpoint to try. Static configuration, bootstrap, mDNS,
+DNS-SRV and file discovery can supply candidates; the Management API can also
+add a persistent manual candidate.
 
-## What gossip is
+![Admission branches into active data transport and independent membership control; recovery remains a separate observation.](/numax/diagrams/reference/peer-lifecycle.svg)
 
-A gossip protocol is a way to spread information through a distributed system without requiring one central coordinator.
+These stages answer different questions:
 
-Instead of sending every update through a leader, each node talks to some peers. Those peers talk to other peers. Over time, the information spreads through the cluster.
+| Observation | Meaning |
+| --- | --- |
+| Candidate | An address is available for dialing. |
+| Active connection | The peer passed the configured transport admission policy. |
+| Membership `Alive` | The control service has a current member view. |
+| Recovery progress | The replica knows which discovered operation positions it has received. |
 
-For Numax, the information being spread is mostly CRDT operations:
+Discovery does not authenticate an endpoint. Secure TLS binds the immediate
+peer's `NodeId` to its certificate; allowlists can restrict admission. Plaintext
+and insecure TLS identities remain unverified. The node can start with no
+candidates, and local readiness does not wait for cluster convergence.
 
-```rust
-pub struct Op {
-    pub id:     OpId,
-    pub origin: NodeId,
-    pub kind:   OpKind,
-}
-```
+## Gossip is the fast path
 
-Each operation has a globally unique `OpId`, the node that produced it, and the CRDT change itself. Peers use `OpId` to deduplicate messages they have already seen.
+A local CRDT mutation gets a UUID `OpId` and a per-origin replication position.
+State, materialized value and replay metadata are committed together, then
+flushed before local success. The operation becomes eligible for delivery to
+selected active connections.
 
----
+![K-fanout delivery and persistence before forwarding](/numax/diagrams/concepts/current-broadcast.svg)
 
-## What exists today
+Receivers persist newly accepted operations before forwarding them with their
+original identity and position. Durable receipt tracking prevents a delayed
+duplicate from applying or forwarding again after the UUID cache expires.
+Ordinary KV writes and CRDT writes have separate paths; not every KV write is
+replicated.
 
-The current data-replication implementation remains intentionally simple and
-deterministic. A node obtains endpoint candidates from static, bootstrap, mDNS,
-DNS-SRV or file providers. The same bounded, updateable candidate snapshot feeds
-initial dialing and reconnect. Anti-entropy uses all active connections,
-including inbound peers and connections whose candidates have been removed.
-Starting with no candidates is valid; later provider updates wake the
-connection machinery. Local readiness does not imply peer convergence.
+A successful send confirms a local stream write. It does not confirm remote
+application or storage durability. Local CRDT success does not wait for an ACK,
+replica count or quorum. See the
+[acceptance contract](/numax/design/peer-discovery/#local-acceptance-and-durability).
 
-Candidates are not members or peers yet. A candidate becomes an active peer
-only after connection admission, the normal wire handshake, TLS identity
-binding when configured, and allowlist authorization. When an operation is
-produced locally, the sync manager queues it and sends it to the currently
-connected peers.
+## Fanout and neighbors
 
-![Current direct broadcast to connected peers](/numax/diagrams/concepts/current-broadcast.svg)
-
-[Mermaid source for this diagram](/numax/diagrams/concepts/current-broadcast.mmd)
-
-This is not SWIM and it is not K-fanout yet. It is a full broadcast to connected peers, bounded by `max_peers`, with batching and backpressure through the operation queue.
-
----
-
-## Wire messages
-
-Peer communication is handled by `nx-net`. The current wire protocol defines these message kinds:
-
-| Message | Purpose |
-|---|---|
-| `Hello` | Start the handshake, declare node id, protocol version and supported serialization formats. |
-| `HelloAck` | Accept the handshake and choose the serialization format. |
-| `PushOps` | Send one or more CRDT operations to a peer. |
-| `PushOpsAck` | Acknowledgement message for received operations. The current sync path does not rely on it as a causal frontier. |
-| `PullSince` | Ask a peer for retained operations. Today this is usually sent with `None`. |
-| `Ping` / `Pong` | Keepalive message types. A received `Ping` is answered with `Pong`. |
-| `Error` | Structured wire error sent before rejecting a request or closing a connection. |
-| `BootstrapHello` | Start a one-shot authenticated bootstrap request with cluster, advertisement and result limit. |
-| `BootstrapAck` | Return the seed identity, matching cluster, negotiated format, bounded endpoint suggestions and their lease. |
-
-The protocol version is currently `5`. Peers negotiate either `Bincode` or
-`Json`, with `Bincode` as the production default and `Json` available for
-debug-style interoperability. Version `5` is deliberately incompatible with
-the version `4` wire contract from Numax `v0.1.4`.
-
----
-
-## Handshake and identity
-
-When a node connects to a peer, the first exchange is:
-
-![Normal peer handshake from transport connection to peer admission](/numax/diagrams/concepts/peer-handshake.svg)
-
-[Mermaid source for this diagram](/numax/diagrams/concepts/peer-handshake.mmd)
-
-The messages carry these fields:
-
-```
-client -> server: Hello(node_id, protocol_version, supported_formats, preferred_format)
-server -> client: HelloAck(node_id, protocol_version, selected_format)
-```
-
-After that, both sides know the peer `NodeId` and the selected serialization format.
-
-If TLS is enabled, the claimed `NodeId` is checked against the peer certificate. This prevents a node from claiming an identity that does not match its certificate. Optional allowlists can further restrict which peer ids are accepted.
-
-### Protocol compatibility
-
-Numax currently requires an exact protocol-version match, there is no implicit
-forward or backward compatibility:
-
-| Local node | Peer node | Result |
-|---|---|---|
-| `N` | `N` | Compatible; continue the handshake |
-| `N` | `N - 1` | Incompatible; reject the handshake |
-| `N` | `N + 1` | Incompatible; reject the handshake |
-
-Both `Hello` and `HelloAck` carry an explicit `protocol_version`, a mismatch is
-rejected before the peer is registered or CRDT operations are exchanged.
-When possible, the rejecting peer sends `Error(ProtocolMismatch)` before closing.
-Serialization-format negotiation does not override protocol compatibility.
-The rules for evolving this contract are defined in
-[Wire Versioning](/numax/design/wire-versioning/).
-
-### Bootstrap handshake
-
-Bootstrap uses the same listener but a separate, one-shot first message:
-
-![One-shot bootstrap handshake with seed validation and endpoint suggestions](/numax/diagrams/concepts/bootstrap-handshake.svg)
-
-[Mermaid source for this diagram](/numax/diagrams/concepts/bootstrap-handshake.mmd)
-
-The one-shot messages carry these fields:
+For each batch, the sender chooses at most K eligible active connections:
 
 ```text
-client -> seed: BootstrapHello(
-  node_id, protocol_version, supported_formats, preferred_format,
-  cluster_id, advertised_endpoint?, max_results
-)
-seed -> client: BootstrapAck(
-  node_id, protocol_version, selected_format,
-  cluster_id, candidates, candidate_ttl_ms
-)
-connection closes
+N = unique identities across the local node, Alive/Suspect members and active peers
+K = min(ceil(log2(N)) + c, gossip_max_fanout, eligible connections)
 ```
 
-The seed authenticates the requesting node using the same TLS certificate
-binding and allowlist checks as a normal peer handshake, validates cluster and
-advertised endpoint, then records that endpoint under a bounded lease. The
-client likewise authenticates the seed and validates the complete response.
-Cluster mismatch or an invalid request yields `BootstrapRejected`.
+The default `c` is 3; the maximum fanout is 64. N is a local estimate rather than
+an exact cluster census. With no eligible connection, K is zero. Each node
+rotates through a recipient order derived from its identity and connection
+addresses; forwarding excludes the immediate sender.
 
-The one-shot exchange never enters the active peer map and emits no
-`PeerConnected` event. Authentication proves only who answered and who made the
-request; it does not vouch for any endpoint in `candidates`. Each suggestion is
-fed into normal reconnection and must authenticate independently before CRDT
-traffic can flow. Response count, cache size, candidate TTL, message size,
-socket time and concurrent client queries are all bounded.
+Connection topology has a separate policy. Active connections are bounded by
+`max_peers`, and the reconnect pool includes a rotating window of membership
+recovery contacts. `Dead` contacts remain useful after a partition; `Left`
+contacts are excluded until fresh owner admission. With full slots, the runtime
+can replace one managed neighbor per 30-second interval to try an alternative.
 
----
+Discovery removal stops new attempts at the endpoint but leaves an admitted
+connection open. Anti-entropy continues over that connection. The
+[topology contract](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts)
+defines contact, withdrawal and rotation limits.
 
-## Broadcast path
+## Backpressure and pacing
 
-Local CRDT writes are applied locally first. Then the corresponding operation is queued for network propagation.
+Local and forwarding queues have item and byte limits. Batch construction,
+transport writes and recovery work also have explicit budgets. A rejected or
+failed send attempt leaves the accepted operation's durable state and recovery
+metadata intact.
 
-The broadcast loop drains that queue, groups operations into batches, records them in the seen-op and op-log metadata, and sends a `PushOps` message through `nx-net`.
+Local gossip and forwarding share an adaptive per-connection byte bucket.
+Smoothed direct-control RTT and writer service time provide congestion feedback;
+queue demand supports gradual recovery of the rate. Connection setup and TLS
+setup are excluded from RTT samples. Jitter spreads coalescing, polling and
+reconnect work over time.
 
-The important boundaries are:
+Defaults exposed under `[limits]` include:
 
-| Boundary | Current default |
-|---|---|
-| Maximum connected peers | `nx_net::DEFAULT_MAX_PEERS` |
-| Queued local ops | `10,000` |
-| Retained op-log entries | `10,000` |
-| Retained seen `OpId`s | `100,000` |
-| Socket timeout | `nx_net::DEFAULT_SOCKET_TIMEOUT` |
+| Setting | Default |
+| --- | --- |
+| `max_peers` | 64 |
+| `queued_ops_limit` | 10,000 per delivery queue |
+| `gossip_fanout_constant` / `gossip_max_fanout` | 3 / 64 |
+| `gossip_min_bytes_per_second` | 65,536 per peer |
+| `gossip_max_bytes_per_second` | 4,194,304 per peer |
+| `gossip_burst_bytes` | `256KiB` |
+| `anti_entropy_interval` | `30s` |
+| `op_log_limit` | 10,000 operations across origins |
 
-If a peer is disconnected, it does not receive the immediate push. That is why anti-entropy exists.
+See [Configuration](/numax/reference/config/) for supported settings and
+[resource budgets](/numax/design/peer-discovery/#resource-budgets) for internal
+limits. These budgets do not constitute a total process-memory cap.
 
----
+## Anti-entropy is the repair path
 
-## Anti-entropy
+Anti-entropy exchanges bounded per-origin history summaries over active data
+connections. It compares advertised history with durable contiguous coverage
+and sparse receipts, then requests missing ranges. An observed maximum alone
+cannot establish that every preceding operation was received.
 
-Anti-entropy is the repair loop.
+Replies are correlated with a source, origin, request ID, interval and deadline.
+Missed or stale replies do not complete newer requests. The loop uses all active
+connections, including inbound peers and peers removed from discovery.
 
-Every `anti_entropy_interval`, a node asks each active connection for retained
-operations using `PullSince`. This cadence is independent of discovery churn;
-missed ticks are skipped rather than replayed in a burst. Candidate removal
-stops future reconnect attempts, not repair over an already admitted connection.
+The replay log retains a count of operations, not a guaranteed duration.
+New writes can evict history needed by an offline peer. If replay is unavailable,
+Numax attempts a complete, versioned CRDT baseline within a 1 MiB payload budget.
+It includes all six families and their tombstones, together with receipt coverage.
 
-Today the request is conservative: it asks for the bounded op-log rather than relying on a single "last seen op id" as a causal frontier. That matters because one newer operation does not prove that every older operation arrived.
+The baseline must cover the receiver's applied history and dominate its existing
+state. Incomplete sources, oversized state and incomparable cuts can therefore
+refuse recovery explicitly. Another source may still succeed. This mechanism
+does not provide arbitrary snapshot merging or unrestricted recovery after
+history expires.
 
-The receiving side deduplicates by `OpId`, applies only unseen operations, and persists the resulting CRDT state.
+The [recovery contract](/numax/design/peer-discovery/#anti-entropy-and-recovery)
+describes retention, baseline limits and failure outcomes. A connected or
+`Alive` node can still have missing state; zero known gaps is not a certificate
+of global convergence.
 
-![Current anti-entropy after a disconnect](/numax/diagrams/concepts/current-anti-entropy.svg)
+## Membership and reconnection
 
-[Mermaid source for this diagram](/numax/diagrams/concepts/current-anti-entropy.mmd)
+SWIM/Lifeguard membership uses independent one-shot control connections for
+probes and member exchange. Suspicion can be refuted by a newer owner update;
+local health slows a degraded detector instead of treating every local delay
+as a remote fault. Epochs and terminal rejection floors preserve ordering across
+restart and leave/rejoin.
 
-The op-log and deduplication history are bounded, so anti-entropy is a practical
-catch-up mechanism, not an infinite historical archive or state transfer.
-Rediscovery alone cannot guarantee recovery when the required history is gone.
+Endpoint reconnect health is separate from this detector. Its `Healthy`,
+`Suspect` and `Dead` states describe connection attempts and their failure
+threshold. Reconnect uses exponential backoff, defaulting to 500 ms initially
+and 30 seconds maximum, with jitter. Three consecutive failures reach the
+endpoint-health `Dead` state; this does not discard a membership recovery contact.
 
----
+## Operate a node
 
-## Peer health and reconnect
-
-Current candidates have a small health state:
-
-| State | Meaning |
-|---|---|
-| `Healthy` | The candidate is connected or recently connected successfully. |
-| `Suspect` | A connection attempt failed, but the peer has not crossed the failure threshold. |
-| `Dead` | Consecutive failures reached `peer_dead_after_failures`. |
-
-Reconnect uses exponential backoff:
-
-| Setting | Current default |
-|---|---|
-| First reconnect delay | `500ms` |
-| Maximum reconnect delay | `30s` |
-| Dead after failures | `3` |
-| Anti-entropy interval | `30s` |
-
-This is simple failure tracking for discovery candidates, including configured
-peers. It is not a full membership protocol yet.
-
----
-
-## What is not implemented yet
-
-The current release line does **not** yet provide:
-
-- SWIM membership,
-- Lifeguard-style failure detection,
-- phi-accrual failure detection,
-- K-fanout dissemination,
-- adaptive gossip rate,
-- NAT traversal,
-- causal frontier metadata for precise incremental pulls.
-
-If you see "gossip" in the current docs, distinguish bootstrap gossip — a
-bounded exchange of endpoint suggestions — from data gossip. Current CRDT
-propagation is still a broadcast to all active peers, with anti-entropy as its
-repair path. Bootstrap suggestions are not membership state.
-
----
-
-## Current foundations and next steps
-
-Peer discovery foundations are implemented in the current `v0.1.5` release;
-membership and K-fanout remain planned for `v0.1.6`.
-
-### v0.1.5 - Peer Discovery: Foundations
-
-This release introduces the `PeerDiscovery` contract and five Rust provider
-implementations: static configuration, authenticated bootstrap, LAN mDNS,
-DNS-SRV and an externally updated peer file. Snapshot/watch handoff is atomic,
-delivery is bounded with explicit overflow, and provider tasks are owned and
-stopped by runtime shutdown.
-
-All five modes (`static`, `bootstrap`, `mdns`, `dns-srv`, `file`) are selectable
-through `--discovery-mode`, `NX_DISCOVERY_MODE` and the `[discovery]` TOML section,
-with precedence CLI > environment > TOML > defaults. Explicit `--peer` entries
-continue to contribute a static source alongside the selected dynamic provider;
-they are not reinterpreted as bootstrap seeds. Embedders can also compose the
-public providers through the `nx-core` Rust API. The detailed semantics are in the
-[Peer Discovery Contract](/numax/design/discovery-contract/).
-
-### v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout
-
-This is where the protocol becomes a real dynamic cluster protocol.
-
-Planned split:
-
-| Channel | Responsibility |
-|---|---|
-| Membership | SWIM / Lifeguard-style view of who is in the cluster. |
-| Failure detection | Suspicion and dead-peer detection without relying only on configured addresses. |
-| Data dissemination | K-fanout gossip for CRDT operations. |
-
-K-fanout means a node does not send every update to every peer. Instead, it sends each update to `K` selected peers. Those peers forward it further. With a good value of `K`, the cluster gets fast propagation without every operation becoming a full-cluster broadcast.
-
-The planned default is based on cluster size:
-
-```text
-K = ceil(log2(N) + c)
-```
-
-where `N` is the known cluster size and `c` is a small safety constant.
-
-The roadmap also includes adaptive fanout based on load and RTT, controlled backpressure, periodic anti-entropy as a repair path, and seedable randomness so tests can reproduce gossip behavior.
-
----
-
-## Why both gossip and anti-entropy
-
-Gossip is the fast path. It spreads new operations quickly.
-
-Anti-entropy is the repair path. It catches up nodes that were offline, partitioned, slow, or unlucky.
-
-Numax needs both because local-first systems must tolerate temporary
-disconnection. CRDTs define convergence semantics; dissemination moves
-operations between peers, and anti-entropy repairs missed operations while the
-required operation and deduplication history remains available.
-
----
-
-## Related
-
-- [CRDT and state](/numax/concepts/crdt-and-state/) - the data model that makes convergence safe
-- [Runtime model](/numax/concepts/runtime-model/) - how modules, host APIs and sync interact
-- [nx-net crate](/numax/reference/crates/nx-net/) - peer transport and wire messages
-- [nx-sync crate](/numax/reference/crates/nx-sync/) - operations, CRDTs and deduplication
-- [Roadmap](/numax/roadmap/) - planned peer discovery releases
+- [Configure discovery](/numax/reference/config/#discovery) to obtain initial contacts.
+- [Add manual candidates](/numax/guides/management-api/#add-a-persistent-peer-candidate) at runtime.
+- [Inspect peer views](/numax/guides/management-api/#independent-observation-views) to distinguish candidates, connections, membership and recovery.
+- [Monitor metrics](/numax/guides/observability/#peer-management-metrics) for probes, queue pressure, retries and gaps.
+- [Read the design contracts](/numax/design/peer-discovery/) for ordering, durability and recovery boundaries.

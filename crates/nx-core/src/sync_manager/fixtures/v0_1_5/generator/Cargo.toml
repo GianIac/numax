@@ -1,0 +1,15 @@
+[package]
+name = "numax-v0-1-5-fixture-generator"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+nx-core = { path = "../../crates/nx-core" }
+nx-store = { path = "../../crates/nx-store" }
+nx-sync = { path = "../../crates/nx-sync" }
+serde = "1"
+serde_json = "1"
+tempfile = "3"

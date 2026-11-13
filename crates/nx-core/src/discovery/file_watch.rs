@@ -48,6 +48,7 @@ impl FileWatchDiscoveryConfig {
 
 struct Lifecycle {
     stopped: bool,
+    preparation: Arc<()>,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<ProviderTask>,
 }
@@ -95,6 +96,7 @@ impl FileWatchDiscovery {
                 config,
                 lifecycle: StdMutex::new(Lifecycle {
                     stopped: false,
+                    preparation: Arc::new(()),
                     shutdown: None,
                     task: None,
                 }),
@@ -103,7 +105,7 @@ impl FileWatchDiscovery {
     }
 
     async fn ensure_started(&self) -> Result<(), DiscoveryError> {
-        {
+        let preparation = {
             let lifecycle = self
                 .inner
                 .lifecycle
@@ -117,7 +119,8 @@ impl FileWatchDiscovery {
             {
                 return Ok(());
             }
-        }
+            Arc::clone(&lifecycle.preparation)
+        };
 
         let initial = read_peer_file(&self.inner.config).await?;
         let mut lifecycle = self
@@ -127,6 +130,9 @@ impl FileWatchDiscovery {
             .unwrap_or_else(|error| error.into_inner());
         if lifecycle.stopped {
             return Err(provider_error("provider is shut down", false));
+        }
+        if !Arc::ptr_eq(&preparation, &lifecycle.preparation) {
+            return Err(provider_error("file preparation was rolled back", true));
         }
         if let Some(task) = lifecycle.task.as_ref()
             && task.running(PROVIDER, &self.inner.state)?
@@ -186,6 +192,23 @@ impl PeerDiscovery for FileWatchDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
+        self.rollback().await
+    }
+
+    fn request_rollback(&self) {
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        lifecycle.preparation = Arc::new(());
+        if let Some(shutdown) = &lifecycle.shutdown {
+            shutdown.send_replace(true);
+        }
+    }
+
+    async fn rollback(&self) -> Result<(), DiscoveryError> {
+        self.request_rollback();
         let task = {
             let lifecycle = self
                 .inner
@@ -351,6 +374,45 @@ fn io_error(path: &Path, error: std::io::Error) -> DiscoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_restarts_file_generation_but_shutdown_remains_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peers");
+        tokio::fs::write(&path, "first:9000").await.unwrap();
+        let provider = FileWatchDiscovery::new(FileWatchDiscoveryConfig::new(&path)).unwrap();
+        let old_watch = provider.watch().await.unwrap();
+        let old = provider
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .task
+            .clone()
+            .unwrap();
+        provider.request_rollback();
+        provider.rollback().await.unwrap();
+        assert!(provider.inner.state.snapshot().peers().is_empty());
+        tokio::fs::write(path, "second:9000").await.unwrap();
+        let fresh = provider.watch().await.unwrap();
+        assert_eq!(fresh.snapshot().peers(), ["second:9000"]);
+        assert_eq!(old_watch.snapshot().peers(), ["first:9000"]);
+        assert!(
+            !old.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        provider.shutdown().await.unwrap();
+        provider.rollback().await.unwrap();
+        assert!(provider.watch().await.is_err());
+    }
 
     #[test]
     fn extreme_poll_interval_is_rejected_before_file_io_or_spawning() {

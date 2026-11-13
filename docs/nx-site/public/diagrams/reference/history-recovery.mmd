@@ -1,0 +1,20 @@
+flowchart TB
+    accTitle: Repair missing CRDT state
+    accDescr: Missing positions are replayed if retained; unavailable history can use a dominating complete baseline. Explicit refusal is scoped to its source.
+    Summary["Compare history and receipts<br/>Known maximum is not receipt"]
+    Range["Request missing positions<br/>Source, origin, attempt and deadline"]
+    Replay["Retained history available<br/>Apply correlated replay page"]
+    Baseline["History unavailable<br/>Request complete CRDT baseline"]
+    Validate["Validate baseline and cut<br/>Payload, digest, coverage and state"]
+    Install["Install accepted progress<br/>State and durable receipt tracking"]
+    Refuse["Explicit source refusal<br/>Incomplete, oversized or conflicting"]
+    Continue["Continue periodic repair"]
+    Summary -->|"Gap found"| Range
+    Range -->|"Retained"| Replay
+    Range -->|"Unavailable"| Baseline
+    Replay -->|"Persist before publish"| Install
+    Baseline --> Validate
+    Validate -->|"Dominating complete cut"| Install
+    Validate -->|"Outside contract"| Refuse
+    Install --> Continue
+    Refuse -->|"Another source may help"| Continue

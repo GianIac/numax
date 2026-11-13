@@ -47,6 +47,49 @@ pub const DEFAULT_PEER_DEAD_AFTER_FAILURES: u32 = 3;
 /// Default interval between anti-entropy pull requests.
 pub const DEFAULT_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Additive term in the default `ceil(log2(N) + c)` gossip fanout.
+pub const DEFAULT_GOSSIP_FANOUT_CONSTANT: usize = 3;
+
+/// Upper bound on peers selected for one gossip batch.
+pub const DEFAULT_GOSSIP_MAX_FANOUT: usize = DEFAULT_MAX_PEERS;
+
+/// Per-peer gossip payload rate. Control and anti-entropy have separate budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GossipRateConfig {
+    pub min_bytes_per_second: u64,
+    pub max_bytes_per_second: u64,
+    pub burst_bytes: usize,
+}
+impl Default for GossipRateConfig {
+    fn default() -> Self {
+        Self {
+            min_bytes_per_second: 64 * 1024,
+            max_bytes_per_second: 4 * 1024 * 1024,
+            burst_bytes: 256 * 1024,
+        }
+    }
+}
+impl GossipRateConfig {
+    pub fn validate(&self) -> Result<(), SyncConfigError> {
+        if self.min_bytes_per_second == 0 {
+            return Err(SyncConfigError::Invalid(
+                "gossip_min_bytes_per_second must be positive".into(),
+            ));
+        }
+        if self.max_bytes_per_second < self.min_bytes_per_second {
+            return Err(SyncConfigError::Invalid(
+                "gossip_max_bytes_per_second must be at least gossip_min_bytes_per_second".into(),
+            ));
+        }
+        if self.burst_bytes == 0 {
+            return Err(SyncConfigError::Invalid(
+                "gossip_burst_bytes must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Sync configuration for the runtime.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -89,6 +132,14 @@ pub struct SyncConfig {
     /// Interval between periodic anti-entropy pull requests.
     pub anti_entropy_interval: Duration,
 
+    /// Additive term in the default `ceil(log2(N) + c)` gossip fanout.
+    pub gossip_fanout_constant: usize,
+
+    /// Maximum peers selected for one gossip batch.
+    pub gossip_max_fanout: usize,
+
+    pub gossip_rate: GossipRateConfig,
+
     /// Serialization format used for outgoing network messages.
     pub serialization_format: SerializationFormat,
 }
@@ -109,6 +160,9 @@ impl Default for SyncConfig {
             reconnect_max_delay: DEFAULT_RECONNECT_MAX_DELAY,
             peer_dead_after_failures: DEFAULT_PEER_DEAD_AFTER_FAILURES,
             anti_entropy_interval: DEFAULT_ANTI_ENTROPY_INTERVAL,
+            gossip_fanout_constant: DEFAULT_GOSSIP_FANOUT_CONSTANT,
+            gossip_max_fanout: DEFAULT_GOSSIP_MAX_FANOUT,
+            gossip_rate: GossipRateConfig::default(),
             serialization_format: SerializationFormat::Bincode,
         }
     }
@@ -118,9 +172,17 @@ impl SyncConfig {
     /// Validate allocation bounds and timer deadlines before starting services.
     /// Zero retry delays and anti-entropy intervals retain their 1 ms normalization.
     pub fn validate(&self) -> Result<(), SyncConfigError> {
+        self.gossip_rate.validate()?;
+        if self.max_message_size == 0 || self.max_message_size > u32::MAX as usize {
+            return Err(SyncConfigError::Invalid(
+                "max_message_size must be in 1..=u32::MAX payload bytes".into(),
+            ));
+        }
         for (name, limit) in [
             ("queued_ops_limit", self.queued_ops_limit),
             ("max_peers", self.max_peers),
+            ("gossip_fanout_constant", self.gossip_fanout_constant),
+            ("gossip_max_fanout", self.gossip_max_fanout),
         ] {
             if limit > tokio::sync::Semaphore::MAX_PERMITS {
                 return Err(SyncConfigError::Invalid(format!(
@@ -147,6 +209,11 @@ impl SyncConfig {
         if self.socket_timeout.is_zero() {
             return Err(SyncConfigError::Invalid(
                 "socket_timeout must be positive".into(),
+            ));
+        }
+        if self.gossip_max_fanout == 0 {
+            return Err(SyncConfigError::Invalid(
+                "gossip_max_fanout must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -217,6 +284,17 @@ impl SyncConfig {
         self
     }
 
+    pub fn with_gossip_rate(mut self, rate: GossipRateConfig) -> Self {
+        self.gossip_rate = rate;
+        self
+    }
+
+    pub fn with_gossip_fanout(mut self, constant: usize, max_fanout: usize) -> Self {
+        self.gossip_fanout_constant = constant;
+        self.gossip_max_fanout = max_fanout;
+        self
+    }
+
     pub fn with_serialization_format(mut self, serialization_format: SerializationFormat) -> Self {
         self.serialization_format = serialization_format;
         self
@@ -231,6 +309,30 @@ impl SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_payload_limit_preserves_small_values_and_rejects_invalid_range() {
+        assert!(
+            SyncConfig::new()
+                .with_max_message_size(1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            SyncConfig::new()
+                .with_max_message_size(0)
+                .validate()
+                .is_err()
+        );
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert!(
+                SyncConfig::new()
+                    .with_max_message_size(too_large)
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn validation_preserves_zero_normalization_and_disabled_peer_admission() {
@@ -261,6 +363,8 @@ mod tests {
             DEFAULT_PEER_DEAD_AFTER_FAILURES
         );
         assert_eq!(cfg.anti_entropy_interval, DEFAULT_ANTI_ENTROPY_INTERVAL);
+        assert_eq!(cfg.gossip_fanout_constant, DEFAULT_GOSSIP_FANOUT_CONSTANT);
+        assert_eq!(cfg.gossip_max_fanout, DEFAULT_GOSSIP_MAX_FANOUT);
         assert_eq!(cfg.serialization_format, SerializationFormat::Bincode);
 
         let cfg = SyncConfig::new().with_listen_addr("0.0.0.0:9000");
@@ -292,6 +396,7 @@ mod tests {
             .with_reconnect_backoff(Duration::from_millis(10), Duration::from_secs(2))
             .with_peer_dead_after_failures(5)
             .with_anti_entropy_interval(Duration::from_secs(3))
+            .with_gossip_fanout(2, 6)
             .with_serialization_format(SerializationFormat::Json);
 
         assert_eq!(cfg.max_peers, 8);
@@ -304,6 +409,18 @@ mod tests {
         assert_eq!(cfg.reconnect_max_delay, Duration::from_secs(2));
         assert_eq!(cfg.peer_dead_after_failures, 5);
         assert_eq!(cfg.anti_entropy_interval, Duration::from_secs(3));
+        assert_eq!(cfg.gossip_fanout_constant, 2);
+        assert_eq!(cfg.gossip_max_fanout, 6);
         assert_eq!(cfg.serialization_format, SerializationFormat::Json);
+    }
+
+    #[test]
+    fn validation_rejects_zero_gossip_fanout_budget() {
+        assert!(
+            SyncConfig::new()
+                .with_gossip_fanout(1, 0)
+                .validate()
+                .is_err()
+        );
     }
 }

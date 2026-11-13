@@ -35,7 +35,7 @@ tags:
   - name: Modules
     description: Registration and one-shot execution of local WASM artifacts.
   - name: Peers
-    description: Read-only inspection of currently connected peers.
+    description: Persistent manual candidates and independent peer observations.
   - name: Datastore
     description: Read-only access to application keys and values.
   - name: Probes
@@ -215,6 +215,84 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
 
   /api/v1/peers:
+    post:
+      tags: [Peers]
+      operationId: addPeerCandidate
+      summary: Accept a persistent manual peer candidate
+      description: |
+        Delegates to RuntimeManagement. A new manual contribution returns 202
+        only after its local batch and covering flush and coordinator publication.
+        It does not imply a connection, authenticated identity, Alive membership,
+        remote receipt or convergence. A repeated canonical address returns 200
+        without redialing or resetting backoff. An address contributed by another
+        source receives its own manual contribution without replacing that source.
+
+        Accepts IPv4, bracketed IPv6 and ASCII DNS host:port, port 1..65535.
+        DNS names are lowercased and a trailing dot is removed. Whitespace, URL
+        schemes/paths, unspecified/multicast/broadcast and known local endpoints
+        are rejected. DNS is not resolved during acceptance. Body limit is 4 KiB
+        or the configured global limit, whichever is smaller.
+
+        Candidates persist in this datastore and discovery cluster across restart;
+        they supplement configured sources without modifying CLI/NX_*/TOML.
+        No removal API is provided. Capacity exhaustion does not evict records.
+        Sync must be running. Startup, shutdown and terminal shutdown reject new
+        submissions. Queued work is bounded. An HTTP timeout, lost response,
+        peer_acceptance_uncertain or interruption after persistence can leave a
+        surviving candidate; retry the identical address to reconcile the outcome.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [address]
+              properties:
+                address:
+                  type: string
+                  minLength: 1
+                  maxLength: 259
+                  example: peer.example:9000
+      responses:
+        "200":
+          description: The same manual contribution was already accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerRegistration"
+        "202":
+          description: The new manual contribution was persisted and published.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerRegistration"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The bounded candidate registry is full; no candidate was added.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          description: Storage/internal error or peer_acceptance_uncertain; a write may survive an uncertain outcome.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "504":
+          $ref: "#/components/responses/RequestTimeout"
     get:
       tags: [Peers]
       operationId: listConnectedPeers
@@ -224,16 +302,35 @@ paths:
         Pages may contain fewer than `limit` peers to fit the 1 MiB response limit;
         use `next_cursor` to continue. If a single peer cannot fit, returns `500`
         with `internal_error` instead of an oversized response or a truncated identity.
+        Without view the existing connected-peer representation is unchanged.
+        Opt-in views have independent snapshots: candidate endpoint and sources
+        are coherent within the coordinator; membership is one actor snapshot;
+        connections, reconnect health, durable recovery and in-flight requests
+        are not a joint transaction. Pagination is live, not snapshot-isolated.
+        Reuse cursors only within their originating view.
+        No view proves global convergence or changes local readiness.
+        The recovery view admits one blocking scan per runtime. Its worker retains
+        that permit after HTTP timeout or cancellation until the scan completes.
+        Additional recovery views return 503 service_unavailable and Retry-After: 1
+        without queuing further scans.
       parameters:
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
+        - name: view
+          in: query
+          description: Optional independent observation; omit for the legacy connected-peer page.
+          schema:
+            type: string
+            enum: [candidates, connections, membership, recovery]
       responses:
         "200":
           description: A bounded page of connected peers ordered by address.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PeerPage"
+                anyOf:
+                  - $ref: "#/components/schemas/PeerPage"
+                  - $ref: "#/components/schemas/PeerObservationPage"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -469,6 +566,156 @@ components:
           minLength: 1
           description: Node identity reported by the connected peer.
           example: node-a
+    PeerRegistration:
+      type: object
+      additionalProperties: false
+      required: [address, source, created, persisted, status]
+      properties:
+        address:
+          type: string
+          maxLength: 259
+        source:
+          const: manual
+        created:
+          type: boolean
+        persisted:
+          const: true
+        status:
+          const: candidate_accepted
+    PeerCandidate:
+      type: object
+      additionalProperties: false
+      required: [address, sources, persisted, reconnect]
+      properties:
+        address:
+          type: string
+        sources:
+          type: array
+          items:
+            type: string
+          description: Sorted source identifiers; not authentication evidence.
+        persisted:
+          type: boolean
+          description: This effective candidate has a flush-confirmed manual contribution.
+        reconnect:
+          type: [string, "null"]
+          enum: [healthy, suspect, dead, null]
+          description: Endpoint reconnect health, NOT SWIM membership.
+    PeerConnection:
+      type: object
+      additionalProperties: false
+      required: [transport_addr, dialed_endpoint, direction, node_id, verification]
+      properties:
+        transport_addr:
+          type: string
+        dialed_endpoint:
+          type: [string, "null"]
+        direction:
+          enum: [inbound, outbound]
+        node_id:
+          type: string
+        verification:
+          enum: [certificate_bound, unverified]
+    PeerMembership:
+      type: object
+      additionalProperties: false
+      required: [node_id, epoch, incarnation, state, endpoint, reporter, service_error]
+      properties:
+        node_id:
+          type: string
+        epoch:
+          type: integer
+          minimum: 1
+        incarnation:
+          type: integer
+          minimum: 0
+        state:
+          enum: [alive, suspect, dead, left]
+        endpoint:
+          type: [string, "null"]
+        reporter:
+          type: string
+        service_error:
+          type: [string, "null"]
+          description: Membership service failure; records may be stale.
+    PeerRecovery:
+      type: object
+      additionalProperties: false
+      required: [origin, contiguous_sequence, known_high_sequence, sparse_positions,
+        missing_positions, source_unavailable, unavailable_evidence, baseline_required,
+        baseline_missing, baseline_unconfirmed, recovery_failure, in_flight]
+      properties:
+        origin:
+          type: string
+        contiguous_sequence:
+          type: integer
+          minimum: 0
+        known_high_sequence:
+          type: integer
+          minimum: 0
+        sparse_positions:
+          type: integer
+          minimum: 0
+        missing_positions:
+          type: integer
+          minimum: 0
+          description: Known high minus contiguous coverage and sparse receipts; not a global missing-operation count.
+        source_unavailable:
+          type: boolean
+        unavailable_evidence:
+          oneOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required: [source, start, end, request_id]
+              properties:
+                source:
+                  type: string
+                start:
+                  type: integer
+                  minimum: 1
+                end:
+                  type: integer
+                  minimum: 1
+                request_id:
+                  type: string
+        baseline_required:
+          type: boolean
+        baseline_missing:
+          type: boolean
+        baseline_unconfirmed:
+          type: boolean
+        recovery_failure:
+          oneOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required: [source, reason]
+              properties:
+                source:
+                  type: string
+                reason:
+                  type: string
+                  description: Bounded BaselineFailure reason; one source's refusal is not global loss proof.
+        in_flight:
+          type: boolean
+          description: An unexpired range/baseline request exists; summary requests are separate.
+    PeerObservationPage:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items:
+                oneOf:
+                  - $ref: "#/components/schemas/PeerCandidate"
+                  - $ref: "#/components/schemas/PeerConnection"
+                  - $ref: "#/components/schemas/PeerMembership"
+                  - $ref: "#/components/schemas/PeerRecovery"
     PeerPage:
       unevaluatedProperties: false
       allOf:
@@ -554,6 +801,8 @@ components:
         - service_unavailable
         - request_timeout
         - internal_error
+        - peer_capacity_exceeded
+        - peer_acceptance_uncertain
 
   responses:
     BadRequest:

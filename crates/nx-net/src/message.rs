@@ -5,7 +5,7 @@ use nx_sync::{NodeId, Op};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 const FORMAT_JSON: u8 = 0x01;
 const FORMAT_BINCODE: u8 = 0x02;
@@ -49,6 +49,25 @@ impl SerializationFormat {
 
 pub const DEFAULT_SUPPORTED_FORMATS: &[SerializationFormat] =
     &[SerializationFormat::Bincode, SerializationFormat::Json];
+
+/// Size of a History frame using the transport encoder, including the codec
+/// byte and four-byte length prefix. Transport payload limits exclude the prefix.
+pub fn history_frame_len(
+    message: &nx_sync::HistoryMessage,
+    format: SerializationFormat,
+) -> NetResult<usize> {
+    Ok(encode_history_frame(message.clone(), format)?.len())
+}
+
+pub(crate) fn encode_history_frame(
+    message: nx_sync::HistoryMessage,
+    format: SerializationFormat,
+) -> NetResult<Vec<u8>> {
+    WireMessage {
+        kind: WireMessageKind::History { message },
+    }
+    .to_bytes_with_format(format)
+}
 
 /// Structured error sent over the wire before closing or rejecting a request.
 #[derive(
@@ -241,6 +260,22 @@ pub(crate) enum WireMessageKind {
         candidates: Vec<String>,
         candidate_ttl_ms: u64,
     },
+    History {
+        message: nx_sync::HistoryMessage,
+    },
+    ControlHello {
+        node_id: NodeId,
+        protocol_version: u32,
+        supported_formats: Vec<SerializationFormat>,
+        preferred_format: SerializationFormat,
+        request: crate::ControlRequest,
+    },
+    ControlAck {
+        node_id: NodeId,
+        protocol_version: u32,
+        selected_format: SerializationFormat,
+        reply: crate::ControlReply,
+    },
 }
 
 #[derive(
@@ -414,7 +449,8 @@ impl WireMessage {
     }
 
     pub(crate) fn to_bytes_with_format(&self, format: SerializationFormat) -> NetResult<Vec<u8>> {
-        encode_frame(
+        self.validate_control()?;
+        let bytes = encode_frame(
             format,
             || serde_json::to_vec(self).map_err(NetError::from),
             || {
@@ -423,15 +459,48 @@ impl WireMessage {
                     wincode::config::Configuration::default().disable_preallocation_size_limit(),
                 )?)
             },
-        )
+        )?;
+        if self.is_control() {
+            validate_payload_len(bytes.len() - 4, crate::MAX_CONTROL_FRAME)?;
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn from_bytes_with_format(bytes: &[u8]) -> NetResult<(SerializationFormat, Self)> {
-        decode_frame(
+        let (format, message): (_, Self) = decode_frame(
             bytes,
             |payload| serde_json::from_slice(payload),
             deserialize_binary_wire_message,
+        )?;
+        if message.is_control() {
+            validate_payload_len(bytes.len(), crate::MAX_CONTROL_FRAME)?;
+        }
+        message.validate_control()?;
+        Ok((format, message))
+    }
+
+    fn is_control(&self) -> bool {
+        matches!(
+            self.kind,
+            WireMessageKind::ControlHello { .. } | WireMessageKind::ControlAck { .. }
         )
+    }
+
+    fn validate_control(&self) -> NetResult<()> {
+        match &self.kind {
+            WireMessageKind::ControlHello {
+                request,
+                supported_formats,
+                ..
+            } => {
+                if supported_formats.is_empty() || supported_formats.len() > 2 {
+                    return Err(NetError::InvalidMessage("invalid control formats".into()));
+                }
+                request.validate()
+            }
+            WireMessageKind::ControlAck { reply, .. } => reply.validate(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -543,7 +612,11 @@ impl TryFrom<WireMessage> for Message {
             WireMessageKind::Error { error } => MessageKind::Error {
                 error: error.try_into()?,
             },
-            WireMessageKind::BootstrapHello { .. } | WireMessageKind::BootstrapAck { .. } => {
+            WireMessageKind::BootstrapHello { .. }
+            | WireMessageKind::BootstrapAck { .. }
+            | WireMessageKind::History { .. }
+            | WireMessageKind::ControlHello { .. }
+            | WireMessageKind::ControlAck { .. } => {
                 return Err(NetError::InvalidMessage(
                     "bootstrap wire messages are not public protocol messages".into(),
                 ));
@@ -782,7 +855,7 @@ mod tests {
             },
         ];
 
-        vec![
+        let mut messages = vec![
             Message::hello(origin.clone()),
             Message::hello_ack(origin),
             Message::push_ops(ops),
@@ -807,7 +880,25 @@ mod tests {
             Message::wire_error(WireError::Internal {
                 reason: "internal".into(),
             }),
-        ]
+        ];
+        for message in &mut messages {
+            match &mut message.kind {
+                MessageKind::Hello {
+                    protocol_version, ..
+                }
+                | MessageKind::HelloAck {
+                    protocol_version, ..
+                } => *protocol_version = 5,
+                MessageKind::Error {
+                    error: WireError::ProtocolMismatch { expected, got },
+                } => {
+                    *expected = 5;
+                    *got = 4;
+                }
+                _ => {}
+            }
+        }
+        messages
     }
 
     fn bootstrap_wire_messages() -> Vec<WireMessage> {
@@ -1015,6 +1106,159 @@ mod tests {
                 let bytes = message.to_bytes_with_format(format).unwrap();
                 let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
                 assert_eq!(decoded, message);
+                assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_v8_baseline_messages_roundtrip_json_and_bincode() {
+        use nx_sync::{BaselineFailure, HistoryMessage};
+        let request_id = nx_sync::OpId::new("baseline-attempt");
+        let origin = NodeId::new("origin");
+        let mut messages = vec![
+            HistoryMessage::BaselineRequest {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                version: 1,
+            },
+            HistoryMessage::Baseline {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                version: 1,
+                payload: vec![0, 1, 255],
+                digest: [42; 32],
+            },
+        ];
+        for reason in [
+            BaselineFailure::UnsupportedVersion,
+            BaselineFailure::SourceIncomplete,
+            BaselineFailure::BudgetExceeded,
+            BaselineFailure::CoverageConflict,
+            BaselineFailure::InvalidState,
+        ] {
+            messages.push(HistoryMessage::BaselineUnavailable {
+                request_id: request_id.clone(),
+                origin: origin.clone(),
+                reason,
+            });
+        }
+        for message in messages {
+            let wire = WireMessage {
+                kind: WireMessageKind::History { message },
+            };
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let bytes = wire.to_bytes_with_format(format).unwrap();
+                assert_eq!(
+                    WireMessage::from_bytes_with_format(&bytes[4..]).unwrap().1,
+                    wire
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_v7_history_roundtrips_in_both_formats_without_changing_legacy_codec() {
+        use nx_sync::{HistoryMessage, HistorySummary, OpPosition, SequencedOp};
+        let origin = NodeId::new("origin");
+        let operation = SequencedOp {
+            op: Op {
+                id: OpId::new("protocol-7-fixture-op"),
+                origin: origin.clone(),
+                kind: OpKind::GCounterIncrement {
+                    key: "visits".into(),
+                    increment: 1,
+                },
+            },
+            position: OpPosition {
+                generation: 3,
+                sequence: 42,
+            },
+        };
+        let messages = [
+            HistoryMessage::SummaryRequest { after_origin: None },
+            HistoryMessage::SummaryRequest {
+                after_origin: Some(origin.as_str().to_owned()),
+            },
+            HistoryMessage::Push {
+                ops: vec![operation.clone()],
+            },
+            HistoryMessage::Summary {
+                entries: vec![HistorySummary {
+                    baseline_required: false,
+                    origin: origin.clone(),
+                    high_sequence: 42,
+                }],
+            },
+            HistoryMessage::Request {
+                request_id: nx_sync::OpId::new("request-1"),
+                origin: origin.clone(),
+                start: 42,
+                end: 42,
+            },
+            HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("request-1"),
+                origin: origin.clone(),
+                start: 42,
+                end: 42,
+                ops: vec![operation],
+            },
+            HistoryMessage::Unavailable {
+                request_id: nx_sync::OpId::new("request-2"),
+                origin,
+                start: 1,
+                end: 41,
+            },
+        ];
+        // Frozen protocol-7 frame hashes (JSON, Bincode). A layout change must
+        // choose a new protocol version, not rewrite these references in place.
+        let expected_hashes = [
+            [
+                "1c7c353ae1912598d36249d976325601c485ddd10214741e686bd87cbffded93",
+                "f64fde74ad91c3530c0397928e3310b96f1a9209214e1164eaad1065e2e822f3",
+            ],
+            [
+                "bdd3175b887915adadf94e86a22bb4a80ff137a1a479857255a9af068759faed",
+                "ea6865d1fb4ddb84e6bfb1e8d73063ffbcaa49223ac485b259bf545fbab3af90",
+            ],
+            [
+                "d1886991e28c2976b8de28685764e500763560faef36c1c2b7baba3acf96367e",
+                "f4eb40c13e605c09de3d9b1eaacdb207fd3017a8d9efade7c7ccfd7e54cd8d16",
+            ],
+            [
+                "c7b0c6e6ea3f41764430e7d1b847ecc5326d08812fbc36378360e9717da179c1",
+                "df6f9b83751e4a7477b38f2d9161ccf81b5b94e581b62b7da9bde27867807150",
+            ],
+            [
+                "82851acf9746868a578fca1e08fedcb1133619a84f94b8fa7ba4404647e8eb1c",
+                "a3cfd5719d83e5cd28eba55f08c49ece3bef1899d892531a95781391e2256ced",
+            ],
+            [
+                "9278d22cdaf92604e76f5cfa2629a89caa41cbb7a70cb9a848e3e7d513080a43",
+                "79ba0a4afc4c1784a261ea992b7e34381df9ee47c45638f15d1abdb1b9cf28f0",
+            ],
+            [
+                "933c8acec05e4b8d96c2959241733e8619706cc7805e53461d62ccb3a6156341",
+                "5fd0bf090af52c544ffc7d6f5db124781757dafaafe5c69cf0575b4ea4f77d0a",
+            ],
+        ];
+        assert_eq!(messages.len(), expected_hashes.len());
+        for (message, expected) in messages.into_iter().zip(expected_hashes) {
+            let wire = WireMessage {
+                kind: WireMessageKind::History { message },
+            };
+            for (format, expected_hash) in [SerializationFormat::Json, SerializationFormat::Bincode]
+                .into_iter()
+                .zip(expected)
+            {
+                let bytes = wire.to_bytes_with_format(format).unwrap();
+                assert_eq!(
+                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                    expected_hash,
+                    "{format:?}: {wire:?}"
+                );
+                let (_, decoded) = WireMessage::from_bytes_with_format(&bytes[4..]).unwrap();
+                assert_eq!(decoded, wire);
                 assert!(Message::from_bytes_with_format(&bytes[4..]).is_err());
             }
         }

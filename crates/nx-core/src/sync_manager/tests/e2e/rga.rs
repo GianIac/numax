@@ -1,6 +1,31 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_rga_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        let first = local_rga_insert_after(&ha, "manual-a", None, b"before").await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_rga(&b, "manual-a", &[b"before"]).await;
+        local_rga_delete(&hb, "manual-a", &first).await;
+        wait_for_rga(&a, "manual-a", &[]).await;
+        assert_eq!(
+            read_materialized_rga(&sa, "manual-a"),
+            read_materialized_rga(&sb, "manual-a")
+        );
+        assert_eq!(
+            read_durable_rga_state(&sa, "manual-a"),
+            read_durable_rga_state(&sb, "manual-a")
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_rga_insert_delete_converge() {
     let key = "comments:doc-1";
     let addr_a = free_addr();

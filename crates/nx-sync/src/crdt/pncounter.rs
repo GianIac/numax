@@ -17,11 +17,20 @@ impl PNCounter {
         }
     }
 
-    /// Returns the converged signed counter value.
+    /// Returns the difference of the full slot totals, clamped to the i64 range.
     pub fn value(&self) -> i64 {
-        let positive = self.positive.value() as i128;
-        let negative = self.negative.value() as i128;
-        clamp_i128_to_i64(positive - negative)
+        let positive = self.positive.total();
+        let negative = self.negative.total();
+        if positive >= negative {
+            (positive - negative).min(i64::MAX as u128) as i64
+        } else {
+            let magnitude = negative - positive;
+            if magnitude > i64::MAX as u128 {
+                i64::MIN
+            } else {
+                -(magnitude as i64)
+            }
+        }
     }
 
     /// Returns the positive slot value for a specific node.
@@ -106,10 +115,6 @@ impl PNCounter {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
-}
-
-fn clamp_i128_to_i64(value: i128) -> i64 {
-    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 #[cfg(test)]
@@ -313,5 +318,87 @@ mod tests {
         counter.decrement(&node, u64::MAX);
 
         assert_eq!(counter.value(), i64::MIN);
+    }
+
+    #[test]
+    fn test_pncounter_cancels_totals_over_u64_before_clamping() {
+        for (positive, negative, expected) in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (0, 1, -1),
+            (i64::MAX as u64, 0, i64::MAX),
+            (i64::MAX as u64 + 1, 0, i64::MAX),
+            (0, i64::MAX as u64, -i64::MAX),
+            (0, i64::MAX as u64 + 1, i64::MIN),
+            (0, u64::MAX, i64::MIN),
+            (u64::MAX, u64::MAX - 7, 7),
+            (u64::MAX - 7, u64::MAX, -7),
+        ] {
+            let mut counter = PNCounter::new();
+            for node in [NodeId::new("a"), NodeId::new("b")] {
+                counter.increment(&node, u64::MAX);
+                counter.decrement(&node, u64::MAX);
+            }
+            counter.increment(&NodeId::new("c"), positive);
+            counter.decrement(&NodeId::new("d"), negative);
+            assert_eq!(counter.value(), expected, "P={positive}, N={negative}");
+            let restored = PNCounter::from_json(&counter.to_json().unwrap()).unwrap();
+            assert_eq!(restored.value(), expected);
+            assert_eq!(restored.positive_for(&NodeId::new("c")), positive);
+            assert_eq!(restored.negative_for(&NodeId::new("d")), negative);
+        }
+    }
+
+    #[test]
+    fn test_pncounter_merge_and_apply_cancel_totals_over_u64() {
+        let a = NodeId::new("a");
+        let b = NodeId::new("b");
+        let mut left = PNCounter::new();
+        left.increment(&a, u64::MAX);
+        left.decrement(&a, u64::MAX);
+        let mut right = PNCounter::new();
+        right.increment(&b, u64::MAX);
+        right.decrement(&b, u64::MAX - 5);
+
+        let mut merged = left.merged_with(&right);
+        assert_eq!(merged.value(), 5);
+        assert_eq!(
+            serde_json::to_value(&merged).unwrap(),
+            serde_json::to_value(right.merged_with(&left)).unwrap()
+        );
+        merged.merge(&right);
+        assert_eq!(merged.value(), 5);
+        assert_eq!(merged.positive_for(&b), u64::MAX);
+        assert_eq!(merged.negative_for(&b), u64::MAX - 5);
+
+        assert!(
+            merged
+                .apply_op(&Op::pncounter_decrement(b.clone(), "pn", 3))
+                .unwrap()
+        );
+        assert_eq!(merged.value(), 2);
+        assert!(
+            merged
+                .apply_op(&Op::pncounter_increment(NodeId::new("c"), "pn", 7))
+                .unwrap()
+        );
+        assert_eq!(merged.value(), 9);
+        assert!(
+            !merged
+                .apply_op(&Op::pncounter_increment(a, "pn", 1))
+                .unwrap()
+        );
+        assert!(
+            merged
+                .apply_op(&Op::pncounter_decrement(b.clone(), "pn", 9))
+                .unwrap()
+        );
+        assert_eq!(merged.negative_for(&b), u64::MAX);
+        assert_eq!(merged.value(), 7);
+        assert!(
+            !merged
+                .apply_op(&Op::pncounter_decrement(b, "pn", 1))
+                .unwrap()
+        );
     }
 }

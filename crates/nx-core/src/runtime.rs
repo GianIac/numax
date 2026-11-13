@@ -134,6 +134,7 @@ pub struct Runtime {
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
     observability_server: Option<ObservabilityServer>,
+    final_flush: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl Runtime {
@@ -237,6 +238,7 @@ impl Runtime {
             sync_manager,
             sync_handle,
             observability_server: None,
+            final_flush: None,
         })
     }
 
@@ -298,9 +300,19 @@ impl Runtime {
             tracing::debug!("shutdown: no sync configured, skipping sync manager");
         }
 
-        self.store
-            .flush()
-            .map_err(|e| anyhow!("failed to flush datastore: {e}"))?;
+        let flush = self.final_flush.get_or_insert_with(|| {
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                store.flush().map_err(|error| {
+                    tracing::warn!(error = %error, "final datastore flush failed");
+                    anyhow!("failed to flush datastore: {error}")
+                })?;
+                Ok(())
+            })
+        });
+        let result = flush.await;
+        self.final_flush = None;
+        result.map_err(|error| anyhow!("final datastore flush task failed: {error}"))??;
 
         if let Some(server) = self.observability_server.take() {
             server.shutdown().await;
@@ -737,6 +749,500 @@ mod tests {
         br#"(module (func (export "run") unreachable))"#
     }
 
+    fn rga_insert_guest(
+        out_id_ptr: u32,
+        out_id_cap: u32,
+        expected_code: i32,
+        save_id: bool,
+        trap_after_call: bool,
+    ) -> Vec<u8> {
+        let save_id = if save_id {
+            format!(
+                "(drop (call $db_set (i32.const 64) (i32.const 6) (i32.const {out_id_ptr}) (local.get $result)))"
+            )
+        } else {
+            String::new()
+        };
+        let trap = if trap_after_call { "unreachable" } else { "" };
+        format!(
+            r#"(module
+                (import "nx" "crdt_rga_insert"
+                    (func $insert (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "nx" "db_set"
+                    (func $db_set (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "comments:doc-1")
+                (data (i32.const 32) "first")
+                (data (i32.const 64) "rga-id")
+                (func (export "run") (local $result i32)
+                    (local.set $result
+                        (call $insert
+                            (i32.const 0) (i32.const 14)
+                            (i32.const 0) (i32.const 0)
+                            (i32.const 32) (i32.const 5)
+                            (i32.const {out_id_ptr}) (i32.const {out_id_cap})))
+                    (if (i32.ne (local.get $result) (i32.const {expected_code}))
+                        (then unreachable))
+                    {save_id}
+                    {trap}))"#
+        )
+        .into_bytes()
+    }
+
+    fn orset_remove_guest(element: &str, expected_code: i32) -> Vec<u8> {
+        format!(
+            r#"(module
+                (import "nx" "crdt_orset_remove"
+                    (func $remove (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "tags:item-1")
+                (data (i32.const 32) "{element}")
+                (func (export "run")
+                    (if (i32.ne
+                            (call $remove
+                                (i32.const 0) (i32.const 11)
+                                (i32.const 32) (i32.const {element_len}))
+                            (i32.const {expected_code}))
+                        (then unreachable))))"#,
+            element_len = element.len()
+        )
+        .into_bytes()
+    }
+
+    fn orset_add_guest(expected_code: i32) -> Vec<u8> {
+        format!(
+            r#"(module
+                (import "nx" "crdt_orset_add"
+                    (func $add (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "tags:item-1")
+                (data (i32.const 32) "blue")
+                (func (export "run")
+                    (if (i32.ne
+                            (call $add
+                                (i32.const 0) (i32.const 11)
+                                (i32.const 32) (i32.const 4))
+                            (i32.const {expected_code}))
+                        (then unreachable))))"#
+        )
+        .into_bytes()
+    }
+
+    fn crdt_mutation_guest(case: &str, trap_after_call: bool) -> Vec<u8> {
+        let (import, parameters, arguments) = match case {
+            "gcounter_inc" => (
+                "crdt_gcounter_inc",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "pncounter_inc" => (
+                "crdt_pncounter_inc",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "pncounter_dec" => (
+                "crdt_pncounter_dec",
+                "i32 i32 i64",
+                "(i32.const 0) (i32.const 10) (i64.const 1)",
+            ),
+            "lww_set" => (
+                "crdt_lww_set",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 64) (i32.const 5)",
+            ),
+            "lww_map_set" => (
+                "crdt_lww_map_set",
+                "i32 i32 i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4) (i32.const 64) (i32.const 5)",
+            ),
+            "lww_map_remove" => (
+                "crdt_lww_map_remove",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "orset_add" => (
+                "crdt_orset_add",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "orset_remove" => (
+                "crdt_orset_remove",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 32) (i32.const 4)",
+            ),
+            "rga_insert" => (
+                "crdt_rga_insert",
+                "i32 i32 i32 i32 i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 0) (i32.const 0) (i32.const 64) (i32.const 5) (i32.const 128) (i32.const 64)",
+            ),
+            "rga_delete" => (
+                "crdt_rga_delete",
+                "i32 i32 i32 i32",
+                "(i32.const 0) (i32.const 10) (i32.const 96) (i32.const 7)",
+            ),
+            _ => panic!("unknown CRDT mutation case: {case}"),
+        };
+        let trap = if trap_after_call { "unreachable" } else { "" };
+        format!(
+            r#"(module
+                (import "nx" "{import}" (func $mutate (param {parameters}) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "guest:crdt")
+                (data (i32.const 32) "blue")
+                (data (i32.const 64) "first")
+                (data (i32.const 96) "missing")
+                (func (export "run") (local $result i32)
+                    (local.set $result (call $mutate {arguments}))
+                    (if (i32.lt_s (local.get $result) (i32.const 0))
+                        (then unreachable))
+                    {trap}))"#
+        )
+        .into_bytes()
+    }
+
+    fn replay_ids(runtime: &Runtime) -> std::collections::HashSet<Vec<u8>> {
+        runtime
+            .store
+            .scan_prefix(b"__nx/crdt/op-log/")
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.strip_prefix(b"__nx/crdt/op-log/").unwrap().to_vec())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn guest_trap_does_not_retry_crdt_mutations_and_explicit_calls_get_new_ids() {
+        for case in [
+            "gcounter_inc",
+            "pncounter_inc",
+            "pncounter_dec",
+            "lww_set",
+            "lww_map_set",
+            "lww_map_remove",
+            "orset_add",
+            "orset_remove",
+            "rga_insert",
+            "rga_delete",
+        ] {
+            let runtime = Runtime::new(RuntimeConfig {
+                datastore_path: temp_datastore_path("numax-crdt-guest-interrupted-response"),
+                enable_wasi: false,
+                sync: Some(
+                    SyncConfig::new()
+                        .with_listen_addr("127.0.0.1:0")
+                        .with_queued_ops_limit(4),
+                ),
+                ..RuntimeConfig::default()
+            })
+            .unwrap();
+
+            if case == "orset_remove" {
+                runtime
+                    .run_module(&crdt_mutation_guest("orset_add", false))
+                    .await
+                    .unwrap();
+            }
+            let before = replay_ids(&runtime);
+            assert!(
+                runtime
+                    .run_module(&crdt_mutation_guest(case, true))
+                    .await
+                    .is_err(),
+                "{case}: guest response should be interrupted"
+            );
+            let after_trap = replay_ids(&runtime);
+            assert_eq!(after_trap.len(), before.len() + 1, "{case}: first call");
+            let first_id = after_trap.difference(&before).next().unwrap().clone();
+
+            if case == "orset_remove" {
+                runtime
+                    .run_module(&crdt_mutation_guest("orset_add", false))
+                    .await
+                    .unwrap();
+            }
+            let before_second_call = replay_ids(&runtime);
+            runtime
+                .run_module(&crdt_mutation_guest(case, false))
+                .await
+                .unwrap();
+            let after_second_call = replay_ids(&runtime);
+            assert_eq!(
+                after_second_call.len(),
+                before_second_call.len() + 1,
+                "{case}: explicit second call"
+            );
+            let second_id = after_second_call
+                .difference(&before_second_call)
+                .next()
+                .unwrap();
+            assert_ne!(second_id, &first_id, "{case}: operation identity");
+            assert_eq!(
+                runtime
+                    .store
+                    .scan_prefix(b"__nx/crdt/seen-op/")
+                    .unwrap()
+                    .len(),
+                after_second_call.len(),
+                "{case}: seen metadata"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orset_remove_noop_succeeds_when_broadcast_queue_is_full() {
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-orset-noop-full-queue-test"),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, false, false))
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .sync_handle
+                .as_ref()
+                .unwrap()
+                .op_sender()
+                .try_reserve()
+                .is_err()
+        );
+        runtime
+            .run_module(&orset_remove_guest("missing", 0))
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/state/orset/")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn orset_remove_with_observed_tags_does_not_persist_when_queue_is_full() {
+        let datastore_path = temp_datastore_path("numax-orset-remove-full-queue-test");
+        let config = RuntimeConfig {
+            datastore_path: datastore_path.clone(),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config.clone()).unwrap();
+        runtime.run_module(&orset_add_guest(0)).await.unwrap();
+        drop(runtime);
+
+        let runtime = Runtime::new(config).unwrap();
+        assert_eq!(
+            runtime.get_orset_elements("tags:item-1").await,
+            Some(vec!["blue".to_string()])
+        );
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, false, false))
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .sync_handle
+                .as_ref()
+                .unwrap()
+                .op_sender()
+                .try_reserve()
+                .is_err()
+        );
+
+        runtime
+            .run_module(&orset_remove_guest("blue", -3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.get_orset_elements("tags:item-1").await,
+            Some(vec!["blue".to_string()])
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn rga_insert_guest_rejects_output_buffers_before_acceptance() {
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-rga-output-preflight-test"),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        runtime
+            .run_module(&rga_insert_guest(128, 35, -2, false, false))
+            .await
+            .unwrap();
+        runtime
+            .run_module(&rga_insert_guest(65_520, 36, -3, false, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(Vec::new())
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/state/rga/")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .is_empty()
+        );
+
+        runtime
+            .run_module(&rga_insert_guest(128, 36, 36, true, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let output_id = String::from_utf8(runtime.store.get(b"rga-id").unwrap().unwrap()).unwrap();
+        let op_log = runtime.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(op_log.len(), 1);
+        assert_eq!(
+            op_log[0].0.strip_prefix(b"__nx/crdt/op-log/").unwrap(),
+            output_id.as_bytes()
+        );
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rga_insert_survives_guest_trap_after_flush_and_enqueue() {
+        let datastore_path = temp_datastore_path("numax-rga-uncertain-response-test");
+        let config = RuntimeConfig {
+            datastore_path: datastore_path.clone(),
+            enable_wasi: false,
+            sync: Some(
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_queued_ops_limit(1),
+            ),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+
+        assert!(
+            runtime
+                .run_module(&rga_insert_guest(128, 36, 36, false, true))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let op_log = runtime.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(op_log.len(), 1);
+        let accepted_id = op_log[0]
+            .0
+            .strip_prefix(b"__nx/crdt/op-log/")
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/seen-op/")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The unstarted manager keeps the first op in its one-slot broadcast queue.
+        runtime
+            .run_module(&rga_insert_guest(128, 36, -3, false, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .scan_prefix(b"__nx/crdt/op-log/")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(runtime);
+
+        let reopened = Runtime::new(RuntimeConfig {
+            datastore_path,
+            enable_wasi: false,
+            sync: Some(SyncConfig::new().with_listen_addr("127.0.0.1:0")),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            reopened.get_rga_values("comments:doc-1").await,
+            Some(vec![b"first".to_vec()])
+        );
+        let recovered_ops = reopened.store.scan_prefix(b"__nx/crdt/op-log/").unwrap();
+        assert_eq!(recovered_ops.len(), 1);
+        assert_eq!(
+            recovered_ops[0]
+                .0
+                .strip_prefix(b"__nx/crdt/op-log/")
+                .unwrap(),
+            accepted_id
+        );
+    }
+
     #[tokio::test]
     async fn serve_returns_immediately_when_sync_is_disabled() {
         let config = RuntimeConfig {
@@ -864,6 +1370,41 @@ mod tests {
         runtime.settle_for(duration).await.unwrap();
 
         assert!(started.elapsed() >= duration);
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_remains_responsive_during_final_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().to_path_buf(),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let flushes_before = runtime.store.completed_flushes();
+        runtime.store.pause_next_flush(reached_tx, resume_rx);
+        let holder = std::thread::spawn(move || {
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let progressed = progress_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+            resume_tx.send(()).unwrap();
+            progressed
+        });
+        let result = runtime
+            .shutdown_with_timeout(Duration::from_millis(20))
+            .await;
+        let _ = progress_tx.send(());
+        let progressed = holder.join().unwrap();
+        runtime.shutdown().await.unwrap();
+        assert_eq!(runtime.store.completed_flushes(), flushes_before + 1);
+        assert!(progressed, "final flush blocked the async timeout");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown timed out")
+        );
     }
 
     #[tokio::test]

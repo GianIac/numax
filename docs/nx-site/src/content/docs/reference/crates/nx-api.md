@@ -26,5 +26,21 @@ the documentation CI before endpoint implementations are accepted.
 
 Endpoint handlers are adapters over `nx-core`'s shared `RuntimeIntrospection`
 and `RuntimeManagement` interfaces. They expose module registration, inspection,
-one-shot execution and deletion, plus read-only peer, datastore and probe
-operations. Unknown routes return a stable JSON `404` response.
+one-shot execution and deletion, persistent manual peer registration, peer
+observation views, and read-only datastore/probe operations. Unknown routes return a stable JSON `404` response.
+
+
+## Peer management
+
+`POST /api/v1/peers` delegates to `RuntimeManagement::add_peer`. It accepts a
+persistent endpoint candidate and does not confirm connection or authentication.
+Its JSON body is limited to 4 KiB, or a smaller global request-body bound.
+
+`GET /api/v1/peers` retains its default active-peer page. The optional
+`view=candidates|connections|membership|recovery` selects independent paginated
+observations through `RuntimeIntrospection::inspect_peers`. Cursors remain scoped
+to their view. Recovery introspection allows one worker-held scan per runtime;
+concurrent scans return `503` rather than queueing more blocking work.
+
+See the [Management API guide](/numax/guides/management-api/#add-a-persistent-peer-candidate)
+for examples, error responses, restart behavior and unknown outcomes.

@@ -246,6 +246,11 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
+gossip_fanout_constant = 3
+gossip_max_fanout = 64
+gossip_min_bytes_per_second = 65536
+gossip_max_bytes_per_second = 4194304
+gossip_burst_bytes = "256KiB"
 
 [discovery]
 mode = "static"
@@ -427,6 +432,11 @@ reconnect_initial_delay = "500ms"
 reconnect_max_delay = "30s"
 peer_dead_after_failures = 3
 anti_entropy_interval = "30s"
+gossip_fanout_constant = 3
+gossip_max_fanout = 64
+gossip_min_bytes_per_second = 65536
+gossip_max_bytes_per_second = 4194304
+gossip_burst_bytes = "256KiB"
 ```
 
 | Field | Type | Description |
@@ -441,9 +451,22 @@ anti_entropy_interval = "30s"
 | `reconnect_max_delay` | duration | Maximum backoff for reconnect attempts |
 | `peer_dead_after_failures` | integer | Consecutive failures before a peer is marked dead |
 | `anti_entropy_interval` | duration | Interval between anti-entropy repair cycles |
+| `gossip_fanout_constant` | nonnegative integer | Additive constant `c` in `ceil(log2(N)) + c`; default `3` |
+| `gossip_max_fanout` | positive integer | Maximum immediate-push recipients; default `64`, also limited by eligible active connections |
+| `gossip_min_bytes_per_second` | positive integer | Per-peer lower bound for adaptive gossip pacing; default `65536` |
+| `gossip_max_bytes_per_second` | positive integer | Per-peer upper/initial gossip byte rate; default `4194304`; must be at least the minimum |
+| `gossip_burst_bytes` | byte size | Positive burst credit; default `256KiB`; one larger legal frame can overdraw the bucket and must be repaid |
 
 `reconnect_initial_delay` and `reconnect_max_delay` must be provided together.
 `reconnect_initial_delay` must be less than or equal to `reconnect_max_delay`.
+
+Fanout estimates N from the union of the local identity, `Alive`/`Suspect`
+membership identities and active data-peer identities, deduplicated by `NodeId`.
+Only active connections are recipients. They rotate in a deterministic order
+hashed by local identity and address; remote forwarding excludes the immediate
+sender. These TOML settings do not create or repair connections and have no
+dedicated CLI flags or environment overrides. The default is `c = 3`; see the
+[fanout policy](/numax/design/peer-discovery/#fanout) for estimation and bounds.
 
 ### [discovery]
 

@@ -1,3 +1,6 @@
+mod sequence;
+pub(super) use sequence::*;
+
 use std::collections::HashMap;
 
 use nx_store::Store as NxStore;
@@ -8,6 +11,240 @@ use super::replication::{
     normalize_op_log_limit, normalize_seen_ops_limit, prune_op_log_and_return_evicted,
 };
 use super::types::*;
+
+#[cfg(test)]
+fn record_remote_storage_timing(stage: &'static str, started: std::time::Instant, success: bool) {
+    debug!(
+        target: "nx_core::sync_manager::storage",
+        message = stage,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success,
+        "bounded remote persistence diagnostic"
+    );
+}
+
+#[cfg(test)]
+pub(super) mod critical_trace {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+
+    pub(in crate::sync_manager) const TARGET: &str = "nx_core::sync_manager::critical_path";
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    thread_local! { static CURRENT: RefCell<Option<Job>> = const { RefCell::new(None) }; }
+
+    pub(in crate::sync_manager) fn clock() -> Instant {
+        *CLOCK.get_or_init(Instant::now)
+    }
+
+    pub(in crate::sync_manager) fn enable() {
+        clock();
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    fn stamp() -> Option<u64> {
+        match u64::try_from(clock().elapsed().as_micros()) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                None
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(in crate::sync_manager) struct Job(Option<Arc<JobState>>);
+
+    struct JobState {
+        id: u64,
+        kind: &'static str,
+        held: Mutex<Vec<&'static str>>,
+        release_begin: AtomicU64,
+        ended: AtomicBool,
+    }
+
+    impl JobState {
+        fn emit(&self, kind: &str, resource: &str, event: &str, status: &str, lower: u64) {
+            if let Some(event_us) = stamp() {
+                tracing::debug!(target: TARGET, critical_trace = true,
+                    job_id = self.id, job_kind = self.kind, span_kind = kind,
+                    resource, critical_event = event, event_us,
+                    release_begin_us = lower,
+                    release_confirmed = kind == "hold" && event == "end" && status != "cancelled",
+                    status, thread_id = ?std::thread::current().id());
+            }
+        }
+
+        fn release_all(&self, status: &str) {
+            let held = match self.held.lock() {
+                Ok(mut held) => std::mem::take(&mut *held),
+                Err(error) => {
+                    tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                    return;
+                }
+            };
+            for resource in held {
+                self.emit(
+                    "hold",
+                    resource,
+                    "end",
+                    status,
+                    self.release_begin.load(Ordering::Acquire),
+                );
+            }
+        }
+
+        fn end(&self, status: &str) {
+            if !self.ended.swap(true, Ordering::AcqRel) {
+                self.release_all(status);
+                self.emit(
+                    "job",
+                    "job",
+                    "end",
+                    status,
+                    self.release_begin.load(Ordering::Acquire),
+                );
+            }
+        }
+    }
+
+    impl Drop for JobState {
+        fn drop(&mut self) {
+            self.end("cancelled");
+        }
+    }
+
+    impl Job {
+        pub(in crate::sync_manager) fn new(kind: &'static str) -> anyhow::Result<Self> {
+            if !ENABLED.load(Ordering::Acquire) {
+                return Ok(Self(None));
+            }
+            let id = NEXT_JOB
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| anyhow::anyhow!("critical trace job ID exhausted"))?;
+            let started = u64::try_from(clock().elapsed().as_micros())?;
+            let state = Arc::new(JobState {
+                id,
+                kind,
+                held: Mutex::new(Vec::new()),
+                release_begin: AtomicU64::new(started),
+                ended: AtomicBool::new(false),
+            });
+            state.emit("job", "job", "begin", "open", started);
+            Ok(Self(Some(state)))
+        }
+
+        pub(in crate::sync_manager) fn span(
+            &self,
+            kind: &'static str,
+            resource: &'static str,
+        ) -> Span {
+            if let Some(state) = &self.0 {
+                state.emit(kind, resource, "begin", "open", 0);
+            }
+            Span {
+                job: self.clone(),
+                kind,
+                resource,
+                finished: false,
+            }
+        }
+
+        pub(in crate::sync_manager) fn acquired(&self, resource: &'static str, wait: Span) {
+            wait.finish("acquired");
+            if let Some(state) = &self.0 {
+                match state.held.lock() {
+                    Ok(mut held) => held.push(resource),
+                    Err(error) => {
+                        tracing::error!(target: TARGET, critical_trace_error = true, critical_error_detail = %error);
+                        return;
+                    }
+                }
+                state.emit("hold", resource, "begin", "open", 0);
+            }
+        }
+
+        pub(in crate::sync_manager) fn release_marker(&self) -> ReleaseMarker {
+            ReleaseMarker(self.clone())
+        }
+
+        pub(in crate::sync_manager) fn run<T>(
+            &self,
+            work: impl FnOnce() -> anyhow::Result<T>,
+        ) -> anyhow::Result<T> {
+            if self.0.is_none() {
+                return work();
+            }
+            let _current = Current(CURRENT.with(|current| current.replace(Some(self.clone()))));
+            let running = self.span("phase", "storage_job");
+            // FnOnce consumes the owned closure: its captured publication guards
+            // have been dropped when the call returns, including on an error.
+            let result = work();
+            let status = if result.is_ok() { "success" } else { "error" };
+            running.finish(status);
+            if let Some(state) = &self.0 {
+                state.end(status);
+            }
+            result
+        }
+    }
+
+    pub(in crate::sync_manager) struct Span {
+        job: Job,
+        kind: &'static str,
+        resource: &'static str,
+        finished: bool,
+    }
+
+    impl Span {
+        pub(in crate::sync_manager) fn finish(mut self, status: &str) {
+            self.finished = true;
+            if let Some(state) = &self.job.0 {
+                state.emit(self.kind, self.resource, "end", status, 0);
+            }
+        }
+
+        pub(in crate::sync_manager) fn finish_result<T, E>(self, result: &Result<T, E>) {
+            self.finish(if result.is_ok() { "success" } else { "error" });
+        }
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if !self.finished
+                && let Some(state) = &self.job.0
+            {
+                state.emit(self.kind, self.resource, "end", "cancelled", 0);
+            }
+        }
+    }
+
+    pub(in crate::sync_manager) struct ReleaseMarker(Job);
+    impl Drop for ReleaseMarker {
+        fn drop(&mut self) {
+            if let Some(state) = &self.0.0
+                && let Some(before_release) = stamp()
+            {
+                state.release_begin.store(before_release, Ordering::Release);
+            }
+        }
+    }
+
+    struct Current(Option<Job>);
+    impl Drop for Current {
+        fn drop(&mut self) {
+            CURRENT.with(|current| current.replace(self.0.take()));
+        }
+    }
+
+    pub(in crate::sync_manager) fn phase(resource: &'static str) -> Span {
+        let job = CURRENT.with(|current| current.borrow().clone());
+        job.unwrap_or(Job(None)).span("phase", resource)
+    }
+}
 
 pub(crate) fn materialized_gcounter_key(key: &str) -> Vec<u8> {
     crdt_store_key(CrdtKind::GCounter, CrdtStoreNamespace::Materialized, key)
@@ -694,7 +931,8 @@ pub(super) fn parse_durable_rga_state(bytes: &[u8]) -> anyhow::Result<Rga> {
     Rga::from_json(json).map_err(|e| anyhow::anyhow!("invalid durable RGA JSON: {e}"))
 }
 
-pub(crate) fn persist_gcounter_state(
+#[cfg(test)]
+pub(super) fn persist_gcounter_state(
     store: &NxStore,
     key: &str,
     counter: &GCounter,
@@ -713,7 +951,45 @@ pub(crate) fn persist_gcounter_state(
     Ok(())
 }
 
-pub(crate) fn persist_pncounter_state(
+pub(super) fn persist_local_gcounter_op(
+    store: &NxStore,
+    key: &str,
+    counter: &GCounter,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_gcounter_state_key(key);
+    let state_json = counter.to_json()?;
+    let materialized_key = materialized_gcounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn persist_pncounter_state(
     store: &NxStore,
     key: &str,
     counter: &PNCounter,
@@ -732,7 +1008,45 @@ pub(crate) fn persist_pncounter_state(
     Ok(())
 }
 
-pub(crate) fn persist_lww_register_state(
+pub(super) fn persist_local_pncounter_op(
+    store: &NxStore,
+    key: &str,
+    counter: &PNCounter,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_pncounter_state_key(key);
+    let state_json = counter.to_json()?;
+    let materialized_key = materialized_pncounter_key(key);
+    let materialized_value = counter.value().to_le_bytes();
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn persist_lww_register_state(
     store: &NxStore,
     key: &str,
     register: &LwwRegister,
@@ -750,7 +1064,44 @@ pub(crate) fn persist_lww_register_state(
     Ok(())
 }
 
-pub(crate) fn persist_lww_map_state(
+pub(super) fn persist_local_lww_register_op(
+    store: &NxStore,
+    key: &str,
+    register: &LwwRegister,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_lww_register_state_key(key);
+    let state_json = register.to_json()?;
+    let materialized_key = materialized_lww_register_key(key);
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), register.value()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn persist_lww_map_state(
     store: &NxStore,
     key: &str,
     map: &LwwMap,
@@ -769,7 +1120,45 @@ pub(crate) fn persist_lww_map_state(
     Ok(())
 }
 
-pub(crate) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> anyhow::Result<()> {
+pub(super) fn persist_local_lww_map_op(
+    store: &NxStore,
+    key: &str,
+    map: &LwwMap,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_lww_map_state_key(key);
+    let state_json = map.to_json()?;
+    let materialized_key = materialized_lww_map_key(key);
+    let materialized_value = serde_json::to_vec(&map.entries())?;
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> anyhow::Result<()> {
     let state_key = durable_orset_state_key(key);
     let state_json = set.to_json()?;
     let materialized_key = materialized_orset_key(key);
@@ -784,7 +1173,45 @@ pub(crate) fn persist_orset_state(store: &NxStore, key: &str, set: &ORSet) -> an
     Ok(())
 }
 
-pub(crate) fn persist_rga_state(store: &NxStore, key: &str, rga: &Rga) -> anyhow::Result<()> {
+pub(super) fn persist_local_orset_op(
+    store: &NxStore,
+    key: &str,
+    set: &ORSet,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_orset_state_key(key);
+    let state_json = set.to_json()?;
+    let materialized_key = materialized_orset_key(key);
+    let materialized_value = serde_json::to_vec(&set.elements())?;
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn persist_rga_state(store: &NxStore, key: &str, rga: &Rga) -> anyhow::Result<()> {
     let state_key = durable_rga_state_key(key);
     let state_json = rga.to_json()?;
     let materialized_key = materialized_rga_key(key);
@@ -797,6 +1224,43 @@ pub(crate) fn persist_rga_state(store: &NxStore, key: &str, rga: &Rga) -> anyhow
         &[],
     )?;
     Ok(())
+}
+
+pub(super) fn persist_local_rga_op(
+    store: &NxStore,
+    key: &str,
+    rga: &Rga,
+    plan: &OpPersistencePlan,
+) -> anyhow::Result<()> {
+    let state_key = durable_rga_state_key(key);
+    let state_json = rga.to_json()?;
+    let materialized_key = materialized_rga_key(key);
+    let materialized_value = serde_json::to_vec(&rga.values())?;
+    let seen_key = seen_op_store_key(plan.op.id.as_str());
+    let seen_sequence = plan.seen_sequence.to_be_bytes();
+    let op_log_key = op_log_store_key(plan.op.id.as_str());
+    let op_log_value = encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?;
+
+    let mut delete_keys = collect_seen_delete_keys(&plan.seen_evicted);
+    delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
+    let deletes = delete_keys
+        .iter()
+        .map(|key| key.as_slice())
+        .collect::<Vec<_>>();
+
+    persist_local_sequence_batch(
+        store,
+        &plan.op,
+        plan.local_generation
+            .ok_or_else(|| anyhow::anyhow!("missing local generation"))?,
+        &[
+            (state_key.as_slice(), state_json.as_bytes()),
+            (materialized_key.as_slice(), materialized_value.as_slice()),
+            (seen_key.as_slice(), seen_sequence.as_slice()),
+            (op_log_key.as_slice(), op_log_value.as_slice()),
+        ],
+        &deletes,
+    )
 }
 
 #[cfg(test)]
@@ -834,7 +1298,12 @@ pub(super) fn collect_seen_delete_keys(evicted: &[String]) -> Vec<Vec<u8>> {
 pub(super) fn collect_op_log_delete_keys(evicted: &[Op]) -> Vec<Vec<u8>> {
     evicted
         .iter()
-        .map(|op| op_log_store_key(op.id.as_str()))
+        .flat_map(|op| {
+            [
+                op_log_store_key(op.id.as_str()),
+                position_key(op.id.as_str()),
+            ]
+        })
         .collect()
 }
 
@@ -869,45 +1338,12 @@ pub(super) fn persist_op_log_evictions(store: &NxStore, evicted: &[Op]) -> anyho
     Ok(())
 }
 
-pub(super) fn persist_local_ops_batch(
-    store: &NxStore,
-    plans: &[OpPersistencePlan],
-) -> anyhow::Result<()> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-
-    let mut set_keys = Vec::new();
-    let mut set_values = Vec::new();
-    let mut delete_keys = Vec::new();
-
-    for plan in plans {
-        set_keys.push(seen_op_store_key(plan.op.id.as_str()));
-        set_values.push(plan.seen_sequence.to_be_bytes().to_vec());
-        set_keys.push(op_log_store_key(plan.op.id.as_str()));
-        set_values.push(encode_durable_op_log_value(plan.op_log_sequence, &plan.op)?);
-        delete_keys.extend(collect_seen_delete_keys(&plan.seen_evicted));
-        delete_keys.extend(collect_op_log_delete_keys(&plan.op_log_evicted));
-    }
-
-    let sets = set_keys
-        .iter()
-        .zip(set_values.iter())
-        .map(|(key, value)| (key.as_slice(), value.as_slice()))
-        .collect::<Vec<_>>();
-    let deletes = delete_keys
-        .iter()
-        .map(|key| key.as_slice())
-        .collect::<Vec<_>>();
-
-    store.apply_batch(&sets, &deletes)?;
-    Ok(())
-}
-
 pub(super) fn persist_remote_ops_batch(
     store: &NxStore,
     plans: &[OpPersistencePlan],
     updates: RemoteCrdtUpdateBatch<'_>,
+    lease: Option<&nx_store::StoreWriteLease<'_>>,
+    sequence_sets: &[(Vec<u8>, Vec<u8>)],
 ) -> anyhow::Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1013,7 +1449,126 @@ pub(super) fn persist_remote_ops_batch(
         .map(|key| key.as_slice())
         .collect::<Vec<_>>();
 
-    store.apply_batch(&sets, &deletes)?;
+    let mut sets = sets;
+    sets.extend(
+        sequence_sets
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice())),
+    );
+    if let Some(lease) = lease {
+        #[cfg(test)]
+        let batch_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("batch");
+        let batch_result = lease.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        phase.finish_result(&batch_result);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage batch completed",
+            batch_started,
+            batch_result.is_ok(),
+        );
+        batch_result?;
+        // Couple remote admission to storage completion: sled can enqueue log
+        // synchronization during apply_batch. Keep the publication guards and
+        // lease until the covering flush succeeds, including on cancellation.
+        #[cfg(test)]
+        let flush_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("flush");
+        let flush_result = lease.flush();
+        #[cfg(test)]
+        phase.finish_result(&flush_result);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage flush completed",
+            flush_started,
+            flush_result.is_ok(),
+        );
+        flush_result?;
+    } else {
+        #[cfg(test)]
+        let batch_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("batch");
+        let batch_result = store.apply_batch(&sets, &deletes);
+        #[cfg(test)]
+        phase.finish_result(&batch_result);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage batch completed",
+            batch_started,
+            batch_result.is_ok(),
+        );
+        batch_result?;
+        #[cfg(test)]
+        let flush_started = std::time::Instant::now();
+        #[cfg(test)]
+        let phase = critical_trace::phase("flush");
+        let flush_result = store.flush();
+        #[cfg(test)]
+        phase.finish_result(&flush_result);
+        #[cfg(test)]
+        record_remote_storage_timing(
+            "remote storage flush completed",
+            flush_started,
+            flush_result.is_ok(),
+        );
+        flush_result?;
+    }
+    Ok(())
+}
+
+fn persist_local_sequence_batch(
+    store: &NxStore,
+    op: &Op,
+    (generation, limits): (u64, super::types::LocalTransportLimits),
+    state_sets: &[(&[u8], &[u8])],
+    deletes: &[&[u8]],
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    let phase = critical_trace::phase("lease_wait");
+    let lease = store.acquire_write_lease();
+    #[cfg(test)]
+    phase.finish_result(&lease);
+    let lease = lease?;
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "local storage lease acquired"
+    );
+    let sequence_sets = local_sequence_sets(&lease, op, generation, limits)?;
+    let mut sets = state_sets.to_vec();
+    sets.extend(
+        sequence_sets
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice())),
+    );
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    let phase = critical_trace::phase("batch");
+    let batch = lease.apply_batch(&sets, deletes);
+    #[cfg(test)]
+    phase.finish_result(&batch);
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        success = batch.is_ok(),
+        "local storage batch completed"
+    );
+    batch?;
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    let phase = critical_trace::phase("flush");
+    let flush = lease.flush();
+    #[cfg(test)]
+    phase.finish_result(&flush);
+    debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        success = flush.is_ok(),
+        "local storage flush completed"
+    );
+    flush?;
     Ok(())
 }
 

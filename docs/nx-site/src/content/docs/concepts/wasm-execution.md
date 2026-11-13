@@ -89,11 +89,11 @@ WASM linear memory is a flat array of bytes. The module and the host share acces
 
 Most host functions follow the same ABI convention:
 
-```
-input:   (ptr: u32, len: u32)  ->  host reads len bytes from linear memory at offset ptr
-output:  (out_ptr: u32, out_cap: u32)  ->  host writes result into linear memory at out_ptr, up to out_cap bytes
-return:  i32  ->  byte count/status on success, negative error code on failure
-```
+| ABI component | Host behavior |
+| --- | --- |
+| Input `(ptr: u32, len: u32)` | Read `len` bytes from the guest's linear memory at `ptr`. |
+| Output `(out_ptr: u32, out_cap: u32)` | Write at most `out_cap` result bytes at `out_ptr`. |
+| Return `i32` | Byte count or status on success; negative error code on failure. |
 
 There are a few special cases: `time_now` and `time_monotonic` return `u64` directly,
 legacy `host_log` returns `()`, and `abort` traps instead of returning normally.
@@ -195,13 +195,26 @@ The async machinery lives entirely on the host side. When a host function needs 
 
 ## Writing a module: minimal example
 
-```rust
-// Cargo.toml
-// [lib]
-// crate-type = ["cdylib"]
-// [dependencies]
-// nx-sdk = { path = "../../crates/nx-sdk" }
+Create a library project with `cargo new --lib my_module`. In `Cargo.toml`,
+set the library output to `cdylib` and add the SDK dependency. Adjust the path
+to point to the `crates/nx-sdk` directory in your Numax checkout:
 
+```toml
+[package]
+name = "my_module"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nx-sdk = { path = "../../crates/nx-sdk" }
+```
+
+Put the guest code in `src/lib.rs`:
+
+```rust
 use nx_sdk::{db, nx_log};
 
 #[unsafe(no_mangle)]
@@ -210,7 +223,7 @@ pub extern "C" fn run() {
 
     match db::get("counter") {
         Ok(Some(bytes)) => {
-            let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0u8; 8]));
+            let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
             let next = n + 1;
             db::set("counter", &next.to_le_bytes()).unwrap();
             nx_log!("counter = {}", next);
@@ -224,9 +237,10 @@ pub extern "C" fn run() {
 }
 ```
 
-Build:
+Build and run from the project directory:
 
 ```bash
+rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
 nx run target/wasm32-unknown-unknown/release/my_module.wasm
 ```

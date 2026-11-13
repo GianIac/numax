@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -41,14 +42,77 @@ const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 1;
 
 type PeerWriter = Arc<Mutex<WriteHalf<NetStream>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalConnectionKey {
+    lower_node_endpoint: SocketAddr,
+    higher_node_endpoint: SocketAddr,
+}
+
+struct PeerDedupCandidate {
+    addr: String,
+    direction: Option<ConnectionDirection>,
+    canonical_key: Option<CanonicalConnectionKey>,
+}
+
 /// Generation identity and cancellation shared by the reader and write snapshots.
 struct ConnectionInstance {
+    created_at: std::time::Instant,
     closed_tx: watch::Sender<bool>,
+}
+
+/// Opaque identity of one data connection. Retaining it does not retain its socket.
+#[derive(Clone)]
+pub struct ConnectionGeneration(Arc<ConnectionInstance>);
+
+impl PartialEq for ConnectionGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ConnectionGeneration {}
+impl ConnectionGeneration {
+    pub fn created_at(&self) -> std::time::Instant {
+        self.0.created_at
+    }
+    pub fn is_closed(&self) -> bool {
+        *self.0.closed_tx.borrow()
+    }
+}
+
+/// One encoded History frame tied to its writer generation, ready for rate admission.
+pub struct PreparedHistory {
+    owner: Weak<StdMutex<TaskRegistry>>,
+    addr: String,
+    peer_id: NodeId,
+    writer: Weak<Mutex<WriteHalf<NetStream>>>,
+    generation: ConnectionGeneration,
+    bytes: Vec<u8>,
+}
+impl PreparedHistory {
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn generation(&self) -> ConnectionGeneration {
+        self.generation.clone()
+    }
+    pub fn peer_id(&self) -> &NodeId {
+        &self.peer_id
+    }
+}
+
+/// Correlated control request/response time, excluding connect and TLS setup.
+/// Includes request writing, remote service and response decoding; not TCP RTT.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlTiming {
+    pub started_at: std::time::Instant,
+    pub round_trip: Duration,
+    pub observed_at: std::time::Instant,
 }
 
 impl ConnectionInstance {
     fn new() -> Self {
         Self {
+            created_at: std::time::Instant::now(),
             closed_tx: watch::channel(false).0,
         }
     }
@@ -162,8 +226,11 @@ struct IncomingContext {
     our_node_id: NodeId,
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
     limits: NodeLimits,
     slot: OwnedSemaphorePermit,
+    connection_slots: Arc<Semaphore>,
+    control: Arc<crate::control::ControlService>,
     shutdown_rx: watch::Receiver<bool>,
     bootstrap_server: Option<Arc<BootstrapServer>>,
 }
@@ -172,6 +239,7 @@ struct ReadLoopContext {
     peer_node_id: NodeId,
     addr: String,
     event_tx: mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
     writer: PeerWriter,
     serialization_format: SerializationFormat,
     max_message_size: usize,
@@ -303,6 +371,12 @@ impl NodeConfig {
 /// Node exit event (for runtime).
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
+    /// Protocol-7 sequenced replication and history exchange.
+    HistoryReceived {
+        from: NodeId,
+        addr: String,
+        message: nx_sync::HistoryMessage,
+    },
     /// received new operations from a peer.
     OpsReceived { from: NodeId, ops: Vec<Op> },
 
@@ -335,6 +409,7 @@ pub enum NodeEvent {
 struct PeerConnection {
     info: PeerInfo,
     connection_info: Option<PeerConnectionInfo>,
+    canonical_key: Option<CanonicalConnectionKey>,
     instance: Arc<ConnectionInstance>,
     state: PeerState,
     serialization_format: SerializationFormat,
@@ -387,6 +462,8 @@ pub struct Node {
     peers: Arc<RwLock<HashMap<String, PeerConnection>>>,
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Option<mpsc::Receiver<NodeEvent>>,
+    priority_event_tx: Option<mpsc::Sender<NodeEvent>>,
+    priority_event_rx: Option<mpsc::Receiver<NodeEvent>>,
     shutdown_tx: watch::Sender<bool>,
     connection_slots: Arc<Semaphore>,
     outbound_attempt_slots: Arc<Semaphore>,
@@ -394,6 +471,9 @@ pub struct Node {
     tasks: Arc<StdMutex<TaskRegistry>>,
     shutdown_lock: Mutex<()>,
     bootstrap_server: Option<Arc<BootstrapServer>>,
+    control: Arc<crate::control::ControlService>,
+    control_rx: Option<mpsc::Receiver<crate::ControlIncoming>>,
+    handshake_slots: Arc<Semaphore>,
 }
 
 impl Node {
@@ -403,12 +483,15 @@ impl Node {
         let (event_tx, event_rx) = mpsc::channel(event_channel_capacity);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let max_peers = config.max_peers;
+        let (control, control_rx) = crate::control::ControlService::new(max_peers);
 
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             event_rx: Some(event_rx),
+            priority_event_tx: None,
+            priority_event_rx: None,
             shutdown_tx,
             connection_slots: Arc::new(Semaphore::new(max_peers)),
             outbound_attempt_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)),
@@ -416,6 +499,9 @@ impl Node {
             tasks: Arc::new(StdMutex::new(TaskRegistry::default())),
             shutdown_lock: Mutex::new(()),
             bootstrap_server: None,
+            control: Arc::new(control),
+            control_rx: Some(control_rx),
+            handshake_slots: Arc::new(Semaphore::new(crate::MAX_CONTROL_REQUESTS)),
         }
     }
 
@@ -442,6 +528,172 @@ impl Node {
         self.event_rx.take()
     }
 
+    /// Reserve part of the configured event capacity for bounded history-control traffic.
+    ///
+    /// Configure this before taking either receiver or starting network tasks.
+    pub fn enable_priority_event_channel(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), NodeConfigError> {
+        if capacity == 0 || capacity >= self.config.event_channel_capacity {
+            return Err(NodeConfigError::InvalidPriorityEventChannelCapacity {
+                event_channel_capacity: self.config.event_channel_capacity,
+            });
+        }
+        if self.event_rx.is_none()
+            || self.priority_event_tx.is_some()
+            || self.priority_event_rx.is_some()
+            || self.event_tx.strong_count() != 1
+        {
+            return Err(NodeConfigError::PriorityEventChannelAlreadyStarted);
+        }
+
+        let event_capacity = self.config.event_channel_capacity - capacity;
+        let (event_tx, event_rx) = mpsc::channel(event_capacity);
+        let (priority_event_tx, priority_event_rx) = mpsc::channel(capacity);
+        self.event_tx = event_tx;
+        self.event_rx = Some(event_rx);
+        self.priority_event_tx = Some(priority_event_tx);
+        self.priority_event_rx = Some(priority_event_rx);
+        Ok(())
+    }
+
+    /// Gets the optional priority event receiver (can only be called once).
+    pub fn take_priority_event_receiver(&mut self) -> Option<mpsc::Receiver<NodeEvent>> {
+        self.priority_event_rx.take()
+    }
+
+    pub fn take_control_receiver(&mut self) -> Option<mpsc::Receiver<crate::ControlIncoming>> {
+        self.control_rx.take()
+    }
+
+    pub async fn control_request(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+    ) -> NetResult<(NodeId, crate::ControlReply)> {
+        self.control_request_tracked(addr, request, budget, None)
+            .await
+    }
+
+    pub async fn control_request_tracked(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+        dispatched: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, crate::ControlReply)> {
+        self.control_request_timed_tracked(addr, request, budget, dispatched)
+            .await
+            .map(|(peer, reply, _)| (peer, reply))
+    }
+
+    pub async fn control_request_timed_tracked(
+        &self,
+        addr: &str,
+        request: crate::ControlRequest,
+        budget: Duration,
+        dispatched: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> NetResult<(NodeId, crate::ControlReply, ControlTiming)> {
+        let _slot = Arc::clone(&self.control.outgoing)
+            .try_acquire_owned()
+            .map_err(|_| NetError::PeerLimitReached(crate::MAX_CONTROL_REQUESTS))?;
+        let request_id = request.request_id;
+        if request.owner.member != self.config.node_id.to_string() || budget.is_zero() {
+            return Err(NetError::InvalidMessage(
+                "control owner/budget mismatch".into(),
+            ));
+        }
+        let work = async {
+            if let Some(dispatched) = dispatched {
+                let _ = dispatched.send(());
+            }
+            let (stream, _, _) = connect_transport(addr, self.config.tls.as_ref(), budget).await?;
+            let certificate = stream.peer_cert_der();
+            if self.config.tls.as_ref().is_some_and(|tls| !tls.insecure) {
+                let certificate = certificate
+                    .as_ref()
+                    .ok_or_else(|| NetError::TlsError("missing peer certificate".into()))?;
+                let expected = crate::tls::derive_protocol_node_id_from_cert(certificate)?;
+                verify_peer_identity(
+                    &self.config.node_id,
+                    &expected,
+                    Some(certificate),
+                    self.config.tls.as_ref(),
+                )?;
+            }
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let formats = supported_formats_for(self.config.serialization_format);
+            let hello = WireMessage {
+                kind: WireMessageKind::ControlHello {
+                    node_id: self.config.node_id.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    supported_formats: formats.clone(),
+                    preferred_format: self.config.serialization_format,
+                    request,
+                },
+            };
+            let started = std::time::Instant::now();
+            write_message(
+                &mut writer,
+                &hello,
+                self.config.serialization_format,
+                budget,
+            )
+            .await?;
+            let (format, response) = read_wire_message_with_format(
+                &mut reader,
+                crate::MAX_CONTROL_FRAME.min(self.config.max_message_size),
+                budget,
+            )
+            .await?;
+            let observed_at = std::time::Instant::now();
+            match response.kind {
+                WireMessageKind::ControlAck {
+                    node_id,
+                    protocol_version,
+                    selected_format,
+                    reply,
+                } => {
+                    if !is_protocol_version_compatible(protocol_version) {
+                        return Err(protocol_version_mismatch(protocol_version));
+                    }
+                    verify_peer_identity(
+                        &self.config.node_id,
+                        &node_id,
+                        certificate.as_ref(),
+                        self.config.tls.as_ref(),
+                    )?;
+                    if !formats.contains(&selected_format)
+                        || format != selected_format
+                        || reply.request_id != request_id
+                        || reply.owner.member != node_id.to_string()
+                    {
+                        return Err(NetError::InvalidMessage(
+                            "uncorrelated control response".into(),
+                        ));
+                    }
+                    Ok((
+                        node_id,
+                        reply,
+                        ControlTiming {
+                            started_at: started,
+                            round_trip: observed_at.saturating_duration_since(started),
+                            observed_at,
+                        },
+                    ))
+                }
+                WireMessageKind::Error { error } => Err(NetError::Wire(error.try_into()?)),
+                _ => Err(NetError::InvalidMessage("expected ControlAck".into())),
+            }
+        };
+        tokio::select! {
+            _ = wait_for_stop(self.shutdown_tx.subscribe()) => Err(NetError::ConnectionFailed("node is shut down".into())),
+            result = timeout(budget.min(self.config.socket_timeout), work) => result.map_err(|_| NetError::Timeout)?,
+        }
+    }
+
     /// Start listener TCP.
     ///
     /// Returns the actual bound address (useful when binding to port 0 in tests).
@@ -454,8 +706,11 @@ impl Node {
         let peers = Arc::clone(&self.peers);
         let node_id = self.config.node_id.clone();
         let event_tx = self.event_tx.clone();
+        let priority_event_tx = self.priority_event_tx.clone();
         let tls = self.config.tls.clone();
         let connection_slots = Arc::clone(&self.connection_slots);
+        let handshake_slots = Arc::clone(&self.handshake_slots);
+        let control = Arc::clone(&self.control);
         let tasks = Arc::clone(&self.tasks);
         let limits = NodeLimits {
             max_peers: self.config.max_peers,
@@ -483,7 +738,7 @@ impl Node {
                         match accepted {
                             Ok((stream, addr)) => {
                                 info!(%addr, "incoming connection");
-                                let slot = match Arc::clone(&connection_slots).try_acquire_owned() {
+                                let slot = match Arc::clone(&handshake_slots).try_acquire_owned() {
                                     Ok(slot) => slot,
                                     Err(_) => {
                                         warn!(%addr, limit = limits.max_peers, "rejecting incoming connection: peer limit reached");
@@ -493,10 +748,13 @@ impl Node {
                                 let peers = Arc::clone(&peers);
                                 let node_id = node_id.clone();
                                 let event_tx = event_tx.clone();
+                                let priority_event_tx = priority_event_tx.clone();
                                 let tls = tls.clone();
                                 let limits = limits;
                                 let shutdown_rx = shutdown_tx.subscribe();
                                 let bootstrap_server = bootstrap_server.clone();
+                                let connection_slots = Arc::clone(&connection_slots);
+                                let control = Arc::clone(&control);
 
                                 let admitted = spawn_task(&tasks, async move {
                                     let context = IncomingContext {
@@ -504,8 +762,11 @@ impl Node {
                                         our_node_id: node_id,
                                         peers,
                                         event_tx,
+                                        priority_event_tx,
                                         limits,
                                         slot,
+                                        connection_slots,
+                                        control,
                                         shutdown_rx,
                                         bootstrap_server,
                                     };
@@ -552,7 +813,7 @@ impl Node {
             .try_acquire_owned()
             .map_err(|_| NetError::PeerLimitReached(self.config.max_peers))?;
 
-        let (stream, transport_addr) =
+        let (stream, local_addr, transport_addr) =
             connect_transport(addr, self.config.tls.as_ref(), self.config.socket_timeout).await?;
 
         // Capture the peer certificate (owned) before moving the stream into split().
@@ -634,7 +895,7 @@ impl Node {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(peer_node_id.clone()),
                     connection_info: Some(PeerConnectionInfo {
-                        transport_addr,
+                        transport_addr: transport_addr.to_string(),
                         dialed_endpoint: Some(addr.to_string()),
                         direction: ConnectionDirection::Outbound,
                         identity: PeerIdentity {
@@ -642,6 +903,12 @@ impl Node {
                             verification: identity_verification(self.config.tls.as_ref()),
                         },
                     }),
+                    canonical_key: Some(canonical_connection_key(
+                        &self.config.node_id,
+                        &peer_node_id,
+                        local_addr,
+                        transport_addr,
+                    )),
                     instance: Arc::clone(&connection_instance),
                     state: PeerState::Connected,
                     serialization_format: negotiated_format,
@@ -656,6 +923,7 @@ impl Node {
         // Keep the peer lock until rejected admission has rolled the insertion back.
         let peers = Arc::clone(&self.peers);
         let event_tx = self.event_tx.clone();
+        let priority_event_tx = self.priority_event_tx.clone();
         let addr_owned = addr.to_string();
         let max_message_size = self.config.max_message_size;
         let socket_timeout = self.config.socket_timeout;
@@ -671,6 +939,7 @@ impl Node {
                 &shutdown_for_events,
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerConnected",
                     NodeEvent::PeerConnected {
@@ -689,6 +958,7 @@ impl Node {
                     peer_node_id: peer_node_id.clone(),
                     addr: addr_owned.clone(),
                     event_tx: event_tx.clone(),
+                    priority_event_tx,
                     writer,
                     serialization_format: negotiated_format,
                     max_message_size,
@@ -721,6 +991,7 @@ impl Node {
             if let Some((node_id, addr, peers_connected)) = disconnected {
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
@@ -744,6 +1015,117 @@ impl Node {
         })
     }
 
+    /// Send protocol-7 history data without changing the legacy public message codec.
+    pub async fn broadcast_history(&self, message: nx_sync::HistoryMessage) -> NetResult<()> {
+        self.broadcast_message(WireMessage {
+            kind: WireMessageKind::History { message },
+        })
+        .await
+    }
+
+    pub async fn send_history_to_addr(
+        &self,
+        addr: &str,
+        message: nx_sync::HistoryMessage,
+    ) -> NetResult<()> {
+        self.send_message_to_addr(
+            addr,
+            WireMessage {
+                kind: WireMessageKind::History { message },
+            },
+        )
+        .await
+    }
+
+    /// Configured bound on a history payload, excluding its length prefix.
+    pub fn max_message_size(&self) -> usize {
+        self.config.max_message_size
+    }
+
+    /// Encode once using the active connection's negotiated codec. The size
+    /// includes framing, and an oversized frame is refused before rate charging.
+    pub async fn prepare_history_to_addr(
+        &self,
+        addr: &str,
+        message: nx_sync::HistoryMessage,
+    ) -> NetResult<PreparedHistory> {
+        let (writer, serialization_format, generation, peer_id) = {
+            let peers = self.peers.read().await;
+            let peer = peers
+                .get(addr)
+                .filter(|peer| peer.state == PeerState::Connected)
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            let writer = peer
+                .writer
+                .as_ref()
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            let peer_id = peer
+                .info
+                .node_id
+                .clone()
+                .ok_or_else(|| NetError::PeerDisconnected(addr.into()))?;
+            (
+                Arc::downgrade(writer),
+                peer.serialization_format,
+                ConnectionGeneration(Arc::clone(&peer.instance)),
+                peer_id,
+            )
+        };
+        let bytes = crate::message::encode_history_frame(message, serialization_format)?;
+        validate_payload_len(bytes.len().saturating_sub(4), self.config.max_message_size)?;
+        Ok(PreparedHistory {
+            owner: Arc::downgrade(&self.tasks),
+            addr: addr.into(),
+            peer_id,
+            writer,
+            generation,
+            bytes,
+        })
+    }
+
+    /// Send only on the generation used for encoding and rate admission.
+    /// Duration is local writer/transport service time, never a round-trip sample.
+    pub async fn send_prepared_history(&self, prepared: PreparedHistory) -> NetResult<Duration> {
+        self.send_prepared_history_with_timeout(prepared, self.config.socket_timeout)
+            .await
+    }
+
+    /// Bound writer acquisition and frame transmission together. A timeout may
+    /// leave a partial frame, so the generation is closed before returning.
+    pub async fn send_prepared_history_with_timeout(
+        &self,
+        prepared: PreparedHistory,
+        budget: Duration,
+    ) -> NetResult<Duration> {
+        if !Weak::ptr_eq(&prepared.owner, &Arc::downgrade(&self.tasks)) {
+            return Err(NetError::InvalidMessage(
+                "prepared frame belongs to another node".into(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let PreparedHistory {
+            addr,
+            writer,
+            generation,
+            bytes,
+            ..
+        } = prepared;
+        let result = timeout(
+            budget.min(self.config.socket_timeout),
+            self.write_to_connection(&addr, writer, &generation.0, &bytes),
+        )
+        .await
+        .unwrap_or(Err(NetError::Timeout));
+        if let Err(error) = result {
+            // The existing reader task owns connection removal and disconnect
+            // notification. Signal it without waiting on the event queue: this
+            // send may itself run inside that queue's consumer.
+            generation.0.closed_tx.send_replace(true);
+            return Err(error);
+        }
+        Ok(started.elapsed())
+    }
+
     /// Send ops to all connected peers.
     pub async fn broadcast_ops(&self, ops: Vec<Op>) -> NetResult<()> {
         self.broadcast_message(Message::push_ops(ops)).await
@@ -765,7 +1147,8 @@ impl Node {
             .await
     }
 
-    async fn broadcast_message(&self, msg: Message) -> NetResult<()> {
+    async fn broadcast_message(&self, msg: impl Into<WireMessage>) -> NetResult<()> {
+        let msg = msg.into();
         let writers = {
             let peers = self.peers.read().await;
             peers
@@ -802,6 +1185,7 @@ impl Node {
                     let shutdown_for_events = self.shutdown_tx.subscribe();
                     send_node_event(
                         &self.event_tx,
+                        None,
                         &shutdown_for_events,
                         "PeerDisconnected",
                         NodeEvent::PeerDisconnected {
@@ -822,7 +1206,8 @@ impl Node {
         Ok(())
     }
 
-    async fn send_message_to_addr(&self, addr: &str, msg: Message) -> NetResult<()> {
+    async fn send_message_to_addr(&self, addr: &str, msg: impl Into<WireMessage>) -> NetResult<()> {
+        let msg = msg.into();
         let peer_writer = {
             let peers = self.peers.read().await;
             peers.get(addr).and_then(|conn| {
@@ -854,6 +1239,7 @@ impl Node {
                 let shutdown_for_events = self.shutdown_tx.subscribe();
                 send_node_event(
                     &self.event_tx,
+                    None,
                     &shutdown_for_events,
                     "PeerDisconnected",
                     NodeEvent::PeerDisconnected {
@@ -913,6 +1299,129 @@ impl Node {
             .collect::<Vec<_>>();
         connected.sort_by(|(left, _), (right, _)| left.cmp(right));
         connected
+    }
+
+    /// Keep a single active transport per handshake identity.
+    ///
+    /// The preferred direction is complementary at both endpoints: the
+    /// lexicographically smaller NodeId keeps its outbound connection, while
+    /// the larger NodeId keeps the corresponding inbound connection.
+    pub async fn deduplicate_peer_connections(&self) -> usize {
+        let disconnected = {
+            let mut peers = self.peers.write().await;
+            let mut by_peer = HashMap::<String, Vec<PeerDedupCandidate>>::new();
+
+            for (addr, connection) in &*peers {
+                if connection.state != PeerState::Connected {
+                    continue;
+                }
+                let Some(node_id) = connection.info.node_id.as_ref() else {
+                    continue;
+                };
+                let direction = connection
+                    .connection_info
+                    .as_ref()
+                    .map(|connection| connection.direction);
+                by_peer
+                    .entry(node_id.to_string())
+                    .or_default()
+                    .push(PeerDedupCandidate {
+                        addr: addr.clone(),
+                        direction,
+                        canonical_key: connection.canonical_key,
+                    });
+            }
+
+            let mut duplicates = Vec::new();
+            for (peer_id, mut connections) in by_peer {
+                let preferred_direction = if self.config.node_id.as_str() < peer_id.as_str() {
+                    ConnectionDirection::Outbound
+                } else {
+                    ConnectionDirection::Inbound
+                };
+                connections.sort_by(|left, right| {
+                    let left_preferred = left.direction == Some(preferred_direction);
+                    let right_preferred = right.direction == Some(preferred_direction);
+                    right_preferred
+                        .cmp(&left_preferred)
+                        .then_with(|| match (left.canonical_key, right.canonical_key) {
+                            (Some(left), Some(right)) => left.cmp(&right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        })
+                        .then_with(|| left.addr.cmp(&right.addr))
+                });
+                duplicates.extend(
+                    connections
+                        .into_iter()
+                        .skip(1)
+                        .map(|candidate| candidate.addr),
+                );
+            }
+            duplicates.sort();
+
+            let mut disconnected = Vec::new();
+            for addr in duplicates {
+                let Some(connection) = peers.remove(&addr) else {
+                    continue;
+                };
+                let node_id = connection.info.node_id.clone();
+                let was_connected = connection.state == PeerState::Connected;
+                drop(connection);
+                if was_connected && let Some(node_id) = node_id {
+                    disconnected.push((node_id, addr, connected_peer_count(&peers)));
+                }
+            }
+            disconnected
+        };
+
+        let removed = disconnected.len();
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        for (node_id, addr, peers_connected) in disconnected {
+            send_node_event(
+                &self.event_tx,
+                None,
+                &shutdown_rx,
+                "PeerDisconnected",
+                NodeEvent::PeerDisconnected {
+                    node_id,
+                    addr,
+                    peers_connected,
+                },
+            )
+            .await;
+        }
+        removed
+    }
+
+    /// Release a topology slot only while the address still belongs to the
+    /// expected peer. Removal cancels the reader/writer generation before event
+    /// delivery, so a saturated event queue cannot retain the admission permit.
+    pub async fn disconnect_peer(&self, addr: &str, expected: &NodeId) -> bool {
+        let peers_connected = {
+            let mut peers = self.peers.write().await;
+            if !peers.get(addr).is_some_and(|peer| {
+                peer.state == PeerState::Connected && peer.info.node_id.as_ref() == Some(expected)
+            }) {
+                return false;
+            }
+            drop(peers.remove(addr));
+            connected_peer_count(&peers)
+        };
+        send_node_event(
+            &self.event_tx,
+            None,
+            &self.shutdown_tx.subscribe(),
+            "PeerDisconnected",
+            NodeEvent::PeerDisconnected {
+                node_id: expected.clone(),
+                addr: addr.to_string(),
+                peers_connected,
+            },
+        )
+        .await;
+        true
     }
 
     /// Returns true when the configured peer address currently has an active connection.
@@ -1018,12 +1527,17 @@ async fn handle_incoming(
         our_node_id,
         peers,
         event_tx,
+        priority_event_tx,
         limits,
-        slot,
+        slot: handshake_slot,
+        connection_slots,
+        control,
         shutdown_rx,
         bootstrap_server,
     } = context;
 
+    let local_addr = stream.local_addr()?;
+    let transport_addr = stream.peer_addr()?;
     let stream: NetStream = match tls {
         Some(ref tls_cfg) => timeout(limits.socket_timeout, tls_cfg.accept_stream(stream))
             .await
@@ -1037,9 +1551,106 @@ async fn handle_incoming(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Wait for HELLO
-    let (hello_format, msg) =
-        read_wire_message_with_format(&mut reader, limits.max_message_size, limits.socket_timeout)
-            .await?;
+    let (hello_format, msg) = read_wire_message_with_format(
+        &mut reader,
+        limits.max_message_size.min(crate::MAX_CONTROL_FRAME),
+        limits.socket_timeout,
+    )
+    .await?;
+    let msg = match msg {
+        WireMessage {
+            kind:
+                WireMessageKind::ControlHello {
+                    node_id,
+                    protocol_version,
+                    supported_formats,
+                    preferred_format: _,
+                    request,
+                },
+        } => {
+            if !is_protocol_version_compatible(protocol_version) {
+                let _ = write_message(
+                    &mut writer,
+                    &WireMessage::wire_error(WireError::protocol_mismatch(protocol_version).into()),
+                    hello_format,
+                    limits.socket_timeout,
+                )
+                .await;
+                return Err(protocol_version_mismatch(protocol_version));
+            }
+            verify_peer_identity(&our_node_id, &node_id, peer_cert.as_ref(), tls.as_ref())?;
+            if request.owner.member != node_id.to_string() {
+                return Err(NetError::InvalidMessage(
+                    "control owner is not the admitted sender".into(),
+                ));
+            }
+            let format =
+                negotiate_serialization_format(limits.serialization_format, &supported_formats)
+                    .ok_or_else(|| NetError::InvalidMessage("no control codec in common".into()))?;
+            let _slot = match Arc::clone(&control.incoming).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    return write_message(
+                        &mut writer,
+                        &WireMessage::wire_error(ProtocolWireError::RateLimited {
+                            retry_after_ms: Some(100),
+                        }),
+                        format,
+                        limits.socket_timeout,
+                    )
+                    .await;
+                }
+            };
+            drop(handshake_slot);
+            let request_id = request.request_id;
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            if control
+                .events
+                .try_send(crate::ControlIncoming {
+                    from: node_id,
+                    verification: identity_verification(tls.as_ref()),
+                    request,
+                    respond_to,
+                })
+                .is_err()
+            {
+                return write_message(
+                    &mut writer,
+                    &WireMessage::wire_error(ProtocolWireError::RateLimited {
+                        retry_after_ms: Some(100),
+                    }),
+                    format,
+                    limits.socket_timeout,
+                )
+                .await;
+            }
+            let reply = tokio::select! {
+                _ = wait_for_stop(shutdown_rx.clone()) => return Ok(()),
+                reply = timeout(limits.socket_timeout.min(Duration::from_secs(2)), response) =>
+                    reply.map_err(|_| NetError::Timeout)?.map_err(|_| NetError::ConnectionFailed("control service unavailable".into()))?,
+            };
+            if reply.request_id != request_id || reply.owner.member != our_node_id.to_string() {
+                return Err(NetError::InvalidMessage(
+                    "invalid local control response".into(),
+                ));
+            }
+            let ack = WireMessage {
+                kind: WireMessageKind::ControlAck {
+                    node_id: our_node_id,
+                    protocol_version: PROTOCOL_VERSION,
+                    selected_format: format,
+                    reply,
+                },
+            };
+            write_message(&mut writer, &ack, format, limits.socket_timeout).await?;
+            return Ok(());
+        }
+        other => other,
+    };
+    let slot = connection_slots
+        .try_acquire_owned()
+        .map_err(|_| NetError::PeerLimitReached(limits.max_peers))?;
+    drop(handshake_slot);
     let handshake = match msg.kind {
         WireMessageKind::Hello {
             node_id,
@@ -1230,7 +1841,7 @@ async fn handle_incoming(
         ensure_peer_slot_available(&peers, limits.max_peers, Some(&addr))?;
     }
 
-    let ack = Message::hello_ack_with_format(our_node_id, negotiated_format);
+    let ack = Message::hello_ack_with_format(our_node_id.clone(), negotiated_format);
     write_message(&mut writer, &ack, negotiated_format, limits.socket_timeout).await?;
 
     let writer = Arc::new(Mutex::new(writer));
@@ -1243,7 +1854,7 @@ async fn handle_incoming(
             PeerConnection {
                 info: PeerInfo::new(&addr).with_node_id(peer_node_id.clone()),
                 connection_info: Some(PeerConnectionInfo {
-                    transport_addr: addr.clone(),
+                    transport_addr: transport_addr.to_string(),
                     dialed_endpoint: None,
                     direction: ConnectionDirection::Inbound,
                     identity: PeerIdentity {
@@ -1251,6 +1862,12 @@ async fn handle_incoming(
                         verification: identity_verification(tls.as_ref()),
                     },
                 }),
+                canonical_key: Some(canonical_connection_key(
+                    &our_node_id,
+                    &peer_node_id,
+                    local_addr,
+                    transport_addr,
+                )),
                 instance: Arc::clone(&connection_instance),
                 state: PeerState::Connected,
                 serialization_format: negotiated_format,
@@ -1270,6 +1887,7 @@ async fn handle_incoming(
         &shutdown_for_events,
         send_node_event(
             &event_tx,
+            None,
             &shutdown_for_events,
             "PeerConnected",
             NodeEvent::PeerConnected {
@@ -1288,6 +1906,7 @@ async fn handle_incoming(
             peer_node_id: peer_node_id.clone(),
             addr: addr.clone(),
             event_tx: event_tx.clone(),
+            priority_event_tx,
             writer,
             serialization_format: negotiated_format,
             max_message_size: limits.max_message_size,
@@ -1316,6 +1935,7 @@ async fn handle_incoming(
     if let Some((node_id, addr, peers_connected)) = disconnected {
         send_node_event(
             &event_tx,
+            None,
             &shutdown_for_events,
             "PeerDisconnected",
             NodeEvent::PeerDisconnected {
@@ -1337,6 +1957,25 @@ fn connected_peer_count(peers: &HashMap<String, PeerConnection>) -> usize {
         .count()
 }
 
+fn canonical_connection_key(
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> CanonicalConnectionKey {
+    if local_node_id.as_str() < peer_node_id.as_str() {
+        CanonicalConnectionKey {
+            lower_node_endpoint: local_addr,
+            higher_node_endpoint: peer_addr,
+        }
+    } else {
+        CanonicalConnectionKey {
+            lower_node_endpoint: peer_addr,
+            higher_node_endpoint: local_addr,
+        }
+    }
+}
+
 fn remove_connection_if_current(
     peers: &mut HashMap<String, PeerConnection>,
     addr: &str,
@@ -1353,12 +1992,13 @@ pub(crate) async fn connect_transport(
     addr: &str,
     tls: Option<&TlsConfig>,
     socket_timeout: Duration,
-) -> NetResult<(NetStream, String)> {
+) -> NetResult<(NetStream, SocketAddr, SocketAddr)> {
     let tcp = timeout(socket_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| NetError::Timeout)?
         .map_err(|error| NetError::ConnectionFailed(format!("{addr}: {error}")))?;
-    let transport_addr = tcp.peer_addr()?.to_string();
+    let local_addr = tcp.local_addr()?;
+    let transport_addr = tcp.peer_addr()?;
     let stream = if let Some(tls_config) = tls {
         let host = endpoint_host(addr)?;
         let server_name =
@@ -1371,7 +2011,7 @@ pub(crate) async fn connect_transport(
     } else {
         NetStream::Plain(tcp)
     };
-    Ok((stream, transport_addr))
+    Ok((stream, local_addr, transport_addr))
 }
 
 fn endpoint_host(endpoint: &str) -> NetResult<&str> {
@@ -1475,25 +2115,146 @@ fn is_protocol_version_compatible(peer_version: u32) -> bool {
     peer_version == PROTOCOL_VERSION
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub struct HistoryTrace {
+    kind: &'static str,
+    peer: String,
+    origin: nx_sync::NodeId,
+    request_id: nx_sync::OpId,
+    start: u64,
+    end: u64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl HistoryTrace {
+    pub fn new(
+        kind: &'static str,
+        peer: &str,
+        origin: &nx_sync::NodeId,
+        request_id: &nx_sync::OpId,
+        start: u64,
+        end: u64,
+    ) -> Self {
+        Self {
+            kind,
+            peer: peer.to_owned(),
+            origin: origin.clone(),
+            request_id: request_id.clone(),
+            start,
+            end,
+        }
+    }
+
+    pub fn from_message(peer: &str, message: &nx_sync::HistoryMessage) -> Option<Self> {
+        use nx_sync::HistoryMessage;
+        let (kind, request_id, origin, start, end) = match message {
+            HistoryMessage::Request {
+                request_id,
+                origin,
+                start,
+                end,
+            } => ("request", request_id, origin, *start, *end),
+            HistoryMessage::Replay {
+                request_id,
+                origin,
+                start,
+                end,
+                ..
+            } => ("replay", request_id, origin, *start, *end),
+            HistoryMessage::Unavailable {
+                request_id,
+                origin,
+                start,
+                end,
+            } => ("unavailable", request_id, origin, *start, *end),
+            _ => return None,
+        };
+        Some(Self::new(kind, peer, origin, request_id, start, end))
+    }
+
+    pub fn emit(&self, stage: &'static str) {
+        debug!(
+            target: "nx_net::recovery_trace",
+            recovery_trace_stage = stage, kind = self.kind, peer = %self.peer,
+            origin = %self.origin, request_id = %self.request_id,
+            start = self.start, end = self.end,
+            "test recovery timeline"
+        );
+    }
+}
+
 async fn send_node_event(
     event_tx: &mpsc::Sender<NodeEvent>,
+    priority_event_tx: Option<&mpsc::Sender<NodeEvent>>,
     shutdown_rx: &watch::Receiver<bool>,
     event_name: &'static str,
     event: NodeEvent,
 ) {
+    #[cfg(any(test, feature = "test-utils"))]
+    let trace = match &event {
+        NodeEvent::HistoryReceived { from, message, .. } => {
+            HistoryTrace::from_message(from.as_str(), message)
+        }
+        _ => None,
+    };
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(trace) = &trace {
+        trace.emit("queue_offer");
+    }
+    let event_tx = match (&event, priority_event_tx) {
+        (
+            NodeEvent::HistoryReceived {
+                message:
+                    nx_sync::HistoryMessage::SummaryRequest { .. }
+                    | nx_sync::HistoryMessage::Summary { .. }
+                    | nx_sync::HistoryMessage::Request { .. }
+                    | nx_sync::HistoryMessage::Unavailable { .. }
+                    | nx_sync::HistoryMessage::BaselineRequest { .. }
+                    | nx_sync::HistoryMessage::BaselineUnavailable { .. },
+                ..
+            },
+            Some(priority_event_tx),
+        ) => priority_event_tx,
+        _ => event_tx,
+    };
     // Keep immediately available shutdown notifications, but never wait for a
     // full queue during shutdown. Disconnect callers release peer resources first.
     let result = match event_tx.try_send(event) {
-        Ok(()) => return,
+        Ok(()) => {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some(trace) = &trace {
+                trace.emit("queue_admitted");
+            }
+            return;
+        }
         Err(mpsc::error::TrySendError::Closed(event)) => Err(mpsc::error::SendError(event)),
         Err(mpsc::error::TrySendError::Full(event)) => {
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some(trace) = &trace {
+                trace.emit("queue_wait_begin");
+            }
             tokio::select! {
                 biased;
-                _ = wait_for_stop(shutdown_rx.clone()) => return,
+                _ = wait_for_stop(shutdown_rx.clone()) => {
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(trace) = &trace {
+                        trace.emit("queue_cancelled");
+                    }
+                    return;
+                },
                 result = event_tx.send(event) => result,
             }
         }
     };
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(trace) = &trace {
+        trace.emit(if result.is_ok() {
+            "queue_admitted"
+        } else {
+            "queue_closed"
+        });
+    }
     if let Err(e) = result {
         if *shutdown_rx.borrow() {
             debug!(
@@ -1528,6 +2289,7 @@ async fn read_messages(
         peer_node_id,
         addr,
         event_tx,
+        priority_event_tx,
         writer,
         serialization_format,
         max_message_size,
@@ -1550,7 +2312,7 @@ async fn read_messages(
                 continue;
             }
 
-            msg = read_message(&mut reader, max_message_size, socket_timeout) => {
+            msg = async { read_wire_message_with_format(&mut reader, max_message_size, socket_timeout).await.map(|(_, message)| message) } => {
                 match msg {
                     Ok(m) => m,
                     Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1562,11 +2324,32 @@ async fn read_messages(
             }
         };
 
+        let msg = match msg {
+            WireMessage {
+                kind: WireMessageKind::History { message },
+            } => {
+                send_node_event(
+                    &event_tx,
+                    priority_event_tx.as_ref(),
+                    &shutdown_for_events,
+                    "HistoryReceived",
+                    NodeEvent::HistoryReceived {
+                        from: peer_node_id.clone(),
+                        addr: addr.clone(),
+                        message,
+                    },
+                )
+                .await;
+                continue;
+            }
+            other => Message::try_from(other)?,
+        };
         match msg.kind {
             MessageKind::PushOps { ops } => {
                 debug!(peer = %peer_node_id, count = ops.len(), "received ops");
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "OpsReceived",
                     NodeEvent::OpsReceived {
@@ -1580,6 +2363,7 @@ async fn read_messages(
                 debug!(peer = %peer_node_id, addr = %addr, ?since_op_id, "received pull request");
                 send_node_event(
                     &event_tx,
+                    None,
                     &shutdown_for_events,
                     "PullRequested",
                     NodeEvent::PullRequested {
@@ -1725,6 +2509,506 @@ mod tests {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
 
+    fn owner(member: &NodeId) -> crate::MembershipRecord {
+        crate::MembershipRecord {
+            member: member.to_string(),
+            reporter: member.to_string(),
+            version: crate::MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state: crate::MembershipState::Alive,
+            endpoint: None,
+        }
+    }
+    #[tokio::test]
+    async fn timed_control_excludes_tls_setup_and_rejects_uncorrelated_replies() {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let pki = TestPki::generate().unwrap();
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for corrupt in [false, true] {
+                let client_id = crate::tls::derive_protocol_node_id_from_cert(
+                    &CertificateDer::from_pem_slice(pki.node2_cert.as_bytes()).unwrap(),
+                )
+                .unwrap();
+                let server_id = crate::tls::derive_protocol_node_id_from_cert(
+                    &CertificateDer::from_pem_slice(pki.node1_cert.as_bytes()).unwrap(),
+                )
+                .unwrap();
+                let client = Node::new(
+                    NodeConfig::new(client_id.clone(), "127.0.0.1:0")
+                        .with_tls(pki.node2_config())
+                        .with_serialization_format(format),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("localhost:{}", listener.local_addr().unwrap().port());
+                let tls_delay = Duration::from_millis(50);
+                let service_delay = Duration::from_millis(15);
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    // Deliberate TLS service delay is the injected fault, not polling.
+                    tokio::time::sleep(tls_delay).await;
+                    let mut stream = pki.node1_config().accept_stream(tcp).await.unwrap();
+                    let (_, request) = read_wire_message_with_format(
+                        &mut stream,
+                        crate::MAX_CONTROL_FRAME,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                    let WireMessageKind::ControlHello { request, .. } = request.kind else {
+                        panic!("missing control request");
+                    };
+                    tokio::time::sleep(service_delay).await;
+                    write_message(
+                        &mut stream,
+                        &WireMessage {
+                            kind: WireMessageKind::ControlAck {
+                                node_id: server_id.clone(),
+                                protocol_version: PROTOCOL_VERSION,
+                                selected_format: format,
+                                reply: crate::ControlReply {
+                                    request_id: request.request_id + u64::from(corrupt),
+                                    owner: owner(&server_id),
+                                    ack: true,
+                                    nack: false,
+                                    records: vec![],
+                                    next: None,
+                                },
+                            },
+                        },
+                        format,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                };
+                let started = std::time::Instant::now();
+                let query = client.control_request_timed_tracked(
+                    &endpoint,
+                    crate::ControlRequest {
+                        request_id: 1,
+                        owner: owner(&client_id),
+                        updates: vec![],
+                        kind: crate::ControlKind::Exchange { after: None },
+                    },
+                    Duration::from_secs(2),
+                    None,
+                );
+                let (result, ()) = timeout(Duration::from_secs(5), async {
+                    tokio::join!(query, server)
+                })
+                .await
+                .unwrap();
+                if corrupt {
+                    assert!(matches!(result, Err(NetError::InvalidMessage(_))));
+                } else {
+                    let (_, _, timing) = result.unwrap();
+                    assert!(timing.round_trip >= service_delay);
+                    assert!(started.elapsed().saturating_sub(timing.round_trip) >= tls_delay);
+                    assert!(timing.observed_at >= started);
+                }
+                client.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_transport_exact_payload_limit_and_one_byte_over_in_negotiated_codec() {
+        use nx_sync::{HistoryMessage, OpPosition, SequencedOp};
+        for (preferred, remote, selected) in [
+            (
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+            ),
+            (
+                SerializationFormat::Bincode,
+                SerializationFormat::Bincode,
+                SerializationFormat::Bincode,
+            ),
+            (
+                SerializationFormat::Bincode,
+                SerializationFormat::Json,
+                SerializationFormat::Json,
+            ),
+        ] {
+            let message = HistoryMessage::Replay {
+                request_id: nx_sync::OpId::new("\0".repeat(128)),
+                origin: NodeId::new("origin\\\""),
+                start: u64::MAX,
+                end: u64::MAX,
+                ops: vec![SequencedOp {
+                    op: nx_sync::Op::lww_register_set(
+                        NodeId::new("origin\\\""),
+                        "key\\\"\n",
+                        vec![255; 4096],
+                        1,
+                    ),
+                    position: OpPosition {
+                        generation: u64::MAX,
+                        sequence: u64::MAX,
+                    },
+                }],
+            };
+            let encoded = crate::message::encode_history_frame(message.clone(), selected).unwrap();
+            let payload_bytes = encoded.len() - 4;
+            assert_eq!(
+                crate::history_frame_len(&message, selected).unwrap(),
+                encoded.len()
+            );
+            assert_eq!(
+                u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
+                payload_bytes
+            );
+            for extra in [0, 1] {
+                let client = Node::new(
+                    NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                        .with_serialization_format(preferred)
+                        .with_max_message_size(payload_bytes - extra),
+                );
+                let server = Node::new(
+                    NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                        .with_serialization_format(remote),
+                );
+                let address = server.start_listener().await.unwrap().to_string();
+                client.connect_to_peer(&address).await.unwrap();
+                let result = client
+                    .prepare_history_to_addr(&address, message.clone())
+                    .await;
+                if extra == 0 {
+                    let prepared = result.unwrap();
+                    assert_eq!(prepared.encoded_len(), encoded.len());
+                    client.send_prepared_history(prepared).await.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(NetError::MessageTooLarge { len, limit })
+                            if len == payload_bytes && limit + 1 == len
+                    ));
+                }
+                client.shutdown().await;
+                server.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_history_accounts_framing_and_cannot_cross_connections_or_nodes() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let client = Node::new(
+                NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_serialization_format(format)
+                    .with_max_message_size(1024),
+            );
+            let server = Node::new(
+                NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let address = server.start_listener().await.unwrap().to_string();
+            client.connect_to_peer(&address).await.unwrap();
+            let message = nx_sync::HistoryMessage::SummaryRequest { after_origin: None };
+            let prepared = client
+                .prepare_history_to_addr(&address, message.clone())
+                .await
+                .unwrap();
+            let encoded = WireMessage {
+                kind: WireMessageKind::History { message },
+            }
+            .to_bytes_with_format(format)
+            .unwrap();
+            assert_eq!(prepared.encoded_len(), encoded.len());
+            let generation = prepared.generation();
+            assert!(!generation.is_closed());
+            client
+                .disconnect_peer(&address, &NodeId::new("server"))
+                .await;
+            client.connect_to_peer(&address).await.unwrap();
+            assert!(generation.is_closed());
+            assert!(matches!(
+                client.send_prepared_history(prepared).await,
+                Err(NetError::PeerDisconnected(_))
+            ));
+            assert!(client.is_connected_addr(&address).await);
+            let newer = client
+                .prepare_history_to_addr(
+                    &address,
+                    nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+                )
+                .await
+                .unwrap();
+            assert!(generation != newer.generation());
+            assert!(matches!(
+                server.send_prepared_history(newer).await,
+                Err(NetError::InvalidMessage(_))
+            ));
+            let oversized = nx_sync::HistoryMessage::SummaryRequest {
+                after_origin: Some("x".repeat(4096)),
+            };
+            assert!(matches!(
+                client.prepare_history_to_addr(&address, oversized).await,
+                Err(NetError::MessageTooLarge { .. })
+            ));
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_event_channel_routes_history_control_while_data_queue_is_full() {
+        let mut server = Node::new(
+            NodeConfig::new(NodeId::new("priority-server"), "127.0.0.1:0")
+                .with_event_channel_capacity(2),
+        );
+        server.enable_priority_event_channel(1).unwrap();
+        let mut data_events = server.take_event_receiver().unwrap();
+        let mut priority_events = server.take_priority_event_receiver().unwrap();
+        let address = server.start_listener().await.unwrap().to_string();
+
+        let client = Node::new(
+            NodeConfig::new(NodeId::new("priority-client"), "127.0.0.1:0")
+                .with_event_channel_capacity(2),
+        );
+        client.connect_to_peer(&address).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while data_events.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(data_events.capacity(), 0);
+        assert_eq!(priority_events.capacity(), 1);
+
+        client
+            .send_history_to_addr(
+                &address,
+                nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+            )
+            .await
+            .unwrap();
+        let priority_event = timeout(Duration::from_secs(5), priority_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            priority_event,
+            NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            data_events.try_recv().unwrap(),
+            NodeEvent::PeerConnected { .. }
+        ));
+        client
+            .send_history_to_addr(&address, nx_sync::HistoryMessage::Push { ops: Vec::new() })
+            .await
+            .unwrap();
+        let data_event = timeout(Duration::from_secs(5), data_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            data_event,
+            NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::Push { .. },
+                ..
+            }
+        ));
+
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_history_timeout_releases_peer_despite_event_backpressure() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            let client = Node::new(
+                NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format),
+            );
+            let server = Node::new(
+                NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let address = server.start_listener().await.unwrap().to_string();
+            client.connect_to_peer(&address).await.unwrap();
+            // PeerConnected occupies the client's only event slot.
+            assert_eq!(client.event_tx.capacity(), 0);
+            let writer = Arc::clone(client.peers.read().await[&address].writer.as_ref().unwrap());
+            let held = writer.lock().await;
+            let prepared = client
+                .prepare_history_to_addr(
+                    &address,
+                    nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+                )
+                .await
+                .unwrap();
+            let generation = prepared.generation();
+            let sent = timeout(
+                Duration::from_secs(1),
+                client.send_prepared_history_with_timeout(prepared, Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(sent, Err(NetError::Timeout)));
+            assert!(generation.is_closed());
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if client.connected_peer_count().await == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                client.connection_slots.available_permits(),
+                DEFAULT_MAX_PEERS
+            );
+            drop(held);
+            drop(writer);
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_rpc_meets_local_budget_while_maximum_data_frame_is_blocked() {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let pki = TestPki::generate().unwrap();
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for secure in [false, true] {
+                let mut client_config = NodeConfig::new(NodeId::new("client"), "127.0.0.1:0")
+                    .with_max_peers(1)
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format);
+                let mut server_config = NodeConfig::new(NodeId::new("server"), "127.0.0.1:0")
+                    .with_max_peers(1)
+                    .with_event_channel_capacity(1)
+                    .with_serialization_format(format);
+                if secure {
+                    client_config.node_id = crate::tls::derive_protocol_node_id_from_cert(
+                        &CertificateDer::from_pem_slice(pki.node2_cert.as_bytes()).unwrap(),
+                    )
+                    .unwrap();
+                    server_config.node_id = crate::tls::derive_protocol_node_id_from_cert(
+                        &CertificateDer::from_pem_slice(pki.node1_cert.as_bytes()).unwrap(),
+                    )
+                    .unwrap();
+                    client_config.tls = Some(pki.node2_config());
+                    server_config.tls = Some(pki.node1_config());
+                }
+                let client_owner = owner(&client_config.node_id);
+                let server_owner = owner(&server_config.node_id);
+                let client = Node::new(client_config);
+                let mut server = Node::new(server_config);
+                let mut incoming = server.take_control_receiver().unwrap();
+                let address = server.start_listener().await.unwrap();
+                let endpoint = if secure {
+                    format!("localhost:{}", address.port())
+                } else {
+                    address.to_string()
+                };
+                client.connect_to_peer(&endpoint).await.unwrap();
+                assert_eq!(client.connection_slots.available_permits(), 0);
+                assert_eq!(server.connection_slots.available_permits(), 0);
+                let (peer_addr, _) = server.connected_peers().await.remove(0);
+                server
+                    .send_message_to_addr(
+                        &peer_addr,
+                        Message {
+                            kind: MessageKind::PushOps { ops: vec![] },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let empty = Message {
+                    kind: MessageKind::Error {
+                        error: WireError::Internal {
+                            reason: String::new(),
+                        },
+                    },
+                };
+                let overhead = empty.to_bytes_with_format(format).unwrap().len() - 4;
+                let maximum = Message {
+                    kind: MessageKind::Error {
+                        error: WireError::Internal {
+                            reason: "x".repeat(DEFAULT_MAX_MESSAGE_SIZE - overhead),
+                        },
+                    },
+                };
+                let bytes = maximum.to_bytes_with_format(format).unwrap();
+                assert_eq!(bytes.len() - 4, DEFAULT_MAX_MESSAGE_SIZE);
+                let writer = Arc::clone(
+                    server.peers.read().await[&peer_addr]
+                        .writer
+                        .as_ref()
+                        .unwrap(),
+                );
+                let data_writer = Arc::clone(&writer);
+                let mut blocked = tokio_test::task::spawn(async move {
+                    write_bytes(
+                        &mut *data_writer.lock().await,
+                        &bytes,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                });
+                assert!(blocked.poll().is_pending());
+                assert!(writer.try_lock().is_err());
+                assert_eq!(client.event_tx.capacity(), 0);
+                let started = std::time::Instant::now();
+                let request = crate::ControlRequest {
+                    request_id: 81,
+                    owner: client_owner,
+                    updates: vec![],
+                    kind: crate::ControlKind::Exchange { after: None },
+                };
+                let serve = async {
+                    let event = incoming.recv().await.unwrap();
+                    event
+                        .respond_to
+                        .send(crate::ControlReply {
+                            request_id: 81,
+                            owner: server_owner,
+                            ack: false,
+                            nack: false,
+                            records: vec![],
+                            next: None,
+                        })
+                        .unwrap();
+                };
+                let budget = Duration::from_millis(500);
+                let (reply, ()) = timeout(Duration::from_secs(2), async {
+                    tokio::join!(client.control_request(&endpoint, request, budget), serve)
+                })
+                .await
+                .unwrap();
+                reply.unwrap();
+                let elapsed = started.elapsed();
+                assert!(elapsed <= budget, "{format:?}, TLS={secure}: {elapsed:?}");
+                assert!(blocked.poll().is_pending());
+                assert!(writer.try_lock().is_err());
+                eprintln!(
+                    "control-maximum-frame {}",
+                    serde_json::json!({"format": format!("{format:?}"), "tls": secure,
+                    "data_payload_bytes": DEFAULT_MAX_MESSAGE_SIZE, "data_slots_available": 0,
+                    "data_event_capacity": 1, "control_budget_ms": budget.as_millis(), "control_elapsed_us": elapsed.as_micros()})
+                );
+                drop(blocked);
+                assert!(writer.try_lock().is_ok());
+                client.shutdown().await;
+                server.shutdown().await;
+            }
+        }
+    }
+
     #[test]
     fn node_config_validates_semaphore_boundaries_without_allocating_them() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0");
@@ -1835,6 +3119,55 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn topology_disconnect_checks_identity_and_releases_slot_before_event_delivery() {
+        let mut node = Node::try_new(
+            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                .with_max_peers(1)
+                .with_event_channel_capacity(1),
+        )
+        .unwrap();
+        let mut events = node.take_event_receiver().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _remote = open_raw_peer(&node, &listener, None).await;
+        let Some(NodeEvent::PeerConnected { addr, .. }) = events.recv().await else {
+            panic!("missing connection event");
+        };
+        assert!(
+            !node
+                .disconnect_peer(&addr, &NodeId::new("wrong-owner"))
+                .await
+        );
+        assert_eq!(node.connected_peer_count().await, 1);
+        node.event_tx
+            .send(NodeEvent::PeerDisconnected {
+                node_id: NodeId::new("queue-filler"),
+                addr: "unused".into(),
+                peers_connected: 1,
+            })
+            .await
+            .unwrap();
+        let expected = NodeId::new("raw-peer");
+        let disconnect = node.disconnect_peer(&addr, &expected);
+        tokio::pin!(disconnect);
+        timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = &mut disconnect => panic!("full event queue must block delivery"),
+            _ = async {
+                while node.connection_slots.available_permits() == 0 { tokio::task::yield_now().await; }
+            } => {}
+        }
+        }).await.unwrap();
+        assert_eq!(node.connected_peer_count().await, 0);
+        events.recv().await.unwrap();
+        assert!(disconnect.await);
+        assert!(
+            matches!(events.recv().await, Some(NodeEvent::PeerDisconnected { node_id, .. }) if node_id == NodeId::new("raw-peer"))
+        );
+        assert!(!node.disconnect_peer(&addr, &NodeId::new("raw-peer")).await);
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1984,6 +3317,7 @@ mod tests {
                     peer_node_id: NodeId::new("peer"),
                     addr: "peer".into(),
                     event_tx,
+                    priority_event_tx: None,
                     writer: Arc::clone(&writer),
                     serialization_format: SerializationFormat::Bincode,
                     max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -2022,6 +3356,168 @@ mod tests {
             assert!(events.try_recv().is_err());
             drop(held_writer);
             drop(shutdown_tx);
+        }
+    }
+
+    struct ControlTestPath {
+        remote: TcpStream,
+        reader: tokio::io::ReadHalf<NetStream>,
+        context: ReadLoopContext,
+        events: mpsc::Receiver<NodeEvent>,
+        instance: ConnectionInstance,
+        shutdown: watch::Sender<bool>,
+        frame_bytes: usize,
+        send_started: std::time::Instant,
+        send_finished: std::time::Instant,
+    }
+
+    async fn control_test_path(
+        format: SerializationFormat,
+        messages: Vec<Message>,
+    ) -> ControlTestPath {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut remote, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        for message in messages {
+            bytes.extend(message.to_bytes_with_format(format).unwrap());
+        }
+        let send_started = std::time::Instant::now();
+        remote.write_all(&bytes).await.unwrap();
+        let send_finished = std::time::Instant::now();
+        let mut peek = vec![0; bytes.len()];
+        timeout(Duration::from_secs(5), async {
+            while stream.peek(&mut peek).await.unwrap() < bytes.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reader, writer) = tokio::io::split(NetStream::Plain(stream));
+        let (event_tx, events) = mpsc::channel(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let instance = ConnectionInstance::new();
+        let closed_rx = instance.closed_tx.subscribe();
+        ControlTestPath {
+            remote,
+            reader,
+            events,
+            instance,
+            shutdown,
+            frame_bytes: bytes.len(),
+            send_started,
+            send_finished,
+            context: ReadLoopContext {
+                peer_node_id: NodeId::new("control-experiment-peer"),
+                addr: "control-experiment-peer".into(),
+                event_tx,
+                priority_event_tx: None,
+                writer: Arc::new(Mutex::new(writer)),
+                serialization_format: format,
+                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                socket_timeout: Duration::from_secs(5),
+                shutdown_rx,
+                closed_rx,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn control_progress_isolated_from_shared_writer_and_event_backpressure() {
+        for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+            for blocked_on_writer in [false, true] {
+                let data_message = || {
+                    Message::push_ops(vec![Op::gcounter_increment(
+                        NodeId::new("control-experiment-peer"),
+                        "control-experiment-counter",
+                        1,
+                    )])
+                };
+                let mut messages = vec![data_message()];
+                if !blocked_on_writer {
+                    messages.push(data_message());
+                }
+                messages.push(Message::ping());
+                let mut shared = control_test_path(format, messages).await;
+                let mut independent = control_test_path(format, vec![Message::ping()]).await;
+                let shared_writer = Arc::clone(&shared.context.writer);
+                let independent_writer = Arc::clone(&independent.context.writer);
+                let held_writer = if blocked_on_writer {
+                    Some(shared_writer.lock().await)
+                } else {
+                    None
+                };
+                let mut shared_read =
+                    tokio_test::task::spawn(read_loop(shared.reader, shared.context));
+                let mut independent_read =
+                    tokio_test::task::spawn(read_loop(independent.reader, independent.context));
+                let (received_format, pong) = timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        biased;
+                        result = &mut shared_read => panic!("shared reader exited before release: {result:?}"),
+                        result = &mut independent_read => panic!("independent reader exited: {result:?}"),
+                        reply = read_message_with_format(&mut independent.remote, DEFAULT_MAX_MESSAGE_SIZE, Duration::from_secs(5)) => reply,
+                    }
+                }).await.unwrap().unwrap();
+                assert_eq!(received_format, format);
+                assert_eq!(pong, Message::pong());
+                assert_eq!(shared.events.len(), 1);
+                let independent_observed = independent.send_started.elapsed();
+                let mut shared_reply = tokio_test::task::spawn(read_message_with_format(
+                    &mut shared.remote,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    Duration::from_secs(5),
+                ));
+                assert!(shared_reply.poll().is_pending());
+                let resumed_at = std::time::Instant::now();
+                if blocked_on_writer {
+                    drop(held_writer);
+                } else {
+                    assert!(matches!(
+                        shared.events.try_recv(),
+                        Ok(NodeEvent::OpsReceived { .. })
+                    ));
+                }
+                let (received_format, pong) = timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        biased;
+                        result = &mut shared_read => panic!("shared reader exited before Pong: {result:?}"),
+                        reply = &mut shared_reply => reply,
+                    }
+                }).await.unwrap().unwrap();
+                assert_eq!(received_format, format);
+                assert_eq!(pong, Message::pong());
+                eprintln!(
+                    "control-isolation {}",
+                    serde_json::json!({
+                        "format": format!("{format:?}"),
+                        "blocked_on": if blocked_on_writer { "writer" } else { "event_queue" },
+                        "event_capacity": 1, "shared_frame_bytes": shared.frame_bytes,
+                        "independent_frame_bytes": independent.frame_bytes,
+                        "shared_write_us": shared.send_finished.duration_since(shared.send_started).as_micros(),
+                        "independent_write_us": independent.send_finished.duration_since(independent.send_started).as_micros(),
+                        "independent_write_start_to_pong_us": independent_observed.as_micros(),
+                        "shared_write_end_to_release_us": resumed_at.duration_since(shared.send_finished).as_micros(),
+                        "shared_release_to_pong_us": resumed_at.elapsed().as_micros(),
+                    })
+                );
+                shared.instance.closed_tx.send_replace(true);
+                independent.instance.closed_tx.send_replace(true);
+                shared.shutdown.send_replace(true);
+                independent.shutdown.send_replace(true);
+                timeout(Duration::from_secs(5), shared_read)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                timeout(Duration::from_secs(5), independent_read)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(Arc::strong_count(&shared_writer), 1);
+                assert_eq!(Arc::strong_count(&independent_writer), 1);
+            }
         }
     }
 
@@ -2083,6 +3579,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -2104,6 +3601,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new("127.0.0.1:9001"),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::new(ConnectionInstance::new()),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -2125,6 +3623,7 @@ mod tests {
             PeerConnection {
                 info: PeerInfo::new(addr),
                 connection_info: None,
+                canonical_key: None,
                 instance: Arc::clone(&current),
                 state: PeerState::Connected,
                 serialization_format: SerializationFormat::Bincode,
@@ -2149,6 +3648,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -2161,6 +3661,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -2415,6 +3916,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new("old")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -2438,6 +3940,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new("replacement")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::clone(&replacement),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -2478,6 +3981,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9001").with_node_id(NodeId::new("peer-a")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Connected,
                     serialization_format: SerializationFormat::Bincode,
@@ -2490,6 +3994,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new("127.0.0.1:9002").with_node_id(NodeId::new("peer-b")),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state: PeerState::Failed,
                     serialization_format: SerializationFormat::Bincode,
@@ -2517,6 +4022,7 @@ mod tests {
                 PeerConnection {
                     info: PeerInfo::new(addr).with_node_id(NodeId::new(addr)),
                     connection_info: None,
+                    canonical_key: None,
                     instance: Arc::new(ConnectionInstance::new()),
                     state,
                     serialization_format: SerializationFormat::Bincode,
@@ -2622,45 +4128,62 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_peer_rejects_protocol_version_mismatch() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let accept_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = NetStream::Plain(stream);
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await.unwrap();
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await.unwrap();
-
-            let ack = Message {
-                kind: MessageKind::HelloAck {
-                    node_id: NodeId::new("old-peer"),
-                    protocol_version: PROTOCOL_VERSION - 1,
-                    selected_format: SerializationFormat::Bincode,
-                },
-            };
-            let bytes = ack.to_bytes().unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            stream.flush().await.unwrap();
-        });
-
-        let node = Node::new(
-            NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
-                .with_socket_timeout(Duration::from_secs(1)),
-        );
-
-        let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
-
-        assert!(matches!(
-            err,
-            NetError::Wire(WireError::ProtocolMismatch {
-                expected: PROTOCOL_VERSION,
-                got
-            }) if got == PROTOCOL_VERSION - 1
-        ));
-        accept_task.await.unwrap();
+        for version in [5, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let accept_task = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = NetStream::Plain(stream);
+                    let hello = read_message(
+                        &mut stream,
+                        DEFAULT_MAX_MESSAGE_SIZE,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(hello.kind, MessageKind::Hello { .. }));
+                    let ack = Message {
+                        kind: MessageKind::HelloAck {
+                            node_id: NodeId::new("incompatible-peer"),
+                            protocol_version: version,
+                            selected_format: format,
+                        },
+                    };
+                    stream
+                        .write_all(&ack.to_bytes_with_format(format).unwrap())
+                        .await
+                        .unwrap();
+                    stream.flush().await.unwrap();
+                    // Rejection must close the socket before any CRDT frame is sent.
+                    let mut byte = [0u8; 1];
+                    assert_eq!(
+                        timeout(Duration::from_secs(1), stream.read(&mut byte))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
+                });
+                let mut node = Node::new(
+                    NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
+                        .with_socket_timeout(Duration::from_secs(1)),
+                );
+                let mut events = node.take_event_receiver().unwrap();
+                let err = node.connect_to_peer(&addr.to_string()).await.unwrap_err();
+                assert!(matches!(
+                    err,
+                    NetError::Wire(WireError::ProtocolMismatch { expected: PROTOCOL_VERSION, got }) if got == version
+                ));
+                accept_task.await.unwrap();
+                assert_eq!(node.connected_peer_count().await, 0);
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                node.shutdown().await;
+            }
+        }
     }
 
     #[test]
@@ -2672,67 +4195,90 @@ mod tests {
 
     #[tokio::test]
     async fn incoming_rejects_protocol_version_mismatch() {
-        let mut node = Node::new(
-            NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
-                .with_socket_timeout(Duration::from_secs(1)),
-        );
-        let mut events = node.take_event_receiver().unwrap();
-        let addr = node.start_listener().await.unwrap();
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let hello = Message {
-            kind: MessageKind::Hello {
-                node_id: NodeId::new("old-peer"),
-                protocol_version: PROTOCOL_VERSION - 1,
-                supported_formats: vec![SerializationFormat::Bincode, SerializationFormat::Json],
-                preferred_format: SerializationFormat::Bincode,
-            },
-        };
-        let bytes = hello.to_bytes().unwrap();
-        stream.write_all(&bytes).await.unwrap();
-        stream.flush().await.unwrap();
-
-        let reply = read_message(
-            &mut stream,
-            DEFAULT_MAX_MESSAGE_SIZE,
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            reply.kind,
-            MessageKind::Error {
-                error: WireError::ProtocolMismatch {
-                    expected: PROTOCOL_VERSION,
-                    got
-                }
-            } if got == PROTOCOL_VERSION - 1
-        ));
-
-        let event = timeout(Duration::from_millis(200), events.recv()).await;
-        assert!(event.is_err(), "old protocol peer must not connect");
-
-        node.shutdown().await;
+        for version in [5, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            for format in [SerializationFormat::Json, SerializationFormat::Bincode] {
+                let mut node = Node::new(
+                    NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0")
+                        .with_socket_timeout(Duration::from_secs(1)),
+                );
+                let mut events = node.take_event_receiver().unwrap();
+                let addr = node.start_listener().await.unwrap();
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                let hello = Message {
+                    kind: MessageKind::Hello {
+                        node_id: NodeId::new("incompatible-peer"),
+                        protocol_version: version,
+                        supported_formats: vec![format],
+                        preferred_format: format,
+                    },
+                };
+                stream
+                    .write_all(&hello.to_bytes_with_format(format).unwrap())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                let reply = read_message(
+                    &mut stream,
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    reply.kind,
+                    MessageKind::Error { error: WireError::ProtocolMismatch { expected: PROTOCOL_VERSION, got } } if got == version
+                ));
+                let mut byte = [0u8; 1];
+                assert_eq!(
+                    timeout(Duration::from_secs(1), stream.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(node.connected_peer_count().await, 0);
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                node.shutdown().await;
+            }
+        }
     }
 
     #[tokio::test]
-    async fn incoming_idle_handshake_consumes_peer_slot() {
+    async fn incoming_idle_handshake_consumes_bounded_handshake_not_peer_slot() {
         let config = NodeConfig::new(NodeId::new("test"), "127.0.0.1:0")
             .with_max_peers(1)
             .with_socket_timeout(Duration::from_secs(5));
-        let node = Node::new(config);
+        let mut node = Node::new(config);
+        node.handshake_slots = Arc::new(Semaphore::new(1));
         let addr = node.start_listener().await.unwrap();
 
         let first = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        timeout(Duration::from_secs(1), async {
+            while node.handshake_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
-        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.connection_slots.available_permits(), 1);
         assert_eq!(node.connected_peer_count().await, 0);
 
-        let second = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(1), second.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
 
-        assert_eq!(node.connection_slots.available_permits(), 0);
+        assert_eq!(node.handshake_slots.available_permits(), 0);
+        assert_eq!(node.connection_slots.available_permits(), 1);
         assert_eq!(node.connected_peer_count().await, 0);
 
         drop(second);
@@ -2807,6 +4353,99 @@ mod tests {
         );
 
         node_a.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_dials_keep_one_canonical_connection_per_identity() {
+        let mut node_a =
+            Node::new(NodeConfig::new(NodeId::new("node-a"), "127.0.0.1:0").with_max_peers(2));
+        let mut node_b =
+            Node::new(NodeConfig::new(NodeId::new("node-b"), "127.0.0.1:0").with_max_peers(2));
+        let mut events_a = node_a.take_event_receiver().unwrap();
+        let mut events_b = node_b.take_event_receiver().unwrap();
+        let addr_a = node_a.start_listener().await.unwrap().to_string();
+        let addr_b = node_b.start_listener().await.unwrap().to_string();
+
+        let (connected_a, connected_b) = tokio::join!(
+            node_a.connect_to_peer(&addr_b),
+            node_b.connect_to_peer(&addr_a)
+        );
+        assert!(
+            connected_a.is_ok(),
+            "node-a failed to connect: {connected_a:?}"
+        );
+        assert!(
+            connected_b.is_ok(),
+            "node-b failed to connect: {connected_b:?}"
+        );
+
+        timeout(Duration::from_secs(1), async {
+            while node_a.connected_peer_count().await != 2
+                || node_b.connected_peer_count().await != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("simultaneous dials did not establish both transports");
+
+        assert_eq!(node_a.connection_slots.available_permits(), 0);
+        assert_eq!(node_b.connection_slots.available_permits(), 0);
+        assert_eq!(node_a.deduplicate_peer_connections().await, 1);
+        assert_eq!(node_b.deduplicate_peer_connections().await, 1);
+
+        let peers_a = node_a.connected_peers().await;
+        let peers_b = node_b.connected_peers().await;
+        assert_eq!(peers_a.len(), 1);
+        assert_eq!(peers_b.len(), 1);
+        assert_eq!(
+            node_a
+                .connection_info(&peers_a[0].0)
+                .await
+                .unwrap()
+                .direction,
+            ConnectionDirection::Outbound
+        );
+        assert_eq!(
+            node_b
+                .connection_info(&peers_b[0].0)
+                .await
+                .unwrap()
+                .direction,
+            ConnectionDirection::Inbound
+        );
+        assert_eq!(node_a.connection_slots.available_permits(), 1);
+        assert_eq!(node_b.connection_slots.available_permits(), 1);
+
+        let disconnected_a = std::iter::from_fn(|| events_a.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    NodeEvent::PeerDisconnected {
+                        node_id,
+                        peers_connected: 1,
+                        ..
+                    } if node_id == &NodeId::new("node-b")
+                )
+            })
+            .count();
+        let disconnected_b = std::iter::from_fn(|| events_b.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    NodeEvent::PeerDisconnected {
+                        node_id,
+                        peers_connected: 1,
+                        ..
+                    } if node_id == &NodeId::new("node-a")
+                )
+            })
+            .count();
+        assert_eq!(disconnected_a, 1);
+        assert_eq!(disconnected_b, 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
     }
 
     #[tokio::test]

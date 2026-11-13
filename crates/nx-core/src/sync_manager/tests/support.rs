@@ -1,6 +1,136 @@
 use super::*;
 use crate::sync_manager::schema::ensure_sync_schema;
 
+pub(super) async fn wait_for_store_file_release(
+    directory: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::fs::{OpenOptions, TryLockError};
+    use std::io::{Error, ErrorKind};
+
+    let deadline = StdInstant::now() + Duration::from_secs(5);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join("db"))?;
+    let mut poll = tokio::time::interval(Duration::from_millis(5));
+    loop {
+        if StdInstant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                "sled file lock was not released",
+            ));
+        }
+        match file.try_lock() {
+            Ok(()) => {
+                if StdInstant::now() >= deadline {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "sled file lock was released too late",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(TryLockError::WouldBlock) => {
+                poll.tick().await;
+            }
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+pub(super) fn log_sync_phase(phase: &str, elapsed: Duration, managers: &[&SyncManager]) {
+    crate::membership::runtime::shutdown_trace(
+        "manager.phase",
+        format_args!("name={phase} elapsed_us={}", elapsed.as_micros()),
+    );
+    eprintln!(
+        "SYNC_PHASE phase={phase} pid={} elapsed_ms={}",
+        std::process::id(),
+        elapsed.as_millis()
+    );
+    for (index, manager) in managers.iter().enumerate() {
+        let snapshot = manager
+            .membership
+            .as_ref()
+            .map(|membership| membership.snapshot.borrow().clone());
+        eprintln!(
+            "SYNC_PHASE node={index} store_owners={} broadcast_finished={:?} \
+             entropy_finished={:?} reconnect_finished={:?} op_log_readable={}",
+            Arc::strong_count(&manager.store),
+            manager
+                .broadcast_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager
+                .anti_entropy_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager
+                .reconnect_task
+                .as_ref()
+                .map(|task| task.is_finished()),
+            manager.op_log.try_read().is_ok(),
+        );
+        eprintln!(
+            "SYNC_PHASE node={index} id={} partition_values={:?} coverage={:?}",
+            manager.node_id,
+            manager.counters.try_read().map(|counters| {
+                ["partition-left", "partition-right"]
+                    .map(|key| counters.get(key).map(GCounter::value))
+            }),
+            manager.handle().replication_progress(),
+        );
+        if let Some(snapshot) = snapshot {
+            eprintln!(
+                "SYNC_PHASE node={index} records={} probes_ok={} probes_failed={} \
+                 health={} error={} max_tick_lateness_us={:?}",
+                snapshot.records.len(),
+                snapshot.successful_probes,
+                snapshot.failed_probes,
+                snapshot.health,
+                snapshot.error.is_some(),
+                snapshot.tick_lateness_micros.iter().max(),
+            );
+        }
+    }
+}
+
+pub(super) async fn traced_shutdown(manager: &mut SyncManager) {
+    let started = StdInstant::now();
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        log_sync_phase("shutdown-start", Duration::ZERO, &[manager]);
+    }
+    let result = manager.shutdown().await;
+    if result.is_err() || std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        log_sync_phase("shutdown-result", started.elapsed(), &[manager]);
+    }
+    assert!(
+        result.is_ok(),
+        "node {} shutdown failed after {:?}: {result:?}",
+        manager.node_id,
+        started.elapsed(),
+    );
+}
+
+pub(super) fn remote_apply_context(manager: &SyncManager) -> RemoteOpApplyContext<'_> {
+    RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
+        counters: &manager.counters,
+        pncounters: &manager.pncounters,
+        lww_registers: &manager.lww_registers,
+        lww_maps: &manager.lww_maps,
+        orsets: &manager.orsets,
+        rgas: &manager.rgas,
+        seen_ops: &manager.seen_ops,
+        seen_ops_next_sequence: &manager.seen_ops_next_sequence,
+        op_log: &manager.op_log,
+        op_log_next_sequence: &manager.op_log_next_sequence,
+        op_log_limit: manager.config.op_log_limit,
+        store: &manager.store,
+        metrics: &manager.metrics,
+    }
+}
+
 /// Fails even on synchronous metadata/lifecycle access, not just on watch acquisition.
 pub(super) struct UntouchedDiscovery;
 
@@ -33,6 +163,28 @@ impl crate::PeerDiscovery for UntouchedDiscovery {
 
 pub(super) fn invalid_sync_configs() -> Vec<(&'static str, SyncConfig)> {
     vec![
+        (
+            "gossip_min_bytes_per_second",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                min_bytes_per_second: 0,
+                ..Default::default()
+            }),
+        ),
+        (
+            "gossip_max_bytes_per_second",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                min_bytes_per_second: 200,
+                max_bytes_per_second: 100,
+                ..Default::default()
+            }),
+        ),
+        (
+            "gossip_burst_bytes",
+            SyncConfig::new().with_gossip_rate(crate::GossipRateConfig {
+                burst_bytes: 0,
+                ..Default::default()
+            }),
+        ),
         (
             "reconnect_initial_delay",
             SyncConfig::new().with_reconnect_backoff(Duration::MAX, Duration::from_secs(1)),
@@ -79,6 +231,30 @@ pub(super) fn temp_store() -> Arc<NxStore> {
 
 pub(super) fn metrics() -> Arc<RuntimeMetrics> {
     Arc::new(RuntimeMetrics::default())
+}
+
+pub(super) async fn manual_pair(
+    format: nx_net::SerializationFormat,
+) -> (
+    SyncManager,
+    SyncHandle,
+    Arc<NxStore>,
+    SyncManager,
+    SyncHandle,
+    Arc<NxStore>,
+    String,
+) {
+    let config = || {
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_serialization_format(format)
+            .with_anti_entropy_interval(Duration::from_millis(20))
+            .with_reconnect_backoff(Duration::from_millis(10), Duration::from_millis(40))
+    };
+    let (mut a, ha, sa) = started_manager_with_config(config()).await;
+    let (b, hb, sb) = started_manager_with_config(config()).await;
+    let endpoint = test_owner_record(&mut a).await.endpoint.unwrap();
+    (a, ha, sa, b, hb, sb, endpoint)
 }
 
 pub(super) fn free_addr() -> String {
@@ -181,6 +357,13 @@ pub(super) fn test_event_context(
     peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 ) -> NodeEventContext {
     NodeEventContext {
+        repair_budget: Arc::new(std::sync::Mutex::new(
+            crate::sync_manager::delivery::RepairBudget::new(StdInstant::now()),
+        )),
+        recovery_rotation: None,
+        history_cursors: Arc::new(RwLock::new(HashMap::new())),
+        history_requests: Arc::new(RwLock::new(HashMap::new())),
+        history_request_timeout: Duration::from_secs(30),
         counters,
         pncounters: Arc::new(RwLock::new(HashMap::new())),
         lww_registers: Arc::new(RwLock::new(HashMap::new())),
@@ -198,6 +381,7 @@ pub(super) fn test_event_context(
             NodeId::generate(),
             "127.0.0.1:0",
         ))),
+        forward_tx: None,
         peer_health,
         active_connections: Arc::new(RwLock::new(HashMap::new())),
         anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
@@ -221,6 +405,7 @@ pub(super) async fn apply_remote_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -256,6 +441,7 @@ pub(super) async fn apply_remote_pncounter_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters,
         lww_registers: &lww_registers,
@@ -291,6 +477,7 @@ pub(super) async fn apply_remote_lww_register_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: registers,
@@ -326,6 +513,7 @@ pub(super) async fn apply_remote_lww_map_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -361,6 +549,7 @@ pub(super) async fn apply_remote_orset_op_for_test(
     let rgas = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -396,6 +585,7 @@ pub(super) async fn apply_remote_rga_op_for_test(
     let orsets = Arc::new(RwLock::new(HashMap::new()));
     let metrics = metrics();
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -418,14 +608,173 @@ pub(super) async fn apply_remote_rga_op_for_test(
 pub(super) async fn wait_for_counter(manager: &SyncManager, key: &str, expected: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if manager.get_counter_value(key).await == expected {
+        let actual = manager.get_counter_value(key).await;
+        if actual == expected {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "counter {key} did not reach {expected}"
+            "counter {key} did not reach {expected}: actual={actual}, progress={:?}",
+            manager.handle().replication_progress()
         );
         sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub(super) fn run_in_isolated_test_process(test_name: &str) -> bool {
+    const CHILD_TEST: &str = "NUMAX_ISOLATED_SYNC_TEST";
+    assert_eq!(std::thread::current().name(), Some(test_name));
+    if std::env::var_os(CHILD_TEST).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+        return false;
+    }
+    let _scenario = process_scenario_io();
+    isolated_test_output(
+        test_name,
+        CHILD_TEST,
+        test_name,
+        std::time::Duration::from_secs(60),
+    );
+    true
+}
+
+pub(super) fn process_scenario_io() -> std::sync::MutexGuard<'static, ()> {
+    // Queue independent host-I/O scenarios before starting any scenario deadline.
+    static PROCESS_SCENARIO_IO: StdMutex<()> = StdMutex::new(());
+    PROCESS_SCENARIO_IO.lock().unwrap_or_else(|poisoned| {
+        // The gate protects no state; expected-panic tests must not poison later scenarios.
+        eprintln!("recovering process scenario I/O gate after a panicking scenario");
+        PROCESS_SCENARIO_IO.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+#[test]
+fn process_scenario_gate_survives_panicking_scenario() {
+    let failed = std::thread::spawn(|| {
+        let _scenario = process_scenario_io();
+        panic!("injected scenario panic");
+    })
+    .join();
+    assert!(failed.is_err());
+    drop(process_scenario_io());
+}
+
+pub(super) fn isolated_test_output(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+) -> Vec<u8> {
+    isolated_test_output_with_capture(test_name, marker, value, lifetime, false)
+}
+
+pub(super) fn isolated_test_output_tail(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+) -> Vec<u8> {
+    isolated_test_output_with_capture(test_name, marker, value, lifetime, true)
+}
+
+fn isolated_test_output_with_capture(
+    test_name: &str,
+    marker: &str,
+    value: &str,
+    lifetime: std::time::Duration,
+    capture_tail: bool,
+) -> Vec<u8> {
+    use std::io::{Read, Seek};
+    use std::process::{Command, Stdio};
+
+    assert_eq!(std::thread::current().name(), Some(test_name));
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut output = tempfile::tempfile().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--include-ignored", "--nocapture"])
+        .env(marker, value)
+        .env("TMPDIR", directory.path())
+        .env("TMP", directory.path())
+        .env("TEMP", directory.path())
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+    crate::membership::runtime::shutdown_trace(
+        "child.started",
+        format_args!("name={test_name} child_pid={}", child.id()),
+    );
+    crate::membership::runtime::dump_shutdown_trace();
+    let deadline = StdInstant::now() + lifetime;
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(error),
+        }
+        if StdInstant::now() >= deadline {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "isolated sync test exceeded its process lifetime",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let cleanup = result.is_err().then(|| (child.kill(), child.wait()));
+    output.rewind().unwrap();
+    let mut bytes = Vec::new();
+    if capture_tail || std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        let length = output.metadata().unwrap().len();
+        output
+            .seek(std::io::SeekFrom::Start(length.saturating_sub(64 * 1024)))
+            .unwrap();
+    }
+    output.take(64 * 1024).read_to_end(&mut bytes).unwrap();
+    let directory_cleanup = directory.close();
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_some() {
+        crate::membership::runtime::shutdown_trace(
+            "child.finished",
+            format_args!(
+                "name={test_name} child_pid={} result={result:?}",
+                child.id()
+            ),
+        );
+        crate::membership::runtime::dump_shutdown_trace();
+        eprintln!("{}", String::from_utf8_lossy(&bytes));
+    }
+    if result.as_ref().is_ok_and(|status| status.success()) && directory_cleanup.is_ok() {
+        return bytes;
+    }
+    let diagnostics = String::from_utf8_lossy(&bytes);
+    panic!(
+        "isolated test {test_name} failed: {result:?}; cleanup={cleanup:?}; \
+         directory_cleanup={directory_cleanup:?}\n{diagnostics}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "isolated sync test exceeded its process lifetime")]
+fn isolated_child_timeout_is_reported() {
+    const MARKER: &str = "NUMAX_ISOLATED_TIMEOUT_CHILD";
+    let test_name = std::thread::current().name().unwrap().to_owned();
+    if std::env::var_os(MARKER).is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
+    isolated_test_output(&test_name, MARKER, "1", Duration::from_millis(100));
+}
+
+#[test]
+#[should_panic(
+    expected = "isolated test sync_manager::manager::tests::support::isolated_child_failure_is_reported failed"
+)]
+fn isolated_child_failure_is_reported() {
+    if !run_in_isolated_test_process(
+        "sync_manager::manager::tests::support::isolated_child_failure_is_reported",
+    ) {
+        std::process::exit(23);
     }
 }
 
@@ -522,21 +871,29 @@ pub(super) async fn wait_for_connected_peer(manager: &SyncManager) {
     }
 }
 
-pub(super) async fn wait_for_pull_request(
+pub(super) async fn wait_for_history_request(
     events: &mut mpsc::Receiver<NodeEvent>,
-) -> (String, Option<String>) {
+) -> (String, nx_sync::OpId, NodeId, u64, u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let NodeEvent::PullRequested {
-                addr, since_op_id, ..
+            if let NodeEvent::HistoryReceived {
+                addr,
+                message:
+                    nx_sync::HistoryMessage::Request {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                    },
+                ..
             } = events.recv().await.expect("peer event channel closed")
             {
-                return (addr, since_op_id);
+                return (addr, request_id, origin, start, end);
             }
         }
     })
     .await
-    .expect("peer did not receive an anti-entropy pull")
+    .expect("peer did not receive a history range request")
 }
 
 pub(super) async fn wait_for_peer_health(
@@ -557,19 +914,28 @@ pub(super) async fn wait_for_peer_health(
     }
 }
 
+async fn reserve_local_op(
+    handle: &SyncHandle,
+) -> crate::sync_manager::delivery::OwnedPermit<AcceptedLocalOp> {
+    handle.op_sender().reserve_owned().await.unwrap()
+}
+
 pub(super) async fn local_increment(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_increment(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.increment_gcounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_pncounter_inc(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.increment_pncounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) {
-    let op = apply_local_pncounter_dec(handle, key, delta).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.decrement_pncounter(key, delta).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_register_set(
@@ -578,13 +944,92 @@ pub(super) async fn local_lww_register_set(
     value: &[u8],
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_register_set(handle, key, value, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .set_lww_register(key, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
+}
+
+pub(super) async fn local_six_family_workload(handle: &SyncHandle, index: u64) {
+    local_increment(handle, "det-g", 7).await;
+    local_pncounter_inc(handle, "det-p", 9).await;
+    local_pncounter_dec(handle, "det-p", 4).await;
+    local_lww_register_set(handle, "det-r", b"winner", 200 + index).await;
+    local_lww_map_set(handle, "det-m", "field", b"removed", 100).await;
+    local_lww_map_remove(handle, "det-m", "field", 200).await;
+    local_orset_add(handle, "det-o", "removed").await;
+    local_orset_remove(handle, "det-o", "removed").await;
+    local_orset_add(handle, "det-o", "present").await;
+    let removed = local_rga_insert_after(handle, "det-a", None, b"removed").await;
+    local_rga_delete(handle, "det-a", &removed).await;
+    local_rga_insert_after(handle, "det-a", None, b"present").await;
+}
+
+pub(super) fn six_family_states(store: &NxStore) -> Vec<serde_json::Value> {
+    [
+        read_durable_gcounter_state(store, "det-g")
+            .to_json()
+            .unwrap(),
+        read_durable_pncounter_state(store, "det-p")
+            .to_json()
+            .unwrap(),
+        read_durable_lww_register_state(store, "det-r")
+            .to_json()
+            .unwrap(),
+        read_durable_lww_map_state(store, "det-m")
+            .to_json()
+            .unwrap(),
+        read_durable_orset_state(store, "det-o").to_json().unwrap(),
+        read_durable_rga_state(store, "det-a").to_json().unwrap(),
+    ]
+    .into_iter()
+    .map(|json| serde_json::from_str(&json).unwrap())
+    .collect()
+}
+
+pub(super) fn assert_six_family_materialized(store: &NxStore) {
+    assert_eq!(read_materialized(store, "det-g"), 14);
+    assert_eq!(read_materialized_pncounter(store, "det-p"), 10);
+    assert_eq!(read_materialized_lww_register(store, "det-r"), b"winner");
+    assert!(read_materialized_lww_map(store, "det-m").is_empty());
+    assert_eq!(read_materialized_orset(store, "det-o"), vec!["present"]);
+    assert_eq!(
+        read_materialized_rga(store, "det-a"),
+        vec![b"present".to_vec(); 2]
+    );
+}
+
+pub(super) async fn assert_six_family_memory(manager: &SyncManager) {
+    assert_eq!(manager.get_counter_value("det-g").await, 14);
+    assert_eq!(manager.get_pncounter_value("det-p").await, 10);
+    assert_eq!(
+        manager.get_lww_register_value("det-r").await,
+        Some(b"winner".to_vec())
+    );
+    assert!(manager.get_lww_map_entries("det-m").await.is_empty());
+    assert_eq!(manager.get_orset_elements("det-o").await, vec!["present"]);
+    assert_eq!(
+        manager.get_rga_values("det-a").await,
+        vec![b"present".to_vec(); 2]
+    );
+}
+
+pub(super) fn assert_durable_dead(store: &NxStore, member: &str) {
+    let bytes = store
+        .get(format!("__nx/membership/floor/{member}").as_bytes())
+        .unwrap()
+        .unwrap();
+    let floor: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(floor["status"], "dead");
+    assert!(floor["closed_epoch"].is_null());
 }
 
 pub(super) async fn local_orset_add(handle: &SyncHandle, key: &str, element: &str) {
-    let op = apply_local_orset_add(handle, key, element).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.add_orset(key, element).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_map_set(
@@ -594,8 +1039,12 @@ pub(super) async fn local_lww_map_set(
     value: &[u8],
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_map_set(handle, key, field, value, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .set_lww_map(key, field, value.to_vec(), timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_lww_map_remove(
@@ -604,13 +1053,21 @@ pub(super) async fn local_lww_map_remove(
     field: &str,
     timestamp_ms: u64,
 ) {
-    let op = apply_local_lww_map_remove(handle, key, field, timestamp_ms).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle
+        .remove_lww_map(key, field, timestamp_ms)
+        .await
+        .unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn local_orset_remove(handle: &SyncHandle, key: &str, element: &str) {
-    if let Some(op) = apply_local_orset_remove(handle, key, element).await {
-        handle.op_sender().send(op).await.unwrap();
+    if handle.orset_remove_is_noop(key, element).await {
+        return;
+    }
+    let permit = reserve_local_op(handle).await;
+    if let Some(op) = handle.remove_orset(key, element).await.unwrap() {
+        permit.send(op);
     }
 }
 
@@ -620,253 +1077,27 @@ pub(super) async fn local_rga_insert_after(
     parent: Option<&str>,
     value: &[u8],
 ) -> String {
-    let (id, op) = apply_local_rga_insert_after(handle, key, parent, value).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.rga_insert_op(key, parent.map(ToOwned::to_owned), value.to_vec());
+    let id = op.id.as_str().to_string();
+    let op = handle.insert_rga(op).await.unwrap();
+    permit.send(op);
     id
 }
 
 pub(super) async fn local_rga_delete(handle: &SyncHandle, key: &str, id: &str) {
-    let op = apply_local_rga_delete(handle, key, id).await;
-    handle.op_sender().send(op).await.unwrap();
+    let permit = reserve_local_op(handle).await;
+    let op = handle.delete_rga(key, id).await.unwrap();
+    permit.send(op);
 }
 
 pub(super) async fn dropped_local_increment(
-    manager: &SyncManager,
+    _manager: &SyncManager,
     handle: &SyncHandle,
     key: &str,
     delta: u64,
 ) {
-    let op = apply_local_increment(handle, key, delta).await;
-    remember_ops(
-        &manager.seen_ops,
-        &manager.seen_ops_next_sequence,
-        &manager.op_log,
-        &manager.op_log_next_sequence,
-        manager.config.op_log_limit,
-        &manager.store,
-        &[op],
-    )
-    .await
-    .unwrap();
-}
-
-pub(super) async fn apply_local_increment(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    {
-        let counters_arc = handle.counters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
-        counter.increment(handle.node_id(), delta);
-
-        persist_gcounter_state(&handle.store(), key, &counter).unwrap();
-        counters.insert(key.to_string(), counter);
-    }
-
-    Op::gcounter_increment(handle.node_id().clone(), key, delta)
-}
-
-pub(super) async fn apply_local_pncounter_inc(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Increment).await
-}
-
-pub(super) async fn apply_local_pncounter_dec(handle: &SyncHandle, key: &str, delta: u64) -> Op {
-    apply_local_pncounter_change(handle, key, delta, PNCounterChangeForTest::Decrement).await
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PNCounterChangeForTest {
-    Increment,
-    Decrement,
-}
-
-async fn apply_local_pncounter_change(
-    handle: &SyncHandle,
-    key: &str,
-    delta: u64,
-    change: PNCounterChangeForTest,
-) -> Op {
-    {
-        let counters_arc = handle.pncounters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(key).cloned().unwrap_or_else(PNCounter::new);
-        match change {
-            PNCounterChangeForTest::Increment => counter.increment(handle.node_id(), delta),
-            PNCounterChangeForTest::Decrement => counter.decrement(handle.node_id(), delta),
-        }
-
-        persist_pncounter_state(&handle.store(), key, &counter).unwrap();
-        counters.insert(key.to_string(), counter);
-    }
-
-    match change {
-        PNCounterChangeForTest::Increment => {
-            Op::pncounter_increment(handle.node_id().clone(), key, delta)
-        }
-        PNCounterChangeForTest::Decrement => {
-            Op::pncounter_decrement(handle.node_id().clone(), key, delta)
-        }
-    }
-}
-
-pub(super) async fn apply_local_lww_register_set(
-    handle: &SyncHandle,
-    key: &str,
-    value: &[u8],
-    timestamp_ms: u64,
-) -> Op {
-    {
-        let registers_arc = handle.lww_registers();
-        let mut registers = registers_arc.write().await;
-        let candidate = LwwRegister::new(value.to_vec(), timestamp_ms, handle.node_id().clone());
-        let register = registers
-            .entry(key.to_string())
-            .or_insert_with(|| candidate.clone());
-        register.merge(&candidate);
-
-        persist_lww_register_state(&handle.store(), key, register).unwrap();
-    }
-
-    Op::lww_register_set(handle.node_id().clone(), key, value.to_vec(), timestamp_ms)
-}
-
-pub(super) async fn apply_local_lww_map_set(
-    handle: &SyncHandle,
-    key: &str,
-    field: &str,
-    value: &[u8],
-    timestamp_ms: u64,
-) -> Op {
-    {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
-        map.set(
-            field.to_string(),
-            value.to_vec(),
-            timestamp_ms,
-            handle.node_id().clone(),
-        );
-
-        persist_lww_map_state(&handle.store(), key, &map).unwrap();
-        maps.insert(key.to_string(), map);
-    }
-
-    Op::lww_map_set(
-        handle.node_id().clone(),
-        key,
-        field,
-        value.to_vec(),
-        timestamp_ms,
-    )
-}
-
-pub(super) async fn apply_local_lww_map_remove(
-    handle: &SyncHandle,
-    key: &str,
-    field: &str,
-    timestamp_ms: u64,
-) -> Op {
-    {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
-        map.remove(field.to_string(), timestamp_ms, handle.node_id().clone());
-
-        persist_lww_map_state(&handle.store(), key, &map).unwrap();
-        maps.insert(key.to_string(), map);
-    }
-
-    Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms)
-}
-
-pub(super) async fn apply_local_orset_add(handle: &SyncHandle, key: &str, element: &str) -> Op {
-    let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key, element);
-    let tag = match &op.kind {
-        OpKind::ORSetAdd { tag, .. } => tag.clone(),
-        other => panic!("unexpected op kind: {other:?}"),
-    };
-
-    {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
-        set.add(element, tag);
-
-        persist_orset_state(&handle.store(), key, &set).unwrap();
-        sets.insert(key.to_string(), set);
-    }
-
-    op
-}
-
-pub(super) async fn apply_local_orset_remove(
-    handle: &SyncHandle,
-    key: &str,
-    element: &str,
-) -> Option<Op> {
-    let observed_tags = {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
-        let observed_tags = set.remove(element);
-        if observed_tags.is_empty() {
-            return None;
-        }
-
-        persist_orset_state(&handle.store(), key, &set).unwrap();
-        sets.insert(key.to_string(), set);
-        observed_tags
-    };
-
-    Some(Op::orset_remove(
-        handle.node_id().clone(),
-        key,
-        element,
-        observed_tags,
-    ))
-}
-
-pub(super) async fn apply_local_rga_insert_after(
-    handle: &SyncHandle,
-    key: &str,
-    parent: Option<&str>,
-    value: &[u8],
-) -> (String, Op) {
-    let op = Op::rga_insert_with_op_id(
-        handle.node_id().clone(),
-        key,
-        parent.map(ToOwned::to_owned),
-        value.to_vec(),
-    );
-    let id = match &op.kind {
-        OpKind::RgaInsert { id, .. } => id.clone(),
-        other => panic!("unexpected op kind: {other:?}"),
-    };
-
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
-        rga.insert(id.clone(), parent.map(ToOwned::to_owned), value.to_vec());
-
-        persist_rga_state(&handle.store(), key, &rga).unwrap();
-        rgas.insert(key.to_string(), rga);
-    }
-
-    (id, op)
-}
-
-pub(super) async fn apply_local_rga_delete(handle: &SyncHandle, key: &str, id: &str) -> Op {
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
-        rga.delete(id.to_string());
-
-        persist_rga_state(&handle.store(), key, &rga).unwrap();
-        rgas.insert(key.to_string(), rga);
-    }
-
-    Op::rga_delete(handle.node_id().clone(), key, id)
+    let _accepted = handle.increment_gcounter(key, delta).await.unwrap();
 }
 
 pub(super) async fn started_manager(addr: String) -> (SyncManager, SyncHandle, Arc<NxStore>) {
@@ -897,4 +1128,206 @@ pub(super) async fn started_manager_with_config(
     let handle = manager.handle();
     manager.start().await.unwrap();
     (manager, handle, store)
+}
+
+/// Data-path partition gate. Closing it terminates all proxied TCP streams;
+/// the membership detector is tested separately, not inferred from this gate.
+pub(super) struct TestDataGate {
+    pub(super) endpoint: String,
+    pub(super) open: tokio::sync::watch::Sender<bool>,
+    pub(super) rejected: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestDataGate {
+    pub(super) async fn new(target: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let (open, mut changed) = tokio::sync::watch::channel(false);
+        let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failures = Arc::clone(&rejected);
+        let task = tokio::spawn(async move {
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    result = changed.changed() => {
+                        if result.is_err() { break; }
+                        if !*changed.borrow_and_update() {
+                            streams.abort_all();
+                            while streams.join_next().await.is_some() {}
+                        }
+                    }
+                    Some(_) = streams.join_next(), if !streams.is_empty() => {}
+                    accepted = listener.accept() => {
+                        let Ok((mut incoming, _)) = accepted else { break; };
+                        if !*changed.borrow() || streams.len() >= 8 {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        let target = target.clone();
+                        streams.spawn(async move {
+                            if let Ok(mut outgoing) = tokio::net::TcpStream::connect(target).await {
+                                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            endpoint,
+            open,
+            rejected,
+            task,
+        }
+    }
+}
+
+impl Drop for TestDataGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(super) async fn stop_test_reconnect(manager: &mut SyncManager) {
+    if let Some(task) = manager.reconnect_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+pub(super) async fn test_owner_record(manager: &mut SyncManager) -> nx_net::MembershipRecord {
+    let id = manager.node_id.to_string();
+    manager
+        .membership
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .wait_for(|snapshot| snapshot.records.iter().any(|record| record.member == id))
+        .await
+        .unwrap()
+        .records
+        .iter()
+        .find(|record| record.member == id)
+        .unwrap()
+        .clone()
+}
+
+/// Run the production reconnect adapter with an explicit membership fixture and
+/// accelerated topology time. Returned senders keep its input streams alive.
+pub(super) async fn test_topology_reconnect(
+    manager: &mut SyncManager,
+    records: Vec<nx_net::MembershipRecord>,
+    rotation_interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<Arc<Vec<String>>>,
+    tokio::sync::watch::Sender<crate::membership::runtime::Snapshot>,
+) {
+    stop_test_reconnect(manager).await;
+    let (candidates_tx, candidates_rx) = tokio::sync::watch::channel(Arc::new(vec![]));
+    let (membership_tx, membership) =
+        tokio::sync::watch::channel(crate::membership::runtime::Snapshot {
+            records,
+            ..Default::default()
+        });
+    manager.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
+        local_id: manager.node_id.clone(),
+        membership,
+        rotation_interval,
+        recovery_rotation: None,
+        node: (manager.node.as_ref().unwrap()).clone(),
+        candidates_rx,
+        max_peers: manager.config.max_peers,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(40),
+        peer_dead_after_failures: 1,
+        shutdown_rx: manager.shutdown_tx.subscribe(),
+        metrics: Arc::clone(&manager.metrics),
+        peer_health: Arc::clone(&manager.peer_health),
+    });
+    (candidates_tx, membership_tx)
+}
+
+/// A real TCP peer with independently delayed control service. Data events are
+/// drained, so RTT inflation is not confused with local data-writer blocking.
+pub(super) struct ControlledControlPeer {
+    pub(super) endpoint: String,
+    pub(super) delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    node: Arc<nx_net::Node>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl ControlledControlPeer {
+    pub(super) async fn start() -> Self {
+        let id = NodeId::new("controlled-peer");
+        let mut node = nx_net::Node::new(nx_net::NodeConfig::new(id.clone(), "127.0.0.1:0"));
+        let mut incoming = node.take_control_receiver().unwrap();
+        let mut events = node.take_event_receiver().unwrap();
+        let endpoint = node.start_listener().await.unwrap().to_string();
+        let owner = nx_net::MembershipRecord {
+            member: id.to_string(),
+            reporter: id.to_string(),
+            version: nx_net::MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state: nx_net::MembershipState::Alive,
+            endpoint: Some(endpoint.clone()),
+        };
+        let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        let delay = Arc::clone(&delay_ms);
+        let task = tokio::spawn(async move {
+            let mut replies = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    event = incoming.recv() => {
+                        let Some(event) = event else { break; };
+                        if replies.len() >= 8 { continue; }
+                        let owner = owner.clone();
+                        let delay = delay.load(std::sync::atomic::Ordering::Relaxed);
+                        replies.spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            let ack = matches!(&event.request.kind, nx_net::ControlKind::Probe { target, version }
+                                if target == &owner.member && version == &owner.version);
+                            let _ = event.respond_to.send(nx_net::ControlReply {
+                                request_id: event.request.request_id, owner, ack, nack: false, records: vec![], next: None,
+                            });
+                        });
+                    }
+                    event = events.recv() => { if event.is_none() { break; } }
+                    Some(_) = replies.join_next(), if !replies.is_empty() => {}
+                }
+            }
+        });
+        Self {
+            endpoint,
+            delay_ms,
+            node: Arc::new(node),
+            task: Some(task),
+        }
+    }
+    pub(super) async fn shutdown(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.node.shutdown().await;
+    }
+}
+impl Drop for ControlledControlPeer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+pub(super) fn metric_value(metrics: &RuntimeMetrics, store: &NxStore, name: &str) -> u64 {
+    metrics
+        .render_for_test(store)
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("missing metric {name}"))
+        .parse()
+        .unwrap()
 }

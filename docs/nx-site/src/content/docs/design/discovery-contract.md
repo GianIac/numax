@@ -5,7 +5,8 @@ description: Snapshot, event delivery, cancellation, and compatibility guarantee
 
 ## Scope and ownership
 
-This contract describes peer discovery in `v0.1.5`, the current Numax version.
+This contract describes the discovery-provider API and coordinator used by the runtime. Provider snapshots supply endpoints; admission,
+membership and data recovery remain separate responsibilities.
 
 The peer discovery abstraction belongs to `nx-core`. It supplies peer endpoint
 candidates to runtime orchestration without moving connection management,
@@ -83,11 +84,27 @@ of candidate churn, and missed ticks are skipped rather than replayed in a
 burst. Removal from discovery therefore does not disable repair over a live
 connection.
 
-Anti-entropy pulls the bounded operation log and relies on receiver
-deduplication. It is not state transfer and does not guarantee unrestricted
-lossless recovery after a partition or restart: required operations and
-deduplication history must still be retained. Rediscovery alone does not prove
-that a missing-history gap can be repaired.
+Anti-entropy repairs missed operations using retained sequenced history or a
+bounded CRDT baseline. Rediscovery alone does not prove recoverability; see the
+[recovery contract](../peer-discovery/#anti-entropy-and-recovery).
+
+## Manual candidates
+
+`RuntimeManagement::add_peer` creates a persistent `manual` contribution on the
+same coordinator. The source ID is reserved; external providers cannot use it.
+Manual candidates have no TTL or provider watch.
+
+Duplicate detection, capacity validation, persistence and publication are
+serialized with provider commands. Storage and a covering flush precede
+publication. Repeating a manual address preserves reconnect backoff; withdrawing
+another source cannot erase its manual contribution.
+
+Registration is available after startup and closes at shutdown. Owned work can
+outlive a cancelled HTTP waiter, leaving a confirmed or uncertain durable record
+for the next startup. Normal handshake, identity and capacity checks apply before
+admission. See [Management API](../../guides/management-api/) for requests,
+errors and restart behavior, and [Schema Versioning](../schema-versioning/#manual-candidate-metadata)
+for storage format.
 
 ## Bounded event delivery
 
@@ -114,47 +131,36 @@ Dropping a watch cancels that subscription. Provider closure terminates the
 watch. `StaticDiscovery` owns no background task, so dropping it or its watch
 requires no asynchronous shutdown or task join.
 
-## Announcements and errors
+## Announcements and lifecycle
 
-Announcement support is a provider capability. `StaticDiscovery::announce()`
-returns the explicit unsupported-operation error; it does not silently succeed
-and does not alter the configured snapshot. Other provider failures are returned
-through the typed discovery error boundary so callers can distinguish an
-unsupported capability, closed delivery, and overflow requiring a resnapshot.
+Providers declare announcement support as unsupported, optional or required.
+A required announcement without a dialable endpoint fails startup.
+`StaticDiscovery::announce()` returns an unsupported-operation error.
 
-Providers declare announcements unsupported, optional, or required. Required
-announcements make startup fail if no dialable local endpoint can be derived.
-Provider `shutdown()` owns withdrawal of announcements and termination of any
-provider-internal work. The coordinator stops and joins every watch task and
-calls every provider shutdown hook during normal shutdown and partial-startup
-rollback. Provider operations have a finite timeout so a stuck implementation
-cannot keep runtime shutdown alive indefinitely.
+| Operation or event | Behavior |
+| --- | --- |
+| Explicit `request_shutdown()` / `shutdown()` | Stop permanently, withdraw announcements and await owned cleanup. Subsequent watches fail. |
+| Startup `request_rollback()` / `rollback()` | Retire the failed generation and its announcements; integrated dynamic providers can restart after successful cleanup. |
+| Unexpected worker exit | Invalidate watches, clear the stale view, join the worker and complete cleanup before any replacement. |
+| Cleanup failure or panic | Remain unavailable; no replacement generation may overlap unreleased resources. |
+| Cancelled shutdown waiter | Cleanup remains owned by the supervisor; another waiter observes the same completion. |
 
-`request_shutdown()` makes a dynamic provider permanently stopped; subsequent
-`shutdown()` calls wait for the same owned completion and can report the same
-failure. Explicit shutdown is terminal, not a restart request. Dropping a
-shutdown waiter does not cancel generation cleanup. Dropping the provider
-signals cancellation; the supervisor owns bounded cleanup while the runtime
-remains alive. Runtime teardown is not a guarantee of external withdrawal.
+During generation finalization, new `discover()` and `watch()` calls fail with
+a retryable error. After cleanup, a new generation is allowed for a retryable
+worker failure or panic; a fatal worker failure blocks restart. The original
+failure remains observable during shutdown. Concurrent subscribers share one
+generation rather than starting overlapping workers.
 
-Unexpected worker exit is different from explicit shutdown. The supervisor
-joins the worker, clears its stale view, invalidates existing watches and
-completes provider-specific cleanup before admitting any replacement generation.
-Watch invalidation or a finished worker alone is not a restart barrier. During
-finalization, a fresh `discover()` or `watch()` fails rather than subscribing to
-the exited producer. After successful cleanup, a later operation may start one
-new generation if the worker outcome permits recovery (including a worker
-panic or retryable error); a fatal worker error blocks restart. A cleanup error
-or panic also blocks restart, even when that cleanup error is marked retryable.
-Concurrent subscribers share restart admission rather than starting overlapping
-generations. Worker errors and panics remain observable during shutdown, even
-when they race a stop request.
+Bootstrap and mDNS retain announcement intent across recoverable unexpected
+exits. Explicit shutdown and startup rollback clear it. Cleanup confirms only
+the provider's local retirement contract, not receipt of a withdrawal by every
+remote peer.
 
-Bootstrap and mDNS retain desired announcement intent across recoverable
-unexpected exits, but do not retain stale candidate views. Explicit shutdown
-clears that intent, including when requested after unexpected finalization.
-Successful cleanup means the provider's local cleanup contract completed; it
-does not imply that every remote peer received a withdrawal or goodbye.
+The coordinator bounds candidate/watch completion and provider cleanup waits.
+Third-party providers inherit conservative rollback defaults that call shutdown;
+they must implement retry-safe cleanup to support startup retries. Dropping a
+provider signals cancellation while its supervisor owns cleanup. Runtime teardown
+does not guarantee external withdrawal.
 
 ## Provider contracts
 
@@ -317,16 +323,6 @@ over-limit update is rejected atomically and the last valid snapshot remains
 active; polling continues. File discovery does not support announcements.
 Shutdown stops and joins the polling task.
 
-### Provider dependencies
-
-The two added runtime dependencies have narrow protocol roles. `mdns-sd`
-provides DNS-SD browse, cache-expiry, unregister/goodbye and daemon shutdown
-behavior that should not be reimplemented as ad-hoc multicast parsing.
-`hickory-resolver` provides real SRV records and their DNS validity deadlines;
-Tokio's host lookup does not expose either. File discovery uses Tokio polling
-instead of adding a filesystem-notification dependency, which also makes
-delete/create and atomic replacement semantics consistent across platforms.
-
 ## Endpoints, identity, and connection admission
 
 Four values remain deliberately separate:
@@ -394,56 +390,8 @@ source when a dynamic provider is selected; they are never reinterpreted as
 bootstrap seeds. Provider construction occurs in `nx-core` after the durable
 local `NodeId` has been loaded.
 
-## Verification coverage
+## Related
 
-Deterministic unit and component tests cover static compatibility, bounded
-watch overflow, snapshot revision continuity, late candidate arrival,
-overlapping source contributions, source removal, startup rollback and
-cancellation-safe shutdown. Provider-specific tests additionally cover:
-
-- bootstrap TTL expiry during a stalled seed query, bounded responses,
-  authenticated TLS/allowlist rejection, seed loss, restart and withdrawal;
-- DNS-SRV ordering, filtering, refresh, validity expiry, transient failure,
-  recovery and cancellation of an in-flight lookup;
-- file creation and removal, atomic replacement, malformed and non-UTF-8
-  updates, last-good retention, recovery and shutdown;
-- mDNS address and instance bounds, self filtering, removal and service-name
-  conflicts, shutdown during replacement, missing withdrawal acknowledgements,
-  preservation of both owned keys and non-renewable cleanup deadlines.
-
-Regression coverage also exercises observation freshness versus cached replay,
-resubscription timestamps, global mDNS retained-state bounds, bounded shutdown
-acknowledgements, non-blocking startup dialing and anti-entropy over active
-connections independently of discovery churn. Capacity tests cover the accepted
-maximum, rejection of zero, maximum-plus-one and `usize::MAX`, legacy static
-normalization with ordered duplicate peers, and defensive internal channel
-rotation. Lifecycle tests cover delayed cleanup as a restart barrier, worker
-and cleanup panics, concurrent resubscription, and terminal explicit shutdown.
-Test presence is not evidence
-that every environment-dependent scenario has run successfully.
-
-The ignored
-`discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint`
-test exercises two real DNS-SD daemons over local multicast, including goodbye
-removal. CI runs this check explicitly on a dedicated macOS runner; keeping it ignored prevents the ordinary cross-platform suite from failing on hosts or containers without multicast support. Run it manually on a multicast-capable host with:
-
-```sh
-cargo test -p nx-core \
-  discovery::mdns::tests::two_daemons_discover_and_remove_an_announced_endpoint \
-  -- --ignored --exact
-```
-
-CI also explicitly selects
-`discovery_lan::mdns_three_daemons_recover_missed_crdt_ops_after_restart` from
-the CLI multiprocess suite on macOS, with `NUMAX_MDNS_E2E=1` and
-`NUMAX_MDNS_LAN_IP` derived from a real local interface. It builds both reader
-and writer variants of the `discovery_lan` guest first. The generic Ubuntu
-ignored-test invocation excludes this multicast-specific module.
-
-That E2E uses three real daemon **processes on one host**, without `--peer`,
-and checks discovery, CRDT replication, missed-operation recovery after restart
-within a configured 128-operation retention bound, stable identities and
-shutdown. It is not evidence of a run on three separate LAN devices or of
-recovery beyond retained history. The three-device LAN demo remains a separate
-release closing check; neither provider-test presence nor CI wiring asserts it
-has passed.
+- [Peer Discovery](../peer-discovery/) — membership, dissemination and recovery contracts.
+- [Configuration](../../reference/config/) — provider selection, bounds and precedence.
+- [Management API](../../guides/management-api/) — persistent candidates and observation views.

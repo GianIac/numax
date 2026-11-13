@@ -1,0 +1,17 @@
+flowchart TB
+    accTitle: Peer discovery and runtime paths
+    accDescr: Candidates pass admission; active data connections and membership control are separate paths. Gossip and repair do not require membership Alive.
+    Candidates["Endpoint candidates<br/>Discovery or manual registration"]
+    Admission["Handshake and identity policy<br/>Version, TLS, allowlist and capacity"]
+    Data["Active data connection<br/>Admitted transport generation"]
+    Control["Membership control<br/>Independent one-shot RPCs"]
+    Gossip["Gossip and anti-entropy<br/>Send operations and repair gaps"]
+    Membership["Member view and probes<br/>Alive, Suspect, Dead or Left"]
+    Observe["Independent observation views<br/>Connection or Alive does not prove recovery"]
+    Candidates --> Admission
+    Admission -->|"Data admission"| Data
+    Admission -->|"Control admission"| Control
+    Data --> Gossip
+    Control --> Membership
+    Gossip --> Observe
+    Membership --> Observe

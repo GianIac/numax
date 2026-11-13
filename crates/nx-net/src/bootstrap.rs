@@ -257,7 +257,7 @@ impl BootstrapClient {
         }
 
         let _query_slot = self.acquire_query_slot()?;
-        let (stream, _transport_addr) =
+        let (stream, _, _) =
             connect_transport(seed, self.config.tls.as_ref(), self.config.socket_timeout).await?;
         let peer_cert = stream.peer_cert_der();
         // A bootstrap request may disclose our advertised endpoint. Apply the
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_u32_max_request_returns_a_bounded_v5_response() {
+    async fn remote_u32_max_request_returns_a_bounded_v6_response() {
         for format in [SerializationFormat::Bincode, SerializationFormat::Json] {
             let node = Node::try_new_with_bootstrap_server(
                 NodeConfig::new(NodeId::new("seed"), "127.0.0.1:0"),
@@ -853,7 +853,7 @@ mod tests {
                     candidates,
                     ..
                 } => {
-                    assert_eq!(protocol_version, 5);
+                    assert_eq!(protocol_version, PROTOCOL_VERSION);
                     assert_eq!(candidates, [bound.to_string()]);
                 }
                 other => panic!("unexpected bootstrap reply: {other:?}"),
@@ -1007,7 +1007,7 @@ mod tests {
             assert!(matches!(
                 hello.kind,
                 WireMessageKind::BootstrapHello {
-                    protocol_version: 5,
+                    protocol_version: PROTOCOL_VERSION,
                     ..
                 }
             ));
@@ -1128,7 +1128,7 @@ mod tests {
 
         // Complete CA-verified TLS first: rejection must be at the node allowlist,
         // not at certificate validation or a client-side seed allowlist.
-        let (mut denied_stream, _) =
+        let (mut denied_stream, _, _) =
             connect_transport(&seed_endpoint, Some(&pki.node2_config()), socket_timeout)
                 .await
                 .unwrap();

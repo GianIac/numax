@@ -1,0 +1,12 @@
+flowchart TB
+    accTitle: Certificate-bound protocol identity
+    accDescr: The protocol NodeId is derived from SHA-256 of the certificate public key SPKI, truncated to sixteen bytes and encoded as lowercase hexadecimal.
+    Cert["Peer certificate<br/>DER encoding"]
+    SPKI["Extract public-key SPKI<br/>Hash its DER bytes with SHA-256"]
+    Truncate["Take first 16 hash bytes<br/>128-bit identity"]
+    Node["Encode lowercase hexadecimal<br/>32-character protocol NodeId"]
+    Verify["Compare with claimed NodeId during admission"]
+    Cert --> SPKI
+    SPKI --> Truncate
+    Truncate --> Node
+    Node --> Verify

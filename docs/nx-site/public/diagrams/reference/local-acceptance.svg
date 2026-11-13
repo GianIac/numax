@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 680" width="640" height="680" role="img" aria-labelledby="title desc">
+<title id="title">Local CRDT acceptance</title><desc id="desc">Local success follows atomic state and replay persistence plus a covering flush. Failed flush is uncertain and fences writes. Delivery failure does not undo acceptance.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#59677d"/></marker></defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#202c40}.node{fill:#f3f1ff;stroke:#8271bd;stroke-width:1.5}.good{fill:#eaf8f2;stroke:#368565}.warn{fill:#fff3e8;stroke:#b47a3b}.muted{fill:#f1f3f7;stroke:#8692a4}.edge{fill:none;stroke:#59677d;stroke-width:1.6;marker-end:url(#arrow)}.label{font-size:14px;paint-order:stroke;stroke:white;stroke-width:6px;stroke-linejoin:round}.sub{font-size:14px;fill:#47566d}</style>
+<rect width="640" height="680" rx="12" fill="white"/>
+<text x="320.0" y="30" text-anchor="middle" font-size="20" font-weight="600">Local CRDT acceptance</text>
+<path class="edge" d="M320.0,125 L320.0,165"/>
+<path class="edge" d="M320.0,241 L320.0,285"/>
+<text class="label" x="320.0" y="255.0" text-anchor="middle">Batch applied</text>
+<path class="edge" d="M320.0,350 L162.5,425"/>
+<text class="label" x="241.25" y="379.5" text-anchor="middle">Flush confirmed</text>
+<path class="edge" d="M320.0,350 L477.5,425"/>
+<text class="label" x="398.75" y="379.5" text-anchor="middle">Flush failed</text>
+<path class="edge" d="M162.5,505 L162.5,565"/>
+<path class="edge" d="M300,600.0 L340,600.0"/>
+<text class="label" x="320.0" y="592.0" text-anchor="middle">Attempt dropped</text>
+<rect class="node " x="150" y="65" width="340" height="60" rx="9"/>
+<text x="320.0" y="100.0" text-anchor="middle" font-size="16" font-weight="600">Validate mutation and reserve slot</text>
+<rect class="node " x="150" y="165" width="340" height="76" rx="9"/>
+<text x="320.0" y="193.0" text-anchor="middle" font-size="16" font-weight="600">Create operation and apply batch</text>
+<text class="sub" x="320.0" y="214.0" text-anchor="middle">State, value, position and replay</text>
+<rect class="node " x="150" y="285" width="340" height="65" rx="9"/>
+<text x="320.0" y="322.5" text-anchor="middle" font-size="16" font-weight="600">Confirm covering storage flush</text>
+<rect class="node good" x="25" y="425" width="275" height="80" rx="9"/>
+<text x="162.5" y="455.0" text-anchor="middle" font-size="16" font-weight="600">Return local success</text>
+<text class="sub" x="162.5" y="476.0" text-anchor="middle">Publish state and try enqueue</text>
+<rect class="node warn" x="340" y="425" width="275" height="80" rx="9"/>
+<text x="477.5" y="455.0" text-anchor="middle" font-size="16" font-weight="600">Uncertain outcome</text>
+<text class="sub" x="477.5" y="476.0" text-anchor="middle">Reopen store before new writes</text>
+<rect class="node " x="25" y="565" width="275" height="70" rx="9"/>
+<text x="162.5" y="590.0" text-anchor="middle" font-size="16" font-weight="600">Gossip delivery attempt</text>
+<text class="sub" x="162.5" y="611.0" text-anchor="middle">Bounded queue, bytes and rate</text>
+<rect class="node muted" x="340" y="565" width="275" height="70" rx="9"/>
+<text x="477.5" y="590.0" text-anchor="middle" font-size="16" font-weight="600">Durable recovery path</text>
+<text class="sub" x="477.5" y="611.0" text-anchor="middle">Replay or qualifying baseline</text>
+</svg>

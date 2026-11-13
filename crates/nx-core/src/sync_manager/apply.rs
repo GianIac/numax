@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use anyhow::Context;
 use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
 use tracing::debug;
 
@@ -9,157 +13,439 @@ use super::replication::{
     apply_seen_insertions, plan_op_log_evictions, plan_seen_evictions,
     prune_op_log_and_return_evicted,
 };
-use super::storage::persist_remote_ops_batch;
+use super::storage::{persist_remote_ops_batch, remote_sequence_sets};
 use super::types::*;
 
+#[cfg(test)]
+static REMOTE_REPLAY_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn set_remote_replay_trace_enabled(enabled: bool) {
+    REMOTE_REPLAY_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[derive(Debug)]
+pub(super) struct RemoteBatchPreparation;
+
+impl std::fmt::Display for RemoteBatchPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote batch preparation failed before CRDT persistence")
+    }
+}
+
+#[cfg(test)]
+fn record_remote_apply_timing(stage: &'static str, started: Instant, success: bool) {
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        message = stage,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        success,
+        "bounded remote apply diagnostic"
+    );
+}
+
+#[cfg(test)]
+fn trace_remote_apply_work(
+    input: usize,
+    applied: usize,
+    duplicates: usize,
+    applied_ids: &[String],
+    duplicate_ids: &[String],
+    success: bool,
+) {
+    let applied_ids = serde_json::to_string(applied_ids).ok();
+    let duplicate_ids = serde_json::to_string(duplicate_ids).ok();
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        remote_apply_input_ops = input as u64,
+        remote_apply_applied_ops = applied as u64,
+        remote_apply_duplicate_ops = duplicates as u64,
+        remote_apply_applied_ids = applied_ids.as_deref().unwrap_or(""),
+        remote_apply_duplicate_ids = duplicate_ids.as_deref().unwrap_or(""),
+        remote_apply_trace_complete = applied_ids.is_some() && duplicate_ids.is_some(),
+        remote_apply_success = success,
+        "bounded remote apply work"
+    );
+}
+
+#[cfg(test)]
+pub(super) fn trace_remote_apply_batch(ops: &[nx_sync::SequencedOp]) {
+    if ops.is_empty() || !REMOTE_REPLAY_TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let entries = ops
+        .iter()
+        .map(|entry| {
+            let size = super::delivery::entry_bytes(&entry.op, &entry.position)?;
+            Some(serde_json::json!({
+                "id": entry.op.id.as_str(),
+                "origin": entry.op.origin.as_str(),
+                "generation": entry.position.generation,
+                "sequence": entry.position.sequence,
+                "size": size,
+                "expected_workload": matches!(
+                    &entry.op.kind,
+                    OpKind::GCounterIncrement { key, increment }
+                        if key == "detector-nominal" && *increment == 1
+                ),
+            }))
+        })
+        .collect::<Option<Vec<_>>>();
+    let encoded_entries = entries
+        .as_ref()
+        .filter(|entries| entries.len() == ops.len())
+        .and_then(|entries| serde_json::to_string(entries).ok());
+    tracing::debug!(
+        target: "nx_core::sync_manager::apply",
+        remote_apply_batch_operations = ops.len() as u64,
+        remote_apply_batch_entries = encoded_entries.as_deref().unwrap_or(""),
+        remote_apply_batch_trace_complete = encoded_entries.is_some(),
+        "bounded sequenced remote apply batch"
+    );
+}
+
+#[cfg(test)]
 pub(super) async fn apply_remote_ops(
     ops: &[Op],
     context: &RemoteOpApplyContext<'_>,
 ) -> anyhow::Result<()> {
-    if ops.is_empty() {
-        return Ok(());
+    apply_ops(ops.to_vec(), None, context).await.map(drop)
+}
+
+#[cfg(test)]
+pub(super) async fn apply_sequenced_ops(
+    ops: &[nx_sync::SequencedOp],
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<()> {
+    apply_sequenced_ops_and_collect(ops, context)
+        .await
+        .map(drop)
+}
+
+pub(super) async fn apply_sequenced_ops_and_collect(
+    ops: &[nx_sync::SequencedOp],
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<Vec<nx_sync::SequencedOp>> {
+    anyhow::ensure!(
+        ops.len() <= 1024,
+        "sequenced batch exceeds operation budget"
+    );
+    #[cfg(test)]
+    trace_remote_apply_batch(ops);
+    let raw = ops.iter().map(|entry| entry.op.clone()).collect::<Vec<_>>();
+    apply_ops(raw, Some(ops.to_vec()), context).await
+}
+
+async fn apply_ops(
+    input: Vec<Op>,
+    sequenced: Option<Vec<nx_sync::SequencedOp>>,
+    context: &RemoteOpApplyContext<'_>,
+) -> anyhow::Result<Vec<nx_sync::SequencedOp>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
     }
 
     let apply_started = Instant::now();
+    #[cfg(test)]
+    let trace = super::storage::critical_trace::Job::new("remote")?;
+    #[cfg(test)]
+    let trace_sequenced_batch = sequenced.is_some();
 
-    let mut seen = context.seen_ops.write().await;
-    let mut log = context.op_log.write().await;
-    let mut counters = context.counters.write().await;
-    let mut pncounters = context.pncounters.write().await;
-    let mut lww_registers = context.lww_registers.write().await;
-    let mut lww_maps = context.lww_maps.write().await;
-    let mut orsets = context.orsets.write().await;
-    let mut rgas = context.rgas.write().await;
-    let mut next_seen_sequence = context.seen_ops_next_sequence.load(Ordering::Relaxed);
-    let mut next_op_log_sequence = context.op_log_next_sequence.load(Ordering::Relaxed);
-    let mut inserted_ids = Vec::new();
-    let mut inserted_ops = Vec::new();
-    let mut plans = Vec::new();
-    let mut counter_updates = HashMap::new();
-    let mut pncounter_updates = HashMap::new();
-    let mut lww_register_updates = HashMap::new();
-    let mut lww_map_updates = HashMap::new();
-    let mut orset_updates = HashMap::new();
-    let mut rga_updates = HashMap::new();
-
-    for op in ops {
-        let op_id = op.id.as_str();
-        if seen.ids.contains(op_id) || inserted_ids.iter().any(|id| id == op_id) {
-            debug!(op_id = %op.id, "skipping duplicate op");
-            continue;
-        }
-
-        let registries = RemoteCrdtRegistries {
-            counters: &counters,
-            pncounters: &pncounters,
-            lww_registers: &lww_registers,
-            lww_maps: &lww_maps,
-            orsets: &orsets,
-            rgas: &rgas,
-        };
-        let mut updates = RemoteCrdtUpdates {
-            counters: &mut counter_updates,
-            pncounters: &mut pncounter_updates,
-            lww_registers: &mut lww_register_updates,
-            lww_maps: &mut lww_map_updates,
-            orsets: &mut orset_updates,
-            rgas: &mut rga_updates,
-        };
-        apply_remote_op_to_crdt_updates(op, &registries, &mut updates);
-
-        inserted_ids.push(op_id.to_string());
-        inserted_ops.push(op.clone());
-    }
-
-    let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
-    let op_log_evicted = plan_op_log_evictions(&log, inserted_ops.len(), context.op_log_limit);
-    let last_insert_index = inserted_ops.len().saturating_sub(1);
-
-    for (index, op) in inserted_ops.iter().enumerate() {
-        plans.push(OpPersistencePlan {
-            op: op.clone(),
-            seen_sequence: next_seen_sequence,
-            op_log_sequence: next_op_log_sequence,
-            seen_evicted: if index == last_insert_index {
-                seen_evicted.clone()
-            } else {
-                Vec::new()
-            },
-            op_log_evicted: if index == last_insert_index {
-                op_log_evicted.clone()
-            } else {
-                Vec::new()
-            },
-        });
-        next_seen_sequence = next_seen_sequence.saturating_add(1);
-        next_op_log_sequence = next_op_log_sequence.saturating_add(1);
-    }
-
-    let duplicate_count = ops.len().saturating_sub(inserted_ops.len());
-    if let Err(error) = persist_remote_ops_batch(
-        context.store,
-        &plans,
-        RemoteCrdtUpdateBatch {
-            counters: &counter_updates,
-            pncounters: &pncounter_updates,
-            lww_registers: &lww_register_updates,
-            lww_maps: &lww_map_updates,
-            orsets: &orset_updates,
-            rgas: &rga_updates,
-        },
-    ) {
-        context.metrics.record_remote_op_batch(
-            ops.len(),
-            0,
-            duplicate_count,
-            apply_started.elapsed(),
-            true,
-        );
-        return Err(error);
-    }
-
-    let applied_count = plans.len();
-    apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
-    log.extend(inserted_ops);
-    prune_op_log_and_return_evicted(&mut log, context.op_log_limit);
-    for (key, counter) in counter_updates {
-        counters.insert(key, counter);
-    }
-    for (key, counter) in pncounter_updates {
-        pncounters.insert(key, counter);
-    }
-    for (key, register) in lww_register_updates {
-        lww_registers.insert(key, register);
-    }
-    for (key, map) in lww_map_updates {
-        lww_maps.insert(key, map);
-    }
-    for (key, set) in orset_updates {
-        orsets.insert(key, set);
-    }
-    for (key, rga) in rga_updates {
-        rgas.insert(key, rga);
-    }
-    context
-        .seen_ops_next_sequence
-        .store(next_seen_sequence, Ordering::Relaxed);
-    context
-        .op_log_next_sequence
-        .store(next_op_log_sequence, Ordering::Relaxed);
-
-    if applied_count > 0 {
-        context.metrics.record_ops(applied_count as u64);
-        debug!(count = applied_count, "applied remote ops batch");
-    }
-    context.metrics.record_remote_op_batch(
-        ops.len(),
-        applied_count,
-        duplicate_count,
-        apply_started.elapsed(),
-        false,
+    #[cfg(test)]
+    let registry_wait_started = Instant::now();
+    #[cfg(test)]
+    let wait = trace.span("wait", "seen");
+    let mut seen = Arc::clone(context.seen_ops).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("seen", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "log");
+    let mut log = Arc::clone(context.op_log).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("log", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "gcounter");
+    let mut counters = Arc::clone(context.counters).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("gcounter", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "pncounter");
+    let mut pncounters = Arc::clone(context.pncounters).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("pncounter", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "lww_register");
+    let mut lww_registers = Arc::clone(context.lww_registers).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("lww_register", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "lww_map");
+    let mut lww_maps = Arc::clone(context.lww_maps).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("lww_map", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "orset");
+    let mut orsets = Arc::clone(context.orsets).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("orset", wait);
+    #[cfg(test)]
+    let wait = trace.span("wait", "rga");
+    let mut rgas = Arc::clone(context.rgas).write_owned().await;
+    #[cfg(test)]
+    trace.acquired("rga", wait);
+    #[cfg(test)]
+    record_remote_apply_timing(
+        "remote registry locks acquired",
+        registry_wait_started,
+        true,
     );
 
-    Ok(())
+    let store = Arc::clone(context.store);
+    let metrics = Arc::clone(context.metrics);
+    let seen_ops_next_sequence = Arc::clone(context.seen_ops_next_sequence);
+    let op_log_next_sequence = Arc::clone(context.op_log_next_sequence);
+    let op_log_limit = context.op_log_limit;
+    // Owned guards serialize this batch with local writes even if its caller is
+    // cancelled. The worker must finish persistence and publication together;
+    // the synchronous storage lease is acquired and dropped only inside it.
+    #[cfg(test)]
+    let storage_dispatch_started = Instant::now();
+    #[cfg(test)]
+    let dispatch_wait = trace.span("wait", "dispatch");
+    #[cfg(test)]
+    let marker_job = trace.clone();
+    let work = move || {
+        #[cfg(test)]
+        let _release = marker_job.release_marker();
+        #[cfg(test)]
+        record_remote_apply_timing("remote storage job started", storage_dispatch_started, true);
+        #[cfg(test)]
+        let preparation_started = Instant::now();
+        let ops = input.as_slice();
+        let sequenced = sequenced.as_deref();
+        let sequence_lease = if sequenced.is_some() {
+            #[cfg(test)]
+            let lease_wait = super::storage::critical_trace::phase("lease_wait");
+            let lease = store.acquire_write_lease();
+            #[cfg(test)]
+            lease_wait.finish_result(&lease);
+            Some(lease?)
+        } else {
+            None
+        };
+        let (accepted_entries, sequence_sets) = match (sequenced, sequence_lease.as_ref()) {
+            (Some(entries), Some(lease)) => {
+                remote_sequence_sets(lease, entries).context(RemoteBatchPreparation)?
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        let accepted_ops = accepted_entries
+            .iter()
+            .map(|entry| entry.op.clone())
+            .collect::<Vec<_>>();
+        let ops = if sequenced.is_some() {
+            accepted_ops.as_slice()
+        } else {
+            ops
+        };
+        let mut next_seen_sequence = seen_ops_next_sequence.load(Ordering::Relaxed);
+        let mut next_op_log_sequence = op_log_next_sequence.load(Ordering::Relaxed);
+        let mut inserted_ids = Vec::new();
+        let mut inserted_ops = Vec::new();
+        let mut duplicate_ids = Vec::new();
+        let mut plans = Vec::new();
+        let mut counter_updates = HashMap::new();
+        let mut pncounter_updates = HashMap::new();
+        let mut lww_register_updates = HashMap::new();
+        let mut lww_map_updates = HashMap::new();
+        let mut orset_updates = HashMap::new();
+        let mut rga_updates = HashMap::new();
+
+        for op in ops {
+            let op_id = op.id.as_str();
+            if sequenced.is_some() {
+                anyhow::ensure!(
+                    !seen.ids.contains(op_id) && !inserted_ids.iter().any(|id| id == op_id),
+                    "operation UUID reused at another sequence"
+                );
+            }
+            if seen.ids.contains(op_id) || inserted_ids.iter().any(|id| id == op_id) {
+                debug!(op_id = %op.id, "skipping duplicate op");
+                duplicate_ids.push(op_id.to_owned());
+                continue;
+            }
+
+            let registries = RemoteCrdtRegistries {
+                counters: &counters,
+                pncounters: &pncounters,
+                lww_registers: &lww_registers,
+                lww_maps: &lww_maps,
+                orsets: &orsets,
+                rgas: &rgas,
+            };
+            let mut updates = RemoteCrdtUpdates {
+                counters: &mut counter_updates,
+                pncounters: &mut pncounter_updates,
+                lww_registers: &mut lww_register_updates,
+                lww_maps: &mut lww_map_updates,
+                orsets: &mut orset_updates,
+                rgas: &mut rga_updates,
+            };
+            apply_remote_op_to_crdt_updates(op, &registries, &mut updates);
+
+            inserted_ids.push(op_id.to_string());
+            inserted_ops.push(op.clone());
+        }
+
+        let seen_evicted = plan_seen_evictions(&seen, &inserted_ids);
+        let op_log_evicted = plan_op_log_evictions(&log, &inserted_ops, op_log_limit);
+        let last_insert_index = inserted_ops.len().saturating_sub(1);
+
+        for (index, op) in inserted_ops.iter().enumerate() {
+            plans.push(OpPersistencePlan {
+                local_generation: None,
+                op: op.clone(),
+                seen_sequence: next_seen_sequence,
+                op_log_sequence: next_op_log_sequence,
+                seen_evicted: if index == last_insert_index {
+                    seen_evicted.clone()
+                } else {
+                    Vec::new()
+                },
+                op_log_evicted: if index == last_insert_index {
+                    op_log_evicted.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+            next_seen_sequence = next_seen_sequence.saturating_add(1);
+            next_op_log_sequence = next_op_log_sequence.saturating_add(1);
+        }
+
+        let duplicate_count = input.len().saturating_sub(inserted_ops.len());
+        #[cfg(test)]
+        record_remote_apply_timing("remote batch prepared", preparation_started, true);
+        if let Err(error) = persist_remote_ops_batch(
+            &store,
+            &plans,
+            RemoteCrdtUpdateBatch {
+                counters: &counter_updates,
+                pncounters: &pncounter_updates,
+                lww_registers: &lww_register_updates,
+                lww_maps: &lww_map_updates,
+                orsets: &orset_updates,
+                rgas: &rga_updates,
+            },
+            sequence_lease.as_ref(),
+            &sequence_sets,
+        ) {
+            metrics.record_remote_op_batch(
+                ops.len(),
+                0,
+                duplicate_count,
+                apply_started.elapsed(),
+                true,
+            );
+            #[cfg(test)]
+            if trace_sequenced_batch {
+                trace_remote_apply_work(
+                    input.len(),
+                    0,
+                    duplicate_count,
+                    &[],
+                    &duplicate_ids,
+                    false,
+                );
+            }
+            return Err(error);
+        }
+
+        #[cfg(test)]
+        let trace_duplicate_ids = if let Some(entries) = sequenced.as_ref() {
+            let mut remaining_applied = inserted_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    if remaining_applied.remove(entry.op.id.as_str()) {
+                        None
+                    } else {
+                        Some(entry.op.id.as_str().to_owned())
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            duplicate_ids.clone()
+        };
+        let forward_entries = sequenced
+            .into_iter()
+            .flatten()
+            .filter(|entry| inserted_ids.iter().any(|id| id == entry.op.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        #[cfg(test)]
+        let publication_started = Instant::now();
+        let applied_count = plans.len();
+        apply_seen_insertions(&mut seen, &inserted_ids, &seen_evicted);
+        log.extend(inserted_ops);
+        prune_op_log_and_return_evicted(&mut log, op_log_limit);
+        for (key, counter) in counter_updates {
+            counters.insert(key, counter);
+        }
+        for (key, counter) in pncounter_updates {
+            pncounters.insert(key, counter);
+        }
+        for (key, register) in lww_register_updates {
+            lww_registers.insert(key, register);
+        }
+        for (key, map) in lww_map_updates {
+            lww_maps.insert(key, map);
+        }
+        for (key, set) in orset_updates {
+            orsets.insert(key, set);
+        }
+        for (key, rga) in rga_updates {
+            rgas.insert(key, rga);
+        }
+        seen_ops_next_sequence.store(next_seen_sequence, Ordering::Relaxed);
+        op_log_next_sequence.store(next_op_log_sequence, Ordering::Relaxed);
+        #[cfg(test)]
+        record_remote_apply_timing("remote registries published", publication_started, true);
+
+        if applied_count > 0 {
+            metrics.record_ops(applied_count as u64);
+            debug!(count = applied_count, "applied remote ops batch");
+        }
+        metrics.record_remote_op_batch(
+            ops.len(),
+            applied_count,
+            duplicate_count,
+            apply_started.elapsed(),
+            false,
+        );
+        #[cfg(test)]
+        if trace_sequenced_batch {
+            trace_remote_apply_work(
+                input.len(),
+                applied_count,
+                duplicate_count,
+                &inserted_ids,
+                &trace_duplicate_ids,
+                true,
+            );
+        }
+
+        Ok(forward_entries)
+    };
+    #[cfg(test)]
+    let work = move || {
+        dispatch_wait.finish("started");
+        trace.run(work)
+    };
+    context.storage_executor.execute(work).await
 }
 
 trait OpApplier {
@@ -515,6 +801,7 @@ mod tests {
         let rgas = Arc::new(RwLock::new(HashMap::new()));
         let metrics = metrics();
         let context = RemoteOpApplyContext {
+            storage_executor: crate::peer_io::StorageExecutor::Blocking,
             counters,
             pncounters: &pncounters,
             lww_registers: &lww_registers,

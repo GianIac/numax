@@ -1,0 +1,16 @@
+flowchart TB
+    accTitle: Local CRDT acceptance
+    accDescr: Local success follows atomic state and replay persistence plus a covering flush. Failed flush is uncertain and fences writes. Delivery failure does not undo acceptance.
+    Call["Validate mutation and reserve slot"]
+    Batch["Create operation and apply batch<br/>State, value, position and replay"]
+    Flush["Confirm covering storage flush"]
+    Success["Return local success<br/>Publish state and try enqueue"]
+    Uncertain["Uncertain outcome<br/>Reopen store before new writes"]
+    Delivery["Gossip delivery attempt<br/>Bounded queue, bytes and rate"]
+    Repair["Durable recovery path<br/>Replay or qualifying baseline"]
+    Call --> Batch
+    Batch -->|"Batch applied"| Flush
+    Flush -->|"Flush confirmed"| Success
+    Flush -->|"Flush failed"| Uncertain
+    Success --> Delivery
+    Delivery -->|"Attempt dropped"| Repair

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 340" width="640" height="340" role="img" aria-labelledby="title desc">
+<title id="title">RGA deletion preserves parent links</title><desc id="desc">The deleted op-2 element remains as a tombstone. Its op-3 child stays reachable and visible.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#59677d"/></marker></defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#202c40}.node{fill:#f3f1ff;stroke:#8271bd;stroke-width:1.5}.good{fill:#eaf8f2;stroke:#368565}.warn{fill:#fff3e8;stroke:#b47a3b}.muted{fill:#f1f3f7;stroke:#8692a4}.edge{fill:none;stroke:#59677d;stroke-width:1.6;marker-end:url(#arrow)}.label{font-size:14px;paint-order:stroke;stroke:white;stroke-width:6px;stroke-linejoin:round}.sub{font-size:14px;fill:#47566d}</style>
+<rect width="640" height="340" rx="12" fill="white"/>
+<text x="320.0" y="30" text-anchor="middle" font-size="20" font-weight="600">RGA deletion preserves parent links</text>
+<path class="edge" d="M200,122.5 L235,122.5"/>
+
+<path class="edge" d="M410,122.5 L445,122.5"/>
+
+<path class="edge" d="M322.5,160 L320.0,230"/>
+<text class="label" x="321.25" y="187.0" text-anchor="middle">Retain identity and links</text>
+<rect class="node good" x="25" y="85" width="175" height="75" rx="9"/>
+<text x="112.5" y="112.5" text-anchor="middle" font-size="16" font-weight="600">a / op-1</text>
+<text class="sub" x="112.5" y="133.5" text-anchor="middle">Head element</text>
+<rect class="node warn" x="235" y="85" width="175" height="75" rx="9"/>
+<text x="322.5" y="112.5" text-anchor="middle" font-size="16" font-weight="600">b / op-2</text>
+<text class="sub" x="322.5" y="133.5" text-anchor="middle">Deleted: tombstone</text>
+<rect class="node good" x="445" y="85" width="175" height="75" rx="9"/>
+<text x="532.5" y="112.5" text-anchor="middle" font-size="16" font-weight="600">c / op-3</text>
+<text class="sub" x="532.5" y="133.5" text-anchor="middle">Child of op-2</text>
+<rect class="node muted" x="100" y="230" width="440" height="75" rx="9"/>
+<text x="320.0" y="257.5" text-anchor="middle" font-size="16" font-weight="600">Internal order: op-1, op-2, op-3</text>
+<text class="sub" x="320.0" y="278.5" text-anchor="middle">Visible values after delete: a, c</text>
+</svg>

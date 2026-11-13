@@ -257,7 +257,54 @@ const RGA_MATERIALIZED_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 const RGA_STATE_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
 // SEEN OPS AND OP LOG
 const SEEN_OPS_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
-const OP_LOG_STEPS: &[MigrationStep] = &[LEGACY_TO_V1];
+const OP_LOG_STEPS: &[MigrationStep] = &[
+    LEGACY_TO_V1,
+    MigrationStep {
+        from_version: 1,
+        to_version: 2,
+        // Payloads are preserved. The new header fences unsequenced old writers.
+        migrate_record: migrate_legacy_record,
+    },
+    MigrationStep {
+        from_version: 2,
+        to_version: 3,
+        migrate_record: migrate_legacy_record,
+    },
+];
+const SEQUENCE_STEPS: &[MigrationStep] = &[
+    LEGACY_TO_V1,
+    MigrationStep {
+        from_version: 1,
+        to_version: 2,
+        migrate_record: migrate_sequence_evidence,
+    },
+    MigrationStep {
+        from_version: 2,
+        to_version: 3,
+        migrate_record: migrate_legacy_record,
+    },
+];
+
+fn migrate_sequence_evidence(
+    table: StoreTable,
+    key: &[u8],
+    value: &[u8],
+) -> Result<RecordMigration, MigrationError> {
+    let replacement = super::storage::migrate_sequence_v1(key, value).map_err(|error| {
+        MigrationError::InvalidRecord {
+            table: table.name(),
+            key: key.to_vec(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(match replacement {
+        Some(value) => RecordMigration {
+            sets: vec![(key.to_vec(), value)],
+            deletes: Vec::new(),
+        },
+        None => RecordMigration::unchanged(),
+    })
+}
 
 impl MigrationCheckpoint {
     fn new(table: StoreTable, from_version: u16, to_version: u16) -> Self {
@@ -458,10 +505,24 @@ fn migrate_table_batch(
             table,
         }
         .encode();
-        lease.apply_batch(
-            &[(schema_key.as_slice(), schema_header.as_slice())],
-            &[checkpoint_key.as_slice()],
-        )?;
+        let usage = if table == StoreTable::Sequences && step.to_version == 2 {
+            Some(
+                super::storage::migrated_sequence_usage(store).map_err(|error| {
+                    MigrationError::InvalidRecord {
+                        table: table.name(),
+                        key: Vec::new(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut sets = vec![(schema_key.as_slice(), schema_header.as_slice())];
+        if let Some((key, value)) = &usage {
+            sets.push((key.as_slice(), value.as_slice()));
+        }
+        lease.apply_batch(&sets, &[checkpoint_key.as_slice()])?;
         return Ok(Some(MigrationProgress::TableCompleted {
             table: table.name(),
             from_version: step.from_version,
@@ -600,6 +661,7 @@ fn migration_steps(table: StoreTable) -> &'static [MigrationStep] {
         StoreTable::RgaState => RGA_STATE_STEPS,
         StoreTable::SeenOps => SEEN_OPS_STEPS,
         StoreTable::OpLog => OP_LOG_STEPS,
+        StoreTable::Sequences => SEQUENCE_STEPS,
     }
 }
 
@@ -751,6 +813,7 @@ fn migrate_legacy_record(
                 .map(|_| ())
                 .map_err(Into::into),
             StoreTable::RgaState => parse_durable_rga_state(value).map(|_| ()),
+            StoreTable::Sequences => super::storage::migrate_sequence_v1(key, value).map(|_| ()),
             StoreTable::SeenOps => parse_seen_op_sequence(value).map(|_| ()),
             StoreTable::OpLog => parse_durable_op_log_value(value).and_then(|(_, op)| {
                 let key_op_id = logical_key_for_prefix(key, table.data_prefix(), table.name())?;
@@ -782,6 +845,7 @@ mod tests {
     use nx_sync::{GCounter, NodeId, Op};
 
     use super::*;
+    use crate::sync_manager::fixtures::parse_fixture;
     use crate::sync_manager::storage::{
         durable_gcounter_state_key, encode_durable_op_log_value, materialized_gcounter_key,
         op_log_store_key,
@@ -795,6 +859,316 @@ mod tests {
         MigrationOptions {
             max_records: NonZeroU32::new(max_records).unwrap(),
             ..MigrationOptions::default()
+        }
+    }
+
+    #[test]
+    fn sequence_v1_migration_preserves_coverage_and_recounts_evidence_bytes_on_resume() {
+        use crate::sync_manager::storage::replication_progress;
+        let directory = tempfile::tempdir().unwrap();
+        let store = NxStore::open(directory.path()).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        let table = StoreTable::Sequences;
+        store
+            .set(
+                &table.schema_key(),
+                &SchemaHeader { version: 1, table }.encode(),
+            )
+            .unwrap();
+        let key = b"__nx/crdt/sequence/origin/remote";
+        let sparse = BTreeMap::from([(2u64, (1u64, "second".to_owned()))]);
+        let value = serde_json::to_vec(&(0u64, 3u64, &sparse, true, true)).unwrap();
+        store.set(key, &value).unwrap();
+        store
+            .set(
+                b"__nx/crdt/sequence/usage",
+                &serde_json::to_vec(&(1usize, key.len() + value.len(), 1usize)).unwrap(),
+            )
+            .unwrap();
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        let before = store.scan_prefix(b"").unwrap();
+        store.inject_disk_full_on_writes(true);
+        let result = SyncSchemaMigration::new(&store, options(1)).unwrap().step();
+        store.inject_disk_full_on_writes(false);
+        assert!(matches!(result, Err(MigrationError::Store(_))));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        {
+            let mut migration = SyncSchemaMigration::new(&store, options(1)).unwrap();
+            assert!(matches!(
+                migration.step().unwrap(),
+                MigrationProgress::BatchValidated {
+                    table: "sequences",
+                    ..
+                }
+            ));
+        }
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        store.flush().unwrap();
+        drop(store);
+        let store = NxStore::open(directory.path()).unwrap();
+        // Resume with a converted receipt and the old accounting/header still
+        // present. Startup must continue to reject this intermediate state.
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        migrate_sync_schema(&store, options(1)).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        let progress = replication_progress(&store).unwrap();
+        assert_eq!(progress[0].contiguous_sequence, 0);
+        assert_eq!(progress[0].known_high_sequence, 3);
+        assert_eq!(progress[0].sparse_positions, 1);
+        assert!(progress[0].baseline_required);
+        // Schema 1 did not retain a source, range, or attempt: do not invent evidence.
+        assert!(!progress[0].source_unavailable);
+        let new_value = store.get(key).unwrap().unwrap();
+        let usage: (usize, usize, usize) =
+            serde_json::from_slice(&store.get(b"__nx/crdt/sequence/usage").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(usage, (1, key.len() + new_value.len(), 1));
+        let after = store.scan_prefix(b"__nx/crdt/sequence/").unwrap();
+        migrate_sync_schema(&store, options(1)).unwrap();
+        assert_eq!(store.scan_prefix(b"__nx/crdt/sequence/").unwrap(), after);
+    }
+
+    #[test]
+    fn v015_fixture_migration_resumes_after_reopen_without_rewriting_payloads() {
+        let records = parse_fixture(include_str!("fixtures/v0_1_5/records.hex"));
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let store = NxStore::open(directory.path()).unwrap();
+            for (key, value) in &records {
+                store.set(key, value).unwrap();
+            }
+            assert!(matches!(
+                super::super::schema::ensure_sync_schema(&store),
+                Err(SchemaError::OlderVersion {
+                    table: StoreTable::OpLog,
+                    found: 1,
+                    current: 3
+                })
+            ));
+            assert_eq!(store.scan_prefix(b"").unwrap(), records);
+            assert!(matches!(
+                SyncSchemaMigration::new(&store, options(1))
+                    .unwrap()
+                    .step()
+                    .unwrap(),
+                MigrationProgress::BatchValidated {
+                    table: "op-log",
+                    records: 1
+                }
+            ));
+            store.flush().unwrap();
+        }
+        let store = NxStore::open(directory.path()).unwrap();
+        migrate_sync_schema(&store, options(1)).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        for (key, value) in &records {
+            if key == &StoreTable::OpLog.schema_key() {
+                assert_eq!(
+                    store.get(key).unwrap().unwrap(),
+                    SchemaHeader::current(StoreTable::OpLog).encode()
+                );
+            } else {
+                assert_eq!(
+                    store.get(key).unwrap().as_ref(),
+                    Some(value),
+                    "historical key: {key:?}"
+                );
+            }
+        }
+        // Migration initializes aggregate accounting, but must never invent an
+        // allocator, origin receipt or replay position for historical records.
+        assert_eq!(
+            store.scan_prefix(b"__nx/crdt/sequence/").unwrap(),
+            vec![(b"__nx/crdt/sequence/usage".to_vec(), b"[0,0,0]".to_vec())]
+        );
+        assert!(
+            !store
+                .prefix_exists(MIGRATION_KEY_PREFIX.as_bytes())
+                .unwrap()
+        );
+        let after = store.scan_prefix(b"").unwrap();
+        migrate_sync_schema(&store, options(1)).unwrap();
+        assert_eq!(store.scan_prefix(b"").unwrap(), after);
+    }
+
+    #[test]
+    fn v015_migration_storage_failures_preserve_checkpoint_and_schema_at_each_boundary() {
+        let records = parse_fixture(include_str!("fixtures/v0_1_5/records.hex"));
+        let store = temp_store();
+        for (key, value) in &records {
+            store.set(key, value).unwrap();
+        }
+        // The fixture has six replay records. Test every record checkpoint and
+        // the final header/checkpoint-removal batch, rather than only first write.
+        for completed in 0..=6 {
+            let before = store.scan_prefix(b"").unwrap();
+            store.inject_disk_full_on_writes(true);
+            let result = SyncSchemaMigration::new(&store, options(1)).unwrap().step();
+            store.inject_disk_full_on_writes(false);
+            assert!(
+                matches!(result, Err(MigrationError::Store(_))),
+                "boundary {completed}: {result:?}"
+            );
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+            let progress = SyncSchemaMigration::new(&store, options(1))
+                .unwrap()
+                .step()
+                .unwrap();
+            if completed < 6 {
+                assert_eq!(
+                    progress,
+                    MigrationProgress::BatchValidated {
+                        table: "op-log",
+                        records: 1
+                    }
+                );
+                assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+            } else {
+                assert_eq!(
+                    progress,
+                    MigrationProgress::TableCompleted {
+                        table: "op-log",
+                        from_version: 1,
+                        to_version: 2
+                    }
+                );
+            }
+        }
+        migrate_sync_schema(&store, options(1)).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+    }
+
+    #[test]
+    fn corrupt_v015_replay_does_not_advance_migration_and_can_resume_after_repair() {
+        let store = temp_store();
+        for (key, value) in parse_fixture(include_str!("fixtures/v0_1_5/records.hex")) {
+            store.set(&key, &value).unwrap();
+        }
+        SyncSchemaMigration::new(&store, options(1))
+            .unwrap()
+            .step()
+            .unwrap();
+        let key = op_log_store_key("fixture-op-2");
+        let original = store.get(&key).unwrap().unwrap();
+        store.set(&key, b"corrupt").unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        assert!(matches!(
+            SyncSchemaMigration::new(&store, options(1)).unwrap().step(),
+            Err(MigrationError::InvalidRecord {
+                table: "op-log",
+                ..
+            })
+        ));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        assert!(super::super::schema::ensure_sync_schema(&store).is_err());
+        store.set(&key, &original).unwrap();
+        migrate_sync_schema(&store, options(1)).unwrap();
+        super::super::schema::ensure_sync_schema(&store).unwrap();
+        assert_eq!(store.get(&key).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn migration_header_crash_child() {
+        let Some(path) = std::env::var_os("NUMAX_MIGRATION_CRASH_STORE") else {
+            return;
+        };
+        let store = NxStore::open(path).unwrap();
+        let checkpoint = match std::env::var("NUMAX_MIGRATION_CRASH_POINT")
+            .unwrap()
+            .as_str()
+        {
+            "before" => nx_store::CrashCheckpoint::BeforeBatch,
+            "after" => nx_store::CrashCheckpoint::AfterBatch,
+            _ => panic!("unknown migration crash checkpoint"),
+        };
+        store.inject_crash_checkpoint(
+            checkpoint,
+            std::env::var_os("NUMAX_MIGRATION_CRASH_MARKER")
+                .unwrap()
+                .into(),
+        );
+        migrate_sync_schema(&store, options(1)).unwrap();
+        panic!("migration passed armed checkpoint");
+    }
+
+    #[test]
+    fn v015_migration_header_and_checkpoint_removal_survive_process_crash_atomically() {
+        for checkpoint in ["before", "after"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("store");
+            let marker = directory.path().join("checkpoint");
+            let records = parse_fixture(include_str!("fixtures/v0_1_5/records.hex"));
+            {
+                let store = NxStore::open(&path).unwrap();
+                for (key, value) in &records {
+                    store.set(key, value).unwrap();
+                }
+                // Validate all six records and durably stop just before the
+                // op-log header update and checkpoint deletion share one batch.
+                for _ in 0..6 {
+                    assert!(matches!(
+                        SyncSchemaMigration::new(&store, options(1))
+                            .unwrap()
+                            .step()
+                            .unwrap(),
+                        MigrationProgress::BatchValidated {
+                            table: "op-log",
+                            records: 1
+                        }
+                    ));
+                }
+                store.flush().unwrap();
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync_manager::migration::tests::migration_header_crash_child",
+                ])
+                .env("NUMAX_MIGRATION_CRASH_STORE", &path)
+                .env("NUMAX_MIGRATION_CRASH_POINT", checkpoint)
+                .env("NUMAX_MIGRATION_CRASH_MARKER", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before checkpoint"
+                );
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("migration checkpoint not reached");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let store = NxStore::open(&path).unwrap();
+            let table = StoreTable::OpLog;
+            let header =
+                SchemaHeader::decode(table, &store.get(&table.schema_key()).unwrap().unwrap())
+                    .unwrap();
+            assert!([1, 2].contains(&header.version));
+            if checkpoint == "before" {
+                assert_eq!(header.version, 1);
+            }
+            assert_eq!(
+                store.get(&checkpoint_key(table)).unwrap().is_some(),
+                header.version == 1
+            );
+            migrate_sync_schema(&store, options(1)).unwrap();
+            super::super::schema::ensure_sync_schema(&store).unwrap();
+            for (key, value) in &records {
+                if !key.starts_with(SCHEMA_KEY_PREFIX.as_bytes()) {
+                    assert_eq!(store.get(key).unwrap().as_ref(), Some(value));
+                }
+            }
+            assert!(
+                !store
+                    .prefix_exists(MIGRATION_KEY_PREFIX.as_bytes())
+                    .unwrap()
+            );
         }
     }
 
@@ -1336,7 +1710,9 @@ mod tests {
     #[test]
     fn migrates_fixture_generated_by_v0_1_0_without_changing_payloads() {
         let records = parse_fixture(include_str!("fixtures/v0_1_0/records.hex"));
-        assert_eq!(records.len(), StoreTable::ALL.len());
+        // The historical fixture predates the additive sequence table.
+        assert_eq!(records.len(), 14);
+        assert!(records.iter().all(|(key, _)| !key.starts_with(super::super::storage::SEQUENCE_PREFIX.as_bytes())));
         assert!(
             records
                 .iter()
@@ -1430,44 +1806,6 @@ mod tests {
         .unwrap();
         assert_eq!(sequence, 9);
         assert_eq!(op.id.as_str(), "fixture-op-1");
-    }
-
-    fn parse_fixture(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-        fixture
-            .lines()
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| {
-                let (key, value) = line
-                    .split_once('\t')
-                    .expect("fixture record must contain a tab separator");
-                (decode_hex(key), decode_hex(value))
-            })
-            .collect()
-    }
-
-    fn decode_hex(hex: &str) -> Vec<u8> {
-        assert!(
-            hex.len().is_multiple_of(2),
-            "hex input must have even length"
-        );
-        hex.as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                let high = decode_nibble(pair[0]);
-                let low = decode_nibble(pair[1]);
-                (high << 4) | low
-            })
-            .collect()
-    }
-
-    fn decode_nibble(byte: u8) -> u8 {
-        match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            _ => panic!("fixture contains non-lowercase-hex byte"),
-        }
     }
 
     #[test]
