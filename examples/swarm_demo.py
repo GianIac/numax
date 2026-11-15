@@ -167,10 +167,12 @@ allow_non_loopback = false
                 raise SwarmError("invalid peer cursor")
             cursors.add(cursor)
 
-    def control(self, values: dict[str, str], clear_completed: bool = False) -> None:
+    def control(self, values: dict[str, str], clear_completed: bool = False, clear_snapshot: bool = False) -> None:
         payload = {"demo:env/" + name: value for name, value in values.items()}
         if clear_completed:
             payload["demo:completed"] = ""
+        if clear_snapshot:
+            payload["demo:snapshot"] = ""
         generator = Path(__file__).resolve().parent / "swarm_control/target/debug/swarm_control"
         generated = subprocess.run([str(generator)], input=json.dumps(payload).encode(), capture_output=True, timeout=10)
         if generated.returncode != 0:
@@ -194,9 +196,15 @@ allow_non_loopback = false
             raise SwarmError(f"node {self.index}: incomplete tick {tick}")
 
     def snapshot(self, render: bool = False, label: str = "snapshot") -> dict:
-        self.control(dict(NUMAX_OBSERVE="1", NUMAX_RENDER="1" if render else "0", NUMAX_SNAPSHOT_LABEL=label))
+        self.control(dict(NUMAX_OBSERVE="1", NUMAX_RENDER="1" if render else "0", NUMAX_SNAPSHOT_LABEL=label), clear_snapshot=True)
         self.run()
-        return json.loads(self.request("keys/" + encoded_key("demo:snapshot")))
+        data = self.request("keys/" + encoded_key("demo:snapshot"))
+        if not data:
+            raise SwarmError(f"node {self.index}: incomplete snapshot")
+        snapshot = json.loads(data)
+        if not isinstance(snapshot, dict):
+            raise SwarmError(f"node {self.index}: invalid snapshot")
+        return snapshot
 
     def stop(self) -> None:
         process = self.process
@@ -243,12 +251,17 @@ class Fleet:
                 node.alive()
             if self.cancelled.is_set():
                 raise SwarmError("interrupted")
-            result = condition()
-            if result:
-                return result
             if time.monotonic() >= deadline:
                 raise SwarmError(f"timeout: {label}")
-            self.cancelled.wait(0.1)
+            result = condition()
+            if self.cancelled.is_set():
+                raise SwarmError("interrupted")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SwarmError(f"timeout: {label}")
+            if result:
+                return result
+            self.cancelled.wait(min(0.1, remaining))
 
     def ready(self, node: Node) -> None:
         def condition():

@@ -1,10 +1,11 @@
 import os
 import socket
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from swarm_demo import Fleet, Node, NoRedirect, SwarmError, validate_config
 
@@ -36,6 +37,84 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(SwarmError):
                 node.tick(1, "0:9")
             run.assert_called_once()
+
+    def test_snapshot_cannot_reuse_previous_value(self):
+        node = object.__new__(Node)
+        node.index = 0
+        stored = {"snapshot": b'{"previous":true}'}
+
+        def control(values, clear_snapshot=False):
+            if clear_snapshot:
+                stored["snapshot"] = b""
+
+        with patch.object(node, "control", side_effect=control), patch.object(node, "run") as run, patch.object(
+            node, "request", side_effect=lambda route: stored["snapshot"]
+        ):
+            with self.assertRaisesRegex(SwarmError, "incomplete snapshot"):
+                node.snapshot()
+            run.assert_called_once()
+
+    def test_snapshot_requires_fresh_object(self):
+        node = object.__new__(Node)
+        node.index = 0
+        for data, succeeds in ((b'{"field":[1]}', True), (b"null", False), (b"[]", False)):
+            with self.subTest(data=data), patch.object(node, "control") as control, patch.object(node, "run"), patch.object(
+                node, "request", return_value=data
+            ):
+                if succeeds:
+                    self.assertEqual(node.snapshot(), {"field": [1]})
+                else:
+                    with self.assertRaisesRegex(SwarmError, "invalid snapshot"):
+                        node.snapshot()
+                self.assertTrue(control.call_args.kwargs["clear_snapshot"])
+
+    def test_failed_snapshot_invalidation_does_not_run_guest(self):
+        node = object.__new__(Node)
+        with patch.object(node, "control", side_effect=SwarmError("invalidation failed")), patch.object(node, "run") as run:
+            with self.assertRaisesRegex(SwarmError, "invalidation failed"):
+                node.snapshot()
+            run.assert_not_called()
+
+    def test_wait_checks_deadline_before_and_after_condition(self):
+        fleet = object.__new__(Fleet)
+        fleet.timeout = 1.0
+        fleet.nodes = []
+        fleet.cancelled = threading.Event()
+        for times, called in (((0, 1), False), ((0, 0, 1), True), ((0, 0, 2), True)):
+            with self.subTest(times=times), patch("swarm_demo.time.monotonic", side_effect=times):
+                condition = Mock(return_value=True)
+                with self.assertRaisesRegex(SwarmError, "timeout: observation"):
+                    fleet.wait(condition, "observation")
+                self.assertEqual(condition.called, called)
+
+    def test_wait_accepts_on_time_and_rejects_cancelled_results(self):
+        fleet = object.__new__(Fleet)
+        fleet.timeout = 1.0
+        fleet.nodes = []
+        fleet.cancelled = threading.Event()
+        with patch("swarm_demo.time.monotonic", side_effect=(0, 0, 0.5)):
+            self.assertEqual(fleet.wait(lambda: {"fresh": True}, "observation"), {"fresh": True})
+
+        def cancel():
+            fleet.cancelled.set()
+            return True
+
+        with patch("swarm_demo.time.monotonic", side_effect=(0, 0)):
+            with self.assertRaisesRegex(SwarmError, "interrupted"):
+                fleet.wait(cancel, "observation")
+
+    def test_wait_polling_does_not_exceed_remaining_budget(self):
+        fleet = object.__new__(Fleet)
+        fleet.timeout = 1.0
+        fleet.nodes = []
+        fleet.cancelled = threading.Event()
+        condition = Mock(return_value=False)
+        with patch("swarm_demo.time.monotonic", side_effect=(0, 0, 0.95, 1)), patch.object(fleet.cancelled, "wait") as wait:
+            with self.assertRaisesRegex(SwarmError, "timeout: observation"):
+                fleet.wait(condition, "observation")
+            condition.assert_called_once()
+            wait.assert_called_once()
+            self.assertAlmostEqual(wait.call_args.args[0], 0.05)
 
     def test_repeated_cursor_is_rejected(self):
         node = object.__new__(Node)
@@ -112,6 +191,10 @@ class LifecycleTests(unittest.TestCase):
                     if kind == "magnets":
                         node.control(dict(NUMAX_BOOST="0:2"))
                     self.assertEqual(node.snapshot(), snapshot)
+                    with patch.object(node, "run") as run:
+                        with self.assertRaisesRegex(SwarmError, "incomplete snapshot"):
+                            node.snapshot()
+                        run.assert_called_once()
                     self.assertEqual(node.snapshot(), snapshot)
                     identity = node.identity
                     node.stop()

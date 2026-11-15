@@ -12,7 +12,9 @@ fn generate(values: &BTreeMap<String, String>) -> Result<Vec<u8>, Box<dyn std::e
     let mut memory = Vec::new();
     let mut instructions = String::new();
     for (key, value) in values {
-        if !(key.starts_with("demo:env/NUMAX_") || key == "demo:completed")
+        if !(key.starts_with("demo:env/NUMAX_")
+            || key == "demo:completed"
+            || (key == "demo:snapshot" && value.is_empty()))
             || key.len() > 128
             || value.len() > 4096
         {
@@ -57,6 +59,7 @@ mod tests {
     #[test]
     fn rejects_non_demo_keys_and_excessive_input() {
         assert!(generate(&BTreeMap::from([("__nx/secret".into(), "value".into())])).is_err());
+        assert!(generate(&BTreeMap::from([("demo:other".into(), "".into())])).is_err());
         assert!(
             generate(&BTreeMap::from([(
                 "demo:env/NUMAX_BOOST".into(),
@@ -64,6 +67,13 @@ mod tests {
             )]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn permits_only_snapshot_invalidation() {
+        let bytes = generate(&BTreeMap::from([("demo:snapshot".into(), "".into())])).unwrap();
+        assert!(bytes.starts_with(b"\0asm"));
+        assert!(generate(&BTreeMap::from([("demo:snapshot".into(), "{}".into())])).is_err());
     }
 
     #[test]
