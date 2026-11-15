@@ -43,8 +43,9 @@ hence after the .wasm binary inspection, it means that explicit WASM import/expo
 
 ## Requirements
 
-- WASI SDK / clang in path
-- A built `nx` runtime
+- WASI SDK or clang++ with WebAssembly target support and `wasm-ld` in PATH
+- Node.js 22 for the ABI smoke test
+- A built `nx` runtime (only needed to run the guest in Numax)
 
 The runtime can be built from the repository root with:
 
@@ -78,6 +79,25 @@ guest.wasm
 ```
 
 The output is written to the `examples/guest_cpp` directory.
+
+### ABI smoke test
+
+After building `guest.wasm`, run from `examples/guest_cpp`:
+
+```bash
+node test.mjs
+```
+
+Alternatively, run from the repository root:
+
+```bash
+node examples/guest_cpp/test.mjs
+```
+
+The smoke test checks the `nx.host_log_v2` and `nx.db_set` imports, the
+`memory` and `run` exports, the log messages, and the key/value pair written by
+the guest. It uses mock host functions and does not require a running Numax
+instance.
 
 ## Run
 
