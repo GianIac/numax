@@ -51,13 +51,26 @@ pub fn env_get(key: &str) -> Result<Option<Vec<u8>>> {
     })
 }
 
+fn decode_module_id_bytes(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| NxError::Internal)
+}
+
 /// Identifier of the current module as provided by the runtime.
 #[must_use = "this SDK call can fail; handle the Result"]
 pub fn module_id() -> Result<String> {
     let bytes =
         read_dynamic(|out_ptr, out_cap| unsafe { ffi::module_id(out_ptr as u32, out_cap) })?
             .ok_or(NxError::NotFound)?;
-    String::from_utf8(bytes).map_err(|_| NxError::Internal)
+    decode_module_id_bytes(bytes)
+}
+
+fn decode_capability_list(bytes: &[u8]) -> Result<Vec<String>> {
+    let text = core::str::from_utf8(bytes).map_err(|_| NxError::Internal)?;
+    Ok(text
+        .split('\n')
+        .filter(|capability| !capability.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 /// Host API capabilities available in the current runtime.
@@ -67,13 +80,16 @@ pub fn host_capabilities() -> Result<Vec<String>> {
         ffi::host_capabilities(out_ptr as u32, out_cap)
     })?
     .ok_or(NxError::NotFound)?;
-    let text = core::str::from_utf8(&bytes).map_err(|_| NxError::Internal)?;
+    decode_capability_list(&bytes)
+}
 
-    Ok(text
-        .split('\n')
-        .filter(|capability| !capability.is_empty())
-        .map(ToString::to_string)
-        .collect())
+fn map_event_emit_rc(rc: i32) -> Result<()> {
+    match rc {
+        0 => Ok(()),
+        ERR_INTERNAL => Err(NxError::Internal),
+        c if c < 0 => Err(NxError::UnknownCode(c)),
+        _ => Err(NxError::UnknownCode(rc)),
+    }
 }
 
 /// Emit a named event to the runtime.
@@ -89,12 +105,7 @@ pub fn event_emit(name: &str, payload: &[u8]) -> Result<()> {
         )
     };
 
-    match rc {
-        0 => Ok(()),
-        ERR_INTERNAL => Err(NxError::Internal),
-        c if c < 0 => Err(NxError::UnknownCode(c)),
-        _ => Err(NxError::UnknownCode(rc)),
-    }
+    map_event_emit_rc(rc)
 }
 
 /// Abort guest execution with a host-visible error message.
@@ -147,6 +158,14 @@ mod tests {
     }
 
     #[test]
+    fn read_dynamic_returns_empty_payload() {
+        assert_eq!(
+            read_dynamic(|out, cap| write_mock_payload(out, cap, b"")),
+            Ok(Some(Vec::new()))
+        );
+    }
+
+    #[test]
     fn read_dynamic_retries_with_larger_buffer_after_buf_too_small() {
         let mut calls = 0u32;
         let got = read_dynamic(|out, cap| {
@@ -180,16 +199,6 @@ mod tests {
         assert_eq!(last_cap as usize, MAX_SYSTEM_BUFFER);
     }
 
-    /// Mirrors `host_capabilities` newline splitting (empty lines dropped).
-    fn decode_capability_list(bytes: &[u8]) -> Result<Vec<String>> {
-        let text = core::str::from_utf8(bytes).map_err(|_| NxError::Internal)?;
-        Ok(text
-            .split('\n')
-            .filter(|capability| !capability.is_empty())
-            .map(ToString::to_string)
-            .collect())
-    }
-
     #[test]
     fn host_capabilities_decode_splits_non_empty_lines() {
         let caps = decode_capability_list(b"net.sync\ndb.kv\nlog.emit").unwrap();
@@ -210,16 +219,18 @@ mod tests {
     }
 
     #[test]
+    fn host_capabilities_decode_handles_empty_list() {
+        for input in ["", "\n\n"] {
+            assert_eq!(decode_capability_list(input.as_bytes()), Ok(Vec::new()));
+        }
+    }
+
+    #[test]
     fn host_capabilities_decode_rejects_invalid_utf8() {
         assert_eq!(
             decode_capability_list(&[0xff, 0xfe, 0xfd]),
             Err(NxError::Internal)
         );
-    }
-
-    /// Mirrors `module_id` UTF-8 decoding after a successful buffer read.
-    fn decode_module_id_bytes(bytes: Vec<u8>) -> Result<String> {
-        String::from_utf8(bytes).map_err(|_| NxError::Internal)
     }
 
     #[test]
@@ -236,16 +247,6 @@ mod tests {
             decode_module_id_bytes(vec![0xff, 0xfe]),
             Err(NxError::Internal)
         );
-    }
-
-    /// Mirrors `event_emit` return-code mapping.
-    fn map_event_emit_rc(rc: i32) -> Result<()> {
-        match rc {
-            0 => Ok(()),
-            ERR_INTERNAL => Err(NxError::Internal),
-            c if c < 0 => Err(NxError::UnknownCode(c)),
-            _ => Err(NxError::UnknownCode(rc)),
-        }
     }
 
     #[test]
