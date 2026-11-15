@@ -30,15 +30,15 @@ and hands a fully-built `RuntimeConfig` to `nx-core`. It never contains runtime 
 
 ## Command structure
 
-```
-nx
-├── run <MODULE> [OPTIONS]
-├── serve [OPTIONS]
-└── config
-    ├── init [--output PATH] [--force]
-    ├── validate [--config PATH]
-    └── show --config PATH --effective
-```
+| Command | Purpose |
+| --- | --- |
+| `nx run <MODULE> [OPTIONS]` | Start a runtime and execute a WASM module. |
+| `nx serve [OPTIONS]` | Start a node without a guest module. |
+| `nx config init [--output PATH] [--force]` | Write a configuration template. |
+| `nx config validate [--config PATH]` | Validate configuration. |
+| `nx config show --config PATH --effective` | Print resolved configuration. |
+| `nx migrate [--datastore-path PATH]` | Migrate a stopped datastore with bounded batches. |
+| `nx completions <SHELL>` | Generate shell completion scripts. |
 
 Defined in `main.rs` as:
 
@@ -64,12 +64,12 @@ All parsing is done by clap `#[derive(Parser)]`. No manual argument parsing.
 
 This is the core of `nx-cli`. Every flag has up to four sources. The pipeline is:
 
-```
-1. CLI flags            (highest priority)
-2. NX_* env vars
-3. numax.toml sections
-4. Runtime defaults     (lowest priority)
-```
+| Priority | Source |
+| --- | --- |
+| 1 — highest | CLI flags |
+| 2 | `NX_*` environment variables |
+| 3 | TOML configuration |
+| 4 — lowest | Runtime defaults |
 
 The entry point is `EffectiveRunConfig::resolve(cli, file_config)` which internally calls
 `resolve_with_env(cli, EnvRunConfig::from_env()?, file_config)`.

@@ -42,7 +42,7 @@ movement decision, not separate modes:
   movement logic reacts to values changed by an outside actor between ticks
 - `GCounter` used for a swarm-wide convergence stat (`mag:settled_events`)
 - local (non-replicated) per-node state via `nx_sdk::db` persisting across
-  repeated `nx run` invocations of the same particle
+  guest invocations on the same daemon
 - `nx_sdk::net::node_id`, `nx_sdk::crypto::random_bytes`,
   `nx_sdk::system::env_get` combined into a stateful, randomized,
   configurable simulation, same building blocks as `distributed_ants` but
@@ -58,16 +58,11 @@ movement decision, not separate modes:
 
 ## Result
 
-A real 14-particle run (16×16 grid, 3 anchors, 120 ticks/particle,
-`seed = 7`, `polarity_enabled = true`) runs a 6-phase scripted scenario:
-phase 1 is the plain seeded weights, then phases 2–6 each apply a live
-boost/cut to one or more anchors (see [Configuration](#configuration)). The
-render shows, per phase, how many *new* particles crossed into
-`settle_radius` of an anchor since the previous phase — the heuristic in
-numbers: phase 2 (anchor 0 boosted to weight 19) adds `+17` settles, phase 4
-(anchor 2 boosted to 22) adds `+16`, phase 5 (anchor 0 re-boosted to 22)
-adds `+6` — every boosted phase jumps well above the `+2`–`+6` baseline
-drift of an unboosted phase.
+The configured scenario starts under seeded anchor weights, then applies
+live boosts/cuts in successive phases (see [Configuration](#configuration)).
+The report shows particle positions, occupancy and new settle events per
+phase. Screenshots illustrate the report layout; they are not a guarantee of
+identical outcomes from another run.
 
 `render_topology.py` turns one node's sequence of converged snapshots — one
 per phase — into a single HTML report that **autoplays through every phase
@@ -85,18 +80,10 @@ each other on top of the shared anchor pull:
 
 ### With vs. without polarity
 
-The same scenario, same seed, run again with `polarity_enabled = false`
-(the [Configuration](#configuration) toggle that restores the original,
-polarity-less MOA rule — every peer with more mass attracts, nothing ever
-repels) makes the effect obvious as a number, not just a visual impression:
-by the end of the run, `mag:settled_events` reaches **~80** with polarity on
-vs. **~197** with it off — without repulsion to spread same-polarity
-particles apart, far more of the swarm piles directly onto the winning
-anchor's exact cell instead of orbiting nearby, so it crosses the settle
-radius far more often. The same phase 5 snapshot with polarity disabled
-shows this directly: `+35` new settles that phase (vs. `+6` with polarity
-on) and up to 4 particles stacked on one cell instead of tidy
-opposite-polarity pairs:
+Set `polarity_enabled = false` to compare the same configured scenario
+without polarity-based repulsion. Positions and settle-event counts depend
+on runtime scheduling and movement randomness as well as the seed; compare
+actual reports rather than treating a historical run as an expected count.
 
 ![The same phase 5 snapshot with polarity_enabled = false: up to four particles piled onto a single cell near the anchor, and a +35 new-settles chip, versus tidy opposite-polarity pairs and +6 with polarity on](screenshots/magnets-no-polarity.png)
 
@@ -117,10 +104,9 @@ target/wasm32-unknown-unknown/release/distributed_magnets.wasm
 
 ## How one tick works
 
-`nx run` invokes a guest's `run()` exactly once per process, then exits —
-there's no in-guest loop or sleep. So "many simulation ticks" means
-re-invoking `nx run` repeatedly against the same `--datastore-path`, while
-`--listen`/`--peer` keeps that node's CRDT state synced with the others.
+Each guest invocation performs one tick; there is no in-guest loop or sleep.
+The demo keeps `nx serve` running and invokes registered guests through
+authenticated loopback management. Manual `nx run` invocations still work.
 Each invocation:
 
 1. Reads grid size, anchor count, seed, settle radius, particle count and
@@ -215,8 +201,10 @@ phase6_boosts = "0:-20,1:5,2:5"
 
 Guest WASM has no filesystem access (only `db`/`net`/`crdt`/`system`/
 `crypto`/`time` host calls), so this file is parsed **host-side** by
-`demo.sh` and re-exposed to every guest invocation as `NUMAX_*` env vars
-(plus a per-node `NUMAX_PARTICLE_ID` that `demo.sh` assigns). Changing
+the shared runner and passed through local `demo:env/NUMAX_*` keys, including
+each node's `NUMAX_PARTICLE_ID`. A small control guest writes these keys via
+the SDK; the management key API remains read-only. Manual runs fall back to
+`NUMAX_*` environment variables. Changing
 `grid_width`/`grid_height`/`anchor_count` and re-running `demo.sh` changes
 the simulated search space accordingly — nothing is hardcoded in the guest.
 
@@ -229,7 +217,7 @@ of this example did. For each phase `N` from 2 to `phase_count`,
 applied as deltas *on top of* the anchor's current live weight (not target
 absolutes, since the underlying `PNCounter` only ever accumulates). Anchor
 indices are 0-based, in the order the seeded layout derives them — run
-`demo.sh` once and check the `ANCHOR` lines in `logs/particle-0.log` before
+`demo.sh` once and check the `ANCHOR` lines in `runs/<id>/node-0/daemon.log` before
 tuning these for a different seed/grid. `demo.sh` validates that indices are
 in range and that tick numbers strictly increase before starting the swarm.
 
@@ -246,20 +234,30 @@ repo root:
 
 ```bash
 cargo build --release -p nx-cli
+cargo build --manifest-path examples/swarm_control/Cargo.toml
 cd examples/distributed_magnets
 cargo build --release --target wasm32-unknown-unknown
 ./demo.sh                      # uses swarm.config.toml
 ./demo.sh my-other-config.toml # or a different config file
 ```
 
-This launches `particles` background nodes, fully meshed as peers, each
-looping `ticks_per_particle` times over its own datastore. On exit it prints
-each node's converged `mag:settled_events` GCounter (should agree across
-nodes, modulo a small skew from the timing of the final snapshot — that's
-normal eventual-consistency, not a bug) and points you at the log to render.
+Requires Python 3.11+ and permission to open local sockets. The shared runner
+starts persistent daemons with ring candidate endpoints, separate stores and
+private loopback management tokens. Network ports start at `base_port`;
+management ports immediately follow that range. At most four guest executions
+are in flight. Healthy membership is observed before ticks; receipt coverage
+and equality of read-only CRDT snapshots are checked at phase boundaries and
+after the final tick. Snapshot collection does not advance particles or
+reapply boosts.
 
-If you'd rather see a single raw tick by hand, the same underlying
-`nx run` invocation the script loops looks like:
+Each run creates a new `runs/<id>` directory, preserving it on success or
+failure. Use `./demo.sh swarm.config.toml --state /tmp/numax-magnets-new-run`
+to choose another new directory. `--timeout` bounds observation phases.
+Mutations are never automatically retried after a failed or uncertain response;
+signals stop and reap only owned daemons. Existing data/log directories remain
+untouched.
+
+For a separate single-node tick by hand:
 
 ```bash
 NUMAX_GRID_W=16 NUMAX_GRID_H=16 NUMAX_ANCHOR_COUNT=3 NUMAX_SEED=7 \
@@ -281,14 +279,14 @@ command to apply a one-off boost the way the scripted scenario does.
 ## Render the topology
 
 ```bash
-python3 render_topology.py logs/particle-0.log --grid-width 16 --grid-height 16 --settle-radius 1 --out topology.html
+python3 render_topology.py runs/<id>/node-0/daemon.log --grid-width 16 --grid-height 16 --settle-radius 1 --out topology.html
 ```
 
 Stdlib-only (no matplotlib/numpy, no external fonts or other network
 requests — the page is fully self-contained). It splits the log into one
 snapshot per `SNAPSHOT,<label>` marker (one per scripted phase, gated behind
-`NUMAX_RENDER=1`, which `demo.sh` sets automatically on the tick right
-before each boost lands, plus a final one at the end), parses each
+`NUMAX_OBSERVE=1` and `NUMAX_RENDER=1`, which the runner sets after convergence
+before each boost lands, plus a final observation at the end), parses each
 snapshot's `FIELD,x,y,v` / `ANCHOR,x,y,weight` / `PARTICLE,id,x,y,mass`
 lines, and writes a single HTML report where every phase is stacked in the
 same spot and a pure-CSS `@keyframes` animation autoplays through them in
@@ -306,11 +304,11 @@ what actually drove the simulation).
 
 Open the resulting `topology.html` in a browser and let it run.
 
-## Reset
+## Data and tokens
 
-```bash
-rm -rf examples/distributed_magnets/data-* examples/distributed_magnets/logs
-```
+Use a new run directory to start again. Existing directories are refused, not
+reset or migrated. Keep tokens private; do not publish them with logs/reports.
+Retain or remove completed directories explicitly after their daemons stop.
 
 ## Notes
 
@@ -319,15 +317,15 @@ rm -rf examples/distributed_magnets/data-* examples/distributed_magnets/logs
 - `--wait-before-run` / `--settle-for` follow the same convention as the
   other examples — see `distributed_counter`'s README for a fuller
   explanation of both.
-- Reusing datastores between `demo.sh` runs of the *same* config is fine;
-  changing grid size, anchor count, or particle count mid-simulation isn't
-  (positions and particle ids from a smaller/differently-seeded world may
-  fall outside the new grid or collide), so `demo.sh` always clears
-  `data-*`/`logs` first.
+- Do not change grid size, seed, anchor count or particle count on an existing
+  manual store: persisted positions and identities belong to its original world.
 - The scripted controller boosts are only ever applied by particle 0's own
   tick loop; every other particle only ever *reads* live anchor weights,
-  never writes them, so there's no risk of two nodes double-applying the
-  same scripted delta.
+  never writes them. Do not retry an uncertain tick: it may already have
+  applied its boost.
+- Run helper tests with `python3 -m unittest discover -s ../ -p test_swarm_demo.py`;
+  use `NUMAX_SWARM_E2E=1` for real lifecycle tests with the debug `nx` binary
+  and both built swarm WASM modules.
 
 ## Future direction: driving weights from a real external signal
 

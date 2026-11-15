@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 use nx_net::{BootstrapServerConfig, Node, NodeConfig, PeerConnectionInfo};
 use nx_store::Store as NxStore;
-use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
-use tokio::sync::{RwLock, mpsc, watch};
+use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, OpKind, PNCounter, Rga};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -20,43 +23,907 @@ use super::peer::{
     normalize_peer_dead_after_failures,
 };
 use super::replication::{
-    drain_node_events, handle_node_event, normalize_op_log_limit, normalize_seen_ops_limit,
-    spawn_anti_entropy_loop, spawn_broadcast_loop, spawn_reconnect_loop,
-    try_connect_configured_peer,
+    PRIORITY_EVENT_BURST, REMOTE_HISTORY_COALESCE_WINDOW, apply_seen_insertions,
+    drain_node_event_queues, handle_node_event, handle_node_events, normalize_op_log_limit,
+    normalize_seen_ops_limit, plan_op_log_evictions, plan_seen_evictions,
+    prune_op_log_and_return_evicted, spawn_anti_entropy_loop, spawn_broadcast_loop,
+    spawn_forward_loop, spawn_reconnect_loop, try_connect_configured_peer,
 };
 use super::schema::ensure_sync_schema;
 use super::storage::{
     hydrate_gcounter_registry, hydrate_lww_map_registry, hydrate_lww_register_registry,
     hydrate_op_log, hydrate_orset_registry, hydrate_pncounter_registry, hydrate_rga_registry,
-    hydrate_seen_ops,
+    hydrate_seen_ops, persist_local_gcounter_op, persist_local_lww_map_op,
+    persist_local_lww_register_op, persist_local_orset_op, persist_local_pncounter_op,
+    persist_local_rga_op,
 };
 use super::types::*;
+
+const MAX_PRIORITY_EVENT_CAPACITY: usize = 64;
+
+fn priority_event_capacity(event_channel_capacity: usize) -> usize {
+    if event_channel_capacity > 1 {
+        (event_channel_capacity / 4).clamp(1, MAX_PRIORITY_EVENT_CAPACITY)
+    } else {
+        0
+    }
+}
+
+async fn receive_scheduled_node_event(
+    event_rx: &mut mpsc::Receiver<nx_net::NodeEvent>,
+    priority_event_rx: &mut Option<mpsc::Receiver<nx_net::NodeEvent>>,
+    priority_events: &mut usize,
+    event_rx_open: &mut bool,
+) -> Option<(nx_net::NodeEvent, bool, bool)> {
+    loop {
+        if !*event_rx_open && priority_event_rx.is_none() {
+            return None;
+        }
+        let priority_allowed =
+            *priority_events < PRIORITY_EVENT_BURST || !*event_rx_open || event_rx.is_empty();
+        tokio::select! {
+            biased;
+            event = async {
+                match priority_event_rx.as_mut() {
+                    Some(receiver) if priority_allowed => receiver.recv().await,
+                    _ => std::future::pending().await,
+                }
+            } => match event {
+                Some(event) => {
+                    *priority_events = (*priority_events).saturating_add(1);
+                    return Some((event, true, true));
+                }
+                None => *priority_event_rx = None,
+            },
+            event = async {
+                if *event_rx_open {
+                    event_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => match event {
+                Some(event) => {
+                    *priority_events = 0;
+                    return Some((event, false, priority_allowed));
+                }
+                None => *event_rx_open = false,
+            }
+        }
+    }
+}
 
 /// Clonable, cheap handle to the SyncManager exposed to host calls.
 #[derive(Clone)]
 pub struct SyncHandle {
+    local_writes: Arc<LocalWrites>,
+    storage_executor: crate::peer_io::StorageExecutor,
+    local_limits: LocalTransportLimits,
+    clock: Arc<dyn crate::peer_io::clock::Clock>,
+    ids: Arc<dyn crate::peer_io::random::IdSource>,
+    recovery_scan_limit: Arc<Semaphore>,
+    candidates: super::candidates::CandidateAccess,
+    membership_view:
+        Arc<std::sync::Mutex<Option<watch::Receiver<crate::membership::runtime::Snapshot>>>>,
+    peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
+    history_requests: Arc<RwLock<HistoryRequests>>,
+    generation: u64,
     node_id: NodeId,
-    op_tx: mpsc::Sender<Op>,
+    op_tx: super::delivery::Sender<AcceptedLocalOp>,
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
     lww_maps: Arc<RwLock<HashMap<String, LwwMap>>>,
     orsets: Arc<RwLock<HashMap<String, ORSet>>>,
     rgas: Arc<RwLock<HashMap<String, Rga>>>,
+    seen_ops: Arc<RwLock<SeenOps>>,
+    seen_ops_next_sequence: Arc<AtomicU64>,
+    op_log: Arc<RwLock<Vec<Op>>>,
+    op_log_next_sequence: Arc<AtomicU64>,
+    op_log_limit: usize,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
     active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
 }
 
+#[derive(Default)]
+struct LocalWrites {
+    stopped: AtomicBool,
+    gate: Arc<RwLock<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum PNCounterDirection {
+    Increment,
+    Decrement,
+}
+
+enum LwwMapChange {
+    Set(Vec<u8>),
+    Remove,
+}
+
+/// Opaque proof that a local operation completed its state-and-replay persistence path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedLocalOp {
+    op: Op,
+    position: nx_sync::OpPosition,
+}
+
+impl super::delivery::Item for AcceptedLocalOp {
+    fn delivery_bytes(&self) -> Option<usize> {
+        super::delivery::entry_bytes(&self.op, &self.position)?
+            .checked_add(std::mem::size_of::<Self>())
+    }
+}
+
+impl AcceptedLocalOp {
+    fn new(store: &NxStore, op: Op) -> anyhow::Result<Self> {
+        let entry = super::storage::sequenced_op(store, &op)?
+            .ok_or_else(|| anyhow::anyhow!("missing accepted operation position"))?;
+        Ok(Self {
+            op,
+            position: entry.position,
+        })
+    }
+
+    pub(crate) fn into_sequenced(self) -> nx_sync::SequencedOp {
+        nx_sync::SequencedOp {
+            op: self.op,
+            position: self.position,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn position(&self) -> nx_sync::OpPosition {
+        self.position
+    }
+
+    pub(crate) fn op(&self) -> &Op {
+        &self.op
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_op(self) -> Op {
+        self.op
+    }
+}
+
+impl std::ops::Deref for AcceptedLocalOp {
+    type Target = Op;
+
+    fn deref(&self) -> &Self::Target {
+        self.op()
+    }
+}
+
+impl PartialEq<Op> for AcceptedLocalOp {
+    fn eq(&self, other: &Op) -> bool {
+        self.op() == other
+    }
+}
+
+impl PartialEq<AcceptedLocalOp> for Op {
+    fn eq(&self, other: &AcceptedLocalOp) -> bool {
+        self == other.op()
+    }
+}
+
 impl SyncHandle {
+    async fn local_mutation<R: Send + Sync + 'static, T: Send + 'static>(
+        &self,
+        registry: Arc<RwLock<R>>,
+        work: impl FnOnce(&Self, &mut SeenOps, &mut Vec<Op>, &mut R) -> anyhow::Result<T>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<T> {
+        #[cfg(test)]
+        let trace = super::storage::critical_trace::Job::new("local")?;
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        let admission_wait = trace.span("wait", "admission");
+        let admission = Arc::clone(&self.local_writes.gate).read_owned().await;
+        #[cfg(test)]
+        trace.acquired("admission", admission_wait);
+        if self.local_writes.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("local operation acceptance is shut down");
+        }
+        // Acquire async guards before dispatch; the owned job retains them through publication.
+        #[cfg(test)]
+        let seen_wait = trace.span("wait", "seen");
+        let mut seen = Arc::clone(&self.seen_ops).write_owned().await;
+        #[cfg(test)]
+        trace.acquired("seen", seen_wait);
+        #[cfg(test)]
+        let log_wait = trace.span("wait", "log");
+        let mut log = Arc::clone(&self.op_log).write_owned().await;
+        #[cfg(test)]
+        trace.acquired("log", log_wait);
+        #[cfg(test)]
+        let registry_wait = trace.span("wait", "registry");
+        let mut state = registry.write_owned().await;
+        #[cfg(test)]
+        trace.acquired("registry", registry_wait);
+        debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "local registry locks acquired"
+        );
+        let dispatched = std::time::Instant::now();
+        let handle = self.clone();
+        #[cfg(test)]
+        let dispatch_wait = trace.span("wait", "dispatch");
+        #[cfg(test)]
+        let marker_job = trace.clone();
+        let work = move || {
+            let _admission = admission;
+            #[cfg(test)]
+            let _release = marker_job.release_marker();
+            debug!(
+                elapsed_us = dispatched.elapsed().as_micros() as u64,
+                "local storage job started"
+            );
+            let result = work(&handle, &mut seen, &mut log, &mut state);
+            if let Err(error) = &result {
+                warn!(error = %error, "local operation acceptance failed");
+            }
+            result
+        };
+        #[cfg(test)]
+        let work = move || {
+            dispatch_wait.finish("started");
+            trace.run(work)
+        };
+        self.storage_executor.execute(work).await
+    }
+
+    fn local_op(&self, kind: OpKind) -> Op {
+        Op {
+            id: self.ids.next(),
+            origin: self.node_id.clone(),
+            kind,
+        }
+    }
+
+    pub(crate) fn rga_insert_op(&self, key: &str, parent: Option<String>, value: Vec<u8>) -> Op {
+        let id = self.ids.next();
+        Op {
+            kind: OpKind::RgaInsert {
+                key: key.into(),
+                id: id.as_str().into(),
+                parent,
+                value,
+            },
+            id,
+            origin: self.node_id.clone(),
+        }
+    }
+    /// Bounded, durable per-origin coverage; known maxima do not imply contiguous receipt.
+    pub fn replication_progress(&self) -> anyhow::Result<Vec<super::ReplicationProgress>> {
+        super::storage::replication_progress(&self.store)
+    }
+
     /// NodeId of the local node (used to stamp locally-produced Ops).
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
 
-    /// Sender to enqueue Ops for broadcast. Backpressure is bounded by the underlying channel capacity.
-    pub fn op_sender(&self) -> mpsc::Sender<Op> {
+    pub(crate) fn op_sender(&self) -> super::delivery::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
+    }
+
+    /// Reserve delivery capacity, accept a local increment, and enqueue it for broadcast.
+    ///
+    /// Persist-only mutation and direct queue access are intentionally unavailable
+    /// outside `nx-core`:
+    ///
+    /// ```compile_fail
+    /// fn bypass(handle: &nx_core::SyncHandle) {
+    ///     let _ = handle.op_sender();
+    ///     let _ = handle.increment_gcounter("visits", 1);
+    /// }
+    /// ```
+    pub async fn submit_gcounter_increment(&self, key: &str, delta: u64) -> anyhow::Result<()> {
+        let permit = self
+            .op_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("local operation queue is closed"))?;
+        let accepted = self.increment_gcounter(key, delta).await?;
+        permit.send(accepted);
+        self.metrics.record_ops(1);
+        Ok(())
+    }
+
+    pub(crate) async fn increment_gcounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.counters),
+            move |handle, seen, log, counters| {
+                handle.accept_gcounter(&key, delta, seen, log, counters)
+            },
+        )
+        .await
+    }
+
+    fn accept_gcounter(
+        &self,
+        key: &str,
+        delta: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        counters: &mut HashMap<String, GCounter>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let op = self.local_op(OpKind::GCounterIncrement {
+            key: key.into(),
+            increment: delta,
+        });
+        let op_id = op.id.as_str().to_string();
+
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate GCounter operation id");
+        }
+
+        let mut counter = counters.get(key).cloned().unwrap_or_else(GCounter::new);
+        counter.increment(&self.node_id, delta);
+
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_gcounter_op(&self.store, key, &counter, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        counters.insert(key.to_string(), counter);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn increment_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        self.change_pncounter(key, delta, PNCounterDirection::Increment)
+            .await
+    }
+
+    pub(crate) async fn decrement_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        self.change_pncounter(key, delta, PNCounterDirection::Decrement)
+            .await
+    }
+
+    async fn change_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+        direction: PNCounterDirection,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.pncounters),
+            move |handle, seen, log, counters| {
+                handle.accept_pncounter(&key, delta, direction, seen, log, counters)
+            },
+        )
+        .await
+    }
+
+    fn accept_pncounter(
+        &self,
+        key: &str,
+        delta: u64,
+        direction: PNCounterDirection,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        counters: &mut HashMap<String, PNCounter>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let op = match direction {
+            PNCounterDirection::Increment => self.local_op(OpKind::PNCounterIncrement {
+                key: key.into(),
+                increment: delta,
+            }),
+            PNCounterDirection::Decrement => self.local_op(OpKind::PNCounterDecrement {
+                key: key.into(),
+                decrement: delta,
+            }),
+        };
+        let op_id = op.id.as_str().to_string();
+
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate PNCounter operation id");
+        }
+
+        let mut counter = counters.get(key).cloned().unwrap_or_else(PNCounter::new);
+        match direction {
+            PNCounterDirection::Increment => counter.increment(&self.node_id, delta),
+            PNCounterDirection::Decrement => counter.decrement(&self.node_id, delta),
+        }
+
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_pncounter_op(&self.store, key, &counter, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        counters.insert(key.to_string(), counter);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn set_lww_register(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.lww_registers),
+            move |handle, seen, log, registers| {
+                handle.accept_lww_register(&key, value, observed_timestamp_ms, seen, log, registers)
+            },
+        )
+        .await
+    }
+
+    fn accept_lww_register(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        registers: &mut HashMap<String, LwwRegister>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let timestamp_ms = registers.get(key).map_or(observed_timestamp_ms, |current| {
+            observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
+        });
+        let op = self.local_op(OpKind::LwwRegisterSet {
+            key: key.into(),
+            value: value.clone(),
+            timestamp_ms,
+        });
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate LwwRegister operation id");
+        }
+
+        let candidate = LwwRegister::new(value, timestamp_ms, self.node_id.clone());
+        let register = registers
+            .get(key)
+            .map(|current| current.merged_with(&candidate))
+            .unwrap_or(candidate);
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_lww_register_op(&self.store, key, &register, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        registers.insert(key.to_string(), register);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn set_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        value: Vec<u8>,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        self.change_lww_map(key, field, LwwMapChange::Set(value), observed_timestamp_ms)
+            .await
+    }
+
+    pub(crate) async fn remove_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        self.change_lww_map(key, field, LwwMapChange::Remove, observed_timestamp_ms)
+            .await
+    }
+
+    async fn change_lww_map(
+        &self,
+        key: &str,
+        field: &str,
+        change: LwwMapChange,
+        observed_timestamp_ms: u64,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        let field = field.to_owned();
+        self.local_mutation(
+            Arc::clone(&self.lww_maps),
+            move |handle, seen, log, maps| {
+                handle.accept_lww_map(
+                    (&key, &field),
+                    change,
+                    observed_timestamp_ms,
+                    seen,
+                    log,
+                    maps,
+                )
+            },
+        )
+        .await
+    }
+
+    fn accept_lww_map(
+        &self,
+        (key, field): (&str, &str),
+        change: LwwMapChange,
+        observed_timestamp_ms: u64,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        maps: &mut HashMap<String, LwwMap>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let mut map = maps.get(key).cloned().unwrap_or_else(LwwMap::new);
+        let timestamp_ms = map.entry(field).map_or(observed_timestamp_ms, |current| {
+            observed_timestamp_ms.max(current.timestamp_ms().saturating_add(1))
+        });
+        let op = match &change {
+            LwwMapChange::Set(value) => self.local_op(OpKind::LwwMapSet {
+                key: key.into(),
+                field: field.into(),
+                value: value.clone(),
+                timestamp_ms,
+            }),
+            LwwMapChange::Remove => self.local_op(OpKind::LwwMapRemove {
+                key: key.into(),
+                field: field.into(),
+                timestamp_ms,
+            }),
+        };
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate LwwMap operation id");
+        }
+
+        match change {
+            LwwMapChange::Set(value) => {
+                map.set(field.to_string(), value, timestamp_ms, self.node_id.clone());
+            }
+            LwwMapChange::Remove => {
+                map.remove(field.to_string(), timestamp_ms, self.node_id.clone());
+            }
+        }
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_lww_map_op(&self.store, key, &map, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        maps.insert(key.to_string(), map);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn add_orset(
+        &self,
+        key: &str,
+        element: &str,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        let element = element.to_owned();
+        self.local_mutation(Arc::clone(&self.orsets), move |handle, seen, log, sets| {
+            handle.accept_orset_add(&key, &element, seen, log, sets)
+        })
+        .await
+    }
+
+    fn accept_orset_add(
+        &self,
+        key: &str,
+        element: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        sets: &mut HashMap<String, ORSet>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let id = self.ids.next();
+        let op = Op {
+            kind: OpKind::ORSetAdd {
+                key: key.into(),
+                element: element.into(),
+                tag: id.as_str().into(),
+            },
+            id,
+            origin: self.node_id.clone(),
+        };
+        let op_id = op.id.as_str().to_string();
+
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate ORSet operation id");
+        }
+
+        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+        set.add(element.to_string(), op_id.clone());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_orset_op(&self.store, key, &set, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        sets.insert(key.to_string(), set);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn orset_remove_is_noop(&self, key: &str, element: &str) -> bool {
+        self.orsets
+            .read()
+            .await
+            .get(key)
+            .is_none_or(|set| set.observed_tags(element).is_empty())
+    }
+
+    pub(crate) async fn remove_orset(
+        &self,
+        key: &str,
+        element: &str,
+    ) -> anyhow::Result<Option<AcceptedLocalOp>> {
+        let key = key.to_owned();
+        let element = element.to_owned();
+        self.local_mutation(Arc::clone(&self.orsets), move |handle, seen, log, sets| {
+            handle.accept_orset_remove(&key, &element, seen, log, sets)
+        })
+        .await
+    }
+
+    fn accept_orset_remove(
+        &self,
+        key: &str,
+        element: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        sets: &mut HashMap<String, ORSet>,
+    ) -> anyhow::Result<Option<AcceptedLocalOp>> {
+        let mut set = sets.get(key).cloned().unwrap_or_else(ORSet::new);
+        let observed_tags = set.observed_tags(element);
+        if observed_tags.is_empty() {
+            return Ok(None);
+        }
+
+        let op = self.local_op(OpKind::ORSetRemove {
+            key: key.into(),
+            element: element.into(),
+            observed_tags: observed_tags.clone(),
+        });
+        let op_id = op.id.as_str().to_string();
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate ORSet operation id");
+        }
+        set.apply_remove(element.to_string(), observed_tags);
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_orset_op(&self.store, key, &set, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        sets.insert(key.to_string(), set);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        Ok(Some(AcceptedLocalOp::new(&self.store, op)?))
+    }
+
+    pub(crate) async fn insert_rga(&self, op: Op) -> anyhow::Result<AcceptedLocalOp> {
+        self.local_mutation(Arc::clone(&self.rgas), move |handle, seen, log, rgas| {
+            handle.accept_rga_insert(op, seen, log, rgas)
+        })
+        .await
+    }
+
+    fn accept_rga_insert(
+        &self,
+        op: Op,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        rgas: &mut HashMap<String, Rga>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let OpKind::RgaInsert {
+            key,
+            id,
+            parent,
+            value,
+        } = &op.kind
+        else {
+            anyhow::bail!("expected RGA insert operation");
+        };
+        if op.origin != self.node_id || id != op.id.as_str() {
+            anyhow::bail!("invalid local RGA insert identity");
+        }
+        let op_id = op.id.as_str().to_string();
+
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate RGA operation id");
+        }
+
+        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+        rga.insert(id.clone(), parent.clone(), value.clone());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_rga_op(&self.store, key, &rga, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        rgas.insert(key.clone(), rga);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
+    }
+
+    pub(crate) async fn delete_rga(&self, key: &str, id: &str) -> anyhow::Result<AcceptedLocalOp> {
+        let key = key.to_owned();
+        let id = id.to_owned();
+        self.local_mutation(Arc::clone(&self.rgas), move |handle, seen, log, rgas| {
+            handle.accept_rga_delete(&key, &id, seen, log, rgas)
+        })
+        .await
+    }
+
+    fn accept_rga_delete(
+        &self,
+        key: &str,
+        id: &str,
+        seen: &mut SeenOps,
+        log: &mut Vec<Op>,
+        rgas: &mut HashMap<String, Rga>,
+    ) -> anyhow::Result<AcceptedLocalOp> {
+        let op = self.local_op(OpKind::RgaDelete {
+            key: key.into(),
+            id: id.into(),
+        });
+        let op_id = op.id.as_str().to_string();
+
+        if seen.ids.contains(&op_id) {
+            anyhow::bail!("generated duplicate RGA operation id");
+        }
+
+        let mut rga = rgas.get(key).cloned().unwrap_or_else(Rga::new);
+        rga.delete(id.to_string());
+        let inserted_ids = [op_id];
+        let plan = OpPersistencePlan {
+            local_generation: Some((self.generation, self.local_limits)),
+            op: op.clone(),
+            seen_sequence: self.seen_ops_next_sequence.load(Ordering::Relaxed),
+            op_log_sequence: self.op_log_next_sequence.load(Ordering::Relaxed),
+            seen_evicted: plan_seen_evictions(seen, &inserted_ids),
+            op_log_evicted: plan_op_log_evictions(
+                log,
+                std::slice::from_ref(&op),
+                self.op_log_limit,
+            ),
+        };
+        persist_local_rga_op(&self.store, key, &rga, &plan)?;
+
+        apply_seen_insertions(seen, &inserted_ids, &plan.seen_evicted);
+        log.push(op.clone());
+        prune_op_log_and_return_evicted(log, self.op_log_limit);
+        rgas.insert(key.to_string(), rga);
+        self.seen_ops_next_sequence
+            .store(plan.seen_sequence.saturating_add(1), Ordering::Relaxed);
+        self.op_log_next_sequence
+            .store(plan.op_log_sequence.saturating_add(1), Ordering::Relaxed);
+
+        AcceptedLocalOp::new(&self.store, op)
     }
 
     /// Read-side handle over the counter registry.
@@ -121,9 +988,111 @@ impl SyncHandle {
         });
         connections
     }
+
+    pub async fn add_peer(
+        &self,
+        address: String,
+    ) -> Result<crate::control::PeerRegistration, crate::control::ControlError> {
+        self.candidates.add(address).await
+    }
+
+    pub(crate) async fn inspect_peers(
+        &self,
+        view: crate::control::PeerView,
+    ) -> Result<Vec<crate::control::PeerObservation>, crate::control::ControlError> {
+        use crate::control::{ControlError, PeerObservation, PeerView};
+        match view {
+            PeerView::Candidates => {
+                let candidates = self.candidates.snapshot()?;
+                let health = self.peer_health.read().await;
+                Ok(candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let reconnect = health.get(&candidate.address).map(|health| health.state);
+                        PeerObservation::Candidate {
+                            candidate,
+                            reconnect,
+                        }
+                    })
+                    .collect())
+            }
+            PeerView::Connections => Ok(self
+                .active_connections()
+                .await
+                .into_iter()
+                .map(PeerObservation::Connection)
+                .collect()),
+            PeerView::Membership => {
+                let state = self
+                    .membership_view
+                    .lock()
+                    .map_err(|_| ControlError::Internal("membership view lock poisoned".into()))?;
+                let receiver = state.as_ref().ok_or(ControlError::ServiceUnavailable)?;
+                let snapshot = receiver.borrow().clone();
+                Ok(snapshot
+                    .records
+                    .into_iter()
+                    .map(|record| PeerObservation::Membership {
+                        record,
+                        service_error: snapshot.error.clone(),
+                    })
+                    .collect())
+            }
+            PeerView::Recovery => {
+                let store = Arc::clone(&self.store);
+                let progress = run_recovery_scan(&self.recovery_scan_limit, move || {
+                    super::storage::replication_progress(&store)
+                })
+                .await?;
+                let requests = self.history_requests.read().await;
+                Ok(progress
+                    .into_iter()
+                    .map(|progress| {
+                        let in_flight = requests.values().any(|origins| {
+                            origins
+                                .get(progress.origin.as_str())
+                                .is_some_and(|request| request.deadline > self.clock.now())
+                        });
+                        PeerObservation::Recovery {
+                            progress,
+                            in_flight,
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+async fn run_recovery_scan(
+    limit: &Arc<Semaphore>,
+    read: impl FnOnce() -> anyhow::Result<Vec<super::ReplicationProgress>> + Send + 'static,
+) -> Result<Vec<super::ReplicationProgress>, crate::control::ControlError> {
+    use crate::control::ControlError;
+    let permit = Arc::clone(limit)
+        .try_acquire_owned()
+        .map_err(|_| ControlError::ServiceUnavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    })
+    .await
+    .map_err(|error| ControlError::Internal(error.to_string()))?
+    .map_err(|error| ControlError::Storage(error.to_string()))
 }
 
 pub struct SyncManager {
+    local_writes: Arc<LocalWrites>,
+    storage_executor: crate::peer_io::StorageExecutor,
+    clock: Arc<dyn crate::peer_io::clock::Clock>,
+    ids: Arc<dyn crate::peer_io::random::IdSource>,
+    recovery_scan_limit: Arc<Semaphore>,
+    candidates: super::candidates::CandidateAccess,
+    membership_view:
+        Arc<std::sync::Mutex<Option<watch::Receiver<crate::membership::runtime::Snapshot>>>>,
+    history_requests: Arc<RwLock<HistoryRequests>>,
+    history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    generation: u64,
     /// NodeId.
     node_id: NodeId,
 
@@ -142,6 +1111,7 @@ pub struct SyncManager {
     /// Network node. Wrapped in `Arc` so the broadcast drain task spawned
     /// by `start` can share ownership with the manager.
     node: Option<Arc<Node>>,
+    membership: Option<crate::membership::runtime::Handle>,
 
     /// GCounter
     counters: Arc<RwLock<HashMap<String, GCounter>>>,
@@ -188,11 +1158,14 @@ pub struct SyncManager {
     /// Last received OpId per peer NodeId, for observation only, not a causal frontier.
     anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,
 
+    /// Shared deterministic rotation cursor for bounded data gossip.
+    fanout_cursor: Arc<AtomicUsize>,
+
     /// Channel to send Ops to broadcast.
-    op_tx: mpsc::Sender<Op>,
+    op_tx: super::delivery::Sender<AcceptedLocalOp>,
 
     /// Receiver drained by `start` into the broadcast task.
-    op_rx: Option<mpsc::Receiver<Op>>,
+    op_rx: Option<super::delivery::Receiver<AcceptedLocalOp>>,
 
     /// Shutdown signal shared with background tasks.
     shutdown_tx: watch::Sender<bool>,
@@ -202,6 +1175,9 @@ pub struct SyncManager {
 
     /// Outbound broadcast drain task.
     broadcast_task: Option<JoinHandle<()>>,
+
+    /// Outbound task forwarding newly persisted remote operations.
+    forward_task: Option<JoinHandle<()>>,
 
     /// Configured peer reconnect task.
     reconnect_task: Option<JoinHandle<()>>,
@@ -258,8 +1234,13 @@ impl SyncManager {
     ) -> anyhow::Result<Self> {
         config.validate()?;
         ensure_sync_schema(&store)?;
+        let generation = super::storage::initialize_sequence_origin(&store, &node_id)?;
 
-        let (op_tx, op_rx) = mpsc::channel(config.queued_ops_limit.max(1));
+        let (op_tx, op_rx) = super::delivery::channel(
+            config.queued_ops_limit.max(1),
+            super::delivery::QUEUE_BYTES,
+            Arc::clone(&metrics),
+        );
         let op_log_limit = normalize_op_log_limit(config.op_log_limit);
         let seen_ops_limit = normalize_seen_ops_limit(config.seen_ops_limit);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
@@ -292,12 +1273,23 @@ impl SyncManager {
         let rgas = Arc::new(RwLock::new(rgas));
 
         Ok(Self {
+            local_writes: Arc::new(LocalWrites::default()),
+            storage_executor: crate::peer_io::StorageExecutor::Blocking,
+            clock: Arc::new(crate::peer_io::clock::SystemClock),
+            ids: Arc::new(crate::peer_io::random::UuidIds),
+            recovery_scan_limit: Arc::new(Semaphore::new(1)),
+            candidates: super::candidates::CandidateAccess::with_metrics(Arc::clone(&metrics)),
+            membership_view: Arc::new(std::sync::Mutex::new(None)),
+            history_requests: Arc::new(RwLock::new(HashMap::new())),
+            history_cursors: Arc::new(RwLock::new(HashMap::new())),
+            generation,
             node_id,
             config,
             discovery_providers,
             discovery_config,
             discovery_coordinator: None,
             node: None,
+            membership: None,
             counters,
             pncounters,
             lww_registers,
@@ -313,11 +1305,13 @@ impl SyncManager {
             peer_health: Arc::new(RwLock::new(peer_health)),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             anti_entropy_watermarks: Arc::new(RwLock::new(HashMap::new())),
+            fanout_cursor: Arc::new(AtomicUsize::new(0)),
             op_tx,
             op_rx: Some(op_rx),
             shutdown_tx,
             event_task: None,
             broadcast_task: None,
+            forward_task: None,
             reconnect_task: None,
             anti_entropy_task: None,
         })
@@ -329,18 +1323,28 @@ impl SyncManager {
     }
 
     /// Return sender
-    pub fn op_sender(&self) -> mpsc::Sender<Op> {
+    #[cfg(test)]
+    pub(crate) fn op_sender(&self) -> super::delivery::Sender<AcceptedLocalOp> {
         self.op_tx.clone()
-    }
-
-    /// Take the receiver of operations
-    pub fn take_op_receiver(&mut self) -> Option<mpsc::Receiver<Op>> {
-        self.op_rx.take()
     }
 
     /// Build a clonable handle exposing the op channel and the counter registry.
     pub fn handle(&self) -> SyncHandle {
         SyncHandle {
+            local_writes: Arc::clone(&self.local_writes),
+            storage_executor: self.storage_executor,
+            local_limits: LocalTransportLimits {
+                max_message_size: self.config.max_message_size,
+                serialization_format: self.config.serialization_format,
+            },
+            clock: Arc::clone(&self.clock),
+            ids: Arc::clone(&self.ids),
+            recovery_scan_limit: Arc::clone(&self.recovery_scan_limit),
+            candidates: self.candidates.clone(),
+            membership_view: Arc::clone(&self.membership_view),
+            peer_health: Arc::clone(&self.peer_health),
+            history_requests: Arc::clone(&self.history_requests),
+            generation: self.generation,
             node_id: self.node_id.clone(),
             op_tx: self.op_tx.clone(),
             counters: Arc::clone(&self.counters),
@@ -349,6 +1353,11 @@ impl SyncManager {
             lww_maps: Arc::clone(&self.lww_maps),
             orsets: Arc::clone(&self.orsets),
             rgas: Arc::clone(&self.rgas),
+            seen_ops: Arc::clone(&self.seen_ops),
+            seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
+            op_log: Arc::clone(&self.op_log),
+            op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
+            op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
             active_connections: Arc::clone(&self.active_connections),
@@ -361,6 +1370,7 @@ impl SyncManager {
     /// are started, not that a peer is connected or replication has settled.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         self.config.validate()?;
+        self.candidates.check_startable()?;
         let listen_addr = match &self.config.listen_addr {
             Some(addr) => addr.clone(),
             None => {
@@ -375,12 +1385,14 @@ impl SyncManager {
 
         // Reject local configuration before acquiring provider watches or tasks.
         // The reconnect loop consumes live candidates, not NodeConfig::initial_peers.
+        let event_channel_capacity = self.config.queued_ops_limit.max(1);
+        let priority_event_capacity = priority_event_capacity(event_channel_capacity);
         let mut node_config = NodeConfig::new(self.node_id.clone(), &listen_addr)
             .with_max_peers(self.config.max_peers)
             .with_max_message_size(self.config.max_message_size)
             .with_socket_timeout(self.config.socket_timeout)
             .with_serialization_format(self.config.serialization_format)
-            .with_event_channel_capacity(self.config.queued_ops_limit.max(1));
+            .with_event_channel_capacity(event_channel_capacity);
         let bootstrap_server = BootstrapServerConfig::new(self.discovery_config.cluster_id())?
             .with_max_cached_candidates(self.discovery_config.max_candidates())?
             .with_max_response_candidates(
@@ -393,15 +1405,31 @@ impl SyncManager {
         }
 
         let mut node = Node::try_new_with_bootstrap_server(node_config, bootstrap_server)?;
+        if priority_event_capacity > 0 {
+            node.enable_priority_event_channel(priority_event_capacity)?;
+        }
         let Some(mut event_rx) = node.take_event_receiver() else {
             anyhow::bail!("network event receiver is unavailable");
         };
+        let mut priority_event_rx = if priority_event_capacity > 0 {
+            Some(
+                node.take_priority_event_receiver()
+                    .ok_or_else(|| anyhow::anyhow!("priority event receiver is unavailable"))?,
+            )
+        } else {
+            None
+        };
+        let control_rx = node
+            .take_control_receiver()
+            .ok_or_else(|| anyhow::anyhow!("membership event receiver is unavailable"))?;
 
         // Provider watches are acquired before binding so discovery startup is
         // atomic with respect to network resources. All later failures roll back.
-        let mut discovery_coordinator = DiscoveryCoordinator::start(
+        let mut discovery_coordinator = DiscoveryCoordinator::prepare_managed(
             self.discovery_providers.clone(),
             self.discovery_config.clone(),
+            Arc::clone(&self.store),
+            self.candidates.clone(),
         )
         .await?;
         let candidates_rx = discovery_coordinator.candidates();
@@ -424,9 +1452,30 @@ impl SyncManager {
                 return Err(error.into());
             }
         };
+        let node = Arc::new(node);
+        let mut membership = match crate::membership::runtime::start_with_metrics(
+            self.node_id.to_string(),
+            advertised_endpoint.clone(),
+            node.clone(),
+            Arc::clone(&self.store),
+            control_rx,
+            Arc::clone(&self.metrics),
+        )
+        .await
+        {
+            Ok(membership) => membership,
+            Err(error) => {
+                node.shutdown().await;
+                rollback_discovery(&mut discovery_coordinator).await;
+                return Err(error);
+            }
+        };
         if let Some(endpoint) = &advertised_endpoint
             && let Err(error) = node.announce_bootstrap_endpoint(endpoint.clone())
         {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             return Err(error.into());
@@ -435,29 +1484,72 @@ impl SyncManager {
             .announce(advertised_endpoint.as_deref())
             .await
         {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             return Err(error.into());
         }
 
         let initial_candidates = Arc::clone(&candidates_rx.borrow());
+        self.metrics.refresh_recovery(Arc::clone(&self.store)).await;
         *self.peer_health.write().await = initial_candidates
             .iter()
             .map(|peer| (peer.clone(), PeerHealth::default()))
             .collect();
 
         let Some(op_rx) = self.op_rx.take() else {
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
             node.shutdown().await;
             rollback_discovery(&mut discovery_coordinator).await;
             anyhow::bail!("sync manager is already started");
         };
 
         // Move the node into an Arc so it can be shared between the manager and the broadcast drain task.
-        let node = Arc::new(node);
+        let membership_snapshot = membership.snapshot.clone();
+        let view = self
+            .membership_view
+            .lock()
+            .map(|mut view| *view = Some(membership_snapshot.clone()))
+            .map_err(|_| anyhow::anyhow!("membership view lock poisoned"));
+        let activated = view.and_then(|()| discovery_coordinator.activate().map_err(Into::into));
+        if let Err(error) = activated {
+            self.op_rx = Some(op_rx);
+            if let Ok(mut view) = self.membership_view.lock() {
+                *view = None;
+            }
+            if let Err(cleanup) = membership.shutdown().await {
+                warn!(%cleanup, "membership startup rollback failed");
+            }
+            node.shutdown().await;
+            rollback_discovery(&mut discovery_coordinator).await;
+            return Err(error);
+        }
+        self.membership = Some(membership);
         self.node = Some(Arc::clone(&node));
 
-        // Inbound loop: apply remote ops into the counter registry.
+        let (forward_tx, forward_rx) = super::delivery::named_channel(
+            self.config.queued_ops_limit.max(1),
+            super::delivery::QUEUE_BYTES,
+            Arc::clone(&self.metrics),
+            true,
+        );
+
+        // Inbound loop: apply remote ops into the CRDT registries.
+        let repair_budget = Arc::new(std::sync::Mutex::new(super::delivery::RepairBudget::new(
+            self.clock.now(),
+        )));
+        let (recovery_rotation_tx, recovery_rotation_rx) =
+            watch::channel(super::types::RecoveryRotation::default());
         let event_context = NodeEventContext {
+            repair_budget: Arc::clone(&repair_budget),
+            recovery_rotation: Some(recovery_rotation_tx),
+            history_cursors: Arc::clone(&self.history_cursors),
+            history_requests: Arc::clone(&self.history_requests),
+            history_request_timeout: self.config.socket_timeout,
             counters: Arc::clone(&self.counters),
             pncounters: Arc::clone(&self.pncounters),
             lww_registers: Arc::clone(&self.lww_registers),
@@ -471,7 +1563,8 @@ impl SyncManager {
             op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
             store: Arc::clone(&self.store),
             metrics: Arc::clone(&self.metrics),
-            node: Arc::clone(&node),
+            node: node.clone(),
+            forward_tx: Some(forward_tx),
             peer_health: Arc::clone(&self.peer_health),
             active_connections: Arc::clone(&self.active_connections),
             anti_entropy_watermarks: Arc::clone(&self.anti_entropy_watermarks),
@@ -481,44 +1574,154 @@ impl SyncManager {
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.event_task = Some(tokio::spawn(async move {
+            let mut priority_events = 0;
+            let mut event_rx_open = true;
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             debug!("event loop shutdown requested");
-                            drain_node_events(&mut event_rx, &event_context).await;
+                            drain_node_event_queues(
+                                &mut event_rx,
+                                &mut priority_event_rx,
+                                &event_context,
+                            )
+                            .await;
                             break;
                         }
                     }
-                    event = event_rx.recv() => {
-                        let Some(event) = event else {
+                    scheduled = receive_scheduled_node_event(
+                        &mut event_rx,
+                        &mut priority_event_rx,
+                        &mut priority_events,
+                        &mut event_rx_open,
+                    ) => {
+                        let Some((event, is_priority, allow_priority_interrupt)) = scheduled else {
                             break;
                         };
-                        handle_node_event(event, &event_context).await;
+                        #[cfg(test)]
+                        let event_kind = match &event {
+                            nx_net::NodeEvent::HistoryReceived { message, .. } => match message {
+                                nx_sync::HistoryMessage::Push { .. } => "push",
+                                nx_sync::HistoryMessage::Summary { .. } => "summary",
+                                nx_sync::HistoryMessage::SummaryRequest { .. } => "summary_request",
+                                nx_sync::HistoryMessage::Request { .. } => "range_request",
+                                nx_sync::HistoryMessage::Replay { .. } => "replay",
+                                nx_sync::HistoryMessage::Unavailable { .. } => "unavailable",
+                                nx_sync::HistoryMessage::BaselineRequest { .. }
+                                | nx_sync::HistoryMessage::Baseline { .. }
+                                | nx_sync::HistoryMessage::BaselineUnavailable { .. } => "baseline",
+                            },
+                            nx_net::NodeEvent::PeerConnected { .. }
+                            | nx_net::NodeEvent::PeerDisconnected { .. } => "peer_lifecycle",
+                            nx_net::NodeEvent::OpsReceived { .. }
+                            | nx_net::NodeEvent::PullRequested { .. } => "legacy",
+                        };
+                        #[cfg(test)]
+                        let data_queue_depth_before = event_rx.len();
+                        #[cfg(test)]
+                        let priority_queue_depth_before =
+                            priority_event_rx.as_ref().map_or(0, |rx| rx.len());
+                        #[cfg(test)]
+                        let queue_depth_before = data_queue_depth_before
+                            .saturating_add(priority_queue_depth_before);
+                        #[cfg(test)]
+                        let event_started = std::time::Instant::now();
+                        #[cfg(test)]
+                        {
+                            super::replication::trace_dequeued_history(&event);
+                            debug!(
+                                target: "nx_core::sync_manager::replication",
+                                recovery_trace_stage = "turn_begin",
+                                kind = event_kind,
+                                "test recovery timeline"
+                            );
+                        }
+                        let pending_priority_event = if is_priority {
+                            handle_node_event(event, &event_context).await;
+                            None
+                        } else {
+                            handle_node_events(
+                                event,
+                                &mut event_rx,
+                                &mut priority_event_rx,
+                                allow_priority_interrupt,
+                                &event_context,
+                                Some(REMOTE_HISTORY_COALESCE_WINDOW),
+                            )
+                            .await
+                        };
+                        if let Some(event) = pending_priority_event {
+                            priority_events = priority_events.saturating_add(1);
+                            handle_node_event(event, &event_context).await;
+                        }
+                        #[cfg(test)]
+                        let data_queue_depth_after = event_rx.len();
+                        #[cfg(test)]
+                        let priority_queue_depth_after =
+                            priority_event_rx.as_ref().map_or(0, |rx| rx.len());
+                        #[cfg(test)]
+                        debug!(
+                            target: "nx_core::sync_manager::manager",
+                            event_handler_kind = %event_kind,
+                            elapsed_us = u64::try_from(event_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                            queue_depth_before = u64::try_from(queue_depth_before).unwrap_or(u64::MAX),
+                            queue_depth_after = u64::try_from(data_queue_depth_after.saturating_add(priority_queue_depth_after)).unwrap_or(u64::MAX),
+                            data_queue_depth_before = u64::try_from(data_queue_depth_before).unwrap_or(u64::MAX),
+                            priority_queue_depth_before = u64::try_from(priority_queue_depth_before).unwrap_or(u64::MAX),
+                            data_queue_depth_after = u64::try_from(data_queue_depth_after).unwrap_or(u64::MAX),
+                            priority_queue_depth_after = u64::try_from(priority_queue_depth_after).unwrap_or(u64::MAX),
+                            "bounded event-loop diagnostic"
+                        );
                     }
                 }
             }
             debug!("event loop terminated");
         }));
 
+        let pacing = Arc::new(std::sync::Mutex::new(super::pacing::Pacer::new(
+            self.config.gossip_rate,
+            self.config.max_peers,
+        )));
         // Outbound loop: drain locally-produced ops into the network.
         self.broadcast_task = Some(spawn_broadcast_loop(
             BroadcastLoopContext {
-                node: Arc::clone(&node),
-                seen_ops: Arc::clone(&self.seen_ops),
-                seen_ops_next_sequence: Arc::clone(&self.seen_ops_next_sequence),
-                op_log: Arc::clone(&self.op_log),
-                op_log_next_sequence: Arc::clone(&self.op_log_next_sequence),
-                op_log_limit: normalize_op_log_limit(self.config.op_log_limit),
-                store: Arc::clone(&self.store),
+                pacing: Arc::clone(&pacing),
+                local_id: self.node_id.clone(),
+                membership: membership_snapshot.clone(),
+                node: node.clone(),
                 metrics: Arc::clone(&self.metrics),
+                max_message_size: self.config.max_message_size,
+                fanout_constant: self.config.gossip_fanout_constant,
+                max_fanout: self.config.gossip_max_fanout,
+                fanout_cursor: Arc::clone(&self.fanout_cursor),
             },
             op_rx,
             self.shutdown_tx.subscribe(),
         ));
 
+        self.forward_task = Some(spawn_forward_loop(
+            ForwardLoopContext {
+                pacing,
+                local_id: self.node_id.clone(),
+                membership: membership_snapshot.clone(),
+                node: node.clone(),
+                metrics: Arc::clone(&self.metrics),
+                fanout_constant: self.config.gossip_fanout_constant,
+                max_fanout: self.config.gossip_max_fanout,
+                max_message_size: self.config.max_message_size,
+                fanout_cursor: Arc::clone(&self.fanout_cursor),
+            },
+            forward_rx,
+            self.shutdown_tx.subscribe(),
+        ));
+
         self.reconnect_task = spawn_reconnect_loop(ReconnectLoopContext {
-            node: Arc::clone(&node),
+            local_id: self.node_id.clone(),
+            membership: membership_snapshot,
+            rotation_interval: super::neighbors::NEIGHBOR_ROTATION_INTERVAL,
+            recovery_rotation: Some(recovery_rotation_rx),
+            node: node.clone(),
             candidates_rx,
             max_peers: self.config.max_peers,
             initial_delay: self.config.reconnect_initial_delay,
@@ -530,10 +1733,19 @@ impl SyncManager {
         });
 
         self.anti_entropy_task = spawn_anti_entropy_loop(AntiEntropyLoopContext {
-            node: Arc::clone(&node),
+            store: Arc::clone(&self.store),
+            jitter_seed: super::delivery::seed(self.node_id.as_str()),
+            repair_budget,
+            history_cursors: Arc::clone(&self.history_cursors),
+            request_timeout: self.config.socket_timeout,
+            node: node.clone(),
             interval: self.config.anti_entropy_interval,
             shutdown_rx: self.shutdown_tx.subscribe(),
             metrics: Arc::clone(&self.metrics),
+            membership: self
+                .membership
+                .as_ref()
+                .map(|membership| membership.snapshot.clone()),
         });
 
         self.discovery_coordinator = Some(discovery_coordinator);
@@ -558,7 +1770,7 @@ impl SyncManager {
         let peer_dead_after_failures =
             normalize_peer_dead_after_failures(self.config.peer_dead_after_failures);
         let connect_context = ConfiguredPeerConnectContext {
-            node,
+            node: node.as_ref(),
             max_peers: self.config.max_peers,
             peer_dead_after_failures,
             metrics: &self.metrics,
@@ -639,31 +1851,52 @@ impl SyncManager {
     }
 
     /// Gracefully stop sync tasks and close network connections.
+    ///
+    /// Retry-safe: owned tasks and the membership handle are released only after
+    /// they have been joined, so a timed-out or cancelled call can be repeated and
+    /// resumes waiting instead of reporting a false success. Data-path loops are
+    /// joined before the membership leave so its terminal write does not compete
+    /// with them for storage; the network stays up for leave announcements.
+    /// An error containing [`super::ShutdownPending`] retains the services needed
+    /// to resume the same shutdown; other errors are not retryable completion.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.local_writes.stopped.store(true, Ordering::Release);
+        self.candidates.stop();
         let _ = self.shutdown_tx.send(true);
+        // Drain dispatched jobs before broadcast shutdown; retrying shutdown after a
+        // timeout must still wait for their guards rather than detach their outcome.
+        drop(self.local_writes.gate.write().await);
+
+        join_task(&mut self.broadcast_task, "broadcast").await;
+        join_task(&mut self.forward_task, "forward").await;
+        join_task(&mut self.event_task, "event").await;
+        join_task(&mut self.reconnect_task, "reconnect").await;
+        join_task(&mut self.anti_entropy_task, "anti-entropy").await;
+
+        let membership_error = if let Some(membership) = self.membership.as_mut() {
+            let snapshot = membership.snapshot.borrow().clone();
+            debug!(members = snapshot.records.len(), health = snapshot.health,
+                successful_probes = snapshot.successful_probes, failed_probes = snapshot.failed_probes,
+                error = ?snapshot.error, "stopping membership service");
+            match membership.shutdown().await {
+                Ok(()) => {
+                    self.membership = None;
+                    None
+                }
+                Err(error) if error.is::<super::ShutdownPending>() => {
+                    warn!(%error, "sync shutdown remains pending; services retained for completion");
+                    return Err(error);
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         let mut discovery_coordinator = self.discovery_coordinator.take();
         if let Some(coordinator) = discovery_coordinator.as_ref() {
             coordinator.request_shutdown();
         }
         let mut discovery_error = None;
-
-        if let Some(task) = self.broadcast_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "broadcast task failed during shutdown");
-        }
-
-        if let Some(task) = self.reconnect_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "reconnect task failed during shutdown");
-        }
-
-        if let Some(task) = self.anti_entropy_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "anti-entropy task failed during shutdown");
-        }
 
         if let Some(mut coordinator) = discovery_coordinator.take()
             && let Err(error) = coordinator.shutdown().await
@@ -673,24 +1906,118 @@ impl SyncManager {
         }
 
         if let Some(node) = self.node.as_ref() {
-            node.shutdown().await;
+            crate::peer_io::PeerIo::shutdown(node.as_ref()).await;
         }
         self.metrics.set_peers_connected(0);
 
-        if let Some(task) = self.event_task.take()
-            && let Err(e) = task.await
-        {
-            warn!(error = %e, "event task failed during shutdown");
-        }
-
         info!("sync manager shut down");
-        discovery_error.map_or(Ok(()), |error| Err(error.into()))
+        membership_error
+            .or_else(|| discovery_error.map(Into::into))
+            .map_or(Ok(()), Err)
+    }
+}
+
+/// Joins an owned task, releasing the handle only once the join has completed.
+async fn join_task(task: &mut Option<JoinHandle<()>>, name: &str) {
+    if let Some(handle) = task.as_mut() {
+        let result = handle.await;
+        *task = None;
+        if let Err(error) = result {
+            warn!(task = name, error = %error, "sync task failed during shutdown");
+        }
     }
 }
 
 async fn rollback_discovery(coordinator: &mut DiscoveryCoordinator) {
-    if let Err(error) = coordinator.shutdown().await {
+    if let Err(error) = coordinator.rollback().await {
         warn!(error = %error, "discovery rollback failed");
+    }
+}
+
+#[cfg(test)]
+mod priority_event_tests {
+    use super::*;
+
+    fn recovery_event() -> nx_net::NodeEvent {
+        nx_net::NodeEvent::HistoryReceived {
+            from: NodeId::new("recovery-peer"),
+            addr: "recovery-peer".to_owned(),
+            message: nx_sync::HistoryMessage::SummaryRequest { after_origin: None },
+        }
+    }
+
+    #[test]
+    fn priority_capacity_reserves_a_bounded_share_of_the_existing_budget() {
+        assert_eq!(priority_event_capacity(1), 0);
+        assert_eq!(priority_event_capacity(2), 1);
+        assert_eq!(priority_event_capacity(1024), MAX_PRIORITY_EVENT_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn recovery_events_progress_without_starving_queued_data() {
+        let (data_tx, mut event_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        let (priority_tx, priority_rx) = mpsc::channel(PRIORITY_EVENT_BURST + 1);
+        data_tx
+            .send(nx_net::NodeEvent::OpsReceived {
+                from: NodeId::new("data-peer"),
+                ops: Vec::new(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..=PRIORITY_EVENT_BURST {
+            priority_tx.send(recovery_event()).await.unwrap();
+        }
+
+        let mut priority_event_rx = Some(priority_rx);
+        let mut priority_events = 0;
+        let mut event_rx_open = true;
+        for _ in 0..PRIORITY_EVENT_BURST {
+            let (event, is_priority, _) = receive_scheduled_node_event(
+                &mut event_rx,
+                &mut priority_event_rx,
+                &mut priority_events,
+                &mut event_rx_open,
+            )
+            .await
+            .unwrap();
+            assert!(is_priority);
+            assert!(matches!(
+                event,
+                nx_net::NodeEvent::HistoryReceived {
+                    message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                    ..
+                }
+            ));
+        }
+
+        let (event, is_priority, allow_priority_interrupt) = receive_scheduled_node_event(
+            &mut event_rx,
+            &mut priority_event_rx,
+            &mut priority_events,
+            &mut event_rx_open,
+        )
+        .await
+        .unwrap();
+        assert!(!is_priority);
+        assert!(!allow_priority_interrupt);
+        assert!(matches!(event, nx_net::NodeEvent::OpsReceived { .. }));
+
+        let (event, is_priority, _) = receive_scheduled_node_event(
+            &mut event_rx,
+            &mut priority_event_rx,
+            &mut priority_events,
+            &mut event_rx_open,
+        )
+        .await
+        .unwrap();
+        assert!(is_priority);
+        assert!(matches!(
+            event,
+            nx_net::NodeEvent::HistoryReceived {
+                message: nx_sync::HistoryMessage::SummaryRequest { .. },
+                ..
+            }
+        ));
     }
 }
 

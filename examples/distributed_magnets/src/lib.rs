@@ -153,6 +153,9 @@ impl Config {
 }
 
 fn env_str(name: &str) -> Option<String> {
+    if let Ok(Some(bytes)) = db::get(&format!("demo:env/{name}")) {
+        return String::from_utf8(bytes).ok();
+    }
     system::env_get(name)
         .ok()
         .flatten()
@@ -405,8 +408,6 @@ fn choose_weighted(items: &[(u32, u32)], weights: &[u64]) -> Result<(u32, u32), 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    nx_log!("distributed_magnets: start");
-
     let node_id = match net::node_id() {
         Ok(id) => id,
         Err(NxError::SyncDisabled) => {
@@ -425,6 +426,57 @@ pub extern "C" fn run() {
     let cfg = Config::from_env();
     let base_anchors = anchors(&cfg);
 
+    if env_str("NUMAX_OBSERVE").as_deref() == Some("1") {
+        let anchor_list = effective_anchors(&base_anchors);
+        let field: Vec<_> = (0..cfg.grid_h)
+            .flat_map(|y| (0..cfg.grid_w).map(move |x| field_value(x, y)))
+            .collect();
+        let positions: Vec<_> = (0..cfg.particle_count)
+            .map(|id| lww_register::get(&peer_pos_key(id)).ok().flatten())
+            .collect();
+        let snapshot = serde_json::json!({
+            "settled_events": gcounter::value(SETTLED_EVENTS_KEY).unwrap_or(0),
+            "anchors": anchor_list,
+            "positions": positions,
+            "field": field,
+        });
+        match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => {
+                if let Err(error) = db::set("demo:snapshot", &bytes) {
+                    nx_log!("distributed_magnets: snapshot failed: {}", error);
+                }
+            }
+            Err(error) => nx_log!("distributed_magnets: snapshot failed: {}", error),
+        }
+        if cfg.render {
+            nx_log!("SNAPSHOT,{}", cfg.snapshot_label);
+            for (x, y, weight) in &anchor_list {
+                nx_log!("ANCHOR,{},{},{}", x, y, weight);
+            }
+            for (id, position) in positions.iter().enumerate() {
+                if let Some(bytes) = position
+                    && bytes.len() == 2
+                {
+                    let position = (bytes[0] as u32, bytes[1] as u32);
+                    nx_log!(
+                        "PARTICLE,{},{},{},{}",
+                        id,
+                        position.0,
+                        position.1,
+                        mass_at(position, &anchor_list)
+                    );
+                }
+            }
+            for y in 0..cfg.grid_h {
+                for x in 0..cfg.grid_w {
+                    nx_log!("FIELD,{},{},{}", x, y, field_value(x, y));
+                }
+            }
+        }
+        return;
+    }
+
+    nx_log!("distributed_magnets: start");
     for &(index, delta) in &cfg.boosts {
         let result = if delta >= 0 {
             pncounter::inc(&anchor_boost_key(index), delta as u64)
@@ -572,5 +624,10 @@ pub extern "C" fn run() {
         }
     }
 
+    if let Some(tick) = env_str("NUMAX_TICK")
+        && let Err(error) = db::set("demo:completed", tick.as_bytes())
+    {
+        nx_log!("distributed_magnets: completion failed: {}", error);
+    }
     nx_log!("distributed_magnets: done");
 }

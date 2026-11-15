@@ -1,0 +1,19 @@
+flowchart TD
+    call[Guest calls a mutating CRDT API] --> preflight{Preflight}
+    preflight -->|Reserved key or sync disabled| rejected[Definitely not accepted]
+    preflight -->|Rga insert output buffer too small| grow[SDK grows buffer and retries safely]
+    grow --> preflight
+    preflight -->|Other error reported as ERR_INTERNAL| uncertain[Outcome unknown to caller]
+    preflight -->|Pass| batch[Atomic state, OpId, seen ID, and replay batch]
+    batch -->|Batch error reported as ERR_INTERNAL| uncertain
+    batch --> flush{Confirmed flush}
+    flush -->|Failure or interruption| uncertain
+    flush -->|Completed| accepted[Durable state and replay record]
+    accepted -->|Process stops before enqueue| uncertain
+    accepted --> enqueue[Publish locally and enqueue for broadcast]
+    enqueue --> response{Guest receives response}
+    response -->|Success| durable[Durable locally under the process-crash model]
+    response -->|Trap, interruption, or lost response| uncertain
+    uncertain --> noRetry[Do not automatically retry the mutation]
+    noRetry --> reopen[Reopen intact store to recover surviving operations]
+    durable --> remote[Remote replication remains unconfirmed]

@@ -1,0 +1,38 @@
+sequenceDiagram
+    accTitle: Proposed SWIM probes and Lifeguard refutation
+    accDescr: A direct probe may succeed or fall back to bounded helpers. Missing replies start suspicion. Buddy notification permits a newer owner incarnation to refute<br/>otherwise a still-current suspicion expires into a local failure judgment.
+    participant A as Observer A
+    participant H as Helper H
+    participant B as Target B
+    Note over A,B: Proposed control exchange<br/>message names are conceptual
+    A->>B: Direct probe (attempt, epoch, incarnation)
+    alt Matching ACK before direct deadline
+        B-->>A: ACK
+        Note over A: Probe succeeds<br/>update local health
+    else No direct ACK in time
+        A->>H: Indirect request (same target, correlated attempt)
+        H->>B: Helper probe
+        opt Helper has no ACK by negative-reply deadline
+            H-->>A: NACK (helper observation only)
+        end
+        alt Matching helper ACK before attempt deadline
+            B-->>H: ACK
+            H-->>A: Correlated ACK
+            Note over A: Probe succeeds even after a NACK
+        else No valid ACK before attempt deadline
+            Note over A: Enter Suspect for the captured pair<br/>Start bounded suspicion timer
+            A->>H: Disseminate Suspect
+            A->>B: Prioritized suspicion notification (Buddy System)
+            Note over A,H: Distinct reporters may shorten the deadline<br/>Duplicates never restart the timer
+            alt Valid refutation reaches A before suspicion expires
+                Note over B: If not leaving, advance own incarnation
+                B->>A: Owner Alive with newer incarnation
+                B->>H: Disseminate newer Alive
+                Note over A: Apply Alive<br/>old timer has no effect
+            else No valid refutation in time
+                Note over A: Recheck pair and timer<br/>Persist rejection floor before publishing Dead
+                A->>H: Disseminate Dead (local failure judgment)
+            end
+        end
+    end
+    Note over A,B: Late, unsolicited or superseded responses cannot complete newer work<br/>A valid newer Alive may still recover Dead if the epoch was not closed

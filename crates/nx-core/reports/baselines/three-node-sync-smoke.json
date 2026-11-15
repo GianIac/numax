@@ -1,22 +1,31 @@
 {
-  "report_schema_version": 1,
+  "report_schema_version": 2,
   "crate": "nx-core",
   "benchmark": "three_node_sync_load",
   "scenario": "multi-node-sync-gcounter",
   "profile": {
+    "acceptance": "local-durable-flush-v1",
     "nodes": 3,
     "duration_secs": 10,
     "target_ops_sec_per_node": 1000,
     "anti_entropy_interval_secs": 80
   },
   "nodes": 3,
-  "load_duration_secs": 10.009,
-  "total_duration_secs": 10.112,
+  "load_duration_secs": 11.051532592,
+  "total_duration_secs": 11.068664994,
   "target_ops_sec_per_node": 1000,
   "target_ops_sec_total": 3000,
   "ops_total": 30000,
-  "ops_sec_avg": 2997.27,
+  "ops_sec_avg": 2714.5556283946034,
   "errors_total": 0,
+  "target_ops_total": 30000,
+  "attempted_ops_total": 30000,
+  "definite_errors_total": 0,
+  "uncertain_ops_total": 0,
+  "unattempted_ops_total": 0,
+  "cleanup_errors_total": 0,
+  "report_complete": true,
+  "error_details": [],
   "queued_ops_limit": 110000,
   "op_log_limit": 110000,
   "seen_ops_limit": 330000,
@@ -24,16 +33,16 @@
   "expected_counter": 30000,
   "observed_counters": [30000, 30000, 30000],
   "converged": true,
-  "convergence_wait_secs": 0.102,
+  "convergence_wait_secs": 0.000213725,
   "resources": {
-    "rss_bytes": 136601600
+    "rss_bytes": 179261440
   },
   "latency_ms": {
-    "p50": 0.001,
-    "p95": 0.002,
-    "p99": 0.031,
-    "max": 0.422,
-    "avg": 0.002
+    "p50": 0.837,
+    "p95": 3.233,
+    "p99": 4.243,
+    "max": 27.811,
+    "avg": 1.089
   },
   "aggregation": {
     "method": "median",
