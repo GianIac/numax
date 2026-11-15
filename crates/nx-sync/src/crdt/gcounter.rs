@@ -17,9 +17,14 @@ impl GCounter {
         }
     }
 
-    /// Returns the total counter value (sum of all slots).
+    /// Returns the sum of all slots, clamped to u64::MAX.
     pub fn value(&self) -> u64 {
-        self.counts.values().sum()
+        self.total().min(u64::MAX as u128) as u64
+    }
+
+    pub(super) fn total(&self) -> u128 {
+        // At most usize::MAX slots of u64::MAX fit in a map, so u128 holds the sum.
+        self.counts.values().map(|&slot| slot as u128).sum()
     }
 
     /// Returns the slot value for a specific node.
@@ -276,6 +281,56 @@ mod tests {
         counter.increment(&node, 1); // should saturate, not overflow
 
         assert_eq!(counter.value(), u64::MAX);
+    }
+
+    #[test]
+    fn test_gcounter_total_over_u64_preserves_slots_and_roundtrips() {
+        let a = NodeId::new("a");
+        let b = NodeId::new("b");
+        let mut counter = GCounter::new();
+        counter.increment(&a, u64::MAX);
+        counter.increment(&b, 1);
+        assert_eq!(counter.value(), u64::MAX);
+        assert_eq!(counter.value_for(&a), u64::MAX);
+        assert_eq!(counter.value_for(&b), 1);
+        assert_eq!(counter.total(), u64::MAX as u128 + 1);
+
+        let restored = GCounter::from_json(&counter.to_json().unwrap()).unwrap();
+        assert_eq!(restored.total(), counter.total());
+        assert_eq!(restored.value(), u64::MAX);
+    }
+
+    #[test]
+    fn test_gcounter_merge_and_apply_over_u64() {
+        let a = NodeId::new("a");
+        let b = NodeId::new("b");
+        let mut left = GCounter::new();
+        left.increment(&a, u64::MAX);
+        let mut right = GCounter::new();
+        right.increment(&b, u64::MAX);
+
+        let mut merged = left.merged_with(&right);
+        assert_eq!(merged.value(), u64::MAX);
+        assert_eq!(merged.total(), 2 * u64::MAX as u128);
+        assert_eq!(
+            serde_json::to_value(&merged).unwrap(),
+            serde_json::to_value(right.merged_with(&left)).unwrap()
+        );
+        merged.merge(&left);
+        assert_eq!(merged.total(), 2 * u64::MAX as u128);
+
+        assert!(
+            merged
+                .apply_op(&Op::gcounter_increment(NodeId::new("c"), "counter", 7))
+                .unwrap()
+        );
+        assert_eq!(merged.value(), u64::MAX);
+        assert_eq!(merged.total(), 2 * u64::MAX as u128 + 7);
+        assert!(
+            !merged
+                .apply_op(&Op::gcounter_increment(a, "counter", 1))
+                .unwrap()
+        );
     }
 
     #[test]

@@ -306,8 +306,10 @@ function ensureCompatibleReports(leftLabel, left, rightLabel, right) {
 }
 
 function ensureReportShape(label, report) {
-  if (report.report_schema_version !== 1) {
-    throw new Error(`${label} report_schema_version must be 1`);
+  if (report.report_schema_version !== 2) {
+    throw new Error(
+      `${label} report_schema_version must be 2; historical enqueue-only reports are not durable-ack references`,
+    );
   }
   if (!report.scenario) {
     throw new Error(`${label} scenario is required`);
@@ -324,6 +326,74 @@ function ensureReportShape(label, report) {
     Array.isArray(report.profile)
   ) {
     throw new Error(`${label} profile is required`);
+  }
+  if (report.profile.acceptance !== "local-durable-flush-v1") {
+    throw new Error(`${label} profile acceptance must be local-durable-flush-v1`);
+  }
+  if (report.report_complete !== true || report.converged !== true) {
+    throw new Error(`${label} report is incomplete or did not converge`);
+  }
+  const target =
+    report.profile.nodes *
+    report.profile.duration_secs *
+    report.profile.target_ops_sec_per_node;
+  if (
+    !Number.isSafeInteger(target) ||
+    target <= 0 ||
+    !Number.isSafeInteger(report.profile.nodes) ||
+    report.profile.nodes < 2 ||
+    !Number.isSafeInteger(report.profile.duration_secs) ||
+    report.profile.duration_secs <= 0 ||
+    !Number.isSafeInteger(report.profile.target_ops_sec_per_node) ||
+    report.profile.target_ops_sec_per_node <= 0 ||
+    !Number.isSafeInteger(report.profile.anti_entropy_interval_secs) ||
+    report.profile.anti_entropy_interval_secs <= 0
+  ) {
+    throw new Error(`${label} profile must define a valid complete workload`);
+  }
+  for (const field of [
+    "errors_total",
+    "definite_errors_total",
+    "uncertain_ops_total",
+    "unattempted_ops_total",
+    "cleanup_errors_total",
+  ]) {
+    if (report[field] !== 0) {
+      throw new Error(`${label} ${field} must be zero`);
+    }
+    if (
+      report.errors_total !==
+        report.definite_errors_total + report.uncertain_ops_total ||
+      report.attempted_ops_total !==
+        report.ops_total + report.definite_errors_total + report.uncertain_ops_total
+    ) {
+      throw new Error(`${label} operation outcome accounting is inconsistent`);
+    }
+  }
+  for (const field of [
+    "target_ops_total",
+    "attempted_ops_total",
+    "ops_total",
+    "expected_counter",
+  ]) {
+    if (report[field] !== target) {
+      throw new Error(
+        `${label} ${field} must equal the complete workload (${target})`,
+      );
+    }
+  }
+  if (
+    report.nodes !== report.profile.nodes ||
+    !Array.isArray(report.observed_counters) ||
+    report.observed_counters.length !== report.nodes ||
+    !report.observed_counters.every((value) => value === target)
+  ) {
+    throw new Error(
+      `${label} observed counters must cover every node and match the accepted workload`,
+    );
+  }
+  if (!Array.isArray(report.error_details) || report.error_details.length !== 0) {
+    throw new Error(`${label} error_details must be an empty array`);
   }
 }
 
@@ -359,6 +429,7 @@ function formatValue(value) {
 function parseArgs(argv) {
   const args = {
     currentPaths: [],
+    aggregateOnly: false,
     mode: "shadow",
     thresholds: { ...DEFAULT_THRESHOLDS },
     minimumDeltas: { ...DEFAULT_MINIMUM_DELTAS },
@@ -375,6 +446,9 @@ function parseArgs(argv) {
         break;
       case "--write-aggregate":
         args.aggregatePath = nextArg(argv, ++index, arg);
+        break;
+      case "--aggregate-only":
+        args.aggregateOnly = true;
         break;
       case "--mode":
         args.mode = nextArg(argv, ++index, arg);
@@ -413,7 +487,14 @@ function parseArgs(argv) {
     }
   }
 
-  if (!args.baselinePath) {
+  if (args.aggregateOnly) {
+    if (args.baselinePath || args.mode !== "shadow") {
+      throw new Error("--aggregate-only cannot use --baseline or --mode blocking");
+    }
+    if (!args.aggregatePath) {
+      throw new Error("--aggregate-only requires --write-aggregate");
+    }
+  } else if (!args.baselinePath) {
     throw new Error("--baseline is required");
   }
   if (args.currentPaths.length === 0) {
@@ -453,6 +534,8 @@ Options:
   --baseline PATH              Baseline JSON report
   --current PATH               Current report; repeat to compare their median
   --write-aggregate PATH       Write the median aggregate report
+  --aggregate-only             Calibrate without a baseline or regression check;
+                               requires --write-aggregate
   --mode shadow|blocking       Warn, or fail on regressions (default: shadow)
   --p99-threshold PERCENT      Allowed median p99 increase (default: 5)
   --p99-min-delta-ms VALUE     Minimum absolute p99 increase (default: 0)
@@ -467,6 +550,16 @@ function main() {
   try {
     const args = parseArgs(process.argv.slice(2));
     const currentReports = args.currentPaths.map(readJson);
+    if (args.aggregateOnly) {
+      const aggregate = aggregateReports(currentReports);
+      mkdirSync(dirname(args.aggregatePath), { recursive: true });
+      writeFileSync(
+        args.aggregatePath,
+        `${JSON.stringify(aggregate, null, 2)}\n`,
+      );
+      console.log(`Calibration median: ${currentReports.length} validated runs; no regression comparison performed`);
+      return;
+    }
     const result = compareReportSet(
       readJson(args.baselinePath),
       currentReports,

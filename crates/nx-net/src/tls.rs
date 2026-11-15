@@ -471,6 +471,20 @@ pub fn generate_signed(
     ca_key_pem: &str,
     common_name: &str,
 ) -> NetResult<(String, String)> {
+    generate_signed_with_names(
+        ca_cert_pem,
+        ca_key_pem,
+        common_name,
+        vec![common_name.to_string()],
+    )
+}
+
+fn generate_signed_with_names(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    common_name: &str,
+    subject_alt_names: Vec<String>,
+) -> NetResult<(String, String)> {
     use rcgen::{CertificateParams, Issuer, KeyPair};
 
     // Parse CA key
@@ -482,7 +496,7 @@ pub fn generate_signed(
         .map_err(|e| NetError::TlsError(format!("failed to parse CA cert: {}", e)))?;
 
     // Create certificate params for the node
-    let mut params = CertificateParams::new(vec![common_name.to_string()])
+    let mut params = CertificateParams::new(subject_alt_names)
         .map_err(|e| NetError::TlsError(format!("failed to create cert params: {}", e)))?;
 
     params.distinguished_name.push(
@@ -548,7 +562,12 @@ impl TestPki {
         let (ca_cert, ca_key) = generate_ca("test-ca")?;
 
         // Generate node certs signed by CA
-        let (node1_cert, node1_key) = generate_signed(&ca_cert, &ca_key, "localhost")?;
+        let (node1_cert, node1_key) = generate_signed_with_names(
+            &ca_cert,
+            &ca_key,
+            "localhost",
+            vec!["localhost".to_string(), "127.0.0.1".to_string()],
+        )?;
         let (node2_cert, node2_key) = generate_signed(&ca_cert, &ca_key, "node-2")?;
 
         // Create temp directory

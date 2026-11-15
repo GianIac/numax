@@ -20,7 +20,14 @@ pub enum StoreError {
     #[error("store write lock is poisoned")]
     WriteLockPoisoned,
 
+    #[error("store durability is uncertain after a failed flush; reopen the store before writing")]
+    DurabilityUncertain,
+
     #[cfg(feature = "test-utils")]
     #[error("injected storage write failure: no space left on device")]
     InjectedDiskFull,
+
+    #[cfg(feature = "test-utils")]
+    #[error("injected storage flush failure: no space left on device")]
+    InjectedFlushFailure,
 }

@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, atomic::AtomicU64};
 use std::time::Duration;
 
-use nx_net::{Node, PeerConnectionInfo};
+use crate::peer_io::PeerIo;
+use nx_net::PeerConnectionInfo;
 use nx_store::Store as NxStore;
 use nx_sync::{GCounter, LwwMap, LwwRegister, NodeId, ORSet, Op, PNCounter, Rga};
 use tokio::sync::{RwLock, watch};
@@ -128,7 +129,11 @@ impl SeenOps {
 }
 
 pub(super) struct ReconnectLoopContext {
-    pub(super) node: Arc<Node>,
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
+    pub(super) rotation_interval: Duration,
+    pub(super) recovery_rotation: Option<watch::Receiver<RecoveryRotation>>,
+    pub(super) node: Arc<dyn PeerIo>,
     pub(super) candidates_rx: watch::Receiver<Arc<Vec<String>>>,
     pub(super) max_peers: usize,
     pub(super) initial_delay: Duration,
@@ -139,25 +144,77 @@ pub(super) struct ReconnectLoopContext {
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct RecoveryRotation {
+    pub(super) generation: u64,
+    pub(super) source_addr: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct HistoryCursor {
+    pub(super) after_origin: Option<String>,
+    pub(super) request_deadline: Option<std::time::Instant>,
+    /// Catch-up session: request summary pages back to back until the walk wraps.
+    pub(super) catch_up: bool,
+    /// The current catch-up walk found missing history.
+    pub(super) walk_gap: bool,
+    /// Walks repeated by this session because earlier ones found gaps.
+    pub(super) rewalks: u32,
+}
+
 pub(super) struct AntiEntropyLoopContext {
-    pub(super) node: Arc<Node>,
+    pub(super) store: Arc<NxStore>,
+    pub(super) jitter_seed: u64,
+    pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
+    pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    pub(super) request_timeout: Duration,
+    pub(super) node: Arc<dyn PeerIo>,
     pub(super) interval: Duration,
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) metrics: Arc<RuntimeMetrics>,
+    /// Membership view used to start catch-up sessions with revived members.
+    pub(super) membership: Option<watch::Receiver<crate::membership::runtime::Snapshot>>,
 }
 
 pub(super) struct BroadcastLoopContext {
-    pub(super) node: Arc<Node>,
-    pub(super) seen_ops: Arc<RwLock<SeenOps>>,
-    pub(super) seen_ops_next_sequence: Arc<AtomicU64>,
-    pub(super) op_log: Arc<RwLock<Vec<Op>>>,
-    pub(super) op_log_next_sequence: Arc<AtomicU64>,
-    pub(super) op_log_limit: usize,
-    pub(super) store: Arc<NxStore>,
+    pub(super) max_message_size: usize,
+    pub(super) pacing: Arc<std::sync::Mutex<super::pacing::Pacer>>,
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
+    pub(super) node: Arc<dyn PeerIo>,
     pub(super) metrics: Arc<RuntimeMetrics>,
+    pub(super) fanout_constant: usize,
+    pub(super) max_fanout: usize,
+    pub(super) fanout_cursor: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct ForwardLoopContext {
+    pub(super) pacing: Arc<std::sync::Mutex<super::pacing::Pacer>>,
+    pub(super) local_id: NodeId,
+    pub(super) membership: watch::Receiver<crate::membership::runtime::Snapshot>,
+    pub(super) node: Arc<dyn PeerIo>,
+    pub(super) metrics: Arc<RuntimeMetrics>,
+    pub(super) fanout_constant: usize,
+    pub(super) max_fanout: usize,
+    pub(super) max_message_size: usize,
+    pub(super) fanout_cursor: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct ForwardedOp {
+    pub(super) source_addr: String,
+    pub(super) entry: nx_sync::SequencedOp,
+}
+
+impl super::delivery::Item for ForwardedOp {
+    fn delivery_bytes(&self) -> Option<usize> {
+        super::delivery::entry_bytes(&self.entry.op, &self.entry.position)?
+            .checked_add(self.source_addr.len())?
+            .checked_add(std::mem::size_of::<Self>())
+    }
 }
 
 pub(super) struct RemoteOpApplyContext<'a> {
+    pub(super) storage_executor: crate::peer_io::StorageExecutor,
     pub(super) counters: &'a Arc<RwLock<HashMap<String, GCounter>>>,
     pub(super) pncounters: &'a Arc<RwLock<HashMap<String, PNCounter>>>,
     pub(super) lww_registers: &'a Arc<RwLock<HashMap<String, LwwRegister>>>,
@@ -200,7 +257,14 @@ pub(super) struct RemoteCrdtUpdateBatch<'a> {
     pub(super) rgas: &'a HashMap<String, Rga>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct LocalTransportLimits {
+    pub(super) max_message_size: usize,
+    pub(super) serialization_format: nx_net::SerializationFormat,
+}
+
 pub(super) struct OpPersistencePlan {
+    pub(super) local_generation: Option<(u64, LocalTransportLimits)>,
     pub(super) op: Op,
     pub(super) seen_sequence: u64,
     pub(super) op_log_sequence: u64,
@@ -208,8 +272,24 @@ pub(super) struct OpPersistencePlan {
     pub(super) op_log_evicted: Vec<Op>,
 }
 
+pub(super) struct PendingHistoryRequest {
+    pub(super) request_id: nx_sync::OpId,
+    pub(super) start: u64,
+    pub(super) end: u64,
+    /// Receipt coverage at baseline request time; never persisted or sent on the wire.
+    pub(super) baseline_revision: Option<[u8; 32]>,
+    pub(super) deadline: std::time::Instant,
+}
+
+pub(super) type HistoryRequests = HashMap<String, HashMap<String, PendingHistoryRequest>>;
+
 #[derive(Clone)]
 pub(super) struct NodeEventContext {
+    pub(super) repair_budget: Arc<std::sync::Mutex<super::delivery::RepairBudget>>,
+    pub(super) recovery_rotation: Option<watch::Sender<RecoveryRotation>>,
+    pub(super) history_cursors: Arc<RwLock<HashMap<String, HistoryCursor>>>,
+    pub(super) history_requests: Arc<RwLock<HistoryRequests>>,
+    pub(super) history_request_timeout: Duration,
     pub(super) counters: Arc<RwLock<HashMap<String, GCounter>>>,
     pub(super) pncounters: Arc<RwLock<HashMap<String, PNCounter>>>,
     pub(super) lww_registers: Arc<RwLock<HashMap<String, LwwRegister>>>,
@@ -223,7 +303,8 @@ pub(super) struct NodeEventContext {
     pub(super) op_log_limit: usize,
     pub(super) store: Arc<NxStore>,
     pub(super) metrics: Arc<RuntimeMetrics>,
-    pub(super) node: Arc<Node>,
+    pub(super) node: Arc<dyn PeerIo>,
+    pub(super) forward_tx: Option<super::delivery::Sender<ForwardedOp>>,
     pub(super) peer_health: Arc<RwLock<HashMap<String, PeerHealth>>>,
     pub(super) active_connections: Arc<RwLock<HashMap<String, PeerConnectionInfo>>>,
     pub(super) anti_entropy_watermarks: Arc<RwLock<HashMap<NodeId, String>>>,

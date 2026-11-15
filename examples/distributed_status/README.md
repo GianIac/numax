@@ -4,8 +4,9 @@ LWW-Register-backed service status replicated across Numax nodes.
 
 This example models a single latest-value state, such as service presence,
 deployment mode, feature state, or operator-selected status. Each node writes
-one local value, broadcasts it, persists durable CRDT state, and converges with
-peers through the sync layer.
+one local value, persists it before acceptance and disseminates it through
+gossip. Local acceptance does not acknowledge remote replication; peers
+converge asynchronously within the available recovery contract.
 
 ## What It Demonstrates
 

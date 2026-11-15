@@ -1,13 +1,9 @@
 use anyhow::Result;
-use nx_sync::{GCounter, LwwMap, LwwRegister, ORSet, Op, OpKind, PNCounter, Rga};
+use nx_sync::OpKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::runtime::HostState;
-use crate::sync_manager::{
-    persist_gcounter_state, persist_lww_map_state, persist_lww_register_state, persist_orset_state,
-    persist_pncounter_state, persist_rga_state,
-};
 
 // error codes
 const ERR_NOT_FOUND: i32 = -1;
@@ -204,23 +200,15 @@ async fn crdt_gcounter_inc_impl(
         }
     };
 
-    // Apply locally and persist the CRDT state before exposing the new value.
-    {
-        let counters_arc = handle.counters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(&key).cloned().unwrap_or_else(GCounter::new);
-        counter.increment(handle.node_id(), delta);
-        if let Err(e) = persist_gcounter_state(&handle.store(), &key, &counter) {
+    let op = match handle.increment_gcounter(&key, delta).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to persist counter");
+            tracing::warn!(error = %e, "crdt_gcounter_inc: failed to persist operation");
             return ERR_INTERNAL;
         }
-
-        counters.insert(key.clone(), counter);
-    }
-
-    let op = Op::gcounter_increment(handle.node_id().clone(), key, delta);
-    tracing::debug!(op_id = %op.id, "queued local GCounter increment");
+    };
+    tracing::debug!(op_id = %op.op().id, "queued local GCounter increment");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -349,29 +337,19 @@ async fn crdt_pncounter_change_impl(
         }
     };
 
-    {
-        let counters_arc = handle.pncounters();
-        let mut counters = counters_arc.write().await;
-        let mut counter = counters.get(&key).cloned().unwrap_or_else(PNCounter::new);
-        match change {
-            PNCounterChange::Increment => counter.increment(handle.node_id(), delta),
-            PNCounterChange::Decrement => counter.decrement(handle.node_id(), delta),
-        }
-
-        if let Err(e) = persist_pncounter_state(&handle.store(), &key, &counter) {
+    let op = match change {
+        PNCounterChange::Increment => handle.increment_pncounter(&key, delta).await,
+        PNCounterChange::Decrement => handle.decrement_pncounter(&key, delta).await,
+    };
+    let op = match op {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "{api_name}: failed to persist counter");
+            tracing::warn!(error = %e, "{api_name}: failed to persist operation");
             return ERR_INTERNAL;
         }
-
-        counters.insert(key.clone(), counter);
-    }
-
-    let op = match change {
-        PNCounterChange::Increment => Op::pncounter_increment(handle.node_id().clone(), key, delta),
-        PNCounterChange::Decrement => Op::pncounter_decrement(handle.node_id().clone(), key, delta),
     };
-    tracing::debug!(op_id = %op.id, api = api_name, "queued local PNCounter op");
+    tracing::debug!(op_id = %op.op().id, api = api_name, "queued local PNCounter op");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -465,38 +443,18 @@ async fn crdt_lww_set_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .set_lww_register(&key, value, observed_timestamp_ms)
+        .await
     {
-        let registers_arc = handle.lww_registers();
-        let mut registers = registers_arc.write().await;
-        if let Some(existing) = registers.get(&key) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
+        Ok(op) => op,
+        Err(e) => {
+            handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_lww_set: failed to persist operation");
+            return ERR_INTERNAL;
         }
-        let candidate = LwwRegister::new(value.clone(), timestamp_ms, handle.node_id().clone());
-        let next_register = match registers.get(&key) {
-            Some(register) => {
-                let mut next = register.clone();
-                if next.merge(&candidate) {
-                    Some(next)
-                } else {
-                    None
-                }
-            }
-            None => Some(candidate.clone()),
-        };
-
-        if let Some(register) = next_register {
-            if let Err(e) = persist_lww_register_state(&handle.store(), &key, &register) {
-                handle.metrics().record_sync_error();
-                tracing::warn!(error = %e, "crdt_lww_set: failed to persist register");
-                return ERR_INTERNAL;
-            }
-            registers.insert(key.clone(), register);
-        }
-    }
-
-    let op = Op::lww_register_set(handle.node_id().clone(), key, value, timestamp_ms);
-    tracing::debug!(op_id = %op.id, "queued local LWW-Register set");
+    };
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Register set");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -619,30 +577,18 @@ async fn crdt_lww_map_set_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .set_lww_map(&key, &field, value, observed_timestamp_ms)
+        .await
     {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
-        if let Some(existing) = map.entry(&field) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
-        }
-        map.set(
-            field.clone(),
-            value.clone(),
-            timestamp_ms,
-            handle.node_id().clone(),
-        );
-        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_lww_map_set: failed to persist map");
+            tracing::warn!(error = %e, "crdt_lww_map_set: failed to persist operation");
             return ERR_INTERNAL;
         }
-        maps.insert(key.clone(), map);
-    }
-
-    let op = Op::lww_map_set(handle.node_id().clone(), key, field, value, timestamp_ms);
-    tracing::debug!(op_id = %op.id, "queued local LWW-Map set");
+    };
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Map set");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -700,25 +646,18 @@ async fn crdt_lww_map_remove_impl(
         }
     };
 
-    let mut timestamp_ms = observed_timestamp_ms;
+    let op = match handle
+        .remove_lww_map(&key, &field, observed_timestamp_ms)
+        .await
     {
-        let maps_arc = handle.lww_maps();
-        let mut maps = maps_arc.write().await;
-        let mut map = maps.get(&key).cloned().unwrap_or_else(LwwMap::new);
-        if let Some(existing) = map.entry(&field) {
-            timestamp_ms = timestamp_ms.max(existing.timestamp_ms().saturating_add(1));
-        }
-        map.remove(field.clone(), timestamp_ms, handle.node_id().clone());
-        if let Err(e) = persist_lww_map_state(&handle.store(), &key, &map) {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_lww_map_remove: failed to persist map");
+            tracing::warn!(error = %e, "crdt_lww_map_remove: failed to persist operation");
             return ERR_INTERNAL;
         }
-        maps.insert(key.clone(), map);
-    }
-
-    let op = Op::lww_map_remove(handle.node_id().clone(), key, field, timestamp_ms);
-    tracing::debug!(op_id = %op.id, "queued local LWW-Map remove");
+    };
+    tracing::debug!(op_id = %op.op().id, "queued local LWW-Map remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -944,29 +883,16 @@ async fn crdt_orset_add_impl(
         }
     };
 
-    let op = Op::orset_add_with_op_id_tag(handle.node_id().clone(), key.clone(), element.clone());
-    let tag = match &op.kind {
-        OpKind::ORSetAdd { tag, .. } => tag.clone(),
-        _ => {
+    let op = match handle.add_orset(&key, &element).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
+            tracing::warn!(error = %e, "crdt_orset_add: failed to persist operation");
             return ERR_INTERNAL;
         }
     };
 
-    {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
-        set.add(element, tag);
-        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
-            handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_orset_add: failed to persist set");
-            return ERR_INTERNAL;
-        }
-        sets.insert(key, set);
-    }
-
-    tracing::debug!(op_id = %op.id, "queued local ORSet add");
+    tracing::debug!(op_id = %op.op().id, "queued local ORSet add");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -1010,6 +936,10 @@ async fn crdt_orset_remove_impl(
         None => return ERR_SYNC_DISABLED,
     };
 
+    if handle.orset_remove_is_noop(&key, &element).await {
+        return 0;
+    }
+
     let op_tx = handle.op_sender();
     let op_permit = match op_tx.try_reserve() {
         Ok(permit) => permit,
@@ -1020,25 +950,16 @@ async fn crdt_orset_remove_impl(
         }
     };
 
-    let observed_tags = {
-        let sets_arc = handle.orsets();
-        let mut sets = sets_arc.write().await;
-        let mut set = sets.get(&key).cloned().unwrap_or_else(ORSet::new);
-        let observed_tags = set.remove(&element);
-        if observed_tags.is_empty() {
-            return 0;
-        }
-        if let Err(e) = persist_orset_state(&handle.store(), &key, &set) {
+    let op = match handle.remove_orset(&key, &element).await {
+        Ok(Some(op)) => op,
+        Ok(None) => return 0,
+        Err(e) => {
             handle.metrics().record_sync_error();
-            tracing::warn!(error = %e, "crdt_orset_remove: failed to persist set");
+            tracing::warn!(error = %e, "crdt_orset_remove: failed to persist operation");
             return ERR_INTERNAL;
         }
-        sets.insert(key.clone(), set);
-        observed_tags
     };
-
-    let op = Op::orset_remove(handle.node_id().clone(), key, element, observed_tags);
-    tracing::debug!(op_id = %op.id, "queued local ORSet remove");
+    tracing::debug!(op_id = %op.op().id, "queued local ORSet remove");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 
@@ -1222,12 +1143,7 @@ async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsert
         }
     };
 
-    let op = Op::rga_insert_with_op_id(
-        handle.node_id().clone(),
-        key.clone(),
-        parent.clone(),
-        value.clone(),
-    );
+    let op = handle.rga_insert_op(&key, parent.clone(), value.clone());
     let element_id = match &op.kind {
         OpKind::RgaInsert { id, .. } => id.clone(),
         _ => {
@@ -1239,28 +1155,30 @@ async fn crdt_rga_insert_impl(mut caller: Caller<'_, HostState>, args: RgaInsert
     if id_bytes.len() > args.out_id_cap as usize {
         return ERR_BUF_TOO_SMALL;
     }
-
+    if (args.out_id_ptr as usize)
+        .checked_add(id_bytes.len())
+        .is_none_or(|end| end > memory.data_size(&caller))
     {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
-        rga.insert(element_id.clone(), parent, value);
-        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
+        return ERR_INTERNAL;
+    }
+
+    let accepted_op = match handle.insert_rga(op).await {
+        Ok(accepted_op) => accepted_op,
+        Err(e) => {
             handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_rga_insert: failed to persist sequence");
             return ERR_INTERNAL;
         }
-        rgas.insert(key, rga);
-    }
+    };
+
+    tracing::debug!(op_id = %accepted_op.op().id, "queued local RGA insert");
+    op_permit.send(accepted_op);
+    handle.metrics().record_ops(1);
 
     if let Err(e) = memory.write(&mut caller, args.out_id_ptr as usize, id_bytes) {
         eprintln!("[nx-core] crdt_rga_insert: failed to write output id: {e}");
         return ERR_INTERNAL;
     }
-
-    tracing::debug!(op_id = %op.id, "queued local RGA insert");
-    op_permit.send(op);
-    handle.metrics().record_ops(1);
 
     id_bytes.len() as i32
 }
@@ -1312,21 +1230,15 @@ async fn crdt_rga_delete_impl(
         }
     };
 
-    {
-        let rgas_arc = handle.rgas();
-        let mut rgas = rgas_arc.write().await;
-        let mut rga = rgas.get(&key).cloned().unwrap_or_else(Rga::new);
-        rga.delete(id.clone());
-        if let Err(e) = persist_rga_state(&handle.store(), &key, &rga) {
+    let op = match handle.delete_rga(&key, &id).await {
+        Ok(op) => op,
+        Err(e) => {
             handle.metrics().record_sync_error();
             tracing::warn!(error = %e, "crdt_rga_delete: failed to persist sequence");
             return ERR_INTERNAL;
         }
-        rgas.insert(key.clone(), rga);
-    }
-
-    let op = Op::rga_delete(handle.node_id().clone(), key, id);
-    tracing::debug!(op_id = %op.id, "queued local RGA delete");
+    };
+    tracing::debug!(op_id = %op.op().id, "queued local RGA delete");
     op_permit.send(op);
     handle.metrics().record_ops(1);
 

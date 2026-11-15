@@ -297,6 +297,27 @@ impl PeerDiscovery for MdnsDiscovery {
 
     async fn shutdown(&self) -> Result<(), DiscoveryError> {
         self.request_shutdown();
+        self.rollback().await
+    }
+
+    fn request_rollback(&self) {
+        let lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(shutdown) = &lifecycle.shutdown {
+            request_shutdown(shutdown, SHUTDOWN_BUDGET);
+        }
+        self.inner
+            .own_endpoint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    async fn rollback(&self) -> Result<(), DiscoveryError> {
+        self.request_rollback();
         let completion = {
             let lifecycle = self
                 .inner
@@ -1614,6 +1635,57 @@ mod tests {
     }
 
     type EventSender<T> = mpsc::Sender<(T, oneshot::Sender<()>)>;
+
+    #[tokio::test]
+    async fn rollback_waits_for_mdns_cleanup_before_restart_and_shutdown_stays_terminal() {
+        let config = MdnsDiscoveryConfig::new("rollback");
+        let provider = MdnsDiscovery::new(config.clone()).unwrap();
+        let mut cleanup = fake_cleanup();
+        replace_announcement(&mut cleanup, &config, "127.0.0.1:9000".into())
+            .await
+            .unwrap();
+        *provider.inner.own_endpoint.lock().unwrap() = Some("127.0.0.1:9000".into());
+        let registrations = cleanup.daemon.state.clone();
+        let (entered, termination) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        cleanup.daemon.termination = Some((entered, released));
+        let (generation, _events, _monitor) = fake_generation(&provider, cleanup);
+        let old = generation.task.clone();
+        provider.ensure_started_with(|| Ok(generation)).unwrap();
+        provider.request_rollback();
+        termination.await.unwrap();
+        assert!(
+            provider
+                .ensure_started_with(|| panic!("old cleanup is pending"))
+                .is_err()
+        );
+        assert!(!old.completion_ready());
+        assert!(provider.inner.own_endpoint.lock().unwrap().is_none());
+        release.send(()).unwrap();
+        provider.rollback().await.unwrap();
+        assert!(registrations.lock().unwrap().active.is_empty());
+        let (generation, _new_events, _new_monitor) = fake_generation(&provider, fake_cleanup());
+        provider.ensure_started_with(|| Ok(generation)).unwrap();
+        assert!(
+            !old.same_generation(
+                provider
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .task
+                    .as_ref()
+                    .unwrap()
+            )
+        );
+        provider.shutdown().await.unwrap();
+        provider.rollback().await.unwrap();
+        assert!(
+            provider
+                .ensure_started_with(|| panic!("explicit shutdown is terminal"))
+                .is_err()
+        );
+    }
 
     fn fake_generation(
         provider: &MdnsDiscovery,

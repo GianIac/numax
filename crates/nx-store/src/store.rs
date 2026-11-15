@@ -1,8 +1,15 @@
 use std::fs;
 use std::path::Path;
 #[cfg(feature = "test-utils")]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::path::PathBuf;
+#[cfg(feature = "test-utils")]
+use std::sync::atomic::AtomicU64;
+use std::sync::{
+    Arc, RwLock, RwLockWriteGuard,
+    atomic::{AtomicBool, Ordering},
+};
+#[cfg(feature = "test-utils")]
+use std::sync::{Mutex, mpsc};
 
 use crate::StoreError;
 
@@ -10,8 +17,58 @@ use crate::StoreError;
 pub struct Store {
     db: sled::Db,
     write_lock: Arc<RwLock<()>>,
+    durability_uncertain: Arc<AtomicBool>,
     #[cfg(feature = "test-utils")]
     fail_writes_with_disk_full: Arc<AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    fail_flushes_with_disk_full: Arc<AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    crash_checkpoint: Arc<Mutex<Option<(CrashCheckpoint, PathBuf)>>>,
+    #[cfg(feature = "test-utils")]
+    flush_pause: Arc<Mutex<Option<FlushPause>>>,
+    #[cfg(feature = "test-utils")]
+    completed_flushes: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    flush_sequence: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    active_flush: Arc<Mutex<Option<(u64, std::time::Instant)>>>,
+    #[cfg(feature = "test-utils")]
+    completed_batches: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    completed_batch_bytes: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    completed_single_mutation_batches: Arc<AtomicU64>,
+    #[cfg(feature = "test-utils")]
+    periodic_flush_ms: Option<u64>,
+}
+
+#[cfg(feature = "test-utils")]
+struct FlushPause {
+    reached: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(feature = "test-utils")]
+struct FlushActivityGuard<'a>(&'a Store);
+
+#[cfg(feature = "test-utils")]
+impl Drop for FlushActivityGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .active_flush
+            .lock()
+            .expect("test flush activity lock") = None;
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashCheckpoint {
+    BeforeBatch,
+    AfterBatch,
+    BeforeFlush,
+    AfterFlush,
 }
 
 pub struct StoreWriteLease<'a> {
@@ -27,6 +84,24 @@ pub struct StoreStats {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_config(path, sled::Config::default())
+    }
+
+    /// Disable Sled's periodic flush/GC service for controlled diagnostic comparisons.
+    /// Explicit covering flushes are unchanged.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn open_without_periodic_flush(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_config(path, sled::Config::default().flush_every_ms(None))
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn periodic_flush_interval_ms(&self) -> Option<u64> {
+        self.periodic_flush_ms
+    }
+
+    fn open_with_config(path: impl AsRef<Path>, config: sled::Config) -> Result<Self, StoreError> {
         let path = path.as_ref();
 
         // if exists and error if not a dir
@@ -39,13 +114,35 @@ impl Store {
             fs::create_dir_all(path)?;
         }
 
-        // open sled in a specific dir
-        let db = sled::open(path)?;
+        #[cfg(feature = "test-utils")]
+        let periodic_flush_ms = config.flush_every_ms;
+        let db = config.path(path).open()?;
         Ok(Self {
             db,
             write_lock: Arc::new(RwLock::new(())),
+            durability_uncertain: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "test-utils")]
             fail_writes_with_disk_full: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            fail_flushes_with_disk_full: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            crash_checkpoint: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            flush_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            completed_flushes: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            flush_sequence: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            active_flush: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-utils")]
+            completed_batches: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            completed_batch_bytes: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            completed_single_mutation_batches: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-utils")]
+            periodic_flush_ms,
         })
     }
 
@@ -97,9 +194,11 @@ impl Store {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.check_injected_write_failure()?;
-        self.db.flush()?;
-        Ok(())
+        let _guard = self
+            .write_lock
+            .read()
+            .map_err(|_| StoreError::WriteLockPoisoned)?;
+        self.flush_unlocked()
     }
 
     /// Inject or clear a deterministic disk-full failure on every write.
@@ -110,6 +209,61 @@ impl Store {
     pub fn inject_disk_full_on_writes(&self, enabled: bool) {
         self.fail_writes_with_disk_full
             .store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn inject_disk_full_on_flush(&self, enabled: bool) {
+        self.fail_flushes_with_disk_full
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Arm a one-shot checkpoint for a child process that the test parent terminates.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn inject_crash_checkpoint(&self, checkpoint: CrashCheckpoint, marker: PathBuf) {
+        *self.crash_checkpoint.lock().expect("test checkpoint lock") = Some((checkpoint, marker));
+    }
+
+    /// Pause one flush immediately before calling sled.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn pause_next_flush(&self, reached: mpsc::Sender<()>, resume: mpsc::Receiver<()>) {
+        *self.flush_pause.lock().expect("test flush pause lock") =
+            Some(FlushPause { reached, resume });
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_flushes(&self) -> u64 {
+        self.completed_flushes.load(Ordering::Acquire)
+    }
+
+    /// Live covering-flush identity and age, including test pauses, without the write lease.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn active_flush(&self) -> Option<(u64, std::time::Duration)> {
+        self.active_flush
+            .lock()
+            .expect("test flush activity lock")
+            .map(|(sequence, started)| (sequence, started.elapsed()))
+    }
+
+    /// Successful batches and logical key/value bytes, not physical disk writes.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_batch_work(&self) -> (u64, u64) {
+        (
+            self.completed_batches.load(Ordering::Acquire),
+            self.completed_batch_bytes.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn completed_single_mutation_batches(&self) -> u64 {
+        self.completed_single_mutation_batches
+            .load(Ordering::Acquire)
     }
 
     pub fn acquire_write_lease(&self) -> Result<StoreWriteLease<'_>, StoreError> {
@@ -124,6 +278,7 @@ impl Store {
     }
 
     fn set_unlocked(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
         self.db.insert(key, value)?;
         Ok(())
@@ -134,7 +289,10 @@ impl Store {
         sets: &[(&[u8], &[u8])],
         deletes: &[&[u8]],
     ) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
+        #[cfg(feature = "test-utils")]
+        self.wait_at_crash_checkpoint(CrashCheckpoint::BeforeBatch);
         let mut batch = sled::Batch::default();
         for (key, value) in sets {
             batch.insert(*key, *value);
@@ -143,12 +301,112 @@ impl Store {
             batch.remove(*key);
         }
         self.db.apply_batch(batch)?;
+        #[cfg(feature = "test-utils")]
+        {
+            let bytes = sets
+                .iter()
+                .map(|(key, value)| key.len() as u64 + value.len() as u64)
+                .chain(deletes.iter().map(|key| key.len() as u64))
+                .sum::<u64>();
+            self.completed_batch_bytes
+                .fetch_add(bytes, Ordering::Release);
+            if matches!((sets.len(), deletes.len()), (1, 0) | (0, 1)) {
+                self.completed_single_mutation_batches
+                    .fetch_add(1, Ordering::Release);
+            }
+            self.completed_batches.fetch_add(1, Ordering::Release);
+        }
+        #[cfg(feature = "test-utils")]
+        self.wait_at_crash_checkpoint(CrashCheckpoint::AfterBatch);
         Ok(())
     }
 
     fn delete_unlocked(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.check_durability()?;
         self.check_injected_write_failure()?;
         self.db.remove(key)?;
+        Ok(())
+    }
+
+    fn flush_unlocked(&self) -> Result<(), StoreError> {
+        #[cfg(feature = "test-utils")]
+        let _activity = {
+            let sequence = self.flush_sequence.fetch_add(1, Ordering::Relaxed);
+            *self.active_flush.lock().expect("test flush activity lock") =
+                Some((sequence, std::time::Instant::now()));
+            FlushActivityGuard(self)
+        };
+        self.check_durability()?;
+        let result = self.check_injected_write_failure().and_then(|_| {
+            self.check_injected_flush_failure()?;
+            #[cfg(feature = "test-utils")]
+            self.wait_at_crash_checkpoint(CrashCheckpoint::BeforeFlush);
+            #[cfg(feature = "test-utils")]
+            self.wait_at_flush_pause();
+            self.db.flush()?;
+            #[cfg(feature = "test-utils")]
+            self.completed_flushes.fetch_add(1, Ordering::Release);
+            #[cfg(feature = "test-utils")]
+            self.wait_at_crash_checkpoint(CrashCheckpoint::AfterFlush);
+            Ok(())
+        });
+        if result.is_err() {
+            self.durability_uncertain.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn wait_at_crash_checkpoint(&self, current: CrashCheckpoint) {
+        let marker = {
+            let mut armed = self.crash_checkpoint.lock().expect("test checkpoint lock");
+            if armed
+                .as_ref()
+                .is_some_and(|(checkpoint, _)| *checkpoint == current)
+            {
+                armed.take().map(|(_, marker)| marker)
+            } else {
+                None
+            }
+        };
+        if let Some(marker) = marker {
+            std::fs::write(marker, b"ready").expect("write test checkpoint marker");
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn wait_at_flush_pause(&self) {
+        let pause = self
+            .flush_pause
+            .lock()
+            .expect("test flush pause lock")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.recv();
+        }
+    }
+
+    fn check_durability(&self) -> Result<(), StoreError> {
+        if self.durability_uncertain.load(Ordering::Acquire) {
+            return Err(StoreError::DurabilityUncertain);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_injected_flush_failure(&self) -> Result<(), StoreError> {
+        if self.fail_flushes_with_disk_full.load(Ordering::Relaxed) {
+            return Err(StoreError::InjectedFlushFailure);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn check_injected_flush_failure(&self) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -418,5 +676,9 @@ impl StoreWriteLease<'_> {
 
     pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
         self.store.delete_unlocked(key)
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.store.flush_unlocked()
     }
 }

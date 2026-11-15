@@ -2,16 +2,314 @@ use super::*;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::sync_manager::{apply::*, peer::*, replication::*, storage::*};
 use nx_net::{ConnectionDirection, NodeEvent, PeerIdentityVerification};
+use nx_store::CrashCheckpoint;
 use nx_sync::OpKind;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant as StdInstant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
+mod backpressure;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod detector_soak;
+mod determinism;
 mod e2e;
+mod local_storage;
+mod manual;
+mod rate;
+mod recovery;
+mod restart;
+mod sequencing;
 mod support;
+mod topology;
 
 use support::*;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual TCP fanout calibration with anti-entropy explicitly stopped"]
+async fn gossip_fanout_tcp_calibration() {
+    const NODES: usize = 16;
+    for constant in [1, 3] {
+        let mut managers = Vec::new();
+        let mut endpoints = Vec::new();
+        for index in 0..NODES {
+            let mut manager = SyncManager::new(
+                NodeId::new(format!("tcp-calibration-{index}")),
+                SyncConfig::new()
+                    .with_listen_addr("127.0.0.1:0")
+                    .with_gossip_fanout(constant, 64),
+                temp_store(),
+                metrics(),
+            );
+            manager.start().await.unwrap();
+            if let Some(task) = manager.anti_entropy_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let snapshot = manager
+                .membership
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .wait_for(|snapshot| !snapshot.records.is_empty())
+                .await
+                .unwrap()
+                .clone();
+            endpoints.push(
+                snapshot
+                    .records
+                    .iter()
+                    .find(|record| record.member == format!("tcp-calibration-{index}"))
+                    .unwrap()
+                    .endpoint
+                    .clone()
+                    .unwrap(),
+            );
+            managers.push(manager);
+        }
+        for (index, manager) in managers.iter().enumerate() {
+            for endpoint in endpoints.iter().skip(index + 1) {
+                manager
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .connect_to_peer(endpoint)
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                let mut ready = true;
+                for manager in &managers {
+                    ready &=
+                        manager.node.as_ref().unwrap().connected_peers().await.len() == NODES - 1;
+                }
+                if ready {
+                    break;
+                }
+                poll.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut complete = 0;
+        let mut reached = 0;
+        let mut latencies = Vec::new();
+        for origin in 0..NODES {
+            let key = format!("fanout-calibration-{origin}");
+            let start = StdInstant::now();
+            local_increment(&managers[origin].handle(), &key, 1).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut poll = tokio::time::interval(Duration::from_millis(2));
+            loop {
+                let mut observed = 0;
+                for manager in &managers {
+                    observed += usize::from(manager.get_counter_value(&key).await == 1);
+                }
+                if observed == NODES || Instant::now() >= deadline {
+                    reached += observed;
+                    if observed == NODES {
+                        complete += 1;
+                        latencies.push(start.elapsed().as_micros() as u64);
+                    }
+                    break;
+                }
+                poll.tick().await;
+            }
+        }
+        latencies.sort_unstable();
+        println!(
+            "FANOUT_TCP_CALIBRATION {}",
+            serde_json::json!({
+                "nodes": NODES, "c": constant, "samples": NODES, "topology": "full-mesh",
+                "transport": "TCP loopback Bincode (wincode)", "loss_percent": 0, "anti_entropy": false,
+                "complete": complete, "coverage": reached as f64 / (NODES * NODES) as f64,
+                "complete_latency_micros": latencies,
+            })
+        );
+        for manager in &mut managers {
+            manager.shutdown().await.unwrap();
+        }
+        if constant == 3 {
+            assert_eq!(complete, NODES);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn wildcard_membership_preserves_optional_advertisement_and_valid_control_contact() {
+    for (bind, contact_ip) in [("0.0.0.0:0", "127.0.0.1"), ("[::]:0", "::1")] {
+        for advertise in [false, true] {
+            let reservation = std::net::TcpListener::bind(bind).unwrap();
+            let bound = reservation.local_addr().unwrap();
+            drop(reservation);
+            let policy = if advertise {
+                DiscoveryRuntimeConfig::new().with_advertised_endpoint(if contact_ip == "::1" {
+                    "[::1]:0"
+                } else {
+                    "127.0.0.1:0"
+                })
+            } else {
+                DiscoveryRuntimeConfig::new()
+            };
+            let mut manager = SyncManager::try_new_with_discovery(
+                NodeId::new("wildcard"),
+                SyncConfig::new().with_listen_addr(bound.to_string()),
+                temp_store(),
+                metrics(),
+                vec![DiscoveryProvider::new(
+                    "static",
+                    Arc::new(StaticDiscovery::new(Vec::new())),
+                )],
+                policy,
+            )
+            .unwrap();
+            manager.start().await.unwrap();
+            let snapshot = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager
+                    .membership
+                    .as_mut()
+                    .unwrap()
+                    .snapshot
+                    .wait_for(|snapshot| !snapshot.records.is_empty()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .clone();
+            let announcement = snapshot
+                .records
+                .iter()
+                .find(|record| record.member == "wildcard")
+                .unwrap()
+                .clone();
+            assert_eq!(announcement.endpoint.is_some(), advertise);
+            if let Some(endpoint) = &announcement.endpoint {
+                let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+                assert!(!endpoint.ip().is_unspecified());
+                assert_eq!(
+                    endpoint.ip(),
+                    contact_ip.parse::<std::net::IpAddr>().unwrap()
+                );
+            }
+            let contact =
+                std::net::SocketAddr::new(contact_ip.parse().unwrap(), bound.port()).to_string();
+            let peer = Node::new(NodeConfig::new(NodeId::new("contact"), "127.0.0.1:0"));
+            peer.start_listener().await.unwrap();
+            let reply = peer
+                .control_request(
+                    &contact,
+                    nx_net::ControlRequest {
+                        request_id: 41,
+                        owner: nx_net::MembershipRecord {
+                            member: "contact".into(),
+                            reporter: "contact".into(),
+                            version: nx_net::MembershipVersion {
+                                epoch: 1,
+                                incarnation: 0,
+                            },
+                            state: nx_net::MembershipState::Alive,
+                            endpoint: None,
+                        },
+                        updates: vec![],
+                        kind: nx_net::ControlKind::Probe {
+                            target: announcement.member.clone(),
+                            version: announcement.version,
+                        },
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
+                .1;
+            assert!(reply.ack);
+            assert_eq!(reply.owner.endpoint, announcement.endpoint);
+            peer.shutdown().await;
+            manager.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn sync_manager_owns_automatic_membership_and_durable_leave() {
+    let mut alice = SyncManager::new(
+        NodeId::new("membership-alice"),
+        SyncConfig::new().with_listen_addr("127.0.0.1:0"),
+        temp_store(),
+        metrics(),
+    );
+    alice.start().await.unwrap();
+    let alice_endpoint = alice
+        .membership
+        .as_mut()
+        .unwrap()
+        .snapshot
+        .wait_for(|snapshot| !snapshot.records.is_empty())
+        .await
+        .unwrap()
+        .records[0]
+        .endpoint
+        .clone()
+        .unwrap();
+    let mut bob = SyncManager::new(
+        NodeId::new("membership-bob"),
+        SyncConfig::new()
+            .with_listen_addr("127.0.0.1:0")
+            .with_peer(alice_endpoint),
+        temp_store(),
+        metrics(),
+    );
+    bob.start().await.unwrap();
+    for manager in [&mut alice, &mut bob] {
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager
+                .membership
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .wait_for(|snapshot| {
+                    snapshot.error.is_some()
+                        || snapshot.records.len() == 2 && snapshot.successful_probes > 0
+                }),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.failed_probes, 0);
+    }
+    bob.shutdown().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        alice
+            .membership
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .wait_for(|snapshot| {
+                snapshot.records.iter().any(|record| {
+                    record.member == "membership-bob"
+                        && record.state == nx_net::MembershipState::Left
+                })
+            }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        alice
+            .store
+            .get(b"__nx/membership/floor/membership-bob")
+            .unwrap()
+            .is_some()
+    );
+    alice.shutdown().await.unwrap();
+}
 
 struct TestDynamicDiscovery {
     state: StdMutex<(u64, Vec<String>)>,
@@ -347,30 +645,31 @@ async fn op_log_since_returns_ops_after_known_id() {
 }
 
 #[tokio::test]
-async fn remember_ops_prunes_op_log_to_configured_limit() {
+async fn local_acceptance_prunes_op_log_to_configured_limit() {
     let store = temp_store();
-    let seen_ops = Arc::new(RwLock::new(SeenOps::new(10)));
-    let seen_ops_next_sequence = Arc::new(AtomicU64::new(0));
-    let op_log_next_sequence = Arc::new(AtomicU64::new(0));
-    let op_log = Arc::new(RwLock::new(Vec::new()));
-    let op_a = Op::gcounter_increment(NodeId::new("node-a"), "counter:visits", 1);
-    let op_b = Op::gcounter_increment(NodeId::new("node-b"), "counter:visits", 2);
-    let op_c = Op::gcounter_increment(NodeId::new("node-c"), "counter:visits", 3);
-
-    remember_ops(
-        &seen_ops,
-        &seen_ops_next_sequence,
-        &op_log,
-        &op_log_next_sequence,
-        2,
-        &store,
-        &[op_a.clone(), op_b.clone(), op_c.clone()],
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new().with_op_log_limit(2),
+        Arc::clone(&store),
+        metrics(),
     )
-    .await
     .unwrap();
+    let handle = manager.handle();
+    let op_a = handle
+        .increment_gcounter("counter:visits", 1)
+        .await
+        .unwrap();
+    let op_b = handle
+        .increment_gcounter("counter:visits", 2)
+        .await
+        .unwrap();
+    let op_c = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
 
-    assert_eq!(op_log.read().await.as_slice(), &[op_b, op_c]);
-    assert!(seen_ops.read().await.contains(op_a.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op_b, op_c]);
+    assert!(manager.seen_ops.read().await.contains(op_a.id.as_str()));
 }
 
 #[test]
@@ -620,9 +919,22 @@ async fn ops_received_updates_anti_entropy_watermark() {
     let expected = op_b.id.as_str().to_string();
 
     handle_node_event(
-        NodeEvent::OpsReceived {
+        NodeEvent::HistoryReceived {
             from: peer.clone(),
-            ops: vec![op_a, op_b],
+            addr: "unused".into(),
+            message: nx_sync::HistoryMessage::Push {
+                ops: vec![op_a, op_b]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, op)| nx_sync::SequencedOp {
+                        op,
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: index as u64 + 1,
+                        },
+                    })
+                    .collect(),
+            },
         },
         &context,
     )
@@ -1390,6 +1702,7 @@ async fn disk_full_does_not_expose_partial_remote_state() {
     let metrics = metrics();
     let op = Op::gcounter_increment(NodeId::new("remote-a"), "counter:visits", 3);
     let context = RemoteOpApplyContext {
+        storage_executor: crate::peer_io::StorageExecutor::Blocking,
         counters: &counters,
         pncounters: &pncounters,
         lww_registers: &lww_registers,
@@ -1445,6 +1758,3073 @@ async fn disk_full_does_not_expose_partial_remote_state() {
         .await
         .expect("the runtime must accept writes after storage recovers");
     assert_eq!(counters.read().await["counter:visits"].value(), 3);
+}
+
+#[tokio::test]
+async fn local_gcounter_batch_restarts_with_state_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    let op = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&op)
+    );
+    assert!(
+        store
+            .get(&seen_op_store_key(op.id.as_str()))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 1);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 1);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_gcounter_batch_failure_does_not_publish_partial_state() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_counter_value("counter:visits").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_gcounter_state_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_gcounter_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle
+        .increment_gcounter("counter:visits", 3)
+        .await
+        .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_gcounter_flush_failure_does_not_publish_or_allow_retry() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_counter_value("counter:visits").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_gcounter_flush_failure_restarts_with_consistent_replay_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .increment_gcounter("counter:visits", 3)
+            .await
+            .is_err()
+    );
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 3);
+    assert_eq!(read_materialized(&store, "counter:visits"), 3);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_gcounter_batches_keep_both_increments() {
+    let store = temp_store();
+    let metrics = metrics();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+    )
+    .unwrap();
+
+    for _ in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let local_handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = tokio::spawn(async move {
+            local_barrier.wait().await;
+            local_handle.increment_gcounter("counter:visits", 2).await
+        });
+
+        let remote_op = Op::gcounter_increment(NodeId::new("remote-node"), "counter:visits", 3);
+        let remote_barrier = Arc::clone(&barrier);
+        let counters = Arc::clone(&manager.counters);
+        let pncounters = Arc::clone(&manager.pncounters);
+        let lww_registers = Arc::clone(&manager.lww_registers);
+        let lww_maps = Arc::clone(&manager.lww_maps);
+        let orsets = Arc::clone(&manager.orsets);
+        let rgas = Arc::clone(&manager.rgas);
+        let seen_ops = Arc::clone(&manager.seen_ops);
+        let seen_ops_next_sequence = Arc::clone(&manager.seen_ops_next_sequence);
+        let op_log = Arc::clone(&manager.op_log);
+        let op_log_next_sequence = Arc::clone(&manager.op_log_next_sequence);
+        let remote_store = Arc::clone(&store);
+        let remote_metrics = Arc::clone(&metrics);
+        let remote = tokio::spawn(async move {
+            let context = RemoteOpApplyContext {
+                storage_executor: crate::peer_io::StorageExecutor::Blocking,
+                counters: &counters,
+                pncounters: &pncounters,
+                lww_registers: &lww_registers,
+                lww_maps: &lww_maps,
+                orsets: &orsets,
+                rgas: &rgas,
+                seen_ops: &seen_ops,
+                seen_ops_next_sequence: &seen_ops_next_sequence,
+                op_log: &op_log,
+                op_log_next_sequence: &op_log_next_sequence,
+                op_log_limit: 1024,
+                store: &remote_store,
+                metrics: &remote_metrics,
+            };
+            remote_barrier.wait().await;
+            apply_remote_ops(std::slice::from_ref(&remote_op), &context).await
+        });
+
+        let (local_result, remote_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            barrier.wait().await;
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote GCounter writes must not deadlock");
+        local_result.unwrap().unwrap();
+        remote_result.unwrap().unwrap();
+    }
+
+    assert_eq!(manager.get_counter_value("counter:visits").await, 80);
+    assert_eq!(read_materialized(&store, "counter:visits"), 80);
+    assert_eq!(
+        read_durable_gcounter_state(&store, "counter:visits").value(),
+        80
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+    assert_eq!(manager.op_log.read().await.len(), 32);
+}
+
+#[tokio::test]
+async fn local_pncounter_batch_restarts_with_both_directions_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let increment = handle.increment_pncounter("stock:sku-1", 10).await.unwrap();
+    let decrement = handle.decrement_pncounter("stock:sku-1", 4).await.unwrap();
+    let expected_ops = [increment, decrement];
+
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 6);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 6);
+    let state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(state.positive_for(&NodeId::new("local-node")), 10);
+    assert_eq!(state.negative_for(&NodeId::new("local-node")), 4);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored_op = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored_op).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 2);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 2);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 6);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), 6);
+    let restarted_state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(
+        restarted_state.positive_for(&NodeId::new("local-node")),
+        state.positive_for(&NodeId::new("local-node"))
+    );
+    assert_eq!(
+        restarted_state.negative_for(&NodeId::new("local-node")),
+        state.negative_for(&NodeId::new("local-node"))
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_pncounter_batch_failure_does_not_publish_partial_state() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.increment_pncounter("stock:sku-1", 10).await.is_err());
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_pncounter_state_key("stock:sku-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_pncounter_key("stock:sku-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle.decrement_pncounter("stock:sku-1", 3).await.unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -3);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_pncounter_flush_failure_blocks_retry_and_recovers_on_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(handle.decrement_pncounter("stock:sku-1", 3).await.is_err());
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .increment_pncounter("stock:sku-1", 2)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, 0);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -3);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -3);
+    assert_eq!(
+        read_durable_pncounter_state(&store, "stock:sku-1")
+            .negative_for(&NodeId::new("local-node")),
+        3
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_pncounter_batches_preserve_directions_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for _ in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle.increment_pncounter("stock:sku-1", 2).await
+        };
+        let remote_op = Op::pncounter_decrement(NodeId::new("remote-node"), "stock:sku-1", 3);
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_pncounter_op_for_test(
+                &remote_op,
+                &manager.pncounters,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote PNCounter writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_pncounter_op_for_test(
+            &remote_op,
+            &manager.pncounters,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    assert_eq!(manager.get_pncounter_value("stock:sku-1").await, -16);
+    assert_eq!(read_materialized_pncounter(&store, "stock:sku-1"), -16);
+    let state = read_durable_pncounter_state(&store, "stock:sku-1");
+    assert_eq!(state.positive_for(&NodeId::new("local-node")), 32);
+    assert_eq!(state.negative_for(&NodeId::new("remote-node")), 48);
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+    assert_eq!(manager.op_log.read().await.len(), 32);
+}
+
+#[tokio::test]
+async fn local_lww_register_batch_preserves_timestamp_and_replay_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let first = handle
+        .set_lww_register("status:user-1", b"online".to_vec(), 100)
+        .await
+        .unwrap();
+    let second = handle
+        .set_lww_register("status:user-1", b"away".to_vec(), 100)
+        .await
+        .unwrap();
+    let expected_ops = [first, second];
+
+    assert!(matches!(
+        &expected_ops[0].kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: 100,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[1].kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: 101,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"away".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"away"
+    );
+    let state = read_durable_lww_register_state(&store, "status:user-1");
+    assert_eq!(state.value(), b"away");
+    assert_eq!(state.timestamp_ms(), 101);
+    assert_eq!(state.writer(), handle.node_id());
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 2);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 2);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"away".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"away"
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        state
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_lww_register_batch_failure_keeps_state_and_metadata_absent() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"online".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_lww_register_state_key("status:user-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_lww_register_key("status:user-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let op = handle
+        .set_lww_register("status:user-1", b"online".to_vec(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_lww_register_flush_failure_blocks_retry_and_recovers_on_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"online".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1").value(),
+        b"online"
+    );
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 1);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, op) = parse_durable_op_log_value(&stored_ops[0].1).unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .set_lww_register("status:user-1", b"away".to_vec(), 101)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(manager.get_lww_register_value("status:user-1").await, None);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"online".as_slice())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"online"
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_lww_register_losing_candidate_still_has_durable_replay_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let initial_manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    drop(initial_manager);
+    let winner = LwwRegister::new(b"winner".to_vec(), u64::MAX, NodeId::new("remote-z"));
+    persist_lww_register_state(&store, "status:user-1", &winner).unwrap();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let op = handle
+        .set_lww_register("status:user-1", b"loser".to_vec(), 100)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        &op.kind,
+        OpKind::LwwRegisterSet {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"winner".as_slice())
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        winner
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        b"winner"
+    );
+    assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&op)
+    );
+    let stored = store
+        .get(&op_log_store_key(op.id.as_str()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, op);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(b"winner".as_slice())
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &[op]);
+}
+
+#[tokio::test]
+async fn local_and_remote_lww_register_batches_keep_winning_value_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..16 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle
+                .set_lww_register("status:user-1", b"local".to_vec(), 100)
+                .await
+        };
+        let remote_op = Op::lww_register_set(
+            NodeId::new("remote-node"),
+            "status:user-1",
+            b"remote".to_vec(),
+            200 + index,
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_lww_register_op_for_test(
+                &remote_op,
+                &manager.lww_registers,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote LwwRegister writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_lww_register_op_for_test(
+            &remote_op,
+            &manager.lww_registers,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 32);
+    let mut expected: Option<LwwRegister> = None;
+    for op in log.iter() {
+        let OpKind::LwwRegisterSet {
+            value,
+            timestamp_ms,
+            ..
+        } = &op.kind
+        else {
+            panic!("unexpected operation in LwwRegister log");
+        };
+        let candidate = LwwRegister::new(value.clone(), *timestamp_ms, op.origin.clone());
+        if let Some(register) = expected.as_mut() {
+            register.merge(&candidate);
+        } else {
+            expected = Some(candidate);
+        }
+    }
+    let expected = expected.unwrap();
+    assert_eq!(
+        manager
+            .get_lww_register_value("status:user-1")
+            .await
+            .as_deref(),
+        Some(expected.value())
+    );
+    assert_eq!(
+        read_materialized_lww_register(&store, "status:user-1"),
+        expected.value()
+    );
+    assert_eq!(
+        read_durable_lww_register_state(&store, "status:user-1"),
+        expected
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 32);
+}
+
+#[tokio::test]
+async fn local_lww_map_batch_restarts_with_fields_tombstone_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let first = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+    let second = handle
+        .set_lww_map("settings:service-a", "theme", b"light".to_vec(), 100)
+        .await
+        .unwrap();
+    let remove = handle
+        .remove_lww_map("settings:service-a", "theme", 100)
+        .await
+        .unwrap();
+    let region = handle
+        .set_lww_map("settings:service-a", "region", b"eu".to_vec(), 50)
+        .await
+        .unwrap();
+    let expected_ops = [first, second, remove, region];
+
+    assert!(matches!(
+        &expected_ops[0].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 100,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[1].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 101,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[2].kind,
+        OpKind::LwwMapRemove {
+            timestamp_ms: 102,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &expected_ops[3].kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: 50,
+            ..
+        }
+    ));
+    let visible = vec![("region".to_string(), b"eu".to_vec())];
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        visible
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        visible
+    );
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert_eq!(state.entries(), visible);
+    assert_eq!(state.entry("theme").unwrap().timestamp_ms(), 102);
+    assert!(!state.entry("theme").unwrap().is_visible());
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 4);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 4);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        visible
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        visible
+    );
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        state
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_lww_map_batch_failure_preserves_previous_state_and_metadata() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .get_lww_map_entries("settings:service-a")
+            .await
+            .is_empty()
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_lww_map_state_key("settings:service-a"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_lww_map_key("settings:service-a"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let set = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .remove_lww_map("settings:service-a", "theme", 200)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert!(
+        read_durable_lww_map_state(&store, "settings:service-a")
+            .entry("theme")
+            .unwrap()
+            .is_visible()
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&set)
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_lww_map_flush_failure_blocks_retry_and_recovers_tombstone() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let set = handle
+        .set_lww_map("settings:service-a", "theme", b"dark".to_vec(), 100)
+        .await
+        .unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .remove_lww_map("settings:service-a", "theme", 200)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"dark".to_vec())]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&set)
+    );
+    assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert!(!state.entry("theme").unwrap().is_visible());
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let remove = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != set.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .set_lww_map("settings:service-a", "theme", b"light".to_vec(), 300)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(
+        manager
+            .get_lww_map_entries("settings:service-a")
+            .await
+            .is_empty()
+    );
+    assert!(read_materialized_lww_map(&store, "settings:service-a").is_empty());
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        state
+    );
+    assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[set.into_op(), remove]
+    );
+}
+
+#[tokio::test]
+async fn local_lww_map_losing_set_and_remove_retain_replay_identity() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-a"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let remote = Op::lww_map_set(
+        NodeId::new("remote-z"),
+        "settings:service-a",
+        "theme",
+        b"winner".to_vec(),
+        u64::MAX,
+    );
+    apply_remote_lww_map_op_for_test(
+        &remote,
+        &manager.lww_maps,
+        &manager.seen_ops,
+        &manager.seen_ops_next_sequence,
+        &manager.op_log,
+        &manager.op_log_next_sequence,
+        &store,
+    )
+    .await;
+    let handle = manager.handle();
+    let losing_set = handle
+        .set_lww_map("settings:service-a", "theme", b"loser".to_vec(), 100)
+        .await
+        .unwrap();
+    let losing_remove = handle
+        .remove_lww_map("settings:service-a", "theme", 100)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        &losing_set.kind,
+        OpKind::LwwMapSet {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &losing_remove.kind,
+        OpKind::LwwMapRemove {
+            timestamp_ms: u64::MAX,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        vec![("theme".to_string(), b"winner".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        vec![("theme".to_string(), b"winner".to_vec())]
+    );
+    let state = read_durable_lww_map_state(&store, "settings:service-a");
+    assert_eq!(state.get("theme"), Some(b"winner".as_slice()));
+    assert_eq!(
+        state.entry("theme").unwrap().writer(),
+        &NodeId::new("remote-z")
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[remote, losing_set.op().clone(), losing_remove.op().clone(),]
+    );
+    for op in [&losing_set, &losing_remove] {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op.op());
+    }
+}
+
+#[tokio::test]
+async fn local_and_remote_lww_map_batches_preserve_field_winners_and_ignore_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            if index % 2 == 0 {
+                handle
+                    .set_lww_map("settings:service-a", "theme", b"local".to_vec(), 100)
+                    .await
+            } else {
+                handle
+                    .remove_lww_map("settings:service-a", "theme", 100)
+                    .await
+            }
+        };
+        let remote_op = if index % 2 == 0 {
+            Op::lww_map_remove(
+                NodeId::new("remote-node"),
+                "settings:service-a",
+                "theme",
+                200 + index,
+            )
+        } else {
+            Op::lww_map_set(
+                NodeId::new("remote-node"),
+                "settings:service-a",
+                "theme",
+                b"remote".to_vec(),
+                200 + index,
+            )
+        };
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_lww_map_op_for_test(
+                &remote_op,
+                &manager.lww_maps,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote LwwMap writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_lww_map_op_for_test(
+            &remote_op,
+            &manager.lww_maps,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 24);
+    let mut expected = LwwMap::new();
+    for op in log.iter() {
+        match &op.kind {
+            OpKind::LwwMapSet {
+                field,
+                value,
+                timestamp_ms,
+                ..
+            } => {
+                expected.set(
+                    field.clone(),
+                    value.clone(),
+                    *timestamp_ms,
+                    op.origin.clone(),
+                );
+            }
+            OpKind::LwwMapRemove {
+                field,
+                timestamp_ms,
+                ..
+            } => {
+                expected.remove(field.clone(), *timestamp_ms, op.origin.clone());
+            }
+            other => panic!("unexpected operation in LwwMap log: {other:?}"),
+        }
+    }
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service-a").await,
+        expected.entries()
+    );
+    assert_eq!(
+        read_materialized_lww_map(&store, "settings:service-a"),
+        expected.entries()
+    );
+    assert_eq!(
+        read_durable_lww_map_state(&store, "settings:service-a"),
+        expected
+    );
+    assert_eq!(manager.seen_ops.read().await.len(), 24);
+}
+
+#[tokio::test]
+async fn local_orset_batch_restarts_with_tags_removals_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let blue = handle.add_orset("tags:item-1", "blue").await.unwrap();
+    let red = handle.add_orset("tags:item-1", "red").await.unwrap();
+    let remove = handle
+        .remove_orset("tags:item-1", "blue")
+        .await
+        .unwrap()
+        .unwrap();
+    let repeated_remove = handle
+        .remove_orset("tags:item-1", "blue")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_ops = [blue, red, remove, repeated_remove];
+
+    assert!(
+        matches!(&expected_ops[0].kind, OpKind::ORSetAdd { tag, .. } if tag == expected_ops[0].id.as_str())
+    );
+    for op in &expected_ops[2..] {
+        assert!(
+            matches!(&op.kind, OpKind::ORSetRemove { observed_tags, .. } if observed_tags == &[expected_ops[0].id.as_str().to_string()])
+        );
+    }
+    assert_eq!(manager.get_orset_elements("tags:item-1").await, vec!["red"]);
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    let state = read_durable_orset_state(&store, "tags:item-1");
+    assert_eq!(
+        state.observed_tags("blue"),
+        vec![expected_ops[0].id.as_str()]
+    );
+    assert!(!state.contains("blue"));
+    assert!(state.contains("red"));
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 4);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 4);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_orset_elements("tags:item-1").await, vec!["red"]);
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["red"]);
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), state);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_orset_remove_without_observed_tags_writes_no_operation() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    assert!(
+        handle
+            .remove_orset("tags:item-1", "missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_orset_state_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_orset_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn local_orset_batch_failure_preserves_previous_state_and_metadata() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.add_orset("tags:item-1", "blue").await.is_err());
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(manager.op_log.read().await.is_empty());
+    assert!(
+        store
+            .get(&durable_orset_state_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_orset_key("tags:item-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    let add = handle.add_orset("tags:item-1", "blue").await.unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.remove_orset("tags:item-1", "blue").await.is_err());
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+    assert_eq!(read_materialized_orset(&store, "tags:item-1"), vec!["blue"]);
+    assert!(read_durable_orset_state(&store, "tags:item-1").contains("blue"));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&add)
+    );
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_orset_flush_failure_blocks_retry_and_recovers_remove() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let add = handle.add_orset("tags:item-1", "blue").await.unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(handle.remove_orset("tags:item-1", "blue").await.is_err());
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&add)
+    );
+    assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
+    let state = read_durable_orset_state(&store, "tags:item-1");
+    assert!(!state.contains("blue"));
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let remove = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != add.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .add_orset("tags:item-1", "red")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        vec!["blue"]
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(manager.get_orset_elements("tags:item-1").await.is_empty());
+    assert!(read_materialized_orset(&store, "tags:item-1").is_empty());
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), state);
+    assert!(manager.seen_ops.read().await.contains(remove.id.as_str()));
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        &[add.into_op(), remove]
+    );
+}
+
+#[tokio::test]
+async fn local_and_remote_orset_batches_keep_tags_and_ignore_delayed_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_barrier = Arc::clone(&barrier);
+        let local = async move {
+            local_barrier.wait().await;
+            handle.add_orset("tags:item-1", "blue").await
+        };
+        let remote_op = Op::orset_add(
+            NodeId::new("remote-node"),
+            "tags:item-1",
+            "blue",
+            format!("remote-tag-{index}"),
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_orset_op_for_test(
+                &remote_op,
+                &manager.orsets,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote ORSet writes must not deadlock");
+        let local_op = local_result.unwrap();
+        assert!(
+            matches!(&local_op.kind, OpKind::ORSetAdd { tag, .. } if tag == local_op.id.as_str())
+        );
+        apply_remote_orset_op_for_test(
+            &remote_op,
+            &manager.orsets,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+        let remove = manager
+            .handle()
+            .remove_orset("tags:item-1", "blue")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&remove.kind, OpKind::ORSetRemove { observed_tags, .. } if observed_tags.contains(&local_op.id.as_str().to_string()) && observed_tags.contains(&format!("remote-tag-{index}")))
+        );
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 36);
+    let mut expected = ORSet::new();
+    for op in log.iter() {
+        match &op.kind {
+            OpKind::ORSetAdd { element, tag, .. } => {
+                expected.apply_add(element.clone(), tag.clone());
+            }
+            OpKind::ORSetRemove {
+                element,
+                observed_tags,
+                ..
+            } => {
+                expected.apply_remove(element.clone(), observed_tags.iter().cloned());
+            }
+            other => panic!("unexpected operation in ORSet log: {other:?}"),
+        }
+    }
+    assert_eq!(
+        manager.get_orset_elements("tags:item-1").await,
+        expected.elements()
+    );
+    assert_eq!(
+        read_materialized_orset(&store, "tags:item-1"),
+        expected.elements()
+    );
+    assert_eq!(read_durable_orset_state(&store, "tags:item-1"), expected);
+    assert_eq!(manager.seen_ops.read().await.len(), 36);
+}
+
+#[tokio::test]
+async fn store_reopen_waits_for_last_database_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let last_handle = Arc::clone(&store);
+    {
+        let mut waiting = Box::pin(wait_for_store_file_release(directory.path()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        drop(store);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+    }
+    drop(last_handle);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    NxStore::open(directory.path()).unwrap();
+}
+
+#[tokio::test]
+async fn local_rga_batch_restarts_with_parents_tombstones_and_replay_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let parent = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"parent".to_vec(),
+    );
+    let parent_id = parent.id.as_str().to_string();
+    let child = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        Some(parent_id.clone()),
+        b"child".to_vec(),
+    );
+    let delete = handle
+        .delete_rga("comments:doc-1", &parent_id)
+        .await
+        .unwrap();
+    handle.insert_rga(child.clone()).await.unwrap();
+    handle.insert_rga(parent.clone()).await.unwrap();
+    let expected_ops = [delete.into_op(), child, parent];
+
+    let state = read_durable_rga_state(&store, "comments:doc-1");
+    assert_eq!(
+        state.ordered_ids(),
+        vec![parent_id, expected_ops[1].id.as_str().to_string()]
+    );
+    assert!(!state.contains(expected_ops[2].id.as_str()));
+    assert_eq!(state.values(), vec![b"child".to_vec()]);
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        state.values()
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        state.values()
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        let stored = store
+            .get(&op_log_store_key(op.id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_durable_op_log_value(&stored).unwrap().1, *op);
+    }
+    assert_eq!(manager.seen_ops_next_sequence.load(Ordering::Relaxed), 3);
+    assert_eq!(manager.op_log_next_sequence.load(Ordering::Relaxed), 3);
+
+    let store_lifetime = Arc::downgrade(&store);
+    drop(handle);
+    drop(manager);
+    assert_eq!(Arc::strong_count(&store), 1);
+    drop(store);
+
+    assert_eq!(store_lifetime.strong_count(), 0);
+    wait_for_store_file_release(directory.path()).await.unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        state.values()
+    );
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), state);
+    assert_eq!(manager.op_log.read().await.as_slice(), &expected_ops);
+    for op in &expected_ops {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn local_rga_batch_failure_does_not_publish_insert_or_delete() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"first".to_vec(),
+    );
+
+    store.inject_disk_full_on_writes(true);
+    assert!(handle.insert_rga(insert.clone()).await.is_err());
+    assert!(manager.get_rga_values("comments:doc-1").await.is_empty());
+    assert!(manager.op_log.read().await.is_empty());
+    assert_eq!(manager.seen_ops.read().await.len(), 0);
+    assert!(
+        store
+            .get(&durable_rga_state_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_rga_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+
+    store.inject_disk_full_on_writes(false);
+    handle.insert_rga(insert.clone()).await.unwrap();
+    store.inject_disk_full_on_writes(true);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        vec![b"first".to_vec()]
+    );
+    assert!(read_durable_rga_state(&store, "comments:doc-1").contains(insert.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[insert]);
+    assert_eq!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn local_rga_flush_failure_blocks_retry_and_recovers_delete() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc-1",
+        None::<String>,
+        b"first".to_vec(),
+    );
+    handle.insert_rga(insert.clone()).await.unwrap();
+
+    store.inject_disk_full_on_flush(true);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(
+        manager.op_log.read().await.as_slice(),
+        std::slice::from_ref(&insert)
+    );
+    assert!(read_materialized_rga(&store, "comments:doc-1").is_empty());
+    let state = read_durable_rga_state(&store, "comments:doc-1");
+    assert!(!state.contains(insert.id.as_str()));
+    let stored_ops = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+    assert_eq!(stored_ops.len(), 2);
+    let delete = stored_ops
+        .iter()
+        .map(|(_, value)| parse_durable_op_log_value(value).unwrap().1)
+        .find(|op| op.id != insert.id)
+        .unwrap();
+
+    store.inject_disk_full_on_flush(false);
+    assert!(
+        handle
+            .delete_rga("comments:doc-1", insert.id.as_str())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("durability is uncertain")
+    );
+    assert_eq!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert!(manager.get_rga_values("comments:doc-1").await.is_empty());
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), state);
+    assert!(manager.seen_ops.read().await.contains(delete.id.as_str()));
+    assert_eq!(manager.op_log.read().await.as_slice(), &[insert, delete]);
+}
+
+#[tokio::test]
+async fn local_rga_insert_rejects_mismatched_identity_without_writing() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let invalid = Op::rga_insert(
+        NodeId::new("local-node"),
+        "comments:doc-1",
+        "different-element-id",
+        None::<String>,
+        b"value".to_vec(),
+    );
+    assert!(manager.handle().insert_rga(invalid).await.is_err());
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .get(&durable_rga_state_key("comments:doc-1"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn local_and_remote_rga_batches_preserve_elements_and_ignore_delayed_duplicates() {
+    let store = temp_store();
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+
+    for index in 0..12 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = manager.handle();
+        let local_op = Op::rga_insert_with_op_id(
+            handle.node_id().clone(),
+            "comments:doc-1",
+            None::<String>,
+            format!("local-{index}").into_bytes(),
+        );
+        let local_barrier = Arc::clone(&barrier);
+        let local = async {
+            local_barrier.wait().await;
+            handle.insert_rga(local_op.clone()).await
+        };
+        let remote_op = Op::rga_insert(
+            NodeId::new("remote-node"),
+            "comments:doc-1",
+            format!("remote-element-{index}"),
+            None::<String>,
+            format!("remote-{index}").into_bytes(),
+        );
+        let remote_barrier = Arc::clone(&barrier);
+        let remote = async {
+            remote_barrier.wait().await;
+            apply_remote_rga_op_for_test(
+                &remote_op,
+                &manager.rgas,
+                &manager.seen_ops,
+                &manager.seen_ops_next_sequence,
+                &manager.op_log,
+                &manager.op_log_next_sequence,
+                &store,
+            )
+            .await;
+        };
+        let (local_result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(local, remote)
+        })
+        .await
+        .expect("local and remote RGA writes must not deadlock");
+        local_result.unwrap();
+        apply_remote_rga_op_for_test(
+            &remote_op,
+            &manager.rgas,
+            &manager.seen_ops,
+            &manager.seen_ops_next_sequence,
+            &manager.op_log,
+            &manager.op_log_next_sequence,
+            &store,
+        )
+        .await;
+        assert!(manager.seen_ops.read().await.contains(local_op.id.as_str()));
+    }
+
+    let log = manager.op_log.read().await;
+    assert_eq!(log.len(), 24);
+    let mut expected = Rga::new();
+    for op in log.iter() {
+        let OpKind::RgaInsert {
+            id, parent, value, ..
+        } = &op.kind
+        else {
+            panic!("unexpected operation in RGA log: {:?}", op.kind);
+        };
+        expected.apply_insert(id.clone(), parent.clone(), value.clone());
+    }
+    assert_eq!(
+        manager.get_rga_values("comments:doc-1").await,
+        expected.values()
+    );
+    assert_eq!(
+        read_materialized_rga(&store, "comments:doc-1"),
+        expected.values()
+    );
+    assert_eq!(read_durable_rga_state(&store, "comments:doc-1"), expected);
+    assert_eq!(manager.seen_ops.read().await.len(), 24);
+}
+
+#[tokio::test]
+async fn local_batches_recover_all_families_without_volatile_enqueue() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+
+    let mut accepted = vec![
+        handle
+            .increment_gcounter("counter:visits", 2)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .increment_pncounter("balance:credits", 3)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .set_lww_register("status:service", b"ready".to_vec(), 10)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .set_lww_map("settings:service", "mode", b"active".to_vec(), 10)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .add_orset("tags:item", "blue")
+            .await
+            .unwrap()
+            .into_op(),
+    ];
+    let rga_insert = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "comments:doc",
+        None::<String>,
+        b"first".to_vec(),
+    );
+    handle.insert_rga(rga_insert.clone()).await.unwrap();
+    accepted.push(rga_insert);
+
+    // Simulate losing the volatile delivery path after each confirmed flush.
+    let sender = handle.op_sender();
+    assert_eq!(sender.capacity(), sender.max_capacity());
+    assert_eq!(manager.op_log.read().await.as_slice(), &accepted);
+    drop(sender);
+    drop(handle);
+    drop(manager);
+    drop(store);
+
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(manager.get_counter_value("counter:visits").await, 2);
+    assert_eq!(manager.get_pncounter_value("balance:credits").await, 3);
+    assert_eq!(
+        manager.get_lww_register_value("status:service").await,
+        Some(b"ready".to_vec())
+    );
+    assert_eq!(
+        manager.get_lww_map_entries("settings:service").await,
+        vec![("mode".to_string(), b"active".to_vec())]
+    );
+    assert_eq!(manager.get_orset_elements("tags:item").await, vec!["blue"]);
+    assert_eq!(
+        manager.get_rga_values("comments:doc").await,
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(manager.op_log.read().await.as_slice(), &accepted);
+    for op in &accepted {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+const CRASH_TEST_CASES: [&str; 10] = [
+    "gcounter",
+    "pncounter",
+    "pncounter_increment",
+    "lww_register",
+    "lww_map",
+    "lww_map_remove",
+    "orset",
+    "orset_remove",
+    "rga",
+    "rga_delete",
+];
+
+fn crash_test_keys(case: &str) -> (Vec<u8>, Vec<u8>) {
+    let key = "crash:local";
+    match case {
+        "gcounter" => (
+            durable_gcounter_state_key(key),
+            materialized_gcounter_key(key),
+        ),
+        "pncounter" | "pncounter_increment" => (
+            durable_pncounter_state_key(key),
+            materialized_pncounter_key(key),
+        ),
+        "lww_register" => (
+            durable_lww_register_state_key(key),
+            materialized_lww_register_key(key),
+        ),
+        "lww_map" | "lww_map_remove" => (
+            durable_lww_map_state_key(key),
+            materialized_lww_map_key(key),
+        ),
+        "orset" | "orset_remove" => (durable_orset_state_key(key), materialized_orset_key(key)),
+        "rga" | "rga_delete" => (durable_rga_state_key(key), materialized_rga_key(key)),
+        _ => panic!("unknown crash test case: {case}"),
+    }
+}
+
+#[tokio::test]
+async fn local_crdt_crash_child() {
+    let Ok(family) = std::env::var("NUMAX_CRASH_TEST_FAMILY") else {
+        return;
+    };
+    let directory = std::env::var("NUMAX_CRASH_TEST_STORE").unwrap();
+    let marker = std::env::var("NUMAX_CRASH_TEST_MARKER").unwrap();
+    let checkpoint = match std::env::var("NUMAX_CRASH_TEST_CHECKPOINT")
+        .unwrap()
+        .as_str()
+    {
+        "before_batch" => CrashCheckpoint::BeforeBatch,
+        "before_flush" => CrashCheckpoint::BeforeFlush,
+        "after_flush" => CrashCheckpoint::AfterFlush,
+        other => panic!("unknown crash checkpoint: {other}"),
+    };
+    let store = Arc::new(NxStore::open(directory).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let key = "crash:local";
+    let inserted_id = match family.as_str() {
+        "lww_map_remove" => {
+            handle
+                .set_lww_map(key, "mode", b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+            None
+        }
+        "orset_remove" => {
+            handle.add_orset(key, "blue").await.unwrap();
+            None
+        }
+        "rga_delete" => {
+            let op = Op::rga_insert_with_op_id(
+                handle.node_id().clone(),
+                key,
+                None::<String>,
+                b"first".to_vec(),
+            );
+            let id = op.id.as_str().to_string();
+            handle.insert_rga(op).await.unwrap();
+            Some(id)
+        }
+        _ => None,
+    };
+    store.inject_crash_checkpoint(checkpoint, marker.into());
+    match family.as_str() {
+        "gcounter" => {
+            handle.increment_gcounter(key, 3).await.unwrap();
+        }
+        "pncounter" => {
+            handle.decrement_pncounter(key, 3).await.unwrap();
+        }
+        "pncounter_increment" => {
+            handle.increment_pncounter(key, 3).await.unwrap();
+        }
+        "lww_register" => {
+            handle
+                .set_lww_register(key, b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+        }
+        "lww_map" => {
+            handle
+                .set_lww_map(key, "mode", b"ready".to_vec(), 7)
+                .await
+                .unwrap();
+        }
+        "lww_map_remove" => {
+            handle.remove_lww_map(key, "mode", 8).await.unwrap();
+        }
+        "orset" => {
+            handle.add_orset(key, "blue").await.unwrap();
+        }
+        "orset_remove" => {
+            handle.remove_orset(key, "blue").await.unwrap().unwrap();
+        }
+        "rga" => {
+            let op = Op::rga_insert_with_op_id(
+                handle.node_id().clone(),
+                key,
+                None::<String>,
+                b"first".to_vec(),
+            );
+            handle.insert_rga(op).await.unwrap();
+        }
+        "rga_delete" => {
+            handle
+                .delete_rga(key, inserted_id.as_deref().unwrap())
+                .await
+                .unwrap();
+        }
+        _ => panic!("unknown crash test family: {family}"),
+    }
+    panic!("mutation passed an armed crash checkpoint");
+}
+
+#[test]
+fn local_crdt_process_crash_preserves_complete_batches() {
+    use std::process::Command;
+
+    for family in CRASH_TEST_CASES {
+        for checkpoint in ["before_batch", "before_flush", "after_flush"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store_path = directory.path().join("store");
+            let marker = directory.path().join("checkpoint");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync_manager::manager::tests::local_crdt_crash_child",
+                    "--nocapture",
+                ])
+                .env("NUMAX_CRASH_TEST_FAMILY", family)
+                .env("NUMAX_CRASH_TEST_CHECKPOINT", checkpoint)
+                .env("NUMAX_CRASH_TEST_STORE", &store_path)
+                .env("NUMAX_CRASH_TEST_MARKER", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = StdInstant::now() + std::time::Duration::from_secs(10);
+            while !marker.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("crash child exited before {family}/{checkpoint}: {status}");
+                }
+                if StdInstant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("crash child did not reach {family}/{checkpoint}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let store = Arc::new(NxStore::open(&store_path).unwrap());
+            let (state_key, materialized_key) = crash_test_keys(family);
+            let state = store.get(&state_key).unwrap();
+            let materialized = store.get(&materialized_key).unwrap();
+            let seen = store.scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes()).unwrap();
+            let replay = store.scan_prefix(OP_LOG_STORE_PREFIX.as_bytes()).unwrap();
+            let baseline_count = usize::from(matches!(
+                family,
+                "lww_map_remove" | "orset_remove" | "rga_delete"
+            ));
+            assert!(
+                replay.len() == baseline_count || replay.len() == baseline_count + 1,
+                "{family}/{checkpoint}: replay count"
+            );
+            let survived = replay.len() == baseline_count + 1;
+            let progress = replication_progress(&store).unwrap();
+            if replay.is_empty() {
+                assert!(
+                    progress.is_empty(),
+                    "{family}/{checkpoint}: unexpected receipt"
+                );
+            } else {
+                assert_eq!(progress.len(), 1);
+                assert_eq!(
+                    progress[0].contiguous_sequence,
+                    replay.len() as u64,
+                    "{family}/{checkpoint}: receipt frontier"
+                );
+                assert_eq!(progress[0].sparse_positions, 0);
+            }
+            assert_eq!(
+                store
+                    .scan_prefix(b"__nx/crdt/sequence/replay/")
+                    .unwrap()
+                    .len(),
+                replay.len(),
+                "{family}/{checkpoint}: replay positions"
+            );
+            assert_eq!(
+                materialized.is_some(),
+                baseline_count != 0 || survived,
+                "{family}/{checkpoint}: materialized"
+            );
+            assert_eq!(
+                state.is_some(),
+                baseline_count != 0 || survived,
+                "{family}/{checkpoint}: state"
+            );
+            assert_eq!(
+                seen.len(),
+                baseline_count + usize::from(survived),
+                "{family}/{checkpoint}: seen"
+            );
+            if checkpoint == "before_batch" {
+                assert!(!survived, "{family}: operation appeared before batch");
+            } else if checkpoint == "after_flush" {
+                assert!(survived, "{family}: confirmed flush lost operation");
+            }
+
+            let manager = SyncManager::try_new(
+                NodeId::new("local-node"),
+                SyncConfig::new(),
+                Arc::clone(&store),
+                metrics(),
+            )
+            .unwrap();
+            let log = manager.op_log.blocking_read();
+            assert_eq!(
+                log.len(),
+                baseline_count + usize::from(survived),
+                "{family}/{checkpoint}: hydrated log"
+            );
+            for op in log.iter() {
+                let sequenced = sequenced_op(&store, op).unwrap().unwrap();
+                assert!(sequenced.position.generation > 0);
+                assert!(
+                    sequenced.position.sequence > 0
+                        && sequenced.position.sequence <= log.len() as u64
+                );
+                assert!(manager.seen_ops.blocking_read().contains(op.id.as_str()));
+                assert!(
+                    store
+                        .get(&seen_op_store_key(op.id.as_str()))
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    store
+                        .get(&op_log_store_key(op.id.as_str()))
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            if survived {
+                let mutation = &log[baseline_count];
+                match family {
+                    "pncounter_increment" => assert!(matches!(
+                        mutation.kind,
+                        OpKind::PNCounterIncrement { increment: 3, .. }
+                    )),
+                    "lww_map_remove" => assert!(matches!(
+                        mutation.kind,
+                        OpKind::LwwMapRemove {
+                            timestamp_ms: 8,
+                            ..
+                        }
+                    )),
+                    "orset_remove" => assert!(matches!(
+                        &mutation.kind,
+                        OpKind::ORSetRemove { observed_tags, .. }
+                            if observed_tags == &[log[0].id.as_str().to_string()]
+                    )),
+                    "rga_delete" => assert!(matches!(
+                        &mutation.kind,
+                        OpKind::RgaDelete { id, .. } if id == log[0].id.as_str()
+                    )),
+                    _ => {}
+                }
+            }
+            drop(log);
+            if survived {
+                let key = "crash:local";
+                match family {
+                    "gcounter" => {
+                        assert_eq!(read_materialized(&store, key), 3);
+                        assert_eq!(read_durable_gcounter_state(&store, key).value(), 3);
+                    }
+                    "pncounter" => {
+                        assert_eq!(read_materialized_pncounter(&store, key), -3);
+                        assert_eq!(read_durable_pncounter_state(&store, key).value(), -3);
+                    }
+                    "pncounter_increment" => {
+                        assert_eq!(read_materialized_pncounter(&store, key), 3);
+                        assert_eq!(read_durable_pncounter_state(&store, key).value(), 3);
+                    }
+                    "lww_register" => {
+                        assert_eq!(read_materialized_lww_register(&store, key), b"ready");
+                        assert_eq!(
+                            read_durable_lww_register_state(&store, key).timestamp_ms(),
+                            7
+                        );
+                    }
+                    "lww_map" => {
+                        assert_eq!(
+                            read_materialized_lww_map(&store, key),
+                            vec![("mode".into(), b"ready".to_vec())]
+                        );
+                        assert_eq!(
+                            read_durable_lww_map_state(&store, key).entries(),
+                            vec![("mode".into(), b"ready".to_vec())]
+                        );
+                    }
+                    "lww_map_remove" => {
+                        assert!(read_materialized_lww_map(&store, key).is_empty());
+                        let state = read_durable_lww_map_state(&store, key);
+                        let entry = state.entry("mode").unwrap();
+                        assert!(!entry.is_visible());
+                        assert_eq!(entry.timestamp_ms(), 8);
+                    }
+                    "orset" => {
+                        assert_eq!(read_materialized_orset(&store, key), vec!["blue"]);
+                        let op = &manager.op_log.blocking_read()[0];
+                        assert_eq!(
+                            read_durable_orset_state(&store, key).observed_tags("blue"),
+                            vec![op.id.as_str().to_string()]
+                        );
+                    }
+                    "orset_remove" => {
+                        assert!(read_materialized_orset(&store, key).is_empty());
+                        assert!(!read_durable_orset_state(&store, key).contains("blue"));
+                    }
+                    "rga" => {
+                        assert_eq!(read_materialized_rga(&store, key), vec![b"first".to_vec()]);
+                        assert_eq!(
+                            read_durable_rga_state(&store, key).values(),
+                            vec![b"first".to_vec()]
+                        );
+                    }
+                    "rga_delete" => {
+                        assert!(read_materialized_rga(&store, key).is_empty());
+                        let inserted_id = manager.op_log.blocking_read()[0].id.as_str().to_string();
+                        let state = read_durable_rga_state(&store, key);
+                        assert_eq!(state.ordered_ids(), vec![inserted_id.clone()]);
+                        assert!(!state.contains(&inserted_id));
+                    }
+                    _ => unreachable!(),
+                }
+            } else if baseline_count != 0 {
+                let key = "crash:local";
+                match family {
+                    "lww_map_remove" => {
+                        let visible = vec![("mode".into(), b"ready".to_vec())];
+                        assert_eq!(read_materialized_lww_map(&store, key), visible);
+                        assert_eq!(read_durable_lww_map_state(&store, key).entries(), visible);
+                    }
+                    "orset_remove" => {
+                        assert_eq!(read_materialized_orset(&store, key), vec!["blue"]);
+                        let inserted_id = manager.op_log.blocking_read()[0].id.as_str().to_string();
+                        assert_eq!(
+                            read_durable_orset_state(&store, key).observed_tags("blue"),
+                            vec![inserted_id]
+                        );
+                    }
+                    "rga_delete" => {
+                        let visible = vec![b"first".to_vec()];
+                        assert_eq!(read_materialized_rga(&store, key), visible);
+                        assert_eq!(read_durable_rga_state(&store, key).values(), visible);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_local_successes_wait_for_their_own_flush_and_recover() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let manager = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    )
+    .unwrap();
+    let handle = manager.handle();
+    let flushes_before = store.completed_flushes();
+    let mut accepted = vec![
+        handle
+            .set_lww_map("concurrent:map", "obsolete", b"remove-me".to_vec(), 1)
+            .await
+            .unwrap()
+            .into_op(),
+        handle
+            .add_orset("concurrent:set", "red")
+            .await
+            .unwrap()
+            .into_op(),
+    ];
+    let removable_rga = Op::rga_insert_with_op_id(
+        handle.node_id().clone(),
+        "concurrent:rga",
+        None::<String>,
+        b"obsolete".to_vec(),
+    );
+    let removable_rga_id = removable_rga.id.as_str().to_string();
+    handle.insert_rga(removable_rga.clone()).await.unwrap();
+    accepted.push(removable_rga);
+    let flushes_before_pause = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .increment_gcounter("concurrent:counter", 1)
+            .await
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_finished(), "local success preceded its flush");
+    assert_eq!(store.completed_flushes(), flushes_before_pause);
+
+    let mut pending = Vec::new();
+    for _ in 0..7 {
+        let handle = handle.clone();
+        pending.push(tokio::spawn(async move {
+            handle.increment_gcounter("concurrent:counter", 1).await
+        }));
+    }
+    let pn_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        pn_handle.increment_pncounter("concurrent:balance", 3).await
+    }));
+    let pn_decrement_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        pn_decrement_handle
+            .decrement_pncounter("concurrent:balance", 1)
+            .await
+    }));
+    let register_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        register_handle
+            .set_lww_register("concurrent:register", b"ready".to_vec(), 7)
+            .await
+    }));
+    let map_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        map_handle
+            .set_lww_map("concurrent:map", "mode", b"ready".to_vec(), 7)
+            .await
+    }));
+    let map_remove_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        map_remove_handle
+            .remove_lww_map("concurrent:map", "obsolete", 8)
+            .await
+    }));
+    let set_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        set_handle.add_orset("concurrent:set", "blue").await
+    }));
+    let set_remove_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        set_remove_handle
+            .remove_orset("concurrent:set", "red")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected observed ORSet tags"))
+    }));
+    let rga_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        let op = Op::rga_insert_with_op_id(
+            rga_handle.node_id().clone(),
+            "concurrent:rga",
+            None::<String>,
+            b"first".to_vec(),
+        );
+        rga_handle.insert_rga(op).await
+    }));
+    let rga_delete_handle = handle.clone();
+    pending.push(tokio::spawn(async move {
+        rga_delete_handle
+            .delete_rga("concurrent:rga", &removable_rga_id)
+            .await
+    }));
+
+    assert!(pending.iter().all(|task| !task.is_finished()));
+    resume_tx.send(()).unwrap();
+    accepted.push(first.await.unwrap().unwrap().into_op());
+    for task in pending {
+        accepted.push(task.await.unwrap().unwrap().into_op());
+    }
+    assert_eq!(accepted.len(), 20);
+    assert_eq!(
+        store.completed_flushes() - flushes_before,
+        accepted.len() as u64,
+        "each accepted local batch must complete a flush"
+    );
+    let ids = accepted
+        .iter()
+        .map(|op| op.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), accepted.len());
+    assert_eq!(manager.get_counter_value("concurrent:counter").await, 8);
+    assert_eq!(manager.op_log.read().await.len(), accepted.len());
+    for op in &accepted {
+        assert!(manager.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            store
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+    let reopened = Arc::new(NxStore::open(directory.path()).unwrap());
+    let hydrated = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&reopened),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(read_materialized(&reopened, "concurrent:counter"), 8);
+    assert_eq!(
+        read_durable_gcounter_state(&reopened, "concurrent:counter").value(),
+        8
+    );
+    assert_eq!(
+        read_materialized_pncounter(&reopened, "concurrent:balance"),
+        2
+    );
+    assert_eq!(
+        read_materialized_lww_register(&reopened, "concurrent:register"),
+        b"ready"
+    );
+    assert_eq!(
+        read_materialized_lww_map(&reopened, "concurrent:map"),
+        vec![("mode".to_string(), b"ready".to_vec())]
+    );
+    assert_eq!(
+        read_materialized_orset(&reopened, "concurrent:set"),
+        vec!["blue"]
+    );
+    assert_eq!(
+        read_materialized_rga(&reopened, "concurrent:rga"),
+        vec![b"first".to_vec()]
+    );
+    assert_eq!(hydrated.op_log.read().await.len(), accepted.len());
+    for op in &accepted {
+        assert!(hydrated.seen_ops.read().await.contains(op.id.as_str()));
+        assert!(
+            reopened
+                .get(&seen_op_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .get(&op_log_store_key(op.id.as_str()))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_success_during_shutdown_still_waits_for_its_flush() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let config = SyncConfig::new().with_listen_addr(free_addr());
+    let (mut manager, handle) =
+        started_manager_with_store(NodeId::new("local-node"), config, Arc::clone(&store)).await;
+    let flushes_before = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+
+    let submit_handle = handle.clone();
+    let submission = tokio::spawn(async move {
+        submit_handle
+            .submit_gcounter_increment("shutdown:counter", 1)
+            .await
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !submission.is_finished(),
+        "local success preceded its flush"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+
+    let mut shutdown_rx = manager.shutdown_tx.subscribe();
+    let shutdown = tokio::spawn(async move { manager.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*shutdown_rx.borrow());
+    assert!(
+        !submission.is_finished(),
+        "shutdown bypassed the local flush"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), submission)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    drop(handle);
+    drop(store);
+    let reopened = Arc::new(NxStore::open(directory.path()).unwrap());
+    let hydrated = SyncManager::try_new(
+        NodeId::new("local-node"),
+        SyncConfig::new(),
+        Arc::clone(&reopened),
+        metrics(),
+    )
+    .unwrap();
+    assert_eq!(read_materialized(&reopened, "shutdown:counter"), 1);
+    assert_eq!(
+        read_durable_gcounter_state(&reopened, "shutdown:counter").value(),
+        1
+    );
+    let log = hydrated.op_log.read().await;
+    assert_eq!(log.len(), 1);
+    let op_id = log[0].id.as_str();
+    assert!(hydrated.seen_ops.read().await.contains(op_id));
+    assert!(reopened.get(&seen_op_store_key(op_id)).unwrap().is_some());
+    assert!(reopened.get(&op_log_store_key(op_id)).unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_shutdown_retry_resumes_membership_leave_and_releases_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NxStore::open(directory.path()).unwrap());
+    let config = SyncConfig::new().with_listen_addr(free_addr());
+    let (mut manager, handle) =
+        started_manager_with_store(NodeId::new("leave-node"), config, Arc::clone(&store)).await;
+    let flushes_before = store.completed_flushes();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    store.pause_next_flush(reached_tx, resume_rx);
+    let reached = tokio::task::spawn_blocking(move || {
+        reached_rx.recv_timeout(std::time::Duration::from_secs(5))
+    });
+    {
+        // Cancel the caller while the terminal membership write is paused in its flush.
+        let shutdown = manager.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            result = &mut shutdown => panic!("shutdown finished during the paused leave flush: {result:?}"),
+            reached = reached => reached.unwrap().unwrap(),
+        }
+    }
+    assert!(
+        manager.membership.is_some(),
+        "a cancelled shutdown released the membership handle"
+    );
+    assert_eq!(store.completed_flushes(), flushes_before);
+
+    resume_tx.send(()).unwrap();
+    // Success requires the actor's confirmation that the terminal floor was flushed.
+    tokio::time::timeout(Duration::from_secs(10), manager.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manager.membership.is_none());
+    assert_eq!(store.completed_flushes(), flushes_before + 1);
+
+    drop(handle);
+    drop(manager);
+    drop(store);
+    NxStore::open(directory.path()).expect("shutdown released the datastore");
 }
 
 #[tokio::test]
@@ -2047,6 +5427,55 @@ async fn reconnect_loop_connects_configured_peer_that_starts_later() {
     assert_eq!(read_materialized(&store_b, key), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_push_is_forwarded_to_a_connected_neighbor() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let addr_c = free_addr();
+        let (mut alice, handle_a, _store_a) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_a)
+                .with_serialization_format(format),
+        )
+        .await;
+        let (mut bob, _handle_b, _store_b) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_b.clone())
+                .with_serialization_format(format),
+        )
+        .await;
+        let (mut carol, _handle_c, store_c) = started_manager_with_config(
+            SyncConfig::new()
+                .with_listen_addr(addr_c)
+                .with_serialization_format(format),
+        )
+        .await;
+
+        alice.connect_to_peer(&addr_b).await.unwrap();
+        carol.connect_to_peer(&addr_b).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bob.connected_peer_count().await < 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("relay node did not connect to both neighbors");
+
+        local_increment(&handle_a, "gossip-chain", 7).await;
+        wait_for_counter(&bob, "gossip-chain", 7).await;
+        wait_for_counter(&carol, "gossip-chain", 7).await;
+        assert_eq!(read_materialized(&store_c, "gossip-chain"), 7);
+
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+        carol.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn dynamic_candidate_connects_after_startup_with_an_empty_snapshot() {
     let addr_a = free_addr();
@@ -2179,7 +5608,13 @@ async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
     let recovery = async {
         let mut ops = Vec::new();
         for expected in 1..=3 {
-            ops.push(Op::gcounter_increment(source_id.clone(), "churn", 1));
+            ops.push(nx_sync::SequencedOp {
+                op: Op::gcounter_increment(source_id.clone(), "churn", 1),
+                position: nx_sync::OpPosition {
+                    generation: 1,
+                    sequence: expected,
+                },
+            });
             updates_rx.changed().await.unwrap();
             let first_change = *updates_rx.borrow_and_update();
             // Observe distinct published changes spanning a full anti-entropy
@@ -2195,40 +5630,47 @@ async fn anti_entropy_recovers_missing_ops_during_continuous_candidate_churn() {
             while let Ok(event) = source_events.try_recv() {
                 assert!(matches!(
                     event,
-                    NodeEvent::PeerConnected { .. } | NodeEvent::PullRequested { .. }
+                    NodeEvent::PeerConnected { .. } | NodeEvent::HistoryReceived { .. }
                 ));
             }
-            let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-            assert_eq!(since, None);
+            let (reply_addr, _) = source.connected_peers().await.into_iter().next().unwrap();
+            source
+                .send_history_to_addr(
+                    &reply_addr,
+                    nx_sync::HistoryMessage::Summary {
+                        entries: vec![nx_sync::HistorySummary {
+                            baseline_required: false,
+                            origin: source_id.clone(),
+                            high_sequence: expected,
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            let (reply_addr, request_id, origin, start, end) =
+                wait_for_history_request(&mut source_events).await;
+            assert_eq!(origin, source_id);
+            assert_eq!((start, end), (expected, expected));
             let change_at_pull = *updates_rx.borrow_and_update();
             updates_rx.changed().await.unwrap();
             assert!(*updates_rx.borrow_and_update() > change_at_pull);
             assert_eq!(target.get_counter_value("churn").await, expected - 1);
             source
-                .send_ops_to_addr(&reply_addr, ops.clone())
+                .send_history_to_addr(
+                    &reply_addr,
+                    nx_sync::HistoryMessage::Replay {
+                        request_id,
+                        origin,
+                        start,
+                        end,
+                        ops: vec![ops.last().unwrap().clone()],
+                    },
+                )
                 .await
                 .unwrap();
-
-            // FIFO on this connection makes the reply to our pull an apply
-            // barrier: the target must have processed the preceding ops first.
-            source
-                .send_pull_since_to_addr(&reply_addr, None)
-                .await
-                .unwrap();
-            loop {
-                match source_events
-                    .recv()
-                    .await
-                    .expect("peer event channel closed")
-                {
-                    NodeEvent::OpsReceived { ops: received, .. } => {
-                        assert_eq!(received, ops);
-                        break;
-                    }
-                    NodeEvent::PullRequested { .. } => {}
-                    event => panic!("unexpected event during recovery: {event:?}"),
-                }
-            }
+            wait_for_counter(&target, "churn", expected).await;
+            let progress = target.handle().replication_progress().unwrap();
+            assert_eq!(progress[0].contiguous_sequence, expected);
             assert_eq!(target.get_counter_value("churn").await, expected);
         }
     };
@@ -2268,11 +5710,44 @@ async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
 
     let older = Op::gcounter_increment(source_id.clone(), "missing", 3);
     let newer = Op::gcounter_increment(source_id.clone(), "received", 7);
+    let old_entry = nx_sync::SequencedOp {
+        op: older.clone(),
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence: 1,
+        },
+    };
+    let new_entry = nx_sync::SequencedOp {
+        op: newer.clone(),
+        position: nx_sync::OpPosition {
+            generation: 1,
+            sequence: 2,
+        },
+    };
     source
-        .send_ops_to_addr(&addr, vec![newer.clone()])
+        .send_history_to_addr(
+            &addr,
+            nx_sync::HistoryMessage::Push {
+                ops: vec![new_entry.clone()],
+            },
+        )
         .await
         .unwrap();
-    wait_for_counter(&target, "received", 7).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        let complete = target.get_counter_value("received").await == 7
+            && target.anti_entropy_watermarks.read().await.get(&source_id)
+                == Some(&newer.id.as_str().to_string());
+        assert!(
+            Instant::now() < deadline,
+            "received state and watermark did not complete"
+        );
+        if complete {
+            break;
+        }
+        poll.tick().await;
+    }
     assert_eq!(target.get_counter_value("missing").await, 0);
     assert_eq!(
         target.anti_entropy_watermarks.read().await.get(&source_id),
@@ -2285,20 +5760,44 @@ async fn anti_entropy_inbound_only_max_peers_one_recovers_older_missing_op() {
 
     // A newer received op must not become a causal frontier. The inbound
     // transport address (not an advertised candidate) is the only valid target.
-    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-    assert_eq!(since, None);
+    let (reply_addr, request_id, origin, start, end) =
+        wait_for_history_request(&mut source_events).await;
+    assert_eq!(origin, source_id);
+    assert_eq!((start, end), (1, 2));
     source
-        .send_ops_to_addr(&reply_addr, vec![older.clone(), newer.clone()])
+        .send_history_to_addr(
+            &reply_addr,
+            nx_sync::HistoryMessage::Replay {
+                request_id,
+                origin,
+                start,
+                end: start,
+                ops: vec![old_entry.clone()],
+            },
+        )
         .await
         .unwrap();
     wait_for_counter(&target, "missing", 3).await;
 
-    // Repeated full bounded-log pulls must still deduplicate previously seen ops.
-    let (reply_addr, since) = wait_for_pull_request(&mut source_events).await;
-    assert_eq!(since, None);
+    // Replayed positions are suppressed even after the gap has closed.
     let barrier = Op::gcounter_increment(source_id, "barrier", 1);
     source
-        .send_ops_to_addr(&reply_addr, vec![older, newer, barrier])
+        .send_history_to_addr(
+            &reply_addr,
+            nx_sync::HistoryMessage::Push {
+                ops: vec![
+                    old_entry,
+                    new_entry,
+                    nx_sync::SequencedOp {
+                        op: barrier,
+                        position: nx_sync::OpPosition {
+                            generation: 1,
+                            sequence: 3,
+                        },
+                    },
+                ],
+            },
+        )
         .await
         .unwrap();
     wait_for_counter(&target, "barrier", 1).await;
@@ -2426,6 +5925,12 @@ async fn anti_entropy_pull_converges_peer_that_missed_broadcast() {
 
 #[tokio::test]
 async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
+    // sled's process-global batch lock also blocks reads in unrelated test stores.
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::intermittent_network_with_ten_percent_lost_pushes_converges",
+    ) {
+        return;
+    }
     let key = "visits";
     let addr_a = free_addr();
     let addr_b = free_addr();
@@ -2434,13 +5939,13 @@ async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
         .with_listen_addr(addr_a.clone())
         .with_peer(addr_b.clone())
         .with_anti_entropy_interval(Duration::from_millis(10));
-    let (manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
+    let (mut manager_a, handle_a, store_a) = started_manager_with_config(config_a).await;
 
     let config_b = SyncConfig::new()
         .with_listen_addr(addr_b)
         .with_peer(addr_a)
         .with_anti_entropy_interval(Duration::from_millis(10));
-    let (manager_b, _handle_b, store_b) = started_manager_with_config(config_b).await;
+    let (mut manager_b, handle_b, store_b) = started_manager_with_config(config_b).await;
 
     wait_for_connected_peer(&manager_a).await;
     wait_for_connected_peer(&manager_b).await;
@@ -2453,10 +5958,26 @@ async fn intermittent_network_with_ten_percent_lost_pushes_converges() {
         }
     }
 
+    let recovery_started = StdInstant::now();
     wait_for_counter(&manager_b, key, 100).await;
+    assert!(
+        recovery_started.elapsed() < Duration::from_secs(5),
+        "lost-push recovery exceeded five seconds: {:?}",
+        recovery_started.elapsed()
+    );
     assert_eq!(manager_a.get_counter_value(key).await, 100);
     assert_eq!(read_materialized(&store_a, key), 100);
     assert_eq!(read_materialized(&store_b, key), 100);
+    let progress = handle_b.replication_progress().unwrap();
+    let source_progress = progress
+        .iter()
+        .find(|p| p.origin == *handle_a.node_id())
+        .unwrap();
+    assert_eq!(source_progress.contiguous_sequence, 100);
+    assert_eq!(source_progress.known_high_sequence, 100);
+    assert_eq!(source_progress.sparse_positions, 0);
+    manager_a.shutdown().await.unwrap();
+    manager_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2660,6 +6181,9 @@ async fn peer_rotation_replaces_dead_peer_with_available_configured_peer() {
         "peer C should not be marked failed while peer slots are full"
     );
 
+    // Lose transport before graceful shutdown: a delivered owner-issued Left
+    // correctly stops reconnect instead of promising a Dead endpoint transition.
+    manager_b.node.as_ref().unwrap().shutdown().await;
     manager_b.shutdown().await.unwrap();
 
     wait_for_peer_health(&manager_a, &addr_b, PeerHealthState::Dead).await;
@@ -2677,8 +6201,7 @@ async fn shutdown_drains_queued_ops_before_closing_connections() {
 
     manager_a.connect_to_peer(&addr_b).await.unwrap();
 
-    let op = Op::gcounter_increment(handle_a.node_id().clone(), key, 1);
-    handle_a.op_sender().send(op).await.unwrap();
+    handle_a.submit_gcounter_increment(key, 1).await.unwrap();
     manager_a.shutdown().await.unwrap();
 
     wait_for_counter(&manager_b, key, 1).await;
@@ -2701,6 +6224,50 @@ async fn manager_normalizes_empty_queued_ops_limit() {
     let manager = SyncManager::new(NodeId::generate(), config, Arc::clone(&store), metrics());
 
     assert_eq!(manager.op_sender().max_capacity(), 1);
+}
+
+#[tokio::test]
+async fn public_gcounter_submission_rejects_closed_queue_before_persistence() {
+    let store = temp_store();
+    let manager = SyncManager::new(
+        NodeId::generate(),
+        SyncConfig::new(),
+        Arc::clone(&store),
+        metrics(),
+    );
+    let handle = manager.handle();
+    drop(manager);
+
+    assert!(
+        handle
+            .submit_gcounter_increment("counter:visits", 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .get(&durable_gcounter_state_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&materialized_gcounter_key("counter:visits"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scan_prefix(SEEN_OP_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .scan_prefix(OP_LOG_STORE_PREFIX.as_bytes())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
