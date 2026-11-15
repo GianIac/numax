@@ -206,7 +206,7 @@ explicitly after their daemons have stopped.
   explanation of both.
 - Do not change grid size, seed or hotspot count on an existing manual store:
   its persisted positions may no longer belong to that world.
-- Run helper tests with `python3 -m unittest discover -s ../ -p test_swarm_demo.py`;
+- Run helper tests with `python3 -m unittest discover -s ../swarm_control -p test_swarm_demo.py`;
   opt into real daemon lifecycle tests with `NUMAX_SWARM_E2E=1`. Those tests
   use the debug `nx` binary and the built swarm WASM modules.
 

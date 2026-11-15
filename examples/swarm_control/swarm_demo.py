@@ -173,7 +173,7 @@ allow_non_loopback = false
             payload["demo:completed"] = ""
         if clear_snapshot:
             payload["demo:snapshot"] = ""
-        generator = Path(__file__).resolve().parent / "swarm_control/target/debug/swarm_control"
+        generator = Path(__file__).resolve().parent / "target/debug/swarm_control"
         generated = subprocess.run([str(generator)], input=json.dumps(payload).encode(), capture_output=True, timeout=10)
         if generated.returncode != 0:
             raise SwarmError("control guest generation failed")
@@ -371,14 +371,14 @@ def main() -> None:
     parser.add_argument("kind", choices=("ants", "magnets"))
     parser.add_argument("config", type=Path)
     parser.add_argument("--state", type=Path)
-    parser.add_argument("--nx", type=Path, default=Path(__file__).resolve().parent.parent / "target/debug/nx")
+    parser.add_argument("--nx", type=Path, default=Path(__file__).resolve().parent.parent.parent / "target/debug/nx")
     parser.add_argument("--timeout", type=float, default=60)
     arguments = parser.parse_args()
     if not 0 < arguments.timeout <= 600:
         parser.error("timeout must be between 0 and 600 seconds")
     with arguments.config.open("rb") as stream:
         config = tomllib.load(stream)
-    example = Path(__file__).resolve().parent / f"distributed_{arguments.kind}"
+    example = Path(__file__).resolve().parent.parent / f"distributed_{arguments.kind}"
     root = arguments.state or example / "runs" / secrets.token_hex(8)
     fleet = Fleet(arguments.kind, config, root, arguments.nx,
                   example / "target/wasm32-unknown-unknown/release" / f"distributed_{arguments.kind}.wasm", arguments.timeout)
