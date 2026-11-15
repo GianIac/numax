@@ -166,14 +166,31 @@ test("rejects mismatched workload profiles", () => {
 });
 
 test("rejects the historical enqueue-only baseline, even against itself", () => {
-  const historical = JSON.parse(readFileSync(
-    new URL("../crates/nx-core/reports/baselines/three-node-sync-smoke.json", import.meta.url),
-    "utf8",
-  ));
+  const historical = {
+    ...reportWith(),
+    report_schema_version: 1,
+    profile: {
+      nodes: 3,
+      duration_secs: 10,
+      target_ops_sec_per_node: 1000,
+      anti_entropy_interval_secs: 80,
+    },
+  };
   assert.throws(
     () => compareReports(historical, historical),
     /report_schema_version/,
   );
+});
+
+test("committed baseline satisfies the durable-ack report contract", () => {
+  const committedBaseline = JSON.parse(readFileSync(
+    new URL("../crates/nx-core/reports/baselines/three-node-sync-smoke.json", import.meta.url),
+    "utf8",
+  ));
+  const aggregate = aggregateReports([committedBaseline]);
+  assert.equal(aggregate.report_schema_version, 2);
+  assert.equal(aggregate.profile.acceptance, "local-durable-flush-v1");
+  assert.ok(Number.isFinite(aggregate.resources.rss_bytes));
 });
 
 test("rejects mismatched acceptance profiles", () => {
