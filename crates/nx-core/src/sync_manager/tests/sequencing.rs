@@ -798,6 +798,7 @@ async fn sequenced_sparse_duplicate_survives_restart_before_gap_closes() {
     store.flush().unwrap();
     drop(target);
     drop(store);
+    wait_for_store_file_release(directory.path()).await.unwrap();
     let store = Arc::new(NxStore::open(directory.path()).unwrap());
     let target =
         SyncManager::try_new(NodeId::new("target"), config, Arc::clone(&store), metrics()).unwrap();
@@ -923,6 +924,7 @@ async fn migrated_v015_all_families_preserve_state_and_reject_legacy_after_evict
     store.flush().unwrap();
     drop(target);
     drop(store);
+    wait_for_store_file_release(directory.path()).await.unwrap();
     let store = Arc::new(NxStore::open(directory.path()).unwrap());
     let target = SyncManager::try_new(origin, config, Arc::clone(&store), metrics()).unwrap();
     let mut context = test_event_context(
