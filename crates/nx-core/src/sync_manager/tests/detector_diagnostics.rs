@@ -201,6 +201,7 @@ struct CriticalPath {
 #[derive(Default)]
 struct RemoteReplayTrace {
     started: Option<StdInstant>,
+    closed: bool,
     batches: VecDeque<Value>,
     operations: usize,
     dropped_batches: u64,
@@ -535,7 +536,7 @@ impl Diagnostics {
 
     pub(super) fn remote_replay_snapshot(&self) -> anyhow::Result<Value> {
         crate::sync_manager::apply::set_remote_replay_trace_enabled(false);
-        let trace = self
+        let mut trace = self
             .remote_replay
             .as_ref()
             .context("remote replay recorder is inactive")?
@@ -545,21 +546,28 @@ impl Diagnostics {
             trace.started.is_some(),
             "remote replay capture was not started"
         );
+        trace.closed = true;
         if trace.overflowed {
             self.check_event_errors("remote replay trace exceeded its bound")?;
             anyhow::bail!("remote replay trace exceeded its bound");
         }
         ensure!(
-            trace
-                .batches
-                .iter()
-                .all(|batch| batch["applied_ops"].is_u64()
-                    && batch["duplicate_ops"].is_u64()
-                    && batch["applied_ids"].is_array()
-                    && batch["duplicate_ids"].is_array()
-                    && batch["success"] == true),
+            trace.batches.iter().all(|batch| {
+                (batch["applied_ops"].is_null()
+                    && batch["duplicate_ops"].is_null()
+                    && batch["applied_ids"].is_null()
+                    && batch["duplicate_ids"].is_null()
+                    && batch["success"].is_null())
+                    || (batch["applied_ops"].is_u64()
+                        && batch["duplicate_ops"].is_u64()
+                        && batch["applied_ids"].is_array()
+                        && batch["duplicate_ids"].is_array()
+                        && batch["success"] == true)
+            }),
             "remote replay trace has an unpaired or failed apply batch"
         );
+        let mut in_flight_batches = 0u64;
+        let mut in_flight_operations = 0u64;
         for batch in &trace.batches {
             let entries = batch["entries"]
                 .as_array()
@@ -570,6 +578,17 @@ impl Diagnostics {
                     .all(|entry| entry["expected_workload"] == true),
                 "remote replay trace contains an operation outside the nominal GCounter workload"
             );
+            if batch["applied_ops"].is_null() {
+                in_flight_batches += 1;
+                in_flight_operations = in_flight_operations
+                    .checked_add(
+                        batch["operations"]
+                            .as_u64()
+                            .context("batch operations missing")?,
+                    )
+                    .context("in-flight operation count overflow")?;
+                continue;
+            }
             let mut input_ids = entries
                 .iter()
                 .map(|entry| {
@@ -603,14 +622,16 @@ impl Diagnostics {
         }
         Ok(json!({
             "version": 1,
-            "complete": true,
+            "complete": in_flight_batches == 0,
             "operation_count": trace.operations,
             "batch_count": trace.batches.len(),
-            "window_complete": trace.dropped_batches == 0,
+            "window_complete": trace.dropped_batches == 0 && in_flight_batches == 0,
+            "in_flight_batch_count": in_flight_batches,
+            "in_flight_operation_count": in_flight_operations,
             "dropped_batch_count": trace.dropped_batches,
             "dropped_operation_count": trace.dropped_operations,
             "batches": trace.batches,
-            "interpretation": "bounded rolling suffix of complete GCounter remote apply batches; operation IDs and positions are retained, arbitrary CRDT payloads are not; offsets are worker-local from nominal start",
+            "interpretation": "bounded frozen GCounter remote apply trace; complete=false means apply was in flight at the cutoff and the trace is not replayable; operation IDs and positions are retained, arbitrary CRDT payloads are not; offsets are worker-local from nominal start",
         }))
     }
 
@@ -628,6 +649,9 @@ impl Diagnostics {
         let Some(started) = trace.started else {
             return;
         };
+        if trace.closed {
+            return;
+        }
         let (Some(operations), Some(entries)) = (
             fields.remote_apply_batch_operations,
             fields.remote_apply_batch_entries.as_ref(),
@@ -755,6 +779,9 @@ impl Diagnostics {
         let Some(started) = trace.started else {
             return;
         };
+        if trace.closed {
+            return;
+        }
         let (
             Some(input),
             Some(applied),
@@ -2311,8 +2338,14 @@ fn diagnostics_report_phase_local_remote_timings_and_batch_deltas() {
     assert_eq!(sample["history_batches"]["stop.control_priority"], 1);
 }
 
+fn remote_replay_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CAPTURE: Mutex<()> = Mutex::new(());
+    CAPTURE.lock().unwrap()
+}
+
 #[test]
 fn remote_replay_capture_pairs_operation_ids_and_classification() -> anyhow::Result<()> {
+    let _capture = remote_replay_test_guard();
     let diagnostics = Diagnostics::with_critical_path()?;
     diagnostics.begin_remote_replay_capture()?;
     let entries = [
@@ -2374,7 +2407,64 @@ fn diagnostic_errors_preserve_first_source_and_reject_snapshots() {
 }
 
 #[test]
+fn remote_replay_snapshot_marks_in_flight_apply_incomplete() -> anyhow::Result<()> {
+    let _capture = remote_replay_test_guard();
+    let diagnostics = Diagnostics::with_critical_path()?;
+    diagnostics.begin_remote_replay_capture()?;
+    diagnostics.record_remote_replay_batch(&Fields {
+        remote_apply_batch_operations: Some(1),
+        remote_apply_batch_trace_complete: true,
+        remote_apply_batch_entries: Some(vec![json!({
+            "id": "in-flight-operation", "origin": "detector-1",
+            "generation": 1, "sequence": 1, "size": 1,
+            "expected_workload": true,
+        })]),
+        ..Fields::default()
+    });
+    let frozen = diagnostics.remote_replay_snapshot()?;
+    assert_eq!(frozen["complete"], false);
+    assert_eq!(frozen["window_complete"], false);
+    assert_eq!(frozen["in_flight_batch_count"], 1);
+    assert_eq!(frozen["in_flight_operation_count"], 1);
+    diagnostics.record_remote_replay_apply(&Fields {
+        remote_apply_input_ops: Some(1),
+        remote_apply_applied_ops: Some(1),
+        remote_apply_duplicate_ops: Some(0),
+        remote_apply_applied_ids: Some(vec!["in-flight-operation".into()]),
+        remote_apply_duplicate_ids: Some(vec![]),
+        remote_apply_trace_complete: Some(true),
+        remote_apply_success: Some(true),
+        ..Fields::default()
+    });
+    diagnostics.event_snapshot()?;
+    assert_eq!(diagnostics.remote_replay_snapshot()?, frozen);
+    Ok(())
+}
+
+#[test]
+fn remote_replay_snapshot_ignores_late_apply_completion() -> anyhow::Result<()> {
+    let _capture = remote_replay_test_guard();
+    let diagnostics = Diagnostics::with_critical_path()?;
+    diagnostics.begin_remote_replay_capture()?;
+    let frozen = diagnostics.remote_replay_snapshot()?;
+    diagnostics.record_remote_replay_apply(&Fields {
+        remote_apply_input_ops: Some(1),
+        remote_apply_applied_ops: Some(1),
+        remote_apply_duplicate_ops: Some(0),
+        remote_apply_applied_ids: Some(vec!["late-operation".into()]),
+        remote_apply_duplicate_ids: Some(vec![]),
+        remote_apply_trace_complete: Some(true),
+        remote_apply_success: Some(true),
+        ..Fields::default()
+    });
+    diagnostics.event_snapshot()?;
+    assert_eq!(diagnostics.remote_replay_snapshot()?, frozen);
+    Ok(())
+}
+
+#[test]
 fn remote_replay_capture_rotates_completed_batches_at_limit() -> anyhow::Result<()> {
+    let _capture = remote_replay_test_guard();
     let diagnostics = Diagnostics::with_critical_path()?;
     diagnostics.begin_remote_replay_capture()?;
     for sequence in 0..REMOTE_REPLAY_BATCH_LIMIT + 2 {
@@ -2420,6 +2510,7 @@ fn remote_replay_capture_rotates_completed_batches_at_limit() -> anyhow::Result<
 
 #[test]
 fn remote_replay_capture_rejects_eviction_of_unpaired_batches() -> anyhow::Result<()> {
+    let _capture = remote_replay_test_guard();
     let diagnostics = Diagnostics::with_critical_path()?;
     diagnostics.begin_remote_replay_capture()?;
     for sequence in 0..=REMOTE_REPLAY_BATCH_LIMIT {

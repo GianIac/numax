@@ -208,6 +208,7 @@ async fn capture_stall(
         "status_samples_before": before,
         "interpretation": "asynchronous samples; source intervals are not logger delivery order; partial captures never certify nominal success",
     }));
+    group.begin_diagnostic_capture().await?;
     if critical {
         capture
             .critical_snapshots(group, &targets, 1, "critical_before")
@@ -311,6 +312,7 @@ async fn capture_stall(
                 .with_context(|| format!("cannot write {}", path.display()))?;
             capture.report.as_mut().context("capture report missing")?["remote_replay_trace"] = json!({
                 "file": "remote-replay-trace.json",
+                "complete": workers.iter().all(|worker| worker["trace"]["complete"] == true),
                 "workers": workers.len(),
                 "batches": batch_count,
                 "operations": operation_count,
@@ -2492,6 +2494,161 @@ fn convergence_failure_report(
     }))
 }
 
+fn verify_nominal_membership(current: &Value, count: usize) -> anyhow::Result<()> {
+    let counts = Counts::from_raw(&current["nominal_counters"])?;
+    ensure!(
+        counts.declared_dead == 0 && counts.learned_dead == 0,
+        "false failure verdict during nominal load: {counts:?}"
+    );
+    ensure!(
+        current["records"].as_u64() == Some(u64::try_from(count)?),
+        "worker lost membership subjects"
+    );
+    ensure!(
+        current["terminal"]
+            .as_array()
+            .context("terminal records missing")?
+            .is_empty(),
+        "terminal membership state during nominal load: {}",
+        current["terminal"]
+    );
+    Ok(())
+}
+
+fn arm_diagnostic_capture(
+    current: &Value,
+    count: usize,
+    nominal_end: &mut Option<Instant>,
+) -> anyhow::Result<()> {
+    if nominal_end.is_some() {
+        verify_nominal_membership(current, count)?;
+        *nominal_end = None;
+    }
+    Ok(())
+}
+
+#[test]
+fn diagnostic_capture_preserves_nominal_health_boundary() -> anyhow::Result<()> {
+    let mut current = json!({"nominal_counters": Counts::default().raw(),
+        "records": 3, "terminal": [{"member": "detector-2", "state": "Left"}]});
+    let end = Instant::now() + Duration::from_secs(8);
+    let mut nominal_end = Some(end);
+    assert!(arm_diagnostic_capture(&current, 3, &mut nominal_end).is_err());
+    assert_eq!(nominal_end, Some(end));
+    current["terminal"] = json!([]);
+    arm_diagnostic_capture(&current, 3, &mut nominal_end)?;
+    assert!(nominal_end.is_none());
+    current["terminal"] = json!([{"member": "detector-2", "state": "Left"}]);
+    assert!(verify_nominal_membership(&current, 3).is_err());
+    arm_diagnostic_capture(&current, 3, &mut nominal_end)?;
+    Ok(())
+}
+
+#[test]
+fn remote_replay_rejects_in_flight_capture() {
+    assert!(
+        parse_remote_replay_batches(&json!({"version": 1, "complete": false,
+        "in_flight_batch_count": 1, "in_flight_operation_count": 1}))
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostic_capture_barrier_survives_staggered_leave() -> anyhow::Result<()> {
+    if run_in_isolated_test_process(
+        "sync_manager::manager::tests::detector_soak::process::diagnostic_capture_barrier_survives_staggered_leave",
+    ) {
+        return Ok(());
+    }
+    let mut group = Processes::spawn(3, None)?;
+    let mut stopped = None;
+    let result = async {
+        let ready = group.phase("ready", None, FORMATION_LIMIT).await?;
+        let owners = ready
+            .iter()
+            .map(|row| row["owner"].clone())
+            .collect::<Vec<_>>();
+        group.broadcast(&json!({"command": "bootstrap", "owners": owners}), None)?;
+        group.phase("bootstrapped", None, FORMATION_LIMIT).await?;
+        let deadline = Instant::now() + FORMATION_LIMIT;
+        loop {
+            while group.receive()?.is_some() {}
+            if group
+                .rows()
+                .iter()
+                .all(|row| row["records"] == 3 && row["all_alive"] == true)
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "capture regression cluster did not form"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        group.broadcast(
+            &json!({"command": "nominal", "duration_s": 8, "period_s": 1,
+            "start_epoch_ms": epoch_ms()? + 3000}),
+            None,
+        )?;
+        group
+            .phase("nominal-armed", None, Duration::from_secs(3))
+            .await?;
+        group.begin_diagnostic_capture().await?;
+        group.command(2, &json!({"command": "stop"}))?;
+        group.children[2].input.take();
+        stopped = Some(2);
+        let deadline = Instant::now() + DETECTION_LIMIT;
+        loop {
+            loop {
+                match group.events.try_recv() {
+                    Ok(Event::Message(index, row)) => ensure!(
+                        row["phase"] != "error",
+                        "worker {index} failed after capture barrier: {row}"
+                    ),
+                    Ok(Event::Closed(2)) => {}
+                    Ok(Event::Closed(index)) => anyhow::bail!("capture observer {index} exited"),
+                    Ok(Event::Invalid(index, error)) => {
+                        anyhow::bail!("invalid capture worker {index}: {error}")
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        anyhow::bail!("capture readers disconnected")
+                    }
+                }
+            }
+            ensure!(
+                !group.overflow.load(Ordering::Relaxed),
+                "capture event queue overflowed"
+            );
+            let rows = group.rows();
+            if rows.iter().take(2).all(|row| {
+                row["terminal"].as_array().is_some_and(|records| {
+                    records
+                        .iter()
+                        .any(|record| record["member"] == "detector-2" && record["state"] == "Left")
+                })
+            }) {
+                for row in rows.iter().take(2) {
+                    assert!(verify_nominal_membership(row, 3).is_err());
+                }
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "capture observers did not observe graceful leave"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    let cleanup = group.stop(stopped).await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "internal worker; invoked only by the detector process coordinator"]
 async fn worker() {
@@ -2599,6 +2756,7 @@ async fn worker_run() -> anyhow::Result<()> {
         let mut operations = 0;
         let mut failure_target: Option<String> = None;
         let mut previous_state = None;
+        let mut capture_armed = false;
         loop {
             tokio::select! {
                 biased;
@@ -2726,6 +2884,14 @@ async fn worker_run() -> anyhow::Result<()> {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
+                        "diagnostic-capture" => {
+                            ensure!(!capture_armed && nominal_started.is_some()
+                                && failure_target.is_none(), "invalid diagnostic capture transition");
+                            let current = status(&node, &stats, &before, &diagnostics, &work_before)?;
+                            arm_diagnostic_capture(&current, count, &mut nominal_end)?;
+                            capture_armed = true;
+                            emit(json!({"phase": "diagnostic-capture-armed"}));
+                        }
                         "critical-snapshot" => {
                             let snapshot = diagnostics.critical_snapshot(true)?
                                 .context("critical snapshot requested for an inactive recorder")?;
@@ -2733,6 +2899,7 @@ async fn worker_run() -> anyhow::Result<()> {
                                 "request_id": number(&command, "request_id")?, "snapshot": snapshot}));
                         }
                         "remote-replay-snapshot" => {
+                            ensure!(capture_armed, "remote replay snapshot before capture barrier");
                             let trace = diagnostics.remote_replay_snapshot()?;
                             emit(json!({"phase": "remote-replay-snapshot",
                                 "request_id": number(&command, "request_id")?, "trace": trace}));
@@ -2749,12 +2916,7 @@ async fn worker_run() -> anyhow::Result<()> {
                     let current = status(&node, &stats, &before, &diagnostics, &work_before)?;
                     if let Some(end) = nominal_end {
                         let counts = Counts::from_raw(&current["nominal_counters"])?;
-                        ensure!(counts.declared_dead == 0 && counts.learned_dead == 0,
-                            "false failure verdict during nominal load: {counts:?}");
-                        ensure!(current["records"].as_u64() == Some(u64::try_from(count)?),
-                            "worker lost membership subjects");
-                        ensure!(current["terminal"].as_array().context("terminal records missing")?.is_empty(),
-                            "terminal membership state during nominal load: {}", current["terminal"]);
+                        verify_nominal_membership(&current, count)?;
                         if Instant::now() >= end {
                             ensure!(stats.offered.load(Ordering::Relaxed) == operations, "nominal offered load not achieved");
                             ensure!(Instant::now() <= end + final_drain, "nominal final drain exceeded its declared limit");
@@ -3198,6 +3360,13 @@ async fn diagnostic_failure_preserves_three_process_timelines() {
 }
 
 impl Processes {
+    async fn begin_diagnostic_capture(&mut self) -> anyhow::Result<()> {
+        self.broadcast(&json!({"command": "diagnostic-capture"}), None)?;
+        self.phase("diagnostic-capture-armed", None, Duration::from_secs(5))
+            .await?;
+        Ok(())
+    }
+
     async fn force_stop_diagnostic(&mut self) -> anyhow::Result<()> {
         for worker in &mut self.children {
             worker.input.take();
@@ -4689,6 +4858,7 @@ async fn run_scenario_with_stall_capture(
             }
             if completed.iter().all(|value| !value.is_null()) { break; }
             if critical_path && started.elapsed() >= duration {
+                group.begin_diagnostic_capture().await?;
                 native_capture.report = Some(json!({
                     "outcome": "no_stall_observed", "nominal_complete": false,
                     "diagnostic_window_complete": true, "diagnostic_window_s": duration.as_secs(),
