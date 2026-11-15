@@ -40,7 +40,11 @@ The hard parts of distributed systems don't disappear, but you stop paying for t
 
 [`Quickstart in 5 Minutes`](https://gianiac.github.io/numax/getting-started/quickstart-5-min/).
 
-For now, build from source:
+Prebuilt `nx` binaries (Linux, macOS, Windows) with `SHA256SUMS`, Sigstore
+signatures and SBOMs are available on the
+[Releases page](https://github.com/GianIac/numax/releases).
+
+Or build from source:
 
 ```bash
 git clone https://github.com/GianIac/numax
