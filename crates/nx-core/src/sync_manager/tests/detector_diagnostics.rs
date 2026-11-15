@@ -187,6 +187,7 @@ pub(super) struct Diagnostics {
     repair_trace_events: Arc<Mutex<BTreeMap<String, RecoveryCount>>>,
     event_loop: Arc<Mutex<BTreeMap<String, EventLoopTiming>>>,
     event_errors: Arc<AtomicU64>,
+    event_error_source: Arc<Mutex<Option<&'static std::panic::Location<'static>>>>,
 }
 
 #[derive(Default)]
@@ -464,6 +465,29 @@ impl Visit for TimelineFields {
 }
 
 impl Diagnostics {
+    #[track_caller]
+    fn record_event_error(&self) {
+        if self.event_errors.fetch_add(1, Ordering::Relaxed) == 0
+            && let Ok(mut source) = self.event_error_source.lock()
+        {
+            *source = Some(std::panic::Location::caller());
+        }
+    }
+
+    fn check_event_errors(&self, context: &str) -> anyhow::Result<()> {
+        if self.event_errors.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let source = self
+            .event_error_source
+            .lock()
+            .ok()
+            .and_then(|source| *source)
+            .map(|source| source.to_string())
+            .unwrap_or_else(|| "unavailable".into());
+        anyhow::bail!("{context}; first diagnostic error at {source}")
+    }
+
     pub(super) fn with_critical_path() -> anyhow::Result<Self> {
         let clock = crate::sync_manager::storage::critical_trace::clock();
         let unix_anchor_us =
@@ -484,10 +508,7 @@ impl Diagnostics {
         let Some(critical) = &self.critical else {
             return Ok(None);
         };
-        ensure!(
-            self.event_errors.load(Ordering::Relaxed) == 0,
-            "critical diagnostic recording failed"
-        );
+        self.check_event_errors("critical diagnostic recording failed")?;
         Ok(Some(
             critical
                 .lock()
@@ -524,7 +545,10 @@ impl Diagnostics {
             trace.started.is_some(),
             "remote replay capture was not started"
         );
-        ensure!(!trace.overflowed, "remote replay trace exceeded its bound");
+        if trace.overflowed {
+            self.check_event_errors("remote replay trace exceeded its bound")?;
+            anyhow::bail!("remote replay trace exceeded its bound");
+        }
         ensure!(
             trace
                 .batches
@@ -597,7 +621,7 @@ impl Diagnostics {
         let mut trace = match trace.lock() {
             Ok(trace) => trace,
             Err(_) => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
@@ -608,7 +632,7 @@ impl Diagnostics {
             fields.remote_apply_batch_operations,
             fields.remote_apply_batch_entries.as_ref(),
         ) else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         if operations == 0 {
@@ -624,15 +648,14 @@ impl Diagnostics {
                     || !entry["size"].is_u64()
                     || !entry["expected_workload"].is_boolean()
             })
-            || trace.batches.len() >= REMOTE_REPLAY_BATCH_LIMIT
         {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         if entries.len() > REMOTE_REPLAY_OPERATION_LIMIT {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         while trace.batches.len() >= REMOTE_REPLAY_BATCH_LIMIT
@@ -643,33 +666,33 @@ impl Diagnostics {
         {
             let Some(oldest) = trace.batches.front() else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             if oldest["applied_ops"].is_null() {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
             let Some(oldest_operations) = oldest["operations"].as_u64() else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             let Ok(oldest_operations_usize) = usize::try_from(oldest_operations) else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             let Some(_) = trace.batches.pop_front() else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             let Some(retained_operations) = trace.operations.checked_sub(oldest_operations_usize)
             else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             let (Some(dropped_batches), Some(dropped_operations)) = (
@@ -677,7 +700,7 @@ impl Diagnostics {
                 trace.dropped_operations.checked_add(oldest_operations),
             ) else {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             };
             trace.operations = retained_operations;
@@ -686,14 +709,14 @@ impl Diagnostics {
         }
         let Some(total_operations) = trace.operations.checked_add(entries.len()) else {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         let at_us = match u64::try_from(started.elapsed().as_micros()) {
             Ok(at_us) => at_us,
             Err(_) => {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
@@ -701,7 +724,7 @@ impl Diagnostics {
             total.checked_add(entry["size"].as_u64()?)
         }) else {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         trace.operations = total_operations;
@@ -725,7 +748,7 @@ impl Diagnostics {
         let mut trace = match trace.lock() {
             Ok(trace) => trace,
             Err(_) => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
@@ -750,7 +773,7 @@ impl Diagnostics {
             fields.remote_apply_success,
         )
         else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         let Some(batch) = trace
@@ -759,7 +782,7 @@ impl Diagnostics {
             .rev()
             .find(|batch| batch["applied_ops"].is_null())
         else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         if !trace_complete
@@ -769,14 +792,14 @@ impl Diagnostics {
             || usize::try_from(duplicates).ok() != Some(duplicate_ids.len())
         {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         let applied_at_us = match u64::try_from(started.elapsed().as_micros()) {
             Ok(at_us) => at_us,
             Err(_) => {
                 trace.overflowed = true;
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
@@ -788,7 +811,7 @@ impl Diagnostics {
         batch["success"] = json!(success);
         if !success {
             trace.overflowed = true;
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
         }
     }
 
@@ -921,10 +944,7 @@ impl Diagnostics {
     }
 
     fn remote_snapshot(&self) -> anyhow::Result<Value> {
-        ensure!(
-            self.event_errors.load(Ordering::Relaxed) == 0,
-            "diagnostic event counter failed"
-        );
+        self.check_event_errors("diagnostic event counter failed")?;
         let timings = self
             .remote_timings
             .lock()
@@ -961,10 +981,7 @@ impl Diagnostics {
         &self,
         events: &Mutex<BTreeMap<String, u64>>,
     ) -> anyhow::Result<BTreeMap<String, u64>> {
-        ensure!(
-            self.event_errors.load(Ordering::Relaxed) == 0,
-            "diagnostic event counter failed"
-        );
+        self.check_event_errors("diagnostic event counter failed")?;
         Ok(events
             .lock()
             .map_err(|_| anyhow::anyhow!("diagnostic event lock poisoned"))?
@@ -984,10 +1001,7 @@ impl Diagnostics {
     }
 
     fn repair_trace_snapshot(&self) -> anyhow::Result<BTreeMap<String, RecoveryCount>> {
-        ensure!(
-            self.event_errors.load(Ordering::Relaxed) == 0,
-            "diagnostic event counter failed"
-        );
+        self.check_event_errors("diagnostic event counter failed")?;
         Ok(self
             .repair_trace_events
             .lock()
@@ -1000,10 +1014,7 @@ impl Diagnostics {
     }
 
     fn event_loop_snapshot(&self) -> anyhow::Result<BTreeMap<String, EventLoopTiming>> {
-        ensure!(
-            self.event_errors.load(Ordering::Relaxed) == 0,
-            "diagnostic event counter failed"
-        );
+        self.check_event_errors("diagnostic event counter failed")?;
         Ok(self
             .event_loop
             .lock()
@@ -1013,7 +1024,7 @@ impl Diagnostics {
 
     fn record_event_loop(&self, kind: String, elapsed_us: u64, queues: EventLoopQueues) {
         if !EVENT_LOOP_KINDS.contains(&kind.as_str()) {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         match self.event_loop.lock() {
@@ -1023,7 +1034,7 @@ impl Diagnostics {
                 events.entry(kind).or_default().record(elapsed_us, queues);
             }
             _ => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
             }
         }
     }
@@ -1032,21 +1043,21 @@ impl Diagnostics {
         let mut timings = match self.remote_timings.lock() {
             Ok(timings) => timings,
             Err(_) => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
         let timing = &mut timings[stage];
         let Some(total_us) = timing.total_us.checked_add(elapsed_us) else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         let Some(count) = timing.count.checked_add(1) else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         let Some(failed) = timing.failed.checked_add(u64::from(failed)) else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         timing.total_us = total_us;
@@ -1074,11 +1085,11 @@ impl Diagnostics {
             fields.history_batch_estimated_bytes,
         )
         else {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         };
         if !HISTORY_BATCH_KINDS.contains(&kind) || !HISTORY_BATCH_STOP_REASONS.contains(&stop) {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         let prefix = format!("kind.{kind}.");
@@ -1094,7 +1105,7 @@ impl Diagnostics {
         let mut counters = match self.history_batches.lock() {
             Ok(counters) => counters,
             Err(_) => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 return;
             }
         };
@@ -1104,7 +1115,7 @@ impl Diagnostics {
                     .get(key)
                     .is_some_and(|count| count.checked_add(*increment).is_none())
         }) {
-            self.event_errors.fetch_add(1, Ordering::Relaxed);
+            self.record_event_error();
             return;
         }
         for (key, increment) in increments {
@@ -1118,7 +1129,7 @@ impl Diagnostics {
                 *events.entry(key).or_default() += 1;
             }
             _ => {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
             }
         }
     }
@@ -1465,7 +1476,7 @@ impl Subscriber for Diagnostics {
                         .record(fields.0)
                 });
             if let Err(error) = recorded {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
                 eprintln!("critical path diagnostic failed: {error:#}");
             }
             return;
@@ -1489,7 +1500,7 @@ impl Subscriber for Diagnostics {
                 }
             };
             if selected && timeline.record(fields.0).is_err() {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
             }
         }
         if metadata.fields().field("recovery_trace_stage").is_some() {
@@ -1502,7 +1513,7 @@ impl Subscriber for Diagnostics {
                 if let Some(elapsed_us) = fields.elapsed_us {
                     self.record_remote_timing(stage, elapsed_us, fields.failed);
                 } else {
-                    self.event_errors.fetch_add(1, Ordering::Relaxed);
+                    self.record_event_error();
                 }
             }
             if fields.recovery_event.is_none() {
@@ -1533,12 +1544,12 @@ impl Subscriber for Diagnostics {
                                 event.items = items;
                             }
                             None => {
-                                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                                self.record_event_error();
                             }
                         }
                     }
                     _ => {
-                        self.event_errors.fetch_add(1, Ordering::Relaxed);
+                        self.record_event_error();
                     }
                 }
             }
@@ -1560,7 +1571,7 @@ impl Subscriber for Diagnostics {
                 if let Some(elapsed_us) = fields.elapsed_us {
                     self.record_remote_timing(stage, elapsed_us, fields.failed);
                 } else {
-                    self.event_errors.fetch_add(1, Ordering::Relaxed);
+                    self.record_event_error();
                 }
             }
             return;
@@ -1614,12 +1625,12 @@ impl Subscriber for Diagnostics {
                 if queue_before != queues.data_before.saturating_add(queues.priority_before)
                     || queue_after != queues.data_after.saturating_add(queues.priority_after)
                 {
-                    self.event_errors.fetch_add(1, Ordering::Relaxed);
+                    self.record_event_error();
                 } else {
                     self.record_event_loop(kind, elapsed_us, queues);
                 }
             } else {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
             }
             return;
         }
@@ -1627,7 +1638,7 @@ impl Subscriber for Diagnostics {
             if let Some(elapsed_us) = fields.elapsed_us {
                 self.record_remote_timing(stage, elapsed_us, fields.failed);
             } else {
-                self.event_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event_error();
             }
             return;
         }
@@ -2347,6 +2358,87 @@ fn remote_replay_capture_pairs_operation_ids_and_classification() -> anyhow::Res
         snapshot["batches"][0]["duplicate_ids"],
         json!(["duplicate-op"])
     );
+    Ok(())
+}
+
+#[test]
+fn diagnostic_errors_preserve_first_source_and_reject_snapshots() {
+    let diagnostics = Diagnostics::default();
+    let first_line = line!() + 1;
+    diagnostics.record_event_error();
+    diagnostics.record_event_error();
+    let error = diagnostics.event_snapshot().unwrap_err().to_string();
+    assert!(error.contains("diagnostic event counter failed"));
+    assert!(error.contains(&format!("{}:{first_line}:", file!())));
+    assert_eq!(diagnostics.event_errors.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn remote_replay_capture_rotates_completed_batches_at_limit() -> anyhow::Result<()> {
+    let diagnostics = Diagnostics::with_critical_path()?;
+    diagnostics.begin_remote_replay_capture()?;
+    for sequence in 0..REMOTE_REPLAY_BATCH_LIMIT + 2 {
+        let id = format!("operation-{sequence}");
+        diagnostics.record_remote_replay_batch(&Fields {
+            remote_apply_batch_operations: Some(1),
+            remote_apply_batch_trace_complete: true,
+            remote_apply_batch_entries: Some(vec![json!({
+                "id": id,
+                "origin": "detector-1",
+                "generation": 1,
+                "sequence": sequence + 1,
+                "size": 1,
+                "expected_workload": true,
+            })]),
+            ..Fields::default()
+        });
+        diagnostics.record_remote_replay_apply(&Fields {
+            remote_apply_input_ops: Some(1),
+            remote_apply_applied_ops: Some(1),
+            remote_apply_duplicate_ops: Some(0),
+            remote_apply_applied_ids: Some(vec![id]),
+            remote_apply_duplicate_ids: Some(vec![]),
+            remote_apply_trace_complete: Some(true),
+            remote_apply_success: Some(true),
+            ..Fields::default()
+        });
+    }
+    let snapshot = diagnostics.remote_replay_snapshot()?;
+    assert_eq!(snapshot["complete"], true);
+    assert_eq!(snapshot["window_complete"], false);
+    assert_eq!(snapshot["batch_count"], REMOTE_REPLAY_BATCH_LIMIT);
+    assert_eq!(snapshot["operation_count"], REMOTE_REPLAY_BATCH_LIMIT);
+    assert_eq!(snapshot["dropped_batch_count"], 2);
+    assert_eq!(snapshot["dropped_operation_count"], 2);
+    assert_eq!(
+        snapshot["batches"][0]["applied_ids"],
+        json!(["operation-2"])
+    );
+    diagnostics.event_snapshot()?;
+    Ok(())
+}
+
+#[test]
+fn remote_replay_capture_rejects_eviction_of_unpaired_batches() -> anyhow::Result<()> {
+    let diagnostics = Diagnostics::with_critical_path()?;
+    diagnostics.begin_remote_replay_capture()?;
+    for sequence in 0..=REMOTE_REPLAY_BATCH_LIMIT {
+        diagnostics.record_remote_replay_batch(&Fields {
+            remote_apply_batch_operations: Some(1),
+            remote_apply_batch_trace_complete: true,
+            remote_apply_batch_entries: Some(vec![json!({
+                "id": format!("operation-{sequence}"),
+                "origin": "detector-1",
+                "generation": 1,
+                "sequence": sequence + 1,
+                "size": 1,
+                "expected_workload": true,
+            })]),
+            ..Fields::default()
+        });
+    }
+    assert!(diagnostics.remote_replay_snapshot().is_err());
+    assert!(diagnostics.event_snapshot().is_err());
     Ok(())
 }
 

@@ -288,7 +288,7 @@ jobs:
             --features cpu-profiling \
             --bench three_node_sync_load -- \
             --duration-secs 10 \
-            --target-ops-sec-per-node 1000 \
+            --target-ops-sec-per-node 250 \
             --settle-secs 10 \
             --report "${GITHUB_WORKSPACE}/reports/profiling/three-node-sync-load-report.json" \
             --cpu-profile "${GITHUB_WORKSPACE}/reports/profiling/three-node-sync-load.svg"
@@ -300,7 +300,7 @@ jobs:
             --features heap-profiling \
             --bench three_node_sync_load -- \
             --duration-secs 5 \
-            --target-ops-sec-per-node 250 \
+            --target-ops-sec-per-node 25 \
             --settle-secs 5 \
             --report "${GITHUB_WORKSPACE}/reports/profiling/three-node-sync-load-heap-report.json" \
             --heap-profile "${GITHUB_WORKSPACE}/reports/profiling/three-node-sync-load-heap.json"

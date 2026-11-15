@@ -1501,8 +1501,8 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn sync_runtime_reuses_persisted_node_id() {
+    #[tokio::test]
+    async fn sync_runtime_reuses_persisted_node_id() {
         let datastore_path = temp_datastore_path("numax-runtime-node-id-test");
         let config = RuntimeConfig {
             datastore_path: datastore_path.clone(),
@@ -1510,9 +1510,31 @@ mod tests {
             ..RuntimeConfig::default()
         };
 
-        let first = Runtime::new(config).unwrap();
+        let mut first = Runtime::new(config).unwrap();
         let first_node_id = first.sync_manager.as_ref().unwrap().node_id().clone();
+        first.shutdown().await.unwrap();
         drop(first);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(datastore_path.join("db"))
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        poll.tick().await;
+                    }
+                    Err(error) => panic!("cannot observe datastore lock release: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("datastore lock was not released after runtime shutdown");
+        drop(file);
 
         let second = Runtime::new(RuntimeConfig {
             datastore_path,

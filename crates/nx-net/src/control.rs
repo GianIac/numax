@@ -411,11 +411,7 @@ mod tests {
                 let mut server = crate::Node::new(server_config);
                 let mut incoming = server.take_control_receiver().unwrap();
                 let bound = server.start_listener().await.unwrap();
-                let address = if secure {
-                    format!("localhost:{}", bound.port())
-                } else {
-                    bound.to_string()
-                };
+                let address = bound.to_string();
                 let mut request_owner = owner();
                 request_owner.member = client_id.to_string();
                 request_owner.reporter = request_owner.member.clone();

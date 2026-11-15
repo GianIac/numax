@@ -2541,7 +2541,7 @@ mod tests {
                         .with_serialization_format(format),
                 );
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let endpoint = format!("localhost:{}", listener.local_addr().unwrap().port());
+                let endpoint = listener.local_addr().unwrap().to_string();
                 let tls_delay = Duration::from_millis(50);
                 let service_delay = Duration::from_millis(15);
                 let server = async {
@@ -2910,11 +2910,7 @@ mod tests {
                 let mut server = Node::new(server_config);
                 let mut incoming = server.take_control_receiver().unwrap();
                 let address = server.start_listener().await.unwrap();
-                let endpoint = if secure {
-                    format!("localhost:{}", address.port())
-                } else {
-                    address.to_string()
-                };
+                let endpoint = address.to_string();
                 client.connect_to_peer(&endpoint).await.unwrap();
                 assert_eq!(client.connection_slots.available_permits(), 0);
                 assert_eq!(server.connection_slots.available_permits(), 0);
@@ -2953,12 +2949,13 @@ mod tests {
                 );
                 let data_writer = Arc::clone(&writer);
                 let mut blocked = tokio_test::task::spawn(async move {
-                    write_bytes(
-                        &mut *data_writer.lock().await,
-                        &bytes,
-                        Duration::from_secs(5),
-                    )
-                    .await
+                    let mut writer = data_writer.lock().await;
+                    for _ in 0..16 {
+                        write_bytes(&mut *writer, &bytes, Duration::from_secs(5)).await?;
+                    }
+                    Err::<(), _>(NetError::InvalidMessage(
+                        "data backpressure not reached within 16 maximum frames".into(),
+                    ))
                 });
                 assert!(blocked.poll().is_pending());
                 assert!(writer.try_lock().is_err());
