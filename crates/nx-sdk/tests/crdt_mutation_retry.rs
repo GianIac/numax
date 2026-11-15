@@ -12,7 +12,7 @@ static SECOND_RGA_CAP: AtomicU32 = AtomicU32::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 macro_rules! mock_mutation {
-    ($name:ident($($arg:ident: $ty:ty),*)) => {
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?)) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn $name($($arg: $ty),*) -> i32 {
             $(let _ = $arg;)*
@@ -26,7 +26,16 @@ mock_mutation!(crdt_gcounter_inc(key_ptr: u32, key_len: u32, delta: u64));
 mock_mutation!(crdt_pncounter_inc(key_ptr: u32, key_len: u32, delta: u64));
 mock_mutation!(crdt_pncounter_dec(key_ptr: u32, key_len: u32, delta: u64));
 mock_mutation!(crdt_lww_set(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32));
-mock_mutation!(crdt_lww_map_set(key_ptr: u32, key_len: u32, field_ptr: u32, field_len: u32, value_ptr: u32, value_len: u32));
+mock_mutation!(
+    crdt_lww_map_set(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+    )
+);
 mock_mutation!(crdt_lww_map_remove(key_ptr: u32, key_len: u32, field_ptr: u32, field_len: u32));
 mock_mutation!(crdt_orset_add(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32));
 mock_mutation!(crdt_orset_remove(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32));

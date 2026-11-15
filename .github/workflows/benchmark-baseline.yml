@@ -16,7 +16,6 @@ env:
 jobs:
   calibrate:
     name: Generate Ubuntu baseline candidate
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -27,6 +26,14 @@ jobs:
           rustflags: ""
       - name: Test benchmark comparator
         run: node scripts/compare-benchmark-report.test.mjs
+      - name: Record calibration provenance
+        run: |
+          mkdir -p reports/baseline-runs
+          git rev-parse HEAD > reports/baseline-runs/environment.txt
+          rustc --version >> reports/baseline-runs/environment.txt
+          cargo --version >> reports/baseline-runs/environment.txt
+          uname -a >> reports/baseline-runs/environment.txt
+          lscpu >> reports/baseline-runs/environment.txt
       - name: Run five calibration benchmarks
         run: |
           mkdir -p reports/baseline-candidate reports/baseline-runs
@@ -41,26 +48,20 @@ jobs:
         run: |
           set +e
           node scripts/compare-benchmark-report.mjs \
-            --baseline crates/nx-core/reports/baselines/three-node-sync-smoke.json \
+            --aggregate-only \
             --current reports/baseline-runs/three-node-sync-smoke-1.json \
             --current reports/baseline-runs/three-node-sync-smoke-2.json \
             --current reports/baseline-runs/three-node-sync-smoke-3.json \
             --current reports/baseline-runs/three-node-sync-smoke-4.json \
             --current reports/baseline-runs/three-node-sync-smoke-5.json \
             --write-aggregate reports/baseline-candidate/three-node-sync-smoke.json \
-            --mode shadow \
-            --p99-threshold 10 \
-            --p99-min-delta-ms 0.1 \
-            --throughput-threshold 5 \
-            --rss-threshold 10 \
-            --rss-min-delta-bytes 16777216 \
-            2>&1 | tee reports/baseline-candidate/comparison.txt
+            2>&1 | tee reports/baseline-candidate/aggregation.txt
           status=${PIPESTATUS[0]}
           set -e
           {
             echo "### Benchmark baseline candidate"
             echo '```text'
-            cat reports/baseline-candidate/comparison.txt
+            cat reports/baseline-candidate/aggregation.txt
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
           exit "${status}"
@@ -68,6 +69,11 @@ jobs:
         run: |
           node -e "const r=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); if(!Number.isFinite(r.resources?.rss_bytes)) throw new Error('candidate rss_bytes is missing')" \
             reports/baseline-candidate/three-node-sync-smoke.json
+          {
+            echo '```json'
+            cat reports/baseline-candidate/three-node-sync-smoke.json
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload baseline candidate and raw reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

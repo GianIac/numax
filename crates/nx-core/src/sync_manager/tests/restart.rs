@@ -89,18 +89,43 @@ impl Cluster {
             assert!(!local.baseline_unconfirmed);
         }
         node.start().await.unwrap();
-        let epoch = node
+        let mut snapshot = node
             .membership
             .as_ref()
-            .unwrap()
+            .expect("started node must own membership")
             .snapshot
-            .borrow()
-            .records
-            .iter()
-            .find(|record| record.member == id.as_str())
-            .unwrap()
-            .version
-            .epoch;
+            .clone();
+        let epoch = tokio::time::timeout(RECOVERY_LIMIT, async {
+            loop {
+                let epoch = {
+                    let current = snapshot.borrow_and_update();
+                    assert!(
+                        current.error.is_none(),
+                        "local membership failed for {id}: {:?}",
+                        current.error
+                    );
+                    current
+                        .records
+                        .iter()
+                        .find(|record| record.member == id.as_str())
+                        .map(|record| record.version.epoch)
+                };
+                if let Some(epoch) = epoch {
+                    break epoch;
+                }
+                snapshot
+                    .changed()
+                    .await
+                    .expect("local membership snapshot stream closed during startup");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "local membership did not publish {id} within {RECOVERY_LIMIT:?}: {:?}",
+                snapshot.borrow()
+            )
+        });
         assert!(epoch > self.epochs[index]);
         self.epochs[index] = epoch;
         self.nodes[index] = Some(node);

@@ -123,7 +123,7 @@ pub(super) mod critical_trace {
                 return Ok(Self(None));
             }
             let id = NEXT_JOB
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| anyhow::anyhow!("critical trace job ID exhausted"))?;
             let started = u64::try_from(clock().elapsed().as_micros())?;
             let state = Arc::new(JobState {

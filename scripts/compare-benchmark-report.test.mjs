@@ -217,6 +217,71 @@ test("CLI rejects an incomplete report even in shadow mode", (t) => {
   assert.equal(result.status, 2);
 });
 
+test("CLI calibrates five runs without a historical baseline", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const aggregatePath = join(directory, "candidate.json");
+  const result = runComparator([
+    "--aggregate-only",
+    ...[1, 5, 3, 4, 2].flatMap((value, index) => [
+      "--current", writeReport(directory, `run-${index}.json`, reportWith({
+        opsSec: value * 100, rssBytes: value * 1000, p99: value,
+      })),
+    ]),
+    "--write-aggregate", aggregatePath,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /5 validated runs; no regression comparison/);
+  const candidate = JSON.parse(readFileSync(aggregatePath, "utf8"));
+  assert.equal(candidate.report_schema_version, 2);
+  assert.equal(candidate.profile.acceptance, "local-durable-flush-v1");
+  assert.equal(candidate.ops_sec_avg, 300);
+  assert.equal(candidate.resources.rss_bytes, 3000);
+  assert.equal(candidate.latency_ms.p99, 3);
+  assert.deepEqual(candidate.aggregation, { method: "median", runs: 5 });
+});
+
+test("CLI calibration rejects invalid or incompatible runs before writing", (t) => {
+  const directory = withTemporaryDirectory(t);
+  for (const [index, patch] of [
+    { report_schema_version: 1 },
+    { report_complete: false },
+    { uncertain_ops_total: 1 },
+    { scenario: "different" },
+  ].entries()) {
+    const aggregatePath = join(directory, `candidate-${index}.json`);
+    const result = runComparator([
+      "--aggregate-only",
+      "--current", writeReport(directory, `valid-${index}.json`, baseline),
+      "--current", writeReport(directory, `invalid-${index}.json`, { ...baseline, ...patch }),
+      "--write-aggregate", aggregatePath,
+    ]);
+    assert.equal(result.status, 2, result.stdout);
+    assert.throws(() => readFileSync(aggregatePath), /ENOENT/);
+  }
+});
+
+test("CLI calibration cannot masquerade as a blocking comparison", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const current = writeReport(directory, "current.json", baseline);
+  const output = join(directory, "candidate.json");
+  for (const extra of [
+    ["--baseline", current],
+    ["--mode", "blocking"],
+  ]) {
+    const result = runComparator([
+      "--aggregate-only", "--current", current, "--write-aggregate", output, ...extra,
+    ]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /cannot use --baseline or --mode blocking/);
+  }
+  const missingOutput = runComparator(["--aggregate-only", "--current", current]);
+  assert.equal(missingOutput.status, 2);
+  assert.match(missingOutput.stderr, /requires --write-aggregate/);
+  const missingBaseline = runComparator(["--current", current, "--write-aggregate", output]);
+  assert.equal(missingBaseline.status, 2);
+  assert.match(missingBaseline.stderr, /--baseline is required/);
+});
+
 test("compares the median of multiple current reports", () => {
   const result = compareReportSet(baseline, [
     {

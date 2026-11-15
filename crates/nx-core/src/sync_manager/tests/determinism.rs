@@ -857,8 +857,8 @@ async fn split_brain_scenario(
             runner.network.partition(&addr(a), &addr(b), true);
         }
     }
-    for index in 0..nodes {
-        local_six_family_workload(&runner.replicas[index].manager.handle(), index as u64).await;
+    for (index, replica) in runner.replicas.iter().enumerate() {
+        local_six_family_workload(&replica.manager.handle(), index as u64).await;
     }
     let healed_at = formed_at + PARTITION_S;
     runner.until(Duration::from_secs(healed_at)).await;

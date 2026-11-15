@@ -75,7 +75,7 @@ impl IdSource for SeededIds {
     fn next(&self) -> nx_sync::OpId {
         let count = self
             .counter
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |value| value.checked_add(1),

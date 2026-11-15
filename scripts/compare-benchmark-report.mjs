@@ -429,6 +429,7 @@ function formatValue(value) {
 function parseArgs(argv) {
   const args = {
     currentPaths: [],
+    aggregateOnly: false,
     mode: "shadow",
     thresholds: { ...DEFAULT_THRESHOLDS },
     minimumDeltas: { ...DEFAULT_MINIMUM_DELTAS },
@@ -445,6 +446,9 @@ function parseArgs(argv) {
         break;
       case "--write-aggregate":
         args.aggregatePath = nextArg(argv, ++index, arg);
+        break;
+      case "--aggregate-only":
+        args.aggregateOnly = true;
         break;
       case "--mode":
         args.mode = nextArg(argv, ++index, arg);
@@ -483,7 +487,14 @@ function parseArgs(argv) {
     }
   }
 
-  if (!args.baselinePath) {
+  if (args.aggregateOnly) {
+    if (args.baselinePath || args.mode !== "shadow") {
+      throw new Error("--aggregate-only cannot use --baseline or --mode blocking");
+    }
+    if (!args.aggregatePath) {
+      throw new Error("--aggregate-only requires --write-aggregate");
+    }
+  } else if (!args.baselinePath) {
     throw new Error("--baseline is required");
   }
   if (args.currentPaths.length === 0) {
@@ -523,6 +534,8 @@ Options:
   --baseline PATH              Baseline JSON report
   --current PATH               Current report; repeat to compare their median
   --write-aggregate PATH       Write the median aggregate report
+  --aggregate-only             Calibrate without a baseline or regression check;
+                               requires --write-aggregate
   --mode shadow|blocking       Warn, or fail on regressions (default: shadow)
   --p99-threshold PERCENT      Allowed median p99 increase (default: 5)
   --p99-min-delta-ms VALUE     Minimum absolute p99 increase (default: 0)
@@ -537,6 +550,16 @@ function main() {
   try {
     const args = parseArgs(process.argv.slice(2));
     const currentReports = args.currentPaths.map(readJson);
+    if (args.aggregateOnly) {
+      const aggregate = aggregateReports(currentReports);
+      mkdirSync(dirname(args.aggregatePath), { recursive: true });
+      writeFileSync(
+        args.aggregatePath,
+        `${JSON.stringify(aggregate, null, 2)}\n`,
+      );
+      console.log(`Calibration median: ${currentReports.length} validated runs; no regression comparison performed`);
+      return;
+    }
     const result = compareReportSet(
       readJson(args.baselinePath),
       currentReports,
