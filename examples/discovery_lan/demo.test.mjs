@@ -7,9 +7,28 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { peerView } from './demo.mjs';
 
 const script = fileURLToPath(new URL('./demo.mjs', import.meta.url));
 const execute = (...args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', timeout: 10000 });
+
+test('peer views preserve their own opaque cursor across pages', async () => {
+  const paths = [];
+  const request = async path => {
+    paths.push(path);
+    return { json: async () => paths.length === 1
+      ? { items: [{ node_id: 'first' }], next_cursor: 'opaque+/=' }
+      : { items: [{ node_id: 'second' }], next_cursor: null } };
+  };
+  assert.deepEqual(await peerView(request, 'membership'), [{ node_id: 'first' }, { node_id: 'second' }]);
+  assert.equal(new URLSearchParams(paths[1].split('?')[1]).get('cursor'), 'opaque+/=');
+  assert.ok(paths.every(path => new URLSearchParams(path.split('?')[1]).get('view') === 'membership'));
+});
+
+test('peer views reject repeated cursors and malformed pages', async () => {
+  await assert.rejects(peerView(async () => ({ json: async () => ({ items: [], next_cursor: 'same' }) }), 'recovery'), /pagination/);
+  await assert.rejects(peerView(async () => ({ json: async () => ({ items: [] }) }), 'connections'), /unexpected connections page/);
+});
 
 test('rejects missing arguments and loopback advertisement', () => {
   assert.notEqual(execute().status, 0);
@@ -110,6 +129,8 @@ test('real script lifecycle: SDK write, HTTP observation, stop and durable resta
     }
     await ready();
     const initial = JSON.parse(command('wait', '--peers', '0', '--value', '0'));
+    assert.ok(initial.membership.some(member => member.member_id === initial.node_id || member.node_id === initial.node_id));
+    assert.ok(Array.isArray(initial.recovery));
     assert.equal(JSON.parse(command('increment')).value, '1');
     await stop();
     start();

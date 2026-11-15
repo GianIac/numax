@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nx-sdk = { version = "0.1.6", path = "../../crates/nx-sdk" }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.release]
 lto = true

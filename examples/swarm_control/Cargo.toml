@@ -1,0 +1,11 @@
+[package]
+name = "swarm_control"
+version = "0.1.6"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde_json = "1"
+wat = "1"
+
+[workspace]

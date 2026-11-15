@@ -80,6 +80,9 @@ impl Config {
 }
 
 fn env_str(name: &str) -> Option<String> {
+    if let Ok(Some(bytes)) = db::get(&format!("demo:env/{name}")) {
+        return String::from_utf8(bytes).ok();
+    }
     system::env_get(name)
         .ok()
         .flatten()
@@ -193,13 +196,13 @@ fn choose_weighted(items: &[(u32, u32)], weights: &[u64]) -> Result<(u32, u32), 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    nx_log!("distributed_ants: start");
-
     let node_id = match net::node_id() {
         Ok(id) => id,
         Err(NxError::SyncDisabled) => {
             nx_log!("distributed_ants: sync is disabled on this runtime.");
-            nx_log!("distributed_ants: start the runtime with --listen <addr> to enable CRDT replication.");
+            nx_log!(
+                "distributed_ants: start the runtime with --listen <addr> to enable CRDT replication."
+            );
             return;
         }
         Err(e) => {
@@ -211,6 +214,37 @@ pub extern "C" fn run() {
     let cfg = Config::from_env();
     let hotspots = hotspots(&cfg);
 
+    if env_str("NUMAX_OBSERVE").as_deref() == Some("1") {
+        let field: Vec<_> = (0..cfg.grid_h)
+            .flat_map(|y| (0..cfg.grid_w).map(move |x| phero_value(x, y)))
+            .collect();
+        let snapshot = serde_json::json!({
+            "trips": gcounter::value(TRIPS_KEY).unwrap_or(0),
+            "field": field,
+        });
+        match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => {
+                if let Err(error) = db::set("demo:snapshot", &bytes) {
+                    nx_log!("distributed_ants: snapshot failed: {}", error);
+                }
+            }
+            Err(error) => nx_log!("distributed_ants: snapshot failed: {}", error),
+        }
+        if cfg.render {
+            nx_log!("NEST,{},{}", cfg.nest.0, cfg.nest.1);
+            for (x, y) in &hotspots {
+                nx_log!("HOTSPOT,{},{}", x, y);
+            }
+            for y in 0..cfg.grid_h {
+                for x in 0..cfg.grid_w {
+                    nx_log!("PHERO,{},{},{}", x, y, phero_value(x, y));
+                }
+            }
+        }
+        return;
+    }
+
+    nx_log!("distributed_ants: start");
     if cfg.render {
         nx_log!("NEST,{},{}", cfg.nest.0, cfg.nest.1);
         for (x, y) in &hotspots {
@@ -226,7 +260,8 @@ pub extern "C" fn run() {
             return;
         }
     };
-    let mut carrying = matches!(db::get(CARRYING_KEY), Ok(Some(bytes)) if bytes.first() == Some(&1));
+    let mut carrying =
+        matches!(db::get(CARRYING_KEY), Ok(Some(bytes)) if bytes.first() == Some(&1));
 
     let goal = if carrying {
         cfg.nest
@@ -312,5 +347,10 @@ pub extern "C" fn run() {
         }
     }
 
+    if let Some(tick) = env_str("NUMAX_TICK")
+        && let Err(error) = db::set("demo:completed", tick.as_bytes())
+    {
+        nx_log!("distributed_ants: completion failed: {}", error);
+    }
     nx_log!("distributed_ants: done");
 }

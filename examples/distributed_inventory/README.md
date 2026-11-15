@@ -4,8 +4,9 @@ PNCounter-backed inventory replicated across Numax nodes.
 
 This example models a product stock value that can move in both directions:
 restocks increase inventory, sales decrease it, and returns increase it again.
-Each node applies one local operation, broadcasts it, persists durable CRDT
-state, and converges with peers through the sync layer.
+Each node persists its local CRDT operation before acceptance, then disseminates
+it through gossip. Local acceptance does not acknowledge remote replication;
+peers converge asynchronously within the available recovery contract.
 
 ## What It Demonstrates
 
