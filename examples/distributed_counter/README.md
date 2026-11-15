@@ -129,9 +129,12 @@ nx run target/wasm32-unknown-unknown/release/distributed_counter.wasm \
 Each invocation runs the guest once, waits for the configured settle window,
 prints the final materialized GCounter value, flushes the local store and exits:
 - each run performs one local increment (`crdt::gcounter::inc(key, 1)`)
-- the increment is broadcast to peers asynchronously
-- missed pushes can be recovered by periodic anti-entropy while peers remain
-  configured and reconnect
+- local acceptance follows a covering durable flush; it does not acknowledge
+  remote replication
+- the increment is disseminated asynchronously through bounded K-fanout gossip
+- periodic anti-entropy repairs missed operations while reachable sources can
+  provide retained history or a qualifying bounded baseline; recovery is not
+  guaranteed for arbitrary downtime
 - `--wait-before-run` gives both processes time to connect before the guest
   emits its increment
 - `--settle-for` gives PushOps and remote apply time to complete before exit
@@ -164,7 +167,7 @@ same `--settle-for` window on all terminals when manually checking convergence.
   into the in-memory registry on startup.
 - Without `--settle-for`, a sync-enabled runtime stays alive until it receives
   SIGINT/SIGTERM/SIGHUP.
-- The `-v` flag enables verbose logs to observe lifecycle, broadcast and apply
+- The `-v` flag enables verbose logs to observe lifecycle, gossip and apply
   paths. Use `--log-format json` for structured logs, and
   `--observability-listen 127.0.0.1:9300` to expose the local metrics endpoint.
 - The production sync wire format is bincode. Add `--debug-protocol` to use

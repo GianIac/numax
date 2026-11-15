@@ -1,0 +1,3404 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nx_net::{
+    ControlIncoming, ControlKind, ControlReply, ControlRequest, MembershipRecord, MembershipState,
+    MembershipVersion,
+};
+use nx_store::Store;
+use std::future::Future;
+#[cfg(test)]
+use std::pin::Pin;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+
+use super::probe::{self, Peer};
+use super::state::{Action, Membership, Status, Update};
+use super::storage::MembershipStore;
+use super::suspicion::Timing;
+use super::{Error, Version};
+use crate::observability::RuntimeMetrics;
+use crate::peer_metrics::{Counter as Metric, Gauge};
+#[cfg(test)]
+use nx_net::Node;
+
+const TICK: Duration = Duration::from_millis(25);
+const CAPACITY: usize = 4096;
+const RPC_BUDGET: Duration = Duration::from_millis(500);
+/// Recovery contacts back off per endpoint between these bounds, so genuinely
+/// dead members cost at most one exchange per endpoint per maximum delay.
+const RECOVERY_DELAY_MIN: Duration = Duration::from_secs(1);
+const RECOVERY_DELAY_MAX: Duration = Duration::from_secs(30);
+/// Minimum spacing between wake-ups that make every recovery contact due again.
+const RECOVERY_WAKE_SPACING: Duration = Duration::from_secs(5);
+const HINT_LIMIT: usize = 64;
+#[cfg(test)]
+const SCHEDULING_SAMPLES_LIMIT: usize = 2048;
+#[cfg(test)]
+pub(crate) mod simulation;
+
+#[cfg(test)]
+static SHUTDOWN_TRACE: std::sync::Mutex<(VecDeque<String>, usize)> =
+    std::sync::Mutex::new((VecDeque::new(), 0));
+
+#[cfg(test)]
+pub(crate) fn shutdown_trace(phase: &str, details: std::fmt::Arguments<'_>) {
+    if std::env::var_os("NUMAX_SHUTDOWN_TRACE").is_none() {
+        return;
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let message = format!(
+        "SHUTDOWN_TRACE pid={} at_us={} task={:?} phase={phase} {details}\n",
+        std::process::id(),
+        START.get_or_init(Instant::now).elapsed().as_micros(),
+        tokio::task::try_id(),
+    );
+    let mut trace = SHUTDOWN_TRACE.lock().expect("shutdown trace lock");
+    if trace.0.len() == 4096 {
+        trace.0.pop_front();
+        trace.1 += 1;
+    }
+    trace.0.push_back(message);
+}
+
+#[cfg(test)]
+pub(crate) fn dump_shutdown_trace() {
+    let (events, dropped) = {
+        let mut trace = SHUTDOWN_TRACE.lock().expect("shutdown trace lock");
+        (std::mem::take(&mut trace.0), std::mem::take(&mut trace.1))
+    };
+    if events.is_empty() {
+        return;
+    }
+    let mut message = format!("SHUTDOWN_TRACE_DUMP dropped={dropped}\n");
+    for event in events {
+        message.push_str(&event);
+    }
+    eprint!("{message}");
+}
+
+// The coordinator owns effects; only their executor differs in deterministic tests.
+struct Jobs<T: Send + 'static> {
+    tasks: JoinSet<T>,
+    #[cfg(test)]
+    deferred: Option<VecDeque<Pin<Box<dyn Future<Output = T> + Send>>>>,
+    #[cfg(test)]
+    active: usize,
+}
+impl<T: Send + 'static> Jobs<T> {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            #[cfg(test)]
+            deferred: None,
+            #[cfg(test)]
+            active: 0,
+        }
+    }
+    fn spawn(&mut self, future: impl Future<Output = T> + Send + 'static) {
+        #[cfg(test)]
+        if let Some(deferred) = &mut self.deferred {
+            self.active += 1;
+            deferred.push_back(Box::pin(future));
+            return;
+        }
+        self.tasks.spawn(future);
+    }
+    fn spawn_blocking(&mut self, work: impl FnOnce() -> T + Send + 'static) {
+        #[cfg(test)]
+        if let Some(deferred) = &mut self.deferred {
+            self.active += 1;
+            deferred.push_back(Box::pin(async move { work() }));
+            return;
+        }
+        self.tasks.spawn_blocking(work);
+    }
+    fn len(&self) -> usize {
+        #[cfg(test)]
+        if self.deferred.is_some() {
+            return self.active;
+        }
+        self.tasks.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    async fn join_next(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+    fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+    #[cfg(test)]
+    fn manual(&mut self) {
+        self.deferred = Some(VecDeque::new());
+    }
+    #[cfg(test)]
+    fn take(&mut self) -> Vec<Pin<Box<dyn Future<Output = T> + Send>>> {
+        self.deferred
+            .as_mut()
+            .expect("deterministic executor")
+            .drain(..)
+            .collect()
+    }
+    #[cfg(test)]
+    fn finished(&mut self) {
+        self.active = self
+            .active
+            .checked_sub(1)
+            .expect("untracked effect completion");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeTiming {
+    pub(crate) member: String,
+    pub(crate) version: MembershipVersion,
+    pub(crate) timing: nx_net::ControlTiming,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Snapshot {
+    pub(crate) records: Vec<MembershipRecord>,
+    pub(crate) probe_timings: Vec<ProbeTiming>,
+    pub(crate) health: u32,
+    pub(crate) error: Option<String>,
+    pub(crate) successful_probes: u64,
+    pub(crate) failed_probes: u64,
+    #[cfg(test)]
+    pub(crate) tick_lateness_micros: Vec<u64>,
+}
+
+struct ShutdownRequest {
+    deadline: tokio::time::Instant,
+    completed: oneshot::Sender<tokio::time::Instant>,
+}
+
+/// A bounded shutdown call ended without completing the retry-safe lifecycle.
+#[derive(Debug)]
+pub enum ShutdownPending {
+    /// The actor still owns the unconfirmed terminal write.
+    DurabilityUnconfirmed,
+    /// The terminal write completed after this call's deadline.
+    DurableLeaveConfirmedLate { lateness: Duration },
+}
+
+impl std::fmt::Display for ShutdownPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DurabilityUnconfirmed => formatter.write_str(
+                "membership shutdown budget exhausted before the durable leave was confirmed; \
+                 storage is still in flight and the actor keeps running; retry shutdown to await the outcome",
+            ),
+            Self::DurableLeaveConfirmedLate { lateness } => write!(
+                formatter,
+                "membership shutdown budget exhausted; durable leave confirmed late; \
+                 critical lateness={lateness:?}; retry shutdown to finish cleanup"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownPending {}
+
+pub(crate) struct Handle {
+    stop: Option<oneshot::Sender<ShutdownRequest>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+    critical: Option<oneshot::Receiver<tokio::time::Instant>>,
+    critical_completed_at: Option<tokio::time::Instant>,
+    failure: Option<String>,
+    pub(crate) snapshot: watch::Receiver<Snapshot>,
+}
+
+/// Records the actor's terminal-floor confirmation once; the oneshot value can only be read once.
+fn critical_completion(
+    critical: &mut Option<oneshot::Receiver<tokio::time::Instant>>,
+    completed_at: &mut Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    if completed_at.is_none()
+        && let Some(receiver) = critical.as_mut()
+        && let Ok(at) = receiver.try_recv()
+    {
+        *completed_at = Some(at);
+    }
+    *completed_at
+}
+
+impl Handle {
+    fn new(
+        stop: oneshot::Sender<ShutdownRequest>,
+        task: JoinHandle<anyhow::Result<()>>,
+        snapshot: watch::Receiver<Snapshot>,
+    ) -> Self {
+        Self {
+            stop: Some(stop),
+            task: Some(task),
+            critical: None,
+            critical_completed_at: None,
+            failure: None,
+            snapshot,
+        }
+    }
+
+    /// Requests a durable leave and waits for the actor within the budget.
+    ///
+    /// Retry-safe: if the budget expires before the terminal floor is confirmed,
+    /// the actor keeps running so that it publishes only after its own flush, and
+    /// a later call resumes waiting for the same outcome. Dropping the handle
+    /// remains the terminal abort.
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.shutdown_with_budget(Duration::from_secs(5)).await
+    }
+
+    async fn shutdown_with_budget(&mut self, budget: Duration) -> anyhow::Result<()> {
+        if let Some(failure) = &self.failure {
+            anyhow::bail!("membership shutdown previously failed: {failure}");
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        #[cfg(test)]
+        shutdown_trace(
+            "handle.request",
+            format_args!(
+                "actor={:?} budget_us={}",
+                self.task.as_ref().map(JoinHandle::id),
+                budget.as_micros()
+            ),
+        );
+        let requested_now = if let Some(stop) = self.stop.take() {
+            let (completed, critical) = oneshot::channel();
+            self.critical = Some(critical);
+            if stop
+                .send(ShutdownRequest {
+                    deadline,
+                    completed,
+                })
+                .is_err()
+            {
+                tracing::debug!("membership task stopped before receiving the shutdown request");
+            }
+            true
+        } else {
+            false
+        };
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let actor = task.id();
+        let (timed_out, joined) = match tokio::time::timeout_at(deadline, &mut *task).await {
+            Ok(joined) => (false, joined),
+            Err(_) => {
+                #[cfg(test)]
+                shutdown_trace("handle.timeout", format_args!("actor={actor}"));
+                if critical_completion(&mut self.critical, &mut self.critical_completed_at)
+                    .is_none()
+                {
+                    return Err(ShutdownPending::DurabilityUnconfirmed.into());
+                }
+                // Only best-effort leave announcements remain after the confirmed critical write.
+                task.abort();
+                (true, task.await)
+            }
+        };
+        self.task = None;
+        let joined = match joined {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = joined {
+            self.failure = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        let completed = critical_completion(&mut self.critical, &mut self.critical_completed_at);
+        #[cfg(test)]
+        shutdown_trace(
+            "handle.result",
+            format_args!("actor={actor} timed_out={timed_out} completed={completed:?}"),
+        );
+        let Some(completed_at) = completed else {
+            let message = "membership shutdown ended without confirming its durable leave";
+            self.failure = Some(message.into());
+            anyhow::bail!(message);
+        };
+        // Lateness is reported only by the call that set this deadline; a retry observes completion.
+        if requested_now && completed_at >= deadline {
+            return Err(ShutdownPending::DurableLeaveConfirmedLate {
+                lateness: completed_at.saturating_duration_since(deadline),
+            }
+            .into());
+        }
+        if timed_out {
+            tracing::warn!(
+                ?budget,
+                "membership leave announcements truncated after durable shutdown completion"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        #[cfg(test)]
+        dump_shutdown_trace();
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn start(
+    local: String,
+    endpoint: Option<String>,
+    node: Arc<dyn crate::peer_io::PeerIo>,
+    store: Arc<Store>,
+    incoming: mpsc::Receiver<ControlIncoming>,
+) -> anyhow::Result<Handle> {
+    start_with_metrics(
+        local,
+        endpoint,
+        node,
+        store,
+        incoming,
+        Arc::new(RuntimeMetrics::default()),
+    )
+    .await
+}
+
+pub(crate) async fn start_with_metrics(
+    local: String,
+    endpoint: Option<String>,
+    node: Arc<dyn crate::peer_io::PeerIo>,
+    store: Arc<Store>,
+    incoming: mpsc::Receiver<ControlIncoming>,
+    metrics: Arc<RuntimeMetrics>,
+) -> anyhow::Result<Handle> {
+    let persisted_store = Arc::clone(&store);
+    let (core, owner) =
+        tokio::task::spawn_blocking(move || initialize(local, endpoint, &persisted_store))
+            .await??;
+    let (stop, stopped) = oneshot::channel();
+    let seed = probe_seed()?;
+    let actor = Actor::new(core, owner, node, store, incoming, metrics, seed);
+    let snapshot = actor.snapshot_tx.subscribe();
+    let task = tokio::spawn(actor.run(stopped));
+    Ok(Handle::new(stop, task, snapshot))
+}
+
+fn random_probe_seed() -> anyhow::Result<u64> {
+    let mut seed = [0u8; 8];
+    getrandom::fill(&mut seed)
+        .map_err(|error| anyhow::anyhow!("membership random seed: {error}"))?;
+    Ok(u64::from_le_bytes(seed))
+}
+
+#[cfg(test)]
+fn probe_seed() -> anyhow::Result<u64> {
+    match std::env::var("NUMAX_TEST_PROBE_SEED") {
+        Ok(seed) => parse_probe_seed(&seed),
+        Err(std::env::VarError::NotPresent) => random_probe_seed(),
+        Err(error) => Err(anyhow::anyhow!(
+            "cannot read NUMAX_TEST_PROBE_SEED: {error}"
+        )),
+    }
+}
+
+#[cfg(test)]
+fn parse_probe_seed(seed: &str) -> anyhow::Result<u64> {
+    seed.parse()
+        .map_err(|error| anyhow::anyhow!("invalid NUMAX_TEST_PROBE_SEED: {error}"))
+}
+
+#[cfg(not(test))]
+fn probe_seed() -> anyhow::Result<u64> {
+    random_probe_seed()
+}
+
+fn initialize(
+    local: String,
+    endpoint: Option<String>,
+    store: &Store,
+) -> anyhow::Result<(Membership, MembershipRecord)> {
+    let timing = Timing {
+        interval: Duration::from_secs(2),
+        direct: RPC_BUDGET,
+        suspicion_min: Duration::from_secs(5),
+        suspicion_max: Duration::from_secs(15),
+        confirmations: 3,
+        health_max: 8,
+    };
+    let mut core = Membership::new(local, CAPACITY, timing, 1, 3).map_err(core_error)?;
+    let actions = MembershipStore::new(store).start(&mut core)?;
+    let initial = actions
+        .into_iter()
+        .find_map(|action| {
+            if let Action::Publish(update) = action {
+                Some(update)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("membership startup did not publish a durable identity"))?;
+    Ok((core, record(initial, endpoint, None)))
+}
+
+impl Actor {
+    fn new(
+        core: Membership,
+        owner: MembershipRecord,
+        node: Arc<dyn crate::peer_io::PeerIo>,
+        store: Arc<Store>,
+        incoming: mpsc::Receiver<ControlIncoming>,
+        metrics: Arc<RuntimeMetrics>,
+        seed: u64,
+    ) -> Self {
+        let rng = crate::peer_io::random::Random::stream(seed, core.local_id(), "probes");
+        let last = node.now();
+        let (snapshot_tx, _) = watch::channel(Snapshot::default());
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(64);
+        Self {
+            local_declarations: BTreeMap::new(),
+            metrics,
+            core,
+            owner,
+            node,
+            store,
+            incoming,
+            records: BTreeMap::new(),
+            timings: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            serial: 0,
+            now: Duration::ZERO,
+            last,
+            jobs: Jobs::new(),
+            pending: BTreeMap::new(),
+            cursor: 0,
+            snapshot_tx,
+            dispatch_tx,
+            dispatch_rx,
+            rng,
+            next_exchange: Duration::ZERO,
+            hints: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            recovery: BTreeMap::new(),
+            next_recovery: Duration::ZERO,
+            recovery_woken_at: None,
+            successful_probes: 0,
+            failed_probes: 0,
+            #[cfg(test)]
+            tick_lateness_micros: VecDeque::new(),
+            writes: Jobs::new(),
+            write_queue: VecDeque::new(),
+        }
+    }
+}
+
+fn core_error(error: Error) -> anyhow::Error {
+    anyhow::anyhow!("membership: {error:?}")
+}
+
+fn version(version: MembershipVersion) -> Version {
+    Version {
+        epoch: version.epoch,
+        incarnation: version.incarnation,
+    }
+}
+fn wire_version(version: Version) -> MembershipVersion {
+    MembershipVersion {
+        epoch: version.epoch,
+        incarnation: version.incarnation,
+    }
+}
+
+fn record(update: Update, endpoint: Option<String>, reporter: Option<String>) -> MembershipRecord {
+    MembershipRecord {
+        reporter: reporter.unwrap_or_else(|| update.member.clone()),
+        member: update.member,
+        version: wire_version(update.version),
+        state: wire_state(update.status),
+        endpoint,
+    }
+}
+
+fn wire_state(status: Status) -> MembershipState {
+    match status {
+        Status::Alive => MembershipState::Alive,
+        Status::Suspect => MembershipState::Suspect,
+        Status::Dead => MembershipState::Dead,
+        Status::Left => MembershipState::Left,
+    }
+}
+
+pub(crate) struct Completion {
+    endpoint: String,
+    expected: Option<String>,
+    mode: Job,
+    timing: Option<nx_net::ControlTiming>,
+    result: nx_net::NetResult<(nx_sync::NodeId, ControlReply)>,
+}
+
+enum Job {
+    Exchange,
+    Probe {
+        attempt: u64,
+        target: Peer,
+        route: Peer,
+    },
+    Helper {
+        event: ControlIncoming,
+        target: Peer,
+    },
+}
+
+pub(crate) struct Dispatch {
+    indirect: bool,
+    attempt: u64,
+    route: Peer,
+}
+
+struct Actor {
+    local_declarations: BTreeMap<String, Version>,
+    metrics: Arc<RuntimeMetrics>,
+    core: Membership,
+    owner: MembershipRecord,
+    node: Arc<dyn crate::peer_io::PeerIo>,
+    store: Arc<Store>,
+    incoming: mpsc::Receiver<ControlIncoming>,
+    records: BTreeMap<String, MembershipRecord>,
+    timings: BTreeMap<String, ProbeTiming>,
+    sessions: BTreeMap<String, (u64, u64)>,
+    serial: u64,
+    now: Duration,
+    last: Instant,
+    jobs: Jobs<Completion>,
+    pending: BTreeMap<String, ()>,
+    cursor: usize,
+    snapshot_tx: watch::Sender<Snapshot>,
+    dispatch_tx: mpsc::Sender<Dispatch>,
+    dispatch_rx: mpsc::Receiver<Dispatch>,
+    rng: crate::peer_io::random::Random,
+    next_exchange: Duration,
+    hints: BTreeMap<String, String>,
+    pages: BTreeMap<String, Option<String>>,
+    recovery: BTreeMap<String, RecoveryContact>,
+    next_recovery: Duration,
+    recovery_woken_at: Option<Duration>,
+    successful_probes: u64,
+    failed_probes: u64,
+    #[cfg(test)]
+    tick_lateness_micros: VecDeque<u64>,
+    writes: Jobs<(u64, Result<(), super::storage::StorageError>)>,
+    write_queue: VecDeque<Action>,
+}
+
+pub(crate) struct Written((u64, Result<(), super::storage::StorageError>));
+
+/// Backoff state of one endpoint in the recovery lane: a Suspect/Dead member or
+/// an unknown member hint. The observed version restarts backoff on new evidence.
+struct RecoveryContact {
+    member: String,
+    version: Option<MembershipVersion>,
+    due: Duration,
+    delay: Duration,
+}
+pub(crate) enum Observation {
+    Dispatch(Dispatch),
+    Written(Written),
+    Completed(Box<Completion>),
+    Tick(Instant),
+    Incoming(Box<ControlIncoming>),
+}
+
+impl Actor {
+    fn core(&mut self) -> &mut Membership {
+        &mut self.core
+    }
+
+    fn serial(&mut self) -> anyhow::Result<u64> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .ok_or_else(|| core_error(Error::Overflow))?;
+        Ok(self.serial)
+    }
+
+    async fn run(mut self, mut stopped: oneshot::Receiver<ShutdownRequest>) -> anyhow::Result<()> {
+        let result = self.run_inner(&mut stopped).await;
+        if let Err(error) = &result {
+            self.core.fence();
+            self.snapshot_tx
+                .send_modify(|snapshot| snapshot.error = Some(error.to_string()));
+            tracing::error!(%error, "membership service fenced");
+        }
+        self.jobs.abort_all();
+        while self.jobs.join_next().await.is_some() {}
+        result
+    }
+
+    async fn run_inner(
+        &mut self,
+        stopped: &mut oneshot::Receiver<ShutdownRequest>,
+    ) -> anyhow::Result<()> {
+        let mut next_tick = self.node.now();
+        let timer = self.node.clone();
+        self.publish_snapshot();
+        loop {
+            tokio::select! {
+                biased;
+                shutdown = &mut *stopped => {
+                    let shutdown = shutdown.map_err(|error| anyhow::anyhow!("membership shutdown request: {error}"))?;
+                    #[cfg(test)]
+                    let stopped_at = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    let queued = self.write_queue.len() + self.writes.len();
+                    #[cfg(test)]
+                    shutdown_trace(
+                        "actor.stop",
+                        format_args!("node={} remaining_us={} queued={queued} jobs={}", self.owner.member,
+                            shutdown.deadline.saturating_duration_since(stopped_at).as_micros(), self.jobs.len()),
+                    );
+                    let actions = self.core().leave().map_err(core_error)?;
+                    self.actions(actions).await?;
+                    #[cfg(test)]
+                    shutdown_trace("actor.leave_queued", format_args!("node={}", self.owner.member));
+                    while let Some(result) = self.writes.join_next().await {
+                        self.written(result?).await?;
+                    }
+                    #[cfg(test)]
+                    let writes_done = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    shutdown_trace("actor.writes_done", format_args!("node={}", self.owner.member));
+                    self.jobs.abort_all();
+                    while self.jobs.join_next().await.is_some() {}
+                    self.publish_snapshot();
+                    let completed_at = tokio::time::Instant::now();
+                    #[cfg(test)]
+                    shutdown_trace("actor.confirm", format_args!("node={} late_us={}", self.owner.member,
+                        completed_at.saturating_duration_since(shutdown.deadline).as_micros()));
+                    if shutdown.completed.send(completed_at).is_err() {
+                        tracing::debug!("membership shutdown completion observer dropped");
+                    }
+                    #[cfg(test)]
+                    if completed_at >= shutdown.deadline {
+                        eprintln!(
+                            "SHUTDOWN_LATE remaining_at_stop_ms={} queued={queued} writes_ms={} \
+                             cancelling_ms={} late_ms={}",
+                            shutdown.deadline.saturating_duration_since(stopped_at).as_millis(),
+                            (writes_done - stopped_at).as_millis(),
+                            (completed_at - writes_done).as_millis(),
+                            completed_at.saturating_duration_since(shutdown.deadline).as_millis(),
+                        );
+                    }
+                    if tokio::time::Instant::now() >= shutdown.deadline {
+                        tracing::warn!("membership leave announcement budget exhausted");
+                        return Ok(());
+                    }
+                    let endpoints: Vec<_> = self.records.values().filter_map(|record| record.endpoint.clone()).collect();
+                    let request = ControlRequest { request_id: self.serial()?, owner: self.owner.clone(), updates: vec![], kind: ControlKind::Exchange { after: None } };
+                    let leave = async {
+                        for batch in endpoints.chunks(8) {
+                            let mut sends = JoinSet::new();
+                            for endpoint in batch {
+                                let node = Arc::clone(&self.node); let endpoint = endpoint.clone(); let request = request.clone();
+                                sends.spawn(async move { let _ = node.control_request(&endpoint, request, RPC_BUDGET).await; });
+                            }
+                            while sends.join_next().await.is_some() {}
+                        }
+                    };
+                    let deadline = shutdown.deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+                    if tokio::time::timeout_at(deadline, leave).await.is_err() {
+                        tracing::warn!("membership leave announcement budget exhausted");
+                    }
+                    return Ok(());
+                }
+                dispatched = self.dispatch_rx.recv() => {
+                    if let Some(dispatched) = dispatched {
+                        self.observe(Observation::Dispatch(dispatched)).await?;
+                    }
+                }
+                written = self.writes.join_next(), if !self.writes.is_empty() => {
+                    self.observe(Observation::Written(Written(written.ok_or_else(|| anyhow::anyhow!("membership write missing"))??))).await?;
+                }
+                result = self.jobs.join_next(), if !self.jobs.is_empty() => {
+                    let completed = result.ok_or_else(|| anyhow::anyhow!("membership job missing"))??;
+                    self.observe(Observation::Completed(Box::new(completed))).await?;
+                }
+                _ = timer.sleep_until(next_tick) => {
+                    let due = next_tick;
+                    next_tick = self.node.now().checked_add(TICK).ok_or_else(|| core_error(Error::Overflow))?;
+                    self.observe(Observation::Tick(due)).await?;
+                }
+                event = self.incoming.recv() => {
+                    let Some(event) = event else { anyhow::bail!("membership ingress closed"); };
+                    self.observe(Observation::Incoming(Box::new(event))).await?;
+                }
+
+            }
+            self.publish_snapshot();
+        }
+    }
+
+    async fn observe(&mut self, event: Observation) -> anyhow::Result<()> {
+        self.advance().await?;
+        match event {
+            Observation::Dispatch(dispatched) => {
+                self.metrics.peers.increment(if dispatched.indirect {
+                    Metric::ProbeIndirect
+                } else {
+                    Metric::ProbeDirect
+                });
+                let actions = self
+                    .core
+                    .probe_dispatched(dispatched.attempt, &dispatched.route, self.now)
+                    .map_err(core_error)?;
+                self.actions(actions).await?;
+            }
+            Observation::Written(written) => self.written(written.0).await?,
+            Observation::Completed(completed) => {
+                self.pending.remove(&completed.endpoint);
+                self.completed(*completed).await?;
+            }
+            Observation::Tick(_due) => {
+                #[cfg(test)]
+                self.record_tick_lateness(self.node.now().saturating_duration_since(_due));
+                self.tick().await?;
+            }
+            Observation::Incoming(event) => self.receive(*event).await?,
+        }
+        self.publish_snapshot();
+        Ok(())
+    }
+
+    async fn tick(&mut self) -> anyhow::Result<()> {
+        let now = self.now;
+        let actions = self.core().tick(now).map_err(core_error)?;
+        for action in &actions {
+            if let Action::PersistFloor { update, .. } = action
+                && update.status == Status::Dead
+            {
+                self.local_declarations
+                    .insert(update.member.clone(), update.version);
+            }
+        }
+        self.actions(actions).await?;
+        let actions = self.core.probe_next(now, |upper| self.rng.choose(upper));
+        if let Ok(actions) = actions {
+            self.actions(actions).await?;
+        }
+        self.exchange_next().await?;
+        self.recovery_next().await?;
+        Ok(())
+    }
+
+    async fn advance(&mut self) -> anyhow::Result<()> {
+        let observed = self.node.now();
+        let elapsed = observed.saturating_duration_since(self.last);
+        self.last = observed;
+        if elapsed > TICK * 4 {
+            let actions = self.core().local_degradation();
+            self.actions(actions).await?;
+        } else {
+            self.now = self.now.saturating_add(elapsed);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_tick_lateness(&mut self, lateness: Duration) {
+        if self.tick_lateness_micros.len() == SCHEDULING_SAMPLES_LIMIT {
+            self.tick_lateness_micros.pop_front();
+        }
+        self.tick_lateness_micros
+            .push_back(lateness.as_micros().min(u64::MAX as u128) as u64);
+    }
+
+    fn publish_snapshot(&self) {
+        self.metrics
+            .peers
+            .set(Gauge::ControlIngress, self.incoming.len() as u64);
+        self.metrics
+            .peers
+            .set(Gauge::ControlCapacity, self.incoming.max_capacity() as u64);
+        self.metrics
+            .peers
+            .set(Gauge::MembershipWrites, self.write_queue.len() as u64);
+        self.metrics.peers.set(Gauge::MembershipWriteCapacity, 64);
+        let mut records: Vec<_> = self.records.values().cloned().collect();
+        records.push(self.owner.clone());
+        records.sort_by(|a, b| a.member.cmp(&b.member));
+        self.snapshot_tx.send_replace(Snapshot {
+            probe_timings: self
+                .timings
+                .values()
+                .filter(|sample| {
+                    self.records.get(&sample.member).is_some_and(|record| {
+                        record.version == sample.version
+                            && matches!(
+                                record.state,
+                                MembershipState::Alive | MembershipState::Suspect
+                            )
+                    })
+                })
+                .cloned()
+                .collect(),
+            records,
+            health: self.core.health(),
+            error: None,
+            successful_probes: self.successful_probes,
+            failed_probes: self.failed_probes,
+            #[cfg(test)]
+            tick_lateness_micros: self.tick_lateness_micros.iter().copied().collect(),
+        });
+    }
+
+    async fn accept_owner(
+        &mut self,
+        from: &str,
+        owner: MembershipRecord,
+    ) -> anyhow::Result<Option<u64>> {
+        if owner.member != from || owner.reporter != from || from == self.owner.member {
+            return Ok(None);
+        }
+        let current = self.sessions.get(from).copied();
+        if current.is_some_and(|(epoch, _)| owner.version.epoch < epoch) {
+            return Ok(None);
+        }
+        let session = match current {
+            Some((epoch, session)) if epoch == owner.version.epoch => session,
+            _ => {
+                if current.is_none() && self.sessions.len() >= CAPACITY {
+                    tracing::warn!("membership session capacity exhausted; new owner rejected");
+                    return Ok(None);
+                }
+                self.serial()?
+            }
+        };
+        let now = self.now;
+        if owner.state == MembershipState::Left
+            && current.is_some_and(|(epoch, _)| epoch == owner.version.epoch)
+        {
+            if let Ok(actions) = self
+                .core()
+                .owner_leave(from, session, version(owner.version), now)
+            {
+                self.actions(actions).await?;
+            }
+            return Ok(None);
+        }
+        if !matches!(owner.state, MembershipState::Alive | MembershipState::Left) {
+            return Ok(None);
+        }
+        let admitted = if current.is_some_and(|(epoch, _)| epoch == owner.version.epoch) {
+            self.core()
+                .owner_alive(from, session, version(owner.version), now)
+        } else {
+            self.core()
+                .admit(from, version(owner.version), session, now)
+        };
+        let actions = match admitted {
+            Ok(actions) => actions,
+            Err(Error::Capacity) => {
+                tracing::warn!("membership capacity exhausted; owner rejected");
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        };
+        if !self
+            .core
+            .accepted_owner(from, version(owner.version), session)
+        {
+            return Ok(None);
+        }
+        self.sessions
+            .insert(from.into(), (owner.version.epoch, session));
+        self.actions(actions).await?;
+        if owner.state == MembershipState::Left {
+            let actions = self
+                .core()
+                .owner_leave(from, session, version(owner.version), now)
+                .map_err(core_error)?;
+            self.actions(actions).await?;
+            return Ok(None);
+        } else {
+            self.records.insert(from.into(), owner);
+        }
+        Ok(Some(session))
+    }
+
+    fn recovery_verdict(&self, from: &str, owner: &MembershipRecord) -> Option<MembershipRecord> {
+        if owner.member != from || owner.reporter != from || owner.state != MembershipState::Alive {
+            return None;
+        }
+        let update = self.core.recovery_verdict(from, version(owner.version))?;
+        Some(record(update, None, Some(self.owner.member.clone())))
+    }
+
+    async fn actions(&mut self, actions: Vec<Action>) -> anyhow::Result<()> {
+        let mut actions = VecDeque::from(actions);
+        while let Some(action) = actions.pop_front() {
+            match action {
+                Action::PersistFloor { .. } => {
+                    if self.write_queue.len() >= 64 {
+                        anyhow::bail!("membership persistence queue exhausted");
+                    }
+                    self.write_queue.push_back(action);
+                    self.start_write()?;
+                }
+                Action::Publish(update) => {
+                    let previous = if update.member == self.owner.member {
+                        Some(&self.owner)
+                    } else {
+                        self.records.get(&update.member)
+                    };
+                    if previous.is_none_or(|record| {
+                        record.state != wire_state(update.status)
+                            || record.version != wire_version(update.version)
+                    }) {
+                        match update.status {
+                            Status::Alive
+                                if previous.is_some_and(|record| {
+                                    record.state == MembershipState::Suspect
+                                }) =>
+                            {
+                                self.metrics.peers.increment(Metric::Refuted)
+                            }
+                            Status::Dead => self.metrics.peers.increment(
+                                if self.local_declarations.remove(&update.member)
+                                    == Some(update.version)
+                                {
+                                    Metric::DeclaredDead
+                                } else {
+                                    Metric::LearnedDead
+                                },
+                            ),
+                            Status::Left => self.metrics.peers.increment(Metric::Left),
+                            _ => {}
+                        }
+                    }
+                    if update.member == self.owner.member {
+                        let refuted = update.status == Status::Alive
+                            && self.owner.version != wire_version(update.version);
+                        self.owner = record(update, self.owner.endpoint.clone(), None);
+                        // Push the newer incarnation to members that may hold us dead.
+                        if refuted {
+                            self.wake_recovery();
+                        }
+                    } else {
+                        let endpoint = self
+                            .records
+                            .get(&update.member)
+                            .and_then(|record| record.endpoint.clone());
+                        let reporter = if matches!(update.status, Status::Alive | Status::Left) {
+                            update.member.clone()
+                        } else {
+                            self.owner.member.clone()
+                        };
+                        self.records.insert(
+                            update.member.clone(),
+                            record(update, endpoint, Some(reporter)),
+                        );
+                    }
+                }
+                Action::Suspicion { update, reporter } => {
+                    if self.records.get(&update.member).is_none_or(|record| {
+                        record.state != MembershipState::Suspect
+                            || record.version != wire_version(update.version)
+                    }) {
+                        self.metrics.peers.increment(Metric::Suspect);
+                    }
+                    let endpoint = self
+                        .records
+                        .get(&update.member)
+                        .and_then(|record| record.endpoint.clone());
+                    self.records.insert(
+                        update.member.clone(),
+                        record(update, endpoint, Some(reporter)),
+                    );
+                }
+                Action::Buddy { member, .. } => {
+                    if let Some(endpoint) = self
+                        .records
+                        .get(&member)
+                        .and_then(|record| record.endpoint.clone())
+                    {
+                        self.launch(
+                            endpoint,
+                            Some(member),
+                            ControlKind::Exchange { after: None },
+                            Job::Exchange,
+                        )?;
+                    }
+                }
+                Action::Probe(probe::Action::Direct {
+                    attempt, target, ..
+                }) => {
+                    if let Some(endpoint) = self
+                        .records
+                        .get(&target.id)
+                        .and_then(|record| record.endpoint.clone())
+                    {
+                        if !self.launch(
+                            endpoint,
+                            Some(target.id.clone()),
+                            ControlKind::Probe {
+                                target: target.id.clone(),
+                                version: wire_version(target.version),
+                            },
+                            Job::Probe {
+                                attempt,
+                                target: target.clone(),
+                                route: target,
+                            },
+                        )? {
+                            let now = self.now;
+                            actions.extend(
+                                self.core()
+                                    .probe_send_failed(attempt, now)
+                                    .map_err(core_error)?,
+                            );
+                        }
+                    } else {
+                        let now = self.now;
+                        actions.extend(
+                            self.core()
+                                .probe_send_failed(attempt, now)
+                                .map_err(core_error)?,
+                        );
+                    }
+                }
+                Action::Probe(probe::Action::Indirect {
+                    attempt,
+                    helper,
+                    target,
+                    ..
+                }) => {
+                    if let Some(endpoint) = self
+                        .records
+                        .get(&helper.id)
+                        .and_then(|record| record.endpoint.clone())
+                    {
+                        if !self.launch(
+                            endpoint,
+                            Some(helper.id.clone()),
+                            ControlKind::Indirect {
+                                target: target.id.clone(),
+                                version: wire_version(target.version),
+                            },
+                            Job::Probe {
+                                attempt,
+                                target,
+                                route: helper,
+                            },
+                        )? {
+                            let now = self.now;
+                            actions.extend(
+                                self.core()
+                                    .probe_send_failed(attempt, now)
+                                    .map_err(core_error)?,
+                            );
+                        }
+                    } else {
+                        let now = self.now;
+                        actions.extend(
+                            self.core()
+                                .probe_send_failed(attempt, now)
+                                .map_err(core_error)?,
+                        );
+                    }
+                }
+                Action::Probe(probe::Action::Finished { outcome, .. }) => match outcome {
+                    probe::Outcome::Success => {
+                        self.metrics.peers.increment(Metric::ProbeSuccess);
+                        self.successful_probes = self.successful_probes.saturating_add(1)
+                    }
+                    probe::Outcome::Failed => {
+                        self.metrics.peers.increment(Metric::ProbeFailed);
+                        self.failed_probes = self.failed_probes.saturating_add(1)
+                    }
+                    probe::Outcome::LocalDegradation => {
+                        self.metrics.peers.increment(Metric::ProbeDegraded)
+                    }
+                },
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn receive(&mut self, event: ControlIncoming) -> anyhow::Result<()> {
+        let from = event.from.to_string();
+        let accepted_session = self
+            .accept_owner(&from, event.request.owner.clone())
+            .await?;
+        if let Some(session) = accepted_session {
+            self.updates(&from, session, &event.request.updates).await?;
+        } else if self.recovery_verdict(&from, &event.request.owner).is_some() {
+            // Mirror of the correlated-reply rule: an equally rejected owner's
+            // request may only make us refute its verdict about ourselves.
+            for record in &event.request.updates {
+                if record.member == self.owner.member
+                    && record.reporter == from
+                    && matches!(
+                        record.state,
+                        MembershipState::Suspect | MembershipState::Dead
+                    )
+                {
+                    let now = self.now;
+                    let actions = self
+                        .core
+                        .refute_self(version(record.version), now)
+                        .map_err(core_error)?;
+                    self.actions(actions).await?;
+                }
+            }
+        }
+        if accepted_session.is_some()
+            && let ControlKind::Indirect { target, version } = &event.request.kind
+            && let Some(record) = self.records.get(target)
+            && record.version == *version
+            && let Some(endpoint) = &record.endpoint
+            && let Some((_, session)) = self.sessions.get(target)
+        {
+            let target = Peer {
+                id: target.clone(),
+                version: super::runtime::version(*version),
+                session: *session,
+            };
+            let endpoint = endpoint.clone();
+            if self.jobs.len() < 8 && self.sessions.contains_key(&from) {
+                let kind = ControlKind::Probe {
+                    target: target.id.clone(),
+                    version: wire_version(target.version),
+                };
+                self.launch(
+                    endpoint,
+                    Some(target.id.clone()),
+                    kind,
+                    Job::Helper { event, target },
+                )?;
+                return Ok(());
+            }
+        }
+        let ack = match &event.request.kind {
+            ControlKind::Probe { target, version } => {
+                target == &self.owner.member && version == &self.owner.version
+            }
+            _ => false,
+        };
+        let after = match &event.request.kind {
+            ControlKind::Exchange { after } => after.as_deref(),
+            _ => None,
+        };
+        let mut page = self
+            .records
+            .values()
+            .filter(|record| after.is_none_or(|after| record.member.as_str() > after));
+        let mut records: Vec<_> = page
+            .by_ref()
+            .take(if accepted_session.is_some() {
+                nx_net::MAX_CONTROL_RECORDS
+            } else {
+                0
+            })
+            .cloned()
+            .collect();
+        let mut next = page
+            .next()
+            .and_then(|_| records.last().map(|record| record.member.clone()));
+        if accepted_session.is_none()
+            && let Some(verdict) = self.recovery_verdict(&from, &event.request.owner)
+        {
+            records.push(verdict);
+            next = None;
+        }
+        let _ = event.respond_to.send(ControlReply {
+            request_id: event.request.request_id,
+            owner: self.owner.clone(),
+            ack,
+            nack: false,
+            records,
+            next,
+        });
+        Ok(())
+    }
+
+    fn start_write(&mut self) -> anyhow::Result<()> {
+        if !self.writes.is_empty() {
+            return Ok(());
+        }
+        while let Some(action) = self.write_queue.pop_front() {
+            if !self.core.pending_floor(&action) {
+                continue;
+            }
+            let Action::PersistFloor { token, update } = action else {
+                continue;
+            };
+            let store = Arc::clone(&self.store);
+            let local = self.core.local_id().to_string();
+            let epoch = self
+                .core
+                .local_epoch()
+                .ok_or_else(|| core_error(Error::NotReady))?;
+            #[cfg(test)]
+            let queued_at = Instant::now();
+            #[cfg(test)]
+            shutdown_trace(
+                "write.queued",
+                format_args!(
+                    "node={local} token={token} member={} version={:?} status={:?}",
+                    update.member, update.version, update.status
+                ),
+            );
+            self.writes.spawn_blocking(move || {
+                #[cfg(test)]
+                shutdown_trace(
+                    "write.started",
+                    format_args!(
+                        "node={local} token={token} member={} version={:?} status={:?} queue_us={}",
+                        update.member,
+                        update.version,
+                        update.status,
+                        queued_at.elapsed().as_micros()
+                    ),
+                );
+                #[cfg(test)]
+                if queued_at.elapsed() > Duration::from_secs(1) {
+                    eprintln!(
+                        "MEMBERSHIP_WRITE_QUEUE elapsed_ms={}",
+                        queued_at.elapsed().as_millis()
+                    );
+                }
+                let result = MembershipStore::new(&store).persist_update(&local, epoch, &update);
+                #[cfg(test)]
+                shutdown_trace(
+                    "write.finished",
+                    format_args!("node={local} token={token} ok={}", result.is_ok()),
+                );
+                (token, result)
+            });
+            break;
+        }
+        Ok(())
+    }
+
+    async fn written(
+        &mut self,
+        (token, result): (u64, Result<(), super::storage::StorageError>),
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        shutdown_trace(
+            "write.observed",
+            format_args!(
+                "node={} token={token} ok={}",
+                self.owner.member,
+                result.is_ok()
+            ),
+        );
+        if let Err(error) = result {
+            let _ = self.core.confirm_floor(token, false);
+            self.core.fence();
+            return Err(error.into());
+        }
+        let actions = self.core.confirm_floor(token, true).map_err(core_error)?;
+        self.actions(actions).await?;
+        #[cfg(test)]
+        shutdown_trace(
+            "write.published",
+            format_args!(
+                "node={} token={token} state={:?}",
+                self.owner.member, self.owner.state
+            ),
+        );
+        self.start_write()?;
+        Ok(())
+    }
+
+    async fn exchange_next(&mut self) -> anyhow::Result<()> {
+        if self.jobs.len() >= 6 || self.now < self.next_exchange {
+            return Ok(());
+        }
+        self.next_exchange = self.now.saturating_add(Duration::from_millis(250));
+        let mut endpoints: Vec<_> = self
+            .records
+            .values()
+            .filter_map(|record| {
+                record
+                    .endpoint
+                    .clone()
+                    .map(|endpoint| (endpoint, record.member.clone()))
+            })
+            .collect();
+        endpoints.extend(
+            self.hints
+                .iter()
+                .map(|(member, endpoint)| (endpoint.clone(), member.clone())),
+        );
+        for (addr, member) in self.node.connected_peers().await {
+            if let Some(info) = self.node.connection_info(&addr).await
+                && let Some(endpoint) = info.dialed_endpoint
+            {
+                endpoints.push((endpoint, member.to_string()));
+            }
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        if endpoints.is_empty() {
+            return Ok(());
+        }
+        // Skip endpoints with an exchange in flight instead of wasting this slot.
+        let len = endpoints.len();
+        let start = self.cursor % len;
+        let Some(offset) = (0..len).find(|offset| {
+            !self
+                .pending
+                .contains_key(&endpoints[(start + offset) % len].0)
+        }) else {
+            return Ok(());
+        };
+        let (endpoint, expected) = endpoints[(start + offset) % len].clone();
+        self.cursor = start + offset + 1;
+        let after = self.pages.get(&expected).cloned().flatten();
+        self.launch(
+            endpoint,
+            Some(expected),
+            ControlKind::Exchange { after },
+            Job::Exchange,
+        )?;
+        Ok(())
+    }
+
+    /// Endpoints that may be on the far side of a healed partition: members this
+    /// node holds Suspect/Dead (never Left) and hints for members not yet known.
+    fn recovery_candidates(&self) -> BTreeMap<String, (String, Option<MembershipVersion>)> {
+        let mut candidates = BTreeMap::new();
+        for record in self.records.values() {
+            if matches!(
+                record.state,
+                MembershipState::Suspect | MembershipState::Dead
+            ) && let Some(endpoint) = &record.endpoint
+            {
+                candidates.insert(
+                    endpoint.clone(),
+                    (record.member.clone(), Some(record.version)),
+                );
+            }
+        }
+        for (member, endpoint) in &self.hints {
+            if !self.records.contains_key(member) {
+                candidates
+                    .entry(endpoint.clone())
+                    .or_insert_with(|| (member.clone(), None));
+            }
+        }
+        candidates
+    }
+
+    /// Recovery lane: at most one exchange per tick toward a due recovery endpoint,
+    /// sharing the exchange job limit. Each endpoint backs off independently.
+    async fn recovery_next(&mut self) -> anyhow::Result<()> {
+        if self.jobs.len() >= 6 || self.now < self.next_recovery {
+            return Ok(());
+        }
+        let now = self.now;
+        let candidates = self.recovery_candidates();
+        self.recovery.retain(|endpoint, contact| {
+            candidates
+                .get(endpoint)
+                .is_some_and(|(member, _)| &contact.member == member)
+        });
+        for (endpoint, (member, version)) in candidates {
+            let contact = self
+                .recovery
+                .entry(endpoint)
+                .or_insert_with(|| RecoveryContact {
+                    member,
+                    version,
+                    due: now,
+                    delay: RECOVERY_DELAY_MIN,
+                });
+            if contact.version != version {
+                contact.version = version;
+                contact.due = now;
+                contact.delay = RECOVERY_DELAY_MIN;
+            }
+        }
+        let Some(endpoint) = self
+            .recovery
+            .iter()
+            .filter(|(endpoint, contact)| {
+                contact.due <= now && !self.pending.contains_key(*endpoint)
+            })
+            .min_by(|a, b| (a.1.due, a.0).cmp(&(b.1.due, b.0)))
+            .map(|(endpoint, _)| endpoint.clone())
+        else {
+            return Ok(());
+        };
+        let contact = self
+            .recovery
+            .get_mut(&endpoint)
+            .ok_or_else(|| anyhow::anyhow!("recovery contact vanished"))?;
+        contact.due = now.saturating_add(contact.delay);
+        contact.delay = contact.delay.saturating_mul(2).min(RECOVERY_DELAY_MAX);
+        let member = contact.member.clone();
+        self.next_recovery = now.saturating_add(TICK);
+        let after = self.pages.get(&member).cloned().flatten();
+        self.launch(
+            endpoint,
+            Some(member),
+            ControlKind::Exchange { after },
+            Job::Exchange,
+        )?;
+        Ok(())
+    }
+
+    /// Makes every recovery contact due again after evidence that a partition may
+    /// have healed (a reply from a recovery endpoint or a local self-refutation).
+    fn wake_recovery(&mut self) {
+        let now = self.now;
+        if self
+            .recovery_woken_at
+            .is_some_and(|woken| now < woken.saturating_add(RECOVERY_WAKE_SPACING))
+        {
+            return;
+        }
+        self.recovery_woken_at = Some(now);
+        for contact in self.recovery.values_mut() {
+            contact.due = now;
+            contact.delay = RECOVERY_DELAY_MIN;
+        }
+    }
+
+    fn launch(
+        &mut self,
+        endpoint: String,
+        expected: Option<String>,
+        kind: ControlKind,
+        mode: Job,
+    ) -> anyhow::Result<bool> {
+        if self.jobs.len() >= 8 {
+            return Ok(false);
+        }
+        let mut updates = Vec::new();
+        if let Some(target) = expected
+            .as_ref()
+            .and_then(|expected| self.records.get(expected))
+            && target.reporter == self.owner.member
+        {
+            updates.push(target.clone());
+        }
+        updates.extend(
+            self.records
+                .values()
+                .filter(|record| {
+                    record.reporter == self.owner.member
+                        && expected
+                            .as_ref()
+                            .is_none_or(|expected| expected != &record.member)
+                })
+                .take(nx_net::MAX_CONTROL_RECORDS - updates.len())
+                .cloned(),
+        );
+        let request = ControlRequest {
+            request_id: self.serial()?,
+            owner: self.owner.clone(),
+            updates,
+            kind,
+        };
+        if matches!(mode, Job::Exchange) {
+            self.pending.insert(endpoint.clone(), ());
+        }
+        let node = Arc::clone(&self.node);
+        let dispatch_tx = self.dispatch_tx.clone();
+        let budget = match &mode {
+            Job::Probe { target, route, .. } if target != route => Duration::from_secs(1),
+            Job::Probe { .. } => RPC_BUDGET * (self.core().health() + 1),
+            _ => RPC_BUDGET,
+        };
+        self.jobs.spawn(async move {
+            let (sent, received) = oneshot::channel();
+            let query = node.control_request_timed_tracked(&endpoint, request, budget, Some(sent));
+            tokio::pin!(query);
+            let result = tokio::select! {
+                biased;
+                sent = received => {
+                    if sent.is_ok() && let Job::Probe { attempt, route, .. } = &mode
+                        && dispatch_tx.try_send(Dispatch { indirect: matches!(&mode, Job::Probe { target, route, .. } if target != route), attempt: *attempt, route: route.clone() }).is_err() {
+                            return Completion { endpoint: endpoint.clone(), expected, mode, timing: None, result: Err(nx_net::NetError::PeerLimitReached(64)) };
+                    }
+                    query.await
+                }
+                result = &mut query => result,
+            };
+            let (result, timing) = match result {
+                Ok((peer, reply, timing)) => (Ok((peer, reply)), Some(timing)),
+                Err(error) => (Err(error), None),
+            };
+            Completion { endpoint: endpoint.clone(), expected, mode, timing, result }
+        });
+        Ok(true)
+    }
+
+    async fn completed(&mut self, completion: Completion) -> anyhow::Result<()> {
+        // Any reply from a member held Suspect/Dead shows the path may have healed.
+        if matches!(completion.mode, Job::Exchange)
+            && completion.result.is_ok()
+            && self
+                .recovery
+                .get(&completion.endpoint)
+                .is_some_and(|contact| contact.version.is_some())
+        {
+            self.wake_recovery();
+        }
+        let result = completion.result.and_then(|(peer, reply)| {
+            if completion
+                .expected
+                .as_ref()
+                .is_some_and(|expected| expected != &peer.to_string())
+            {
+                Err(nx_net::NetError::InvalidMessage(
+                    "unexpected control identity".into(),
+                ))
+            } else {
+                Ok((peer, reply))
+            }
+        });
+        let mut accepted_session = None;
+        let result = match result {
+            Ok((peer, reply)) => {
+                accepted_session = self
+                    .accept_owner(&peer.to_string(), reply.owner.clone())
+                    .await?;
+                if accepted_session.is_some() {
+                    Ok((peer, reply))
+                } else {
+                    // This owner is not a reporter or helper. It may only tell us
+                    // its judgment of ourselves so both sides can escape mutual death.
+                    if self
+                        .recovery_verdict(&peer.to_string(), &reply.owner)
+                        .is_some()
+                    {
+                        for record in &reply.records {
+                            if record.member == self.owner.member
+                                && record.reporter == peer.to_string()
+                                && matches!(
+                                    record.state,
+                                    MembershipState::Suspect | MembershipState::Dead
+                                )
+                            {
+                                let now = self.now;
+                                let actions = self
+                                    .core
+                                    .refute_self(version(record.version), now)
+                                    .map_err(core_error)?;
+                                self.actions(actions).await?;
+                            }
+                        }
+                    }
+                    Err(nx_net::NetError::InvalidMessage(
+                        "unaccepted control owner".into(),
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let now = self.now;
+        if let Job::Probe {
+            attempt,
+            target,
+            route,
+        } = &completion.mode
+        {
+            let actions = match &result {
+                Ok((_, reply)) if reply.ack || reply.nack => self
+                    .core()
+                    .probe_reply(*attempt, target, route, reply.ack, now),
+                Ok(_) => self.core().probe_send_failed(*attempt, now),
+                Err(
+                    nx_net::NetError::PeerLimitReached(_)
+                    | nx_net::NetError::TlsError(_)
+                    | nx_net::NetError::InvalidMessage(_),
+                ) => self.core().probe_send_failed(*attempt, now),
+                Err(nx_net::NetError::Wire(nx_net::WireError::RateLimited { .. })) => {
+                    self.core().probe_send_failed(*attempt, now)
+                }
+                _ => Ok(vec![]),
+            }
+            .map_err(core_error)?;
+            let direct_success = target == route
+                && actions.iter().any(|action| {
+                    matches!(action, Action::Probe(probe::Action::Finished {
+                    attempt: completed, outcome: probe::Outcome::Success, ..
+                }) if completed == attempt)
+                });
+            if direct_success
+                && let (Ok((peer, reply)), Some(timing)) = (&result, completion.timing)
+                && reply.ack
+                && version(reply.owner.version) == target.version
+                && accepted_session == Some(target.session)
+            {
+                self.timings.insert(
+                    peer.to_string(),
+                    ProbeTiming {
+                        member: peer.to_string(),
+                        version: reply.owner.version,
+                        timing,
+                    },
+                );
+            }
+            self.actions(actions).await?;
+        }
+        if let Job::Helper { event, target } = completion.mode {
+            let ack = result.as_ref().is_ok_and(|(peer, reply)| {
+                peer.to_string() == target.id
+                    && reply.ack
+                    && version(reply.owner.version) == target.version
+            });
+            let nack = !ack
+                && matches!(
+                    result,
+                    Err(nx_net::NetError::Io(_)
+                        | nx_net::NetError::Timeout
+                        | nx_net::NetError::ConnectionFailed(_))
+                );
+            let _ = event.respond_to.send(ControlReply {
+                request_id: event.request.request_id,
+                owner: self.owner.clone(),
+                ack,
+                nack,
+                records: vec![],
+                next: None,
+            });
+        }
+        if let Ok((peer, reply)) = result
+            && let Some(session) = accepted_session
+        {
+            let peer = peer.to_string();
+            self.hints.remove(&peer);
+            if self.pages.len() < CAPACITY || self.pages.contains_key(&peer) {
+                self.pages.insert(peer.clone(), reply.next);
+            }
+            self.updates(&peer, session, &reply.records).await?;
+        }
+        Ok(())
+    }
+
+    async fn updates(
+        &mut self,
+        from: &str,
+        session: u64,
+        records: &[MembershipRecord],
+    ) -> anyhow::Result<()> {
+        for record in records {
+            if record.state == MembershipState::Left {
+                let now = self.now;
+                if let Ok(actions) = self.core().relay_leave(
+                    from,
+                    session,
+                    &record.member,
+                    version(record.version),
+                    now,
+                ) {
+                    self.actions(actions).await?;
+                }
+                continue;
+            }
+            if matches!(record.state, MembershipState::Alive | MembershipState::Left)
+                && record.member != self.owner.member
+            {
+                if let Some(endpoint) = &record.endpoint
+                    && self.hints.len() < HINT_LIMIT
+                    && !self.records.contains_key(&record.member)
+                {
+                    self.hints.insert(record.member.clone(), endpoint.clone());
+                }
+                continue;
+            }
+            if record.reporter != from {
+                continue;
+            }
+            let now = self.now;
+            let actions = match record.state {
+                MembershipState::Suspect => {
+                    self.core()
+                        .suspect(from, session, &record.member, version(record.version), now)
+                }
+                MembershipState::Dead => self.core().report_dead(
+                    from,
+                    session,
+                    &record.member,
+                    version(record.version),
+                    now,
+                ),
+                _ => Ok(vec![]),
+            };
+            if let Ok(actions) = actions {
+                self.actions(actions).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_probe_seed_parses_and_rejects_invalid_values() {
+        assert_eq!(parse_probe_seed("42").unwrap(), 42);
+        assert!(parse_probe_seed("not-a-seed").is_err());
+    }
+
+    fn controlled_shutdown<F>(
+        run: impl FnOnce(ShutdownRequest) -> F + Send + 'static,
+    ) -> (Handle, oneshot::Receiver<()>)
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let (stop, stopped) = oneshot::channel();
+        let (lifetime, dropped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _lifetime = lifetime;
+            run(stopped.await?).await
+        });
+        let (_, snapshot) = watch::channel(Snapshot::default());
+        (Handle::new(stop, task, snapshot), dropped)
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_announcements_only_after_timely_critical_completion() {
+        use std::cmp::Ordering;
+
+        for timing in [
+            Some(Ordering::Less),
+            Some(Ordering::Equal),
+            Some(Ordering::Greater),
+            None,
+        ] {
+            let (mut handle, mut dropped) = controlled_shutdown(move |request| async move {
+                if let Some(timing) = timing {
+                    let at = match timing {
+                        Ordering::Less => request.deadline - Duration::from_nanos(1),
+                        Ordering::Equal => request.deadline,
+                        Ordering::Greater => request.deadline + Duration::from_nanos(1),
+                    };
+                    request.completed.send(at).unwrap();
+                }
+                std::future::pending::<anyhow::Result<()>>().await
+            });
+            let result = handle.shutdown_with_budget(Duration::from_secs(1)).await;
+            assert_eq!(result.is_ok(), timing == Some(Ordering::Less), "{result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("shutdown budget exhausted"));
+            }
+            if timing.is_some() {
+                assert!(matches!(
+                    dropped.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            } else {
+                // Without a critical confirmation the actor is kept for a retry.
+                assert!(matches!(
+                    dropped.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                drop(handle);
+                assert!(dropped.await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_retry_resumes_waiting_for_pending_critical_completion() {
+        let (release, released) = oneshot::channel::<()>();
+        let (mut handle, mut dropped) = controlled_shutdown(|request| async move {
+            released.await?;
+            request.completed.send(tokio::time::Instant::now()).unwrap();
+            Ok(())
+        });
+        let error = handle
+            .shutdown_with_budget(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ShutdownPending>(),
+            Some(ShutdownPending::DurabilityUnconfirmed)
+        ));
+        assert!(error.to_string().contains("retry shutdown"));
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let error = handle
+            .shutdown_with_budget(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retry shutdown"));
+        release.send(()).unwrap();
+        handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_late_confirmation_even_when_task_completes() {
+        let (mut handle, mut dropped) = controlled_shutdown(|request| async move {
+            request
+                .completed
+                .send(request.deadline + Duration::from_nanos(1))
+                .unwrap();
+            Ok(())
+        });
+        let error = handle
+            .shutdown_with_budget(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ShutdownPending>(),
+            Some(ShutdownPending::DurableLeaveConfirmedLate { .. })
+        ));
+        assert!(error.to_string().contains("shutdown budget exhausted"));
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_task_errors_after_critical_completion() {
+        for panic in [false, true] {
+            let (mut handle, mut dropped) = controlled_shutdown(move |request| async move {
+                request
+                    .completed
+                    .send(request.deadline - Duration::from_nanos(1))
+                    .unwrap();
+                if panic {
+                    panic!("injected shutdown task panic");
+                }
+                anyhow::bail!("injected shutdown task error");
+            });
+            let error = handle
+                .shutdown_with_budget(Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            if panic {
+                assert!(
+                    error
+                        .downcast_ref::<tokio::task::JoinError>()
+                        .unwrap()
+                        .is_panic()
+                );
+            } else {
+                assert!(error.to_string().contains("injected shutdown task error"));
+            }
+            assert!(matches!(
+                dropped.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+            // A retry must not turn the observed failure into success.
+            let retried = handle
+                .shutdown_with_budget(Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(retried.to_string().contains("previously failed"));
+        }
+    }
+
+    fn owner(member: &str, epoch: u64, incarnation: u64) -> MembershipRecord {
+        MembershipRecord {
+            member: member.into(),
+            reporter: member.into(),
+            version: MembershipVersion { epoch, incarnation },
+            state: MembershipState::Alive,
+            endpoint: None,
+        }
+    }
+
+    fn actor(floors: &[super::super::schema::Floor]) -> (tempfile::TempDir, Actor) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let timing = super::super::suspicion::tests::timing();
+        let mut initial = Membership::new("local".into(), CAPACITY, timing, 1, 3).unwrap();
+        MembershipStore::new(&store).start(&mut initial).unwrap();
+        for floor in floors {
+            store
+                .set(
+                    format!("__nx/membership/floor/{}", floor.member).as_bytes(),
+                    &floor.encode().unwrap(),
+                )
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let mut core = Membership::new("local".into(), CAPACITY, timing, 1, 3).unwrap();
+        MembershipStore::new(&store).start(&mut core).unwrap();
+        let mut node = Node::new(nx_net::NodeConfig::new(
+            nx_sync::NodeId::new("local"),
+            "127.0.0.1:0",
+        ));
+        let incoming = node.take_control_receiver().unwrap();
+        let (snapshot_tx, _) = watch::channel(Snapshot::default());
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(64);
+        (
+            directory,
+            Actor {
+                local_declarations: BTreeMap::new(),
+                metrics: Arc::new(RuntimeMetrics::default()),
+                core,
+                owner: owner("local", 2, 0),
+                node: Arc::new(node),
+                store,
+                incoming,
+                records: BTreeMap::new(),
+                timings: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+                serial: 0,
+                now: Duration::ZERO,
+                last: Instant::now(),
+                jobs: Jobs::new(),
+                pending: BTreeMap::new(),
+                cursor: 0,
+                snapshot_tx,
+                dispatch_tx,
+                dispatch_rx,
+                rng: crate::peer_io::random::Random::new(1),
+                next_exchange: Duration::ZERO,
+                hints: BTreeMap::new(),
+                pages: BTreeMap::new(),
+                recovery: BTreeMap::new(),
+                next_recovery: Duration::ZERO,
+                recovery_woken_at: None,
+                successful_probes: 0,
+                failed_probes: 0,
+                tick_lateness_micros: VecDeque::new(),
+                writes: Jobs::new(),
+                write_queue: VecDeque::new(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_exchange_only_refutes_self_without_readmitting_a_reporter() {
+        for restored in [false, true] {
+            for terminal in [false, true] {
+                let floors = if restored {
+                    vec![super::super::schema::Floor {
+                        member: "bob".into(),
+                        version: Version {
+                            epoch: 1,
+                            incarnation: 0,
+                        },
+                        status: Status::Dead,
+                        closed_epoch: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                let (_directory, mut actor) = actor(&floors);
+                if !restored {
+                    actor.accept_owner("bob", owner("bob", 1, 0)).await.unwrap();
+                    let actions = actor
+                        .core
+                        .probe_failed(
+                            "bob",
+                            Version {
+                                epoch: 1,
+                                incarnation: 0,
+                            },
+                            Duration::ZERO,
+                        )
+                        .unwrap();
+                    actor.actions(actions).await.unwrap();
+                    if terminal {
+                        let actions = actor.core.tick(Duration::from_secs(30)).unwrap();
+                        for action in actions {
+                            if matches!(action, Action::PersistFloor { .. }) {
+                                let published = MembershipStore::new(&actor.store)
+                                    .persist(&mut actor.core, &action)
+                                    .unwrap();
+                                actor.actions(published).await.unwrap();
+                            }
+                        }
+                        actor.now = Duration::from_secs(30);
+                    }
+                }
+                actor
+                    .accept_owner("carol", owner("carol", 1, 0))
+                    .await
+                    .unwrap();
+                let (respond_to, reply) = oneshot::channel();
+                actor
+                    .receive(ControlIncoming {
+                        from: nx_sync::NodeId::new("bob"),
+                        verification: nx_net::PeerIdentityVerification::Unverified,
+                        request: ControlRequest {
+                            request_id: 7,
+                            owner: owner("bob", 1, 0),
+                            updates: vec![],
+                            kind: ControlKind::Exchange {
+                                after: Some("zzz".into()),
+                            },
+                        },
+                        respond_to,
+                    })
+                    .await
+                    .unwrap();
+                let reply = reply.await.unwrap();
+                assert_eq!(reply.records.len(), 1);
+                assert_eq!(reply.records[0].member, "bob");
+                assert!(reply.next.is_none());
+                let sessions = actor.sessions.clone();
+                let before = actor.core.snapshot();
+                let mut accusation = actor.owner.clone();
+                accusation.reporter = "bob".into();
+                accusation.state = MembershipState::Dead;
+                let mut third_party = owner("carol", 1, 0);
+                third_party.reporter = "bob".into();
+                third_party.state = MembershipState::Dead;
+                actor
+                    .completed(Completion {
+                        endpoint: "127.0.0.1:9999".into(),
+                        expected: Some("bob".into()),
+                        mode: Job::Exchange,
+                        timing: None,
+                        result: Ok((
+                            nx_sync::NodeId::new("bob"),
+                            ControlReply {
+                                request_id: 7,
+                                owner: owner("bob", 1, 0),
+                                ack: false,
+                                nack: false,
+                                records: vec![accusation, third_party],
+                                next: Some("not-authorized".into()),
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(actor.owner.version.incarnation, 1);
+                assert_eq!(actor.sessions, sessions);
+                assert_eq!(actor.core.snapshot(), before);
+                assert!(actor.pages.is_empty());
+                assert!(actor.writes.is_empty());
+                assert!(
+                    actor
+                        .accept_owner("bob", owner("bob", 1, 0))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    actor
+                        .accept_owner("bob", owner("bob", 1, 1))
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    fn member_record(name: &str, state: MembershipState, endpoint: &str) -> MembershipRecord {
+        MembershipRecord {
+            member: name.into(),
+            reporter: if state == MembershipState::Alive {
+                name.into()
+            } else {
+                "local".into()
+            },
+            version: MembershipVersion {
+                epoch: 1,
+                incarnation: 0,
+            },
+            state,
+            endpoint: Some(endpoint.into()),
+        }
+    }
+
+    /// Returns endpoints launched since the last call and completes their jobs.
+    fn drain_launched(actor: &mut Actor) -> Vec<String> {
+        let launched = actor.pending.keys().cloned().collect();
+        for _ in actor.jobs.take() {
+            actor.jobs.finished();
+        }
+        actor.pending.clear();
+        launched
+    }
+
+    #[tokio::test]
+    async fn exchange_slot_skips_endpoints_with_pending_exchange() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for (name, endpoint) in [("a", "e-a"), ("b", "e-b"), ("c", "e-c")] {
+            actor.records.insert(
+                name.into(),
+                member_record(name, MembershipState::Alive, endpoint),
+            );
+        }
+        actor.pending.insert("e-a".into(), ());
+        actor.exchange_next().await.unwrap();
+        let mut pending: Vec<_> = actor.pending.keys().cloned().collect();
+        pending.sort();
+        assert_eq!(pending, ["e-a", "e-b"], "busy endpoint wasted the slot");
+        actor.pending.remove("e-b");
+        actor.now = Duration::from_millis(250);
+        actor.exchange_next().await.unwrap();
+        assert!(actor.pending.contains_key("e-c"), "cursor did not advance");
+    }
+
+    #[tokio::test]
+    async fn recovery_lane_backs_off_and_targets_only_suspect_dead_and_hints() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for (name, state, endpoint) in [
+            ("dead", MembershipState::Dead, "e-dead"),
+            ("suspect", MembershipState::Suspect, "e-suspect"),
+            ("left", MembershipState::Left, "e-left"),
+            ("alive", MembershipState::Alive, "e-alive"),
+        ] {
+            actor
+                .records
+                .insert(name.into(), member_record(name, state, endpoint));
+        }
+        actor.hints.insert("unknown".into(), "e-hint".into());
+        actor.hints.insert("alive".into(), "e-alive-hint".into());
+
+        let mut contacts: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+        let horizon = Duration::from_secs(300);
+        while actor.now <= horizon {
+            actor.recovery_next().await.unwrap();
+            for endpoint in drain_launched(&mut actor) {
+                contacts.entry(endpoint).or_default().push(actor.now);
+            }
+            actor.now += TICK;
+        }
+        let targets: Vec<_> = contacts.keys().cloned().collect();
+        assert_eq!(targets, ["e-dead", "e-hint", "e-suspect"]);
+        for (endpoint, times) in &contacts {
+            // Prompt first contact, then doubling delays capped at the maximum.
+            assert!(times[0] <= TICK * 3, "{endpoint}");
+            let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
+            for gap in &gaps {
+                assert!(*gap >= RECOVERY_DELAY_MIN && *gap <= RECOVERY_DELAY_MAX + TICK * 4);
+            }
+            assert!(
+                gaps.iter()
+                    .rev()
+                    .take(3)
+                    .all(|gap| *gap >= RECOVERY_DELAY_MAX),
+                "{endpoint}: backoff did not reach the cap: {gaps:?}"
+            );
+            let bound = horizon.as_secs() / RECOVERY_DELAY_MAX.as_secs() + 6;
+            assert!(times.len() as u64 <= bound, "{endpoint}: {}", times.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lane_shares_the_exchange_job_limit() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        for index in 0..20 {
+            let name = format!("dead-{index:02}");
+            actor.records.insert(
+                name.clone(),
+                member_record(&name, MembershipState::Dead, &format!("e-{index:02}")),
+            );
+        }
+        for _ in 0..40 {
+            actor.recovery_next().await.unwrap();
+            actor.now += TICK;
+        }
+        assert_eq!(actor.jobs.len(), 6);
+        assert_eq!(actor.pending.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn refutation_wakes_recovery_contacts_at_most_once_per_spacing() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.jobs.manual();
+        actor.records.insert(
+            "dead".into(),
+            member_record("dead", MembershipState::Dead, "e-dead"),
+        );
+        // Grow the backoff well beyond the minimum.
+        for _ in 0..(20_000 / TICK.as_millis() as usize) {
+            actor.recovery_next().await.unwrap();
+            drain_launched(&mut actor);
+            actor.now += TICK;
+        }
+        let grown = &actor.recovery["e-dead"];
+        assert!(grown.due > actor.now && grown.delay > RECOVERY_DELAY_MIN);
+
+        let refute = |actor: &mut Actor| {
+            let version = Version {
+                epoch: actor.owner.version.epoch,
+                incarnation: actor.owner.version.incarnation,
+            };
+            actor.core.refute_self(version, actor.now).unwrap()
+        };
+        let actions = refute(&mut actor);
+        actor.actions(actions).await.unwrap();
+        assert_eq!(actor.owner.version.incarnation, 1);
+        assert_eq!(actor.recovery["e-dead"].due, actor.now);
+        actor.recovery_next().await.unwrap();
+        assert_eq!(drain_launched(&mut actor), ["e-dead"]);
+
+        // Within the spacing, a second refutation must not make the contact due early.
+        actor.now += Duration::from_millis(500);
+        let actions = refute(&mut actor);
+        actor.actions(actions).await.unwrap();
+        assert_eq!(actor.owner.version.incarnation, 2);
+        assert!(
+            actor.recovery["e-dead"].due > actor.now,
+            "wake-up was not rate limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_request_carrying_own_verdict_refutes_only_self() {
+        for (reporter, held_dead, expect_refutation) in [
+            ("bob", true, true),
+            ("carol", true, false),
+            ("bob", false, false),
+        ] {
+            let floors = if held_dead {
+                vec![super::super::schema::Floor {
+                    member: "bob".into(),
+                    version: Version {
+                        epoch: 1,
+                        incarnation: 0,
+                    },
+                    status: Status::Dead,
+                    closed_epoch: None,
+                }]
+            } else {
+                vec![]
+            };
+            let (_directory, mut actor) = actor(&floors);
+            actor
+                .accept_owner("carol", owner("carol", 1, 0))
+                .await
+                .unwrap();
+            let sessions = actor.sessions.clone();
+            let before = actor.core.snapshot();
+            let mut verdict = actor.owner.clone();
+            verdict.reporter = reporter.into();
+            verdict.state = MembershipState::Dead;
+            let mut third_party = owner("carol", 1, 0);
+            third_party.reporter = "bob".into();
+            third_party.state = MembershipState::Dead;
+            let (respond_to, reply) = oneshot::channel();
+            actor
+                .receive(ControlIncoming {
+                    from: nx_sync::NodeId::new("bob"),
+                    verification: nx_net::PeerIdentityVerification::Unverified,
+                    request: ControlRequest {
+                        request_id: 9,
+                        owner: owner("bob", 1, 0),
+                        updates: vec![verdict, third_party],
+                        kind: ControlKind::Exchange { after: None },
+                    },
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            let reply = reply.await.unwrap();
+            if !held_dead {
+                // An admissible owner takes the normal authenticated path instead.
+                continue;
+            }
+            assert_eq!(
+                actor.owner.version.incarnation,
+                u64::from(expect_refutation),
+                "reporter={reporter}"
+            );
+            assert_eq!(reply.owner.version, actor.owner.version);
+            assert_eq!(reply.records.len(), 1);
+            assert_eq!(reply.records[0].member, "bob");
+            assert_eq!(actor.sessions, sessions);
+            assert_eq!(actor.core.snapshot(), before);
+            assert!(actor.writes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_cannot_borrow_stale_or_closed_owner_authority() {
+        for (status, epoch, incarnation, wrong_reporter) in [
+            (Status::Dead, 1, 3, false),
+            (Status::Dead, 2, 2, false),
+            (Status::Dead, 2, 3, true),
+            (Status::Left, 2, 3, false),
+            (Status::Left, 2, 4, false),
+        ] {
+            let floor = super::super::schema::Floor {
+                member: "bob".into(),
+                version: Version {
+                    epoch: 2,
+                    incarnation: 3,
+                },
+                status,
+                closed_epoch: (status == Status::Left).then_some(2),
+            };
+            let (_directory, mut actor) = actor(&[floor]);
+            let mut remote = owner("bob", epoch, incarnation);
+            if wrong_reporter {
+                remote.reporter = "carol".into();
+            }
+            let mut accusation = actor.owner.clone();
+            accusation.reporter = "bob".into();
+            accusation.state = MembershipState::Suspect;
+            actor
+                .completed(Completion {
+                    endpoint: "127.0.0.1:9999".into(),
+                    expected: Some("bob".into()),
+                    mode: Job::Exchange,
+                    timing: None,
+                    result: Ok((
+                        nx_sync::NodeId::new("bob"),
+                        ControlReply {
+                            request_id: 1,
+                            owner: remote,
+                            ack: true,
+                            nack: false,
+                            records: vec![accusation],
+                            next: None,
+                        },
+                    )),
+                })
+                .await
+                .unwrap();
+            assert_eq!(actor.owner.version.incarnation, 0);
+            assert!(actor.sessions.is_empty());
+            assert!(actor.pages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_probe_is_accounted_once_and_late_reply_cannot_succeed() {
+        let (_directory, mut actor) = actor(&[]);
+        actor.accept_owner("bob", owner("bob", 1, 0)).await.unwrap();
+        let actions = actor.core.probe_next(Duration::ZERO, |_| 0).unwrap();
+        let (attempt, target) = actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Probe(probe::Action::Direct {
+                    attempt, target, ..
+                }) => Some((attempt, target)),
+                _ => None,
+            })
+            .unwrap();
+        actor
+            .core
+            .probe_dispatched(attempt, &target, Duration::ZERO)
+            .unwrap();
+        actor.last = actor.node.now() - Duration::from_millis(101);
+        actor.advance().await.unwrap();
+        let actions = actor
+            .core
+            .probe_reply(attempt, &target, &target, true, actor.now)
+            .unwrap();
+        assert!(actions.is_empty());
+        actor.last = actor.node.now() - Duration::from_millis(101);
+        actor.advance().await.unwrap();
+        let metrics = actor.metrics.render_for_test(&actor.store);
+        assert!(
+            metrics.lines().any(|line| line
+                == "numax_membership_probe_results_total{outcome=\"local_degradation\"} 1"),
+            "{metrics}"
+        );
+        assert_eq!(actor.successful_probes, 0);
+        assert_eq!(actor.failed_probes, 0);
+        assert!(
+            actor
+                .core
+                .snapshot()
+                .iter()
+                .all(|r| r.status == Status::Alive)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_current_successful_direct_probes_publish_round_trip_samples() {
+        for case in 0..8 {
+            let (_directory, mut actor) = actor(&[]);
+            for member in ["bob", "carol"] {
+                actor
+                    .accept_owner(member, owner(member, 1, 0))
+                    .await
+                    .unwrap();
+            }
+            let actions = actor.core.probe_next(Duration::ZERO, |_| 0).unwrap();
+            let (attempt, target) = actions
+                .into_iter()
+                .find_map(|action| match action {
+                    Action::Probe(probe::Action::Direct {
+                        attempt, target, ..
+                    }) => Some((attempt, target)),
+                    _ => None,
+                })
+                .unwrap();
+            actor
+                .core
+                .probe_dispatched(attempt, &target, Duration::ZERO)
+                .unwrap();
+            let mut route = target.clone();
+            if case == 5 {
+                let helper = if target.id == "bob" { "carol" } else { "bob" };
+                route = Peer {
+                    id: helper.into(),
+                    version: Version {
+                        epoch: 1,
+                        incarnation: 0,
+                    },
+                    session: actor.sessions[helper].1,
+                };
+            }
+            if case == 7 {
+                route.session += 1;
+            }
+            if case == 4 {
+                actor
+                    .core
+                    .probe_send_failed(attempt, Duration::ZERO)
+                    .unwrap();
+            }
+            let mut response_owner = owner(&route.id, 1, 0);
+            if case == 6 {
+                response_owner.version.incarnation += 1;
+            }
+            let timing = nx_net::ControlTiming {
+                started_at: Instant::now(),
+                observed_at: Instant::now(),
+                round_trip: Duration::from_millis(10),
+            };
+            let response = if case == 1 {
+                Err(nx_net::NetError::Timeout)
+            } else {
+                Ok((
+                    nx_sync::NodeId::new(if case == 2 { "stranger" } else { &route.id }),
+                    ControlReply {
+                        request_id: 1,
+                        owner: response_owner,
+                        ack: case != 3,
+                        nack: case == 3,
+                        records: vec![],
+                        next: None,
+                    },
+                ))
+            };
+            actor
+                .completed(Completion {
+                    endpoint: "127.0.0.1:9000".into(),
+                    expected: Some(route.id.clone()),
+                    mode: Job::Probe {
+                        attempt,
+                        target: target.clone(),
+                        route,
+                    },
+                    timing: Some(timing),
+                    result: response,
+                })
+                .await
+                .unwrap();
+            assert_eq!(actor.timings.len(), usize::from(case == 0), "case {case}");
+            if case == 0 {
+                let accepted = actor.timings[&target.id].timing.observed_at;
+                actor
+                    .completed(Completion {
+                        endpoint: "127.0.0.1:9000".into(),
+                        expected: Some(target.id.clone()),
+                        mode: Job::Probe {
+                            attempt,
+                            target: target.clone(),
+                            route: target.clone(),
+                        },
+                        timing: Some(nx_net::ControlTiming {
+                            observed_at: accepted + Duration::from_secs(1),
+                            ..timing
+                        }),
+                        result: Ok((
+                            nx_sync::NodeId::new(&target.id),
+                            ControlReply {
+                                request_id: 2,
+                                owner: owner(&target.id, 1, 0),
+                                ack: true,
+                                nack: false,
+                                records: vec![],
+                                next: None,
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(actor.timings[&target.id].timing.observed_at, accepted);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_admission_after_restore_does_not_cache_rejected_sessions() {
+        for status in [Status::Dead, Status::Left] {
+            let floor = super::super::schema::Floor {
+                member: "bob".into(),
+                version: Version {
+                    epoch: 7,
+                    incarnation: 2,
+                },
+                status,
+                closed_epoch: (status == Status::Left).then_some(7),
+            };
+            let (_directory, mut actor) = actor(&[floor]);
+            assert!(
+                actor
+                    .accept_owner("bob", owner("bob", 7, 2))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!actor.sessions.contains_key("bob"));
+            let refutation = actor.accept_owner("bob", owner("bob", 7, 3)).await.unwrap();
+            assert_eq!(refutation.is_some(), status == Status::Dead);
+            if status == Status::Left {
+                assert!(!actor.sessions.contains_key("bob"));
+            }
+            let session = actor
+                .accept_owner("bob", owner("bob", 8, 0))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(actor.core.accepted_owner(
+                "bob",
+                Version {
+                    epoch: 8,
+                    incarnation: 0
+                },
+                session
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_owner_requests_and_replies_cannot_borrow_current_session() {
+        for state in [
+            MembershipState::Suspect,
+            MembershipState::Dead,
+            MembershipState::Left,
+        ] {
+            for response in [false, true] {
+                let (_directory, mut actor) = actor(&[]);
+                actor
+                    .accept_owner("bob", owner("bob", 1, 0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                actor
+                    .accept_owner("bob", owner("bob", 2, 0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                actor
+                    .accept_owner("carol", owner("carol", 1, 0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = actor.core.snapshot();
+                let session = actor.sessions["bob"];
+                let mut update = owner("carol", 1, 0);
+                update.reporter = "bob".into();
+                update.state = state;
+                if response {
+                    actor
+                        .completed(Completion {
+                            endpoint: "127.0.0.1:9999".into(),
+                            expected: Some("bob".into()),
+                            mode: Job::Exchange,
+                            timing: None,
+                            result: Ok((
+                                nx_sync::NodeId::new("bob"),
+                                ControlReply {
+                                    request_id: 42,
+                                    owner: owner("bob", 1, 0),
+                                    ack: false,
+                                    nack: false,
+                                    records: vec![update],
+                                    next: Some("cursor".into()),
+                                },
+                            )),
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    let (respond_to, reply) = oneshot::channel();
+                    actor
+                        .receive(ControlIncoming {
+                            from: nx_sync::NodeId::new("bob"),
+                            verification: nx_net::PeerIdentityVerification::Unverified,
+                            request: ControlRequest {
+                                request_id: 42,
+                                owner: owner("bob", 1, 0),
+                                updates: vec![update],
+                                kind: ControlKind::Exchange { after: None },
+                            },
+                            respond_to,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(reply.await.unwrap().records.is_empty());
+                }
+                assert_eq!(actor.core.snapshot(), before);
+                assert_eq!(actor.sessions["bob"], session);
+                assert!(actor.writes.is_empty());
+                assert!(actor.write_queue.is_empty());
+                assert!(actor.pages.is_empty());
+                assert!(actor.hints.is_empty());
+                let mut fresh = owner("carol", 1, 0);
+                fresh.reporter = "bob".into();
+                fresh.state = state;
+                actor.updates("bob", session.1, &[fresh]).await.unwrap();
+                if state == MembershipState::Suspect {
+                    assert_ne!(actor.core.snapshot(), before);
+                } else {
+                    assert!(!actor.writes.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_admission_at_capacity_allows_known_member_restart() {
+        let (_directory, mut actor) = actor(&[]);
+        for index in 0..CAPACITY {
+            let member = format!("member-{index}");
+            actor
+                .accept_owner(&member, owner(&member, 1, 0))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let previous = actor.sessions["member-0"];
+        let replacement = actor
+            .accept_owner("member-0", owner("member-0", 2, 0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement, previous.1);
+        assert_eq!(actor.sessions.len(), CAPACITY);
+        assert!(
+            actor
+                .accept_owner("extra", owner("extra", 1, 0))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!actor.sessions.contains_key("extra"));
+        assert!(actor.core.accepted_owner(
+            "member-0",
+            Version {
+                epoch: 2,
+                incarnation: 0
+            },
+            replacement
+        ));
+    }
+
+    struct Running {
+        _directory: tempfile::TempDir,
+        store: Arc<Store>,
+        node: Arc<Node>,
+        handle: Option<Handle>,
+        endpoint: String,
+    }
+
+    impl Running {
+        async fn new(member: &str, format: nx_net::SerializationFormat) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path()).unwrap());
+            let (node, incoming, endpoint) = Self::network(member, format).await;
+            let handle = start(
+                member.into(),
+                Some(endpoint.clone()),
+                node.clone(),
+                Arc::clone(&store),
+                incoming,
+            )
+            .await
+            .unwrap();
+            Self {
+                _directory: directory,
+                store,
+                node,
+                handle: Some(handle),
+                endpoint,
+            }
+        }
+
+        async fn network(
+            member: &str,
+            format: nx_net::SerializationFormat,
+        ) -> (Arc<Node>, mpsc::Receiver<ControlIncoming>, String) {
+            let mut node = Node::new(
+                nx_net::NodeConfig::new(nx_sync::NodeId::new(member), "127.0.0.1:0")
+                    .with_serialization_format(format),
+            );
+            let incoming = node.take_control_receiver().unwrap();
+            let endpoint = node.start_listener().await.unwrap().to_string();
+            (Arc::new(node), incoming, endpoint)
+        }
+
+        async fn wait(&mut self, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+            let receiver = &mut self.handle.as_mut().unwrap().snapshot;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                receiver.wait_for(|snapshot| snapshot.error.is_some() || predicate(snapshot)),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .clone()
+        }
+
+        async fn owner(&mut self, member: &str) -> MembershipRecord {
+            self.wait(|snapshot| {
+                snapshot
+                    .records
+                    .iter()
+                    .any(|record| record.member == member)
+            })
+            .await
+            .records
+            .into_iter()
+            .find(|record| record.member == member)
+            .unwrap()
+        }
+
+        async fn stop(mut self) {
+            if let Some(mut handle) = self.handle.take() {
+                handle.shutdown().await.unwrap();
+            }
+            self.node.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_probes_helpers_refutes_leaves_and_restarts_both_codecs() {
+        for format in [
+            nx_net::SerializationFormat::Json,
+            nx_net::SerializationFormat::Bincode,
+        ] {
+            let mut alice = Running::new("alice", format).await;
+            let mut bob = Running::new("bob", format).await;
+            let mut carol = Running::new("carol", format).await;
+            alice.node.connect_to_peer(&bob.endpoint).await.unwrap();
+            carol.node.connect_to_peer(&bob.endpoint).await.unwrap();
+            for runtime in [&mut alice, &mut bob, &mut carol] {
+                let snapshot = runtime
+                    .wait(|snapshot| snapshot.records.len() == 3 && snapshot.successful_probes > 0)
+                    .await;
+                assert!(snapshot.error.is_none());
+                assert_eq!(snapshot.failed_probes, 0);
+            }
+            let owner = alice.owner("alice").await;
+            let target = carol.owner("carol").await;
+            let reply = alice
+                .node
+                .control_request(
+                    &bob.endpoint,
+                    ControlRequest {
+                        request_id: 9001,
+                        owner: owner.clone(),
+                        updates: vec![],
+                        kind: ControlKind::Indirect {
+                            target: target.member,
+                            version: target.version,
+                        },
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap()
+                .1;
+            assert!(reply.ack);
+            assert!(!reply.nack);
+
+            let mut accused = bob.owner("bob").await;
+            accused.state = MembershipState::Suspect;
+            accused.reporter = "alice".into();
+            let reply = alice
+                .node
+                .control_request(
+                    &bob.endpoint,
+                    ControlRequest {
+                        request_id: 9002,
+                        owner,
+                        updates: vec![accused.clone()],
+                        kind: ControlKind::Exchange { after: None },
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap()
+                .1;
+            assert_eq!(
+                reply.owner.version.incarnation,
+                accused.version.incarnation + 1
+            );
+            alice
+                .wait(|snapshot| {
+                    snapshot.records.iter().any(|record| {
+                        record.member == "bob"
+                            && record.version.incarnation == reply.owner.version.incarnation
+                    })
+                })
+                .await;
+            bob.handle.take().unwrap().shutdown().await.unwrap();
+            bob.node.shutdown().await;
+            let snapshot = alice
+                .wait(|snapshot| {
+                    snapshot.records.iter().any(|record| {
+                        record.member == "bob" && record.state == MembershipState::Left
+                    })
+                })
+                .await;
+            assert!(snapshot.error.is_none());
+            assert!(
+                alice
+                    .store
+                    .get(b"__nx/membership/floor/bob")
+                    .unwrap()
+                    .is_some()
+            );
+
+            let (node, incoming, endpoint) = Running::network("bob", format).await;
+            bob.node = node;
+            bob.endpoint = endpoint;
+            bob.handle = Some(
+                start(
+                    "bob".into(),
+                    Some(bob.endpoint.clone()),
+                    bob.node.clone(),
+                    Arc::clone(&bob.store),
+                    incoming,
+                )
+                .await
+                .unwrap(),
+            );
+            let owner = bob.owner("bob").await;
+            assert_eq!(owner.version.epoch, 2);
+            bob.node
+                .control_request(
+                    &alice.endpoint,
+                    ControlRequest {
+                        request_id: 9003,
+                        owner,
+                        updates: vec![],
+                        kind: ControlKind::Exchange { after: None },
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            alice
+                .wait(|snapshot| {
+                    snapshot.records.iter().any(|record| {
+                        record.member == "bob"
+                            && record.state == MembershipState::Alive
+                            && record.version.epoch == 2
+                    })
+                })
+                .await;
+            alice.stop().await;
+            bob.stop().await;
+            carol.stop().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_serves_probes_during_flush_and_fences_storage_errors() {
+        for fail_flush in [false, true] {
+            let format = nx_net::SerializationFormat::Bincode;
+            let mut alice = Running::new("alice", format).await;
+            let mut bob = Running::new("bob", format).await;
+            alice.node.connect_to_peer(&bob.endpoint).await.unwrap();
+            alice.wait(|snapshot| snapshot.records.len() == 2).await;
+            let baseline_tick_samples = alice
+                .handle
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .borrow()
+                .tick_lateness_micros
+                .len();
+            let target = alice.owner("alice").await;
+            let mut owner = bob.owner("bob").await;
+            owner.state = MembershipState::Left;
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            if fail_flush {
+                alice.store.inject_disk_full_on_flush(true);
+            } else {
+                alice.store.pause_next_flush(reached_tx, resume_rx);
+            }
+            bob.node
+                .control_request(
+                    &alice.endpoint,
+                    ControlRequest {
+                        request_id: 9200,
+                        owner: owner.clone(),
+                        updates: vec![],
+                        kind: ControlKind::Exchange { after: None },
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            if !fail_flush {
+                tokio::task::spawn_blocking(move || {
+                    reached_rx.recv_timeout(Duration::from_secs(5))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                let paused_snapshot = alice
+                    .wait(|snapshot| {
+                        snapshot.tick_lateness_micros.len() >= baseline_tick_samples + 40
+                    })
+                    .await;
+                assert_eq!(paused_snapshot.failed_probes, 0);
+                assert!(
+                    paused_snapshot
+                        .records
+                        .iter()
+                        .all(|record| { record.state == MembershipState::Alive })
+                );
+                let mut tick_lateness =
+                    paused_snapshot.tick_lateness_micros[baseline_tick_samples..].to_vec();
+                tick_lateness.sort_unstable();
+                eprintln!(
+                    "slow-storage-control {}",
+                    serde_json::json!({
+                        "tick_samples": tick_lateness.len(),
+                        "tick_lateness_p50_us": tick_lateness[(tick_lateness.len() * 50 - 1) / 100],
+                        "tick_lateness_p95_us": tick_lateness[(tick_lateness.len() * 95 - 1) / 100],
+                        "tick_lateness_max_us": tick_lateness.last(),
+                        "successful_probes": paused_snapshot.successful_probes,
+                        "failed_probes": paused_snapshot.failed_probes,
+                        "health": paused_snapshot.health
+                    })
+                );
+                let reply = bob
+                    .node
+                    .control_request(
+                        &alice.endpoint,
+                        ControlRequest {
+                            request_id: 9201,
+                            owner,
+                            updates: vec![],
+                            kind: ControlKind::Probe {
+                                target: target.member,
+                                version: target.version,
+                            },
+                        },
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap()
+                    .1;
+                assert!(reply.ack, "probe stalled behind membership flush");
+                assert!(
+                    !reply
+                        .records
+                        .iter()
+                        .any(|record| record.member == "bob"
+                            && record.state == MembershipState::Left)
+                );
+                assert!(
+                    !alice
+                        .handle
+                        .as_ref()
+                        .unwrap()
+                        .snapshot
+                        .borrow()
+                        .records
+                        .iter()
+                        .any(|record| record.member == "bob"
+                            && record.state == MembershipState::Left)
+                );
+                resume_tx.send(()).unwrap();
+            }
+            let snapshot = alice
+                .wait(|snapshot| {
+                    snapshot.records.iter().any(|record| {
+                        record.member == "bob" && record.state == MembershipState::Left
+                    })
+                })
+                .await;
+            if fail_flush {
+                assert!(
+                    snapshot
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.contains("membership storage"))
+                );
+                assert!(
+                    !snapshot
+                        .records
+                        .iter()
+                        .any(|record| record.member == "bob"
+                            && record.state == MembershipState::Left)
+                );
+                assert!(alice.handle.take().unwrap().shutdown().await.is_err());
+                alice.node.shutdown().await;
+            } else {
+                assert!(snapshot.error.is_none());
+                alice.stop().await;
+            }
+            bob.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn production_adapter_makes_progress_with_cpu_bound_wasm() {
+        let format = nx_net::SerializationFormat::Bincode;
+        let mut alice = Running::new("alice", format).await;
+        let bob = Running::new("bob", format).await;
+        alice.node.connect_to_peer(&bob.endpoint).await.unwrap();
+        alice.wait(|snapshot| snapshot.records.len() == 2).await;
+        let baseline = alice
+            .handle
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .borrow()
+            .successful_probes;
+        let directory = tempfile::tempdir().unwrap();
+        let mut guest_runtime = crate::runtime::Runtime::new(crate::runtime::RuntimeConfig {
+            datastore_path: directory.path().join("guest"),
+            enable_wasi: false,
+            ..crate::runtime::RuntimeConfig::default()
+        })
+        .unwrap();
+        let wasm = [
+            0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 7, 7, 1, 3, 114, 117, 110,
+            0, 0, 10, 9, 1, 7, 0, 3, 64, 12, 0, 11, 11,
+        ];
+        let started = Instant::now();
+        {
+            let guest = guest_runtime.run_module(&wasm);
+            tokio::pin!(guest);
+            let snapshot = tokio::select! {
+                biased;
+                result = &mut guest => panic!("CPU-bound guest unexpectedly completed: {result:?}"),
+                snapshot = alice.wait(|snapshot| {
+                    snapshot.successful_probes > baseline
+                        && snapshot.tick_lateness_micros.len() >= 80
+                }) => snapshot,
+            };
+            assert!(snapshot.error.is_none());
+            assert_eq!(snapshot.failed_probes, 0);
+            assert!(
+                snapshot
+                    .records
+                    .iter()
+                    .all(|record| record.state == MembershipState::Alive)
+            );
+            let mut tick_lateness = snapshot.tick_lateness_micros.clone();
+            tick_lateness.sort_unstable();
+            let p50 = tick_lateness[(tick_lateness.len() * 50 - 1) / 100];
+            let p95 = tick_lateness[(tick_lateness.len() * 95 - 1) / 100];
+            eprintln!(
+                "cpu-bound-control {}",
+                serde_json::json!({"elapsed_ms": started.elapsed().as_millis(),
+                "successful_probes": snapshot.successful_probes, "failed_probes": snapshot.failed_probes,
+                "tick_samples": tick_lateness.len(), "tick_lateness_p50_us": p50,
+                "tick_lateness_p95_us": p95, "tick_lateness_max_us": tick_lateness.last(),
+                "health": snapshot.health})
+            );
+        }
+        guest_runtime.shutdown().await.unwrap();
+        alice.stop().await;
+        bob.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_confirms_own_left_only_after_flush() {
+        let mut alice = Running::new("shutdown-flush", nx_net::SerializationFormat::Json).await;
+        alice.owner("shutdown-flush").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(async move {
+            let mut handle = handle;
+            handle.shutdown().await
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let premature_completion = stopping.is_finished();
+        let premature_left = snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-flush" && record.state == MembershipState::Left
+        });
+        let flushed_while_paused = alice.store.completed_flushes();
+        resume_tx.send(()).unwrap();
+        stopping.await.unwrap().unwrap();
+        assert!(!premature_completion);
+        assert!(!premature_left);
+        assert_eq!(flushed_while_paused, before);
+        assert_eq!(alice.store.completed_flushes(), before + 1);
+        let key = [super::super::schema::FLOOR_PREFIX, b"shutdown-flush"].concat();
+        let floor = super::super::schema::Floor::decode(
+            "shutdown-flush",
+            &alice.store.get(&key).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor.status, Status::Left);
+        assert_eq!(floor.closed_epoch, Some(floor.version.epoch));
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_retry_confirms_own_left_after_late_flush() {
+        let mut alice = Running::new("shutdown-late", nx_net::SerializationFormat::Bincode).await;
+        alice.owner("shutdown-late").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let mut handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(async move {
+            let result = handle
+                .shutdown_with_budget(Duration::from_millis(200))
+                .await;
+            (handle, result)
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut handle, result) = stopping.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("retry shutdown"));
+        assert_eq!(alice.store.completed_flushes(), before);
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-late" && record.state == MembershipState::Left
+        }));
+        resume_tx.send(()).unwrap();
+        handle.shutdown().await.unwrap();
+        assert_eq!(alice.store.completed_flushes(), before + 1);
+        let key = [super::super::schema::FLOOR_PREFIX, b"shutdown-late"].concat();
+        let floor = super::super::schema::Floor::decode(
+            "shutdown-late",
+            &alice.store.get(&key).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor.status, Status::Left);
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_dropped_after_timeout_cannot_publish_late_flush() {
+        let mut alice = Running::new("shutdown-drop", nx_net::SerializationFormat::Bincode).await;
+        alice.owner("shutdown-drop").await;
+        let before = alice.store.completed_flushes();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        let mut handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let stopping = tokio::spawn(async move {
+            let result = handle
+                .shutdown_with_budget(Duration::from_millis(200))
+                .await;
+            (handle, result)
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (handle, result) = stopping.await.unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown budget exhausted")
+        );
+        // Dropping the handle is the terminal abort: the in-flight flush may finish,
+        // but the aborted actor must not publish it.
+        drop(handle);
+        let flushed_while_paused = alice.store.completed_flushes();
+        resume_tx.send(()).unwrap();
+        let store = Arc::clone(&alice.store);
+        tokio::task::spawn_blocking(move || store.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(flushed_while_paused, before);
+        assert_eq!(alice.store.completed_flushes(), before + 2);
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-drop" && record.state == MembershipState::Left
+        }));
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_propagates_own_flush_failure_without_left() {
+        let mut alice = Running::new("shutdown-failure", nx_net::SerializationFormat::Json).await;
+        alice.owner("shutdown-failure").await;
+        let before = alice.store.completed_flushes();
+        alice.store.inject_disk_full_on_flush(true);
+        let mut handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let result = handle.shutdown().await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("membership storage")
+        );
+        assert_eq!(alice.store.completed_flushes(), before);
+        assert!(snapshot.borrow().error.is_some());
+        assert!(!snapshot.borrow().records.iter().any(|record| {
+            record.member == "shutdown-failure" && record.state == MembershipState::Left
+        }));
+        assert!(matches!(
+            alice.store.flush(),
+            Err(nx_store::StoreError::DurabilityUncertain)
+        ));
+        alice.node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_shutdown_is_bounded_while_storage_is_paused() {
+        let format = nx_net::SerializationFormat::Bincode;
+        let mut alice = Running::new("alice", format).await;
+        let mut bob = Running::new("bob", format).await;
+        alice.node.connect_to_peer(&bob.endpoint).await.unwrap();
+        alice.wait(|snapshot| snapshot.records.len() == 2).await;
+        let mut owner = bob.owner("bob").await;
+        owner.state = MembershipState::Left;
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        alice.store.pause_next_flush(reached_tx, resume_rx);
+        bob.node
+            .control_request(
+                &alice.endpoint,
+                ControlRequest {
+                    request_id: 9300,
+                    owner,
+                    updates: vec![],
+                    kind: ControlKind::Exchange { after: None },
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut handle = alice.handle.take().unwrap();
+        let snapshot = handle.snapshot.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.shutdown_with_budget(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown budget exhausted")
+        );
+        assert!(
+            !snapshot
+                .borrow()
+                .records
+                .iter()
+                .any(|record| record.member == "alice" && record.state == MembershipState::Left)
+        );
+        resume_tx.send(()).unwrap();
+        // The retained actor finishes the queued writes; a retry observes the durable leave.
+        handle.shutdown().await.unwrap();
+        let key = [super::super::schema::FLOOR_PREFIX, b"alice"].concat();
+        let floor =
+            super::super::schema::Floor::decode("alice", &alice.store.get(&key).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(floor.status, Status::Left);
+        alice.node.shutdown().await;
+        bob.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn production_adapter_detects_crash_and_helper_sends_nack() {
+        let format = nx_net::SerializationFormat::Bincode;
+        let mut alice = Running::new("alice", format).await;
+        let mut bob = Running::new("bob", format).await;
+        let mut carol = Running::new("carol", format).await;
+        alice.node.connect_to_peer(&bob.endpoint).await.unwrap();
+        carol.node.connect_to_peer(&bob.endpoint).await.unwrap();
+        for runtime in [&mut alice, &mut bob, &mut carol] {
+            runtime
+                .wait(|snapshot| snapshot.records.len() == 3 && snapshot.successful_probes > 0)
+                .await;
+        }
+        let owner = alice.owner("alice").await;
+        let target = carol.owner("carol").await;
+        drop(carol.handle.take());
+        carol.node.shutdown().await;
+        let reply = alice
+            .node
+            .control_request(
+                &bob.endpoint,
+                ControlRequest {
+                    request_id: 9100,
+                    owner,
+                    updates: vec![],
+                    kind: ControlKind::Indirect {
+                        target: target.member,
+                        version: target.version,
+                    },
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+            .1;
+        assert!(!reply.ack);
+        assert!(reply.nack);
+        let snapshot = alice
+            .wait(|snapshot| {
+                snapshot
+                    .records
+                    .iter()
+                    .any(|record| record.member == "carol" && record.state == MembershipState::Dead)
+            })
+            .await;
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.failed_probes > 0);
+        assert!(
+            alice
+                .store
+                .get(b"__nx/membership/floor/carol")
+                .unwrap()
+                .is_some()
+        );
+        alice.stop().await;
+        bob.stop().await;
+        carol.stop().await;
+    }
+}

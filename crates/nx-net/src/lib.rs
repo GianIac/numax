@@ -1,8 +1,12 @@
 mod bootstrap;
+mod control;
 mod error;
 mod message;
 mod node;
 mod peer;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod testing;
 mod tls;
 
 pub use bootstrap::{
@@ -11,16 +15,25 @@ pub use bootstrap::{
     DEFAULT_BOOTSTRAP_RESPONSE_CAPACITY, DEFAULT_MAX_CONCURRENT_BOOTSTRAP_QUERIES,
     MAX_BOOTSTRAP_CANDIDATE_TTL, MAX_BOOTSTRAP_RESPONSE_CAPACITY,
 };
+pub use control::{
+    ControlIncoming, ControlKind, ControlReply, ControlRequest, MAX_CONTROL_FRAME,
+    MAX_CONTROL_RECORDS, MAX_CONTROL_REQUESTS, MembershipRecord, MembershipState,
+    MembershipVersion,
+};
 pub use error::{BootstrapError, BootstrapResult, NetError, NetResult, NodeConfigError};
 pub use message::{
     Message, MessageKind, PROTOCOL_VERSION, SerializationFormat, WireError, WireRetryPolicy,
+    history_frame_len,
 };
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use node::HistoryTrace;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use node::read_wire_message_for_fuzzing;
 pub use node::{
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS, DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig,
-    NodeEvent,
+    ConnectionGeneration, ControlTiming, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PEERS,
+    DEFAULT_SOCKET_TIMEOUT, Node, NodeConfig, NodeEvent, PreparedHistory,
 };
 pub use peer::{
     ConnectionDirection, PeerConnectionInfo, PeerId, PeerIdentity, PeerIdentityVerification,

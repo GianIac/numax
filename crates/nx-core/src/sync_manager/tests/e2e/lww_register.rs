@@ -1,6 +1,31 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_register_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        local_lww_register_set(&ha, "manual-r", b"before", 100).await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_lww_register(&b, "manual-r", b"before").await;
+        local_lww_register_set(&hb, "manual-r", b"after", 200).await;
+        wait_for_lww_register(&a, "manual-r", b"after").await;
+        assert_eq!(
+            read_materialized_lww_register(&sa, "manual-r"),
+            read_materialized_lww_register(&sb, "manual-r")
+        );
+        assert_eq!(
+            read_durable_lww_register_state(&sa, "manual-r"),
+            read_durable_lww_register_state(&sb, "manual-r")
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_lww_register_sets_converge_to_latest_value() {
     let key = "status:user-1";
     let addr_a = free_addr();

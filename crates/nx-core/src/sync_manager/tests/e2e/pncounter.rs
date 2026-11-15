@@ -1,6 +1,41 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_pncounter_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        local_pncounter_inc(&ha, "manual-p", 7).await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_pncounter(&b, "manual-p", 7).await;
+        local_pncounter_dec(&hb, "manual-p", 2).await;
+        wait_for_pncounter(&a, "manual-p", 5).await;
+        assert_eq!(
+            read_materialized_pncounter(&sa, "manual-p"),
+            read_materialized_pncounter(&sb, "manual-p")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &read_durable_pncounter_state(&sa, "manual-p")
+                    .to_json()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &read_durable_pncounter_state(&sb, "manual-p")
+                    .to_json()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_pncounter_inc_dec_converge() {
     let key = "inventory:sku-1";
     let addr_a = free_addr();

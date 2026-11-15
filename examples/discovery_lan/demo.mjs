@@ -115,6 +115,27 @@ async function run(request, module) {
   await request(`modules/${module}/runs`, { method: 'POST', allowed: [204] });
 }
 
+export async function peerView(request, view) {
+  const items = [];
+  const cursors = new Set();
+  let cursor;
+  do {
+    const query = new URLSearchParams({ view, limit: '10' });
+    if (cursor !== undefined) query.set('cursor', cursor);
+    const page = await (await request(`peers?${query}`)).json();
+    check(Array.isArray(page.items) && (page.next_cursor === null ||
+      (typeof page.next_cursor === 'string' && page.next_cursor.length > 0)),
+    `unexpected ${view} page`);
+    items.push(...page.items);
+    cursor = page.next_cursor;
+    if (cursor !== null) {
+      check(!cursors.has(cursor) && cursors.size < 32, `invalid ${view} pagination`);
+      cursors.add(cursor);
+    }
+  } while (cursor !== null);
+  return items;
+}
+
 async function snapshot(request, reader, state) {
   await run(request, reader); // Read-only CRDT operation; refreshes LOCAL KV projection.
   const response = await request(`keys/${SNAPSHOT}`);
@@ -127,12 +148,13 @@ async function snapshot(request, reader, state) {
     if (error.code !== 'EEXIST') throw error;
     check(await readFile(identityPath, 'utf8') === nodeId, 'node identity changed; do not replace the datastore');
   }
-  const peers = await (await request('peers?limit=10')).json();
-  check(peers.next_cursor === null && Array.isArray(peers.items), 'unexpected peer page');
-  const ids = peers.items.map(peer => peer.node_id);
+  const connections = await peerView(request, 'connections');
+  const membership = await peerView(request, 'membership');
+  const recovery = await peerView(request, 'recovery');
+  const ids = connections.map(peer => peer.node_id);
   check(!ids.includes(nodeId), 'unexpected self connection');
   // Management lists connections; inbound/outbound links may share an identity.
-  return { node_id: nodeId, value, peer_ids: [...new Set(ids)].sort(), connections: peers.items };
+  return { node_id: nodeId, value, peer_ids: [...new Set(ids)].sort(), connections, membership, recovery };
 }
 
 async function waitFor(label, timeout, condition, isAlive = () => true) {
@@ -234,7 +256,9 @@ async function main() {
   console.log(JSON.stringify(result, null, 2));
 }
 
-main().catch(error => {
-  console.error(`discovery_lan: ${error.message}`);
-  process.exitCode = 1;
-});
+if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(`discovery_lan: ${error.message}`);
+    process.exitCode = 1;
+  });
+}

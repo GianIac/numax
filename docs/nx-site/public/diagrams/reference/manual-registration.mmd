@@ -1,0 +1,16 @@
+flowchart TB
+    accTitle: Register a manual peer
+    accDescr: HTTP registration confirms a stored endpoint candidate, not a connected or authenticated peer. Repeated canonical addresses are idempotent.
+    Post["POST /api/v1/peers<br/>Authenticated JSON request"]
+    Check["Validate endpoint and contribution<br/>Capacity checked for new contributions"]
+    Existing["Existing manual contribution<br/>200, created: false"]
+    Persist["Persist batch and flush<br/>Endpoint, schema and cluster scope"]
+    Publish["Publish candidate<br/>202, created: true"]
+    Normal["Normal admission and repair<br/>No connection implied by 202"]
+    Error["Storage outcome uncertain<br/>500; same address reconciles retry"]
+    Post --> Check
+    Check -->|"Duplicate"| Existing
+    Check -->|"New contribution"| Persist
+    Persist -->|"Flush confirmed"| Publish
+    Persist -->|"Failure after batch"| Error
+    Publish -->|"Eligible for dialing"| Normal
