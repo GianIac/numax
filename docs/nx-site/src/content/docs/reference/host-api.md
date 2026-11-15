@@ -281,6 +281,28 @@ let keys = db::keys("user:")?;
 
 ## CRDT API
 
+A successful mutating CRDT call confirms the local state-and-replay flush, not
+receipt by another node. `ERR_INTERNAL` or an interrupted call has an unknown
+outcome; repeating it creates a new operation. The RGA insert
+`ERR_BUFFER_TOO_SMALL` path is checked before persistence and may be retried
+with a larger output buffer. See the [SDK outcome table](/numax/reference/crates/nx-sdk/#mutating-crdt-calls-and-uncertain-outcomes)
+for the guest-facing contract.
+
+Before accepting a local mutation, Numax checks that its complete single-operation
+history replay fits the local `max_message_size` and the bounded replay byte
+budget. This includes the wire envelope, escaped fields and any valid replay
+request identity, in every negotiable codec (Bincode also permits JSON fallback).
+
+An oversized operation is rejected before changing durable or in-memory CRDT
+state, sequence allocation, deduplication or history. It uses the existing
+`ERR_INTERNAL` path; ABI signatures and error codes are unchanged. Guests cannot
+distinguish this preflight rejection from other `ERR_INTERNAL` outcomes.
+
+Acceptance guarantees transportability of retained history under the local
+limits, not delivery, retention beyond its window, or compatibility with a peer's
+smaller limits. Rate limiting can defer gossip. Full-state baselines remain
+bounded and are not guaranteed for arbitrary datastore sizes.
+
 CRDT functions operate on replicated state managed by the runtime sync manager.
 They require sync to be enabled; otherwise they return `ERR_SYNC_DISABLED`.
 

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,16 +12,31 @@ import {
 } from "./compare-benchmark-report.mjs";
 
 const baseline = {
-  report_schema_version: 1,
+  report_schema_version: 2,
   crate: "nx-core",
   benchmark: "three_node_sync_load",
   scenario: "multi-node-sync-gcounter",
   profile: {
+    acceptance: "local-durable-flush-v1",
     nodes: 3,
     duration_secs: 10,
     target_ops_sec_per_node: 1000,
     anti_entropy_interval_secs: 80,
   },
+  nodes: 3,
+  target_ops_total: 30000,
+  attempted_ops_total: 30000,
+  ops_total: 30000,
+  errors_total: 0,
+  definite_errors_total: 0,
+  uncertain_ops_total: 0,
+  unattempted_ops_total: 0,
+  cleanup_errors_total: 0,
+  error_details: [],
+  report_complete: true,
+  expected_counter: 30000,
+  observed_counters: [30000, 30000, 30000],
+  converged: true,
   ops_sec_avg: 1000,
   resources: {
     rss_bytes: 1000,
@@ -70,7 +84,7 @@ function runComparator(args) {
 }
 
 function withTemporaryDirectory(testContext) {
-  const directory = mkdtempSync(join(tmpdir(), "numax-benchmark-comparator-"));
+  const directory = mkdtempSync(join(process.cwd(), ".numax-benchmark-comparator-"));
   testContext.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }
@@ -144,11 +158,145 @@ test("rejects mismatched workload profiles", () => {
         ...baseline,
         profile: {
           ...baseline.profile,
-          nodes: 10,
+          anti_entropy_interval_secs: 81,
         },
       }),
     /profile mismatch/,
   );
+});
+
+test("rejects the historical enqueue-only baseline, even against itself", () => {
+  const historical = {
+    ...reportWith(),
+    report_schema_version: 1,
+    profile: {
+      nodes: 3,
+      duration_secs: 10,
+      target_ops_sec_per_node: 1000,
+      anti_entropy_interval_secs: 80,
+    },
+  };
+  assert.throws(
+    () => compareReports(historical, historical),
+    /report_schema_version/,
+  );
+});
+
+test("committed baseline satisfies the durable-ack report contract", () => {
+  const committedBaseline = JSON.parse(readFileSync(
+    new URL("../crates/nx-core/reports/baselines/three-node-sync-smoke.json", import.meta.url),
+    "utf8",
+  ));
+  const aggregate = aggregateReports([committedBaseline]);
+  assert.equal(aggregate.report_schema_version, 2);
+  assert.equal(aggregate.profile.acceptance, "local-durable-flush-v1");
+  assert.ok(Number.isFinite(aggregate.resources.rss_bytes));
+});
+
+test("rejects mismatched acceptance profiles", () => {
+  assert.throws(
+    () => compareReports(baseline, {
+      ...baseline,
+      profile: { ...baseline.profile, acceptance: "enqueue-memory-v1" },
+    }),
+    /acceptance|profile mismatch/,
+  );
+});
+
+test("rejects incomplete or failed runs before taking a median", () => {
+  for (const patch of [
+    { report_complete: false },
+    { errors_total: 1 },
+    { definite_errors_total: 1 },
+    { uncertain_ops_total: 1, expected_counter: null },
+    { cleanup_errors_total: 1 },
+    { unattempted_ops_total: 1 },
+    { attempted_ops_total: 29999 },
+    { ops_total: 29999 },
+    { converged: false },
+    { observed_counters: [30000, 29999, 30000] },
+    { observed_counters: [30000] },
+    { error_details: ["producer task timed out"] },
+    { report_complete: undefined },
+    { definite_errors_total: undefined },
+  ]) {
+    assert.throws(() => compareReportSet(baseline, [baseline, { ...baseline, ...patch }, baseline]));
+  }
+});
+
+test("CLI rejects an incomplete report even in shadow mode", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const result = runComparator([
+    "--baseline", writeReport(directory, "baseline.json", baseline),
+    "--current", writeReport(directory, "incomplete.json", { ...baseline, report_complete: false }),
+    "--mode", "shadow",
+  ]);
+  assert.equal(result.status, 2);
+});
+
+test("CLI calibrates five runs without a historical baseline", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const aggregatePath = join(directory, "candidate.json");
+  const result = runComparator([
+    "--aggregate-only",
+    ...[1, 5, 3, 4, 2].flatMap((value, index) => [
+      "--current", writeReport(directory, `run-${index}.json`, reportWith({
+        opsSec: value * 100, rssBytes: value * 1000, p99: value,
+      })),
+    ]),
+    "--write-aggregate", aggregatePath,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /5 validated runs; no regression comparison/);
+  const candidate = JSON.parse(readFileSync(aggregatePath, "utf8"));
+  assert.equal(candidate.report_schema_version, 2);
+  assert.equal(candidate.profile.acceptance, "local-durable-flush-v1");
+  assert.equal(candidate.ops_sec_avg, 300);
+  assert.equal(candidate.resources.rss_bytes, 3000);
+  assert.equal(candidate.latency_ms.p99, 3);
+  assert.deepEqual(candidate.aggregation, { method: "median", runs: 5 });
+});
+
+test("CLI calibration rejects invalid or incompatible runs before writing", (t) => {
+  const directory = withTemporaryDirectory(t);
+  for (const [index, patch] of [
+    { report_schema_version: 1 },
+    { report_complete: false },
+    { uncertain_ops_total: 1 },
+    { scenario: "different" },
+  ].entries()) {
+    const aggregatePath = join(directory, `candidate-${index}.json`);
+    const result = runComparator([
+      "--aggregate-only",
+      "--current", writeReport(directory, `valid-${index}.json`, baseline),
+      "--current", writeReport(directory, `invalid-${index}.json`, { ...baseline, ...patch }),
+      "--write-aggregate", aggregatePath,
+    ]);
+    assert.equal(result.status, 2, result.stdout);
+    assert.throws(() => readFileSync(aggregatePath), /ENOENT/);
+  }
+});
+
+test("CLI calibration cannot masquerade as a blocking comparison", (t) => {
+  const directory = withTemporaryDirectory(t);
+  const current = writeReport(directory, "current.json", baseline);
+  const output = join(directory, "candidate.json");
+  for (const extra of [
+    ["--baseline", current],
+    ["--mode", "blocking"],
+  ]) {
+    const result = runComparator([
+      "--aggregate-only", "--current", current, "--write-aggregate", output, ...extra,
+    ]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /cannot use --baseline or --mode blocking/);
+  }
+  const missingOutput = runComparator(["--aggregate-only", "--current", current]);
+  assert.equal(missingOutput.status, 2);
+  assert.match(missingOutput.stderr, /requires --write-aggregate/);
+  const missingBaseline = runComparator(["--current", current, "--write-aggregate", output]);
+  assert.equal(missingBaseline.status, 2);
+  assert.match(missingBaseline.stderr, /--baseline is required/);
 });
 
 test("compares the median of multiple current reports", () => {

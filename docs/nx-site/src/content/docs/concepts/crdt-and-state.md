@@ -107,7 +107,7 @@ Numax ships six CRDT types. Each solves a specific problem. Here they are with n
 
 **Use it for:** totals that can only increase. Page views, event counts, likes, completed tasks, bytes transferred.
 
-**How it works:** each node owns its own `u64` slot. A node can only increment its own slot. The total is the sum of all slots. Merge takes the maximum of each slot.
+**How it works:** each node owns its own `u64` slot. A node can only increment its own slot. The visible total is `min(sum of all slots, u64::MAX)`. Merge takes the maximum of each slot.
 
 ```
 Node A slot: 10
@@ -117,6 +117,11 @@ Total:        17
 ```
 
 If Node A's slot on Node B shows 8 but Node A actually has 10, merge will use 10. A slot can never decrease. This makes concurrent increments safe without coordination.
+
+Each slot saturates at `u64::MAX`. Reading the total sums the stored slots in
+`u128` before clamping to `u64::MAX`; it neither wraps nor panics when several
+valid slots exceed the visible range. The individual slots and their merge
+semantics are unchanged, including in durable state and bounded baselines.
 
 ```rust
 use nx_sdk::crdt::gcounter;
@@ -133,16 +138,21 @@ let total: u64 = gcounter::value("counter:visits")?;
 
 **How it works:** two GCounters internally. One tracks increments (`P`), one tracks decrements (`N`). The visible value is `P - N`. Merge handles each GCounter independently.
 
-```
-Node A local slots: P[A]=10, N[A]=3  ->  value = 7
-Node B local slots: P[B]=5,  N[B]=8  ->  value = -3
-After merge:
-  P slots = { A: 10, B: 5  } -> sum P = 15
-  N slots = { A: 3,  B: 8  } -> sum N = 11
-  value = 15 - 11 = 4
-```
+![PNCounter merge preserves positive and negative per-origin slots and yields visible value 4.](/numax/diagrams/reference/pncounter-merge.svg)
 
-Overflow is handled with `saturating_add` and the final `i64` value is clamped to `[i64::MIN, i64::MAX]`.
+Each positive and negative slot saturates at `u64::MAX`, as in GCounter.
+The visible value is `clamp(sum(P slots) - sum(N slots), i64::MIN, i64::MAX)`.
+Both totals are accumulated in `u128`, then their sign and difference magnitude
+are computed before the final clamp. The totals are **not** separately clamped
+to `u64::MAX`: for example, `P = u64::MAX + 9` and `N = u64::MAX + 4`
+yield `5`, not `0`. Reads do not discard slots, so later opposing updates can
+bring a previously clamped value back into range.
+
+These numeric rules do not broaden recovery guarantees: bounded state transfer
+still requires a complete baseline that dominates the recipient's coverage and
+state. Divergent cuts are rejected without dropping local writes; a successful
+state merge is not a promise of arbitrary divergent-baseline recovery or
+unlimited history retention.
 
 ```rust
 use nx_sdk::crdt::pncounter;
@@ -248,16 +258,7 @@ let all_tags: Vec<String> = orset::elements("tags:item-1")?;
 
 Deletes are tombstones: the element id is added to a deleted-ids set. The element stays in the data structure (so parent links remain valid) but is invisible in `values()`. Children of deleted elements remain visible.
 
-```
-insert "a" at head -> id="op-1"
-insert "b" after "op-1" -> id="op-2"
-insert "c" after "op-2" -> id="op-3"
-values: ["a", "b", "c"]
-
-delete "op-2"
-values: ["a", "c"]
-ordered_ids (including tombstones): ["op-1", "op-2", "op-3"]
-```
+![Deleting the middle RGA element preserves its identity and the parent link to its visible child.](/numax/diagrams/reference/rga-tombstone.svg)
 
 ```rust
 use nx_sdk::crdt::rga;

@@ -36,9 +36,13 @@ claimed here.
 
 ## Understanding `--listen` vs `--advertised-endpoint`
 
-In static clustering (`v0.1.4`), every node had to know all other nodes' IP addresses in advance via repeated `--peer` flags ($O(N^2)$ configuration).
+Static `--peer` flags supply known candidate endpoints; they do not require
+every node to list every other node or guarantee a fully connected mesh.
+Discovery supplies candidates dynamically. Membership, admitted connections
+and replica recovery remain separate runtime responsibilities. Runtime uses bounded neighbors and K-fanout gossip rather than sending every
+operation directly to every discovered endpoint.
 
-With discovery in `v0.1.5`+, each node only describes **itself** ($O(1)$ configuration per node):
+For this mDNS example, each node describes its own reachable endpoint:
 
 - `--listen <ip:port>`: The local socket address the daemon binds to (where the OS listens for incoming TCP connections).
 - `--advertised-endpoint <ip:port>`: The address published over mDNS/Gossip for remote peers to dial back via TCP.
@@ -325,6 +329,14 @@ refreshes the reader projection without adding a CRDT operation:
 node examples/discovery_lan/demo.mjs status --state "$STATE"
 ```
 
+Status includes paginated `connections`, `membership` and `recovery` views.
+Membership includes the local owner; `peer_ids` deduplicates remote connected
+identities. These views are collected independently, not as an atomic cluster
+snapshot. An `Alive` member, active connection or absence of known gaps alone
+does not prove convergence. The demo's wait conditions still use the expected
+CRDT value and connected identities. Runtime manual peer registration is a
+separate workflow in the Management API guide, not part of this mDNS-only demo.
+
 ## Retention and evidence
 
 Both demo and test explicitly configure `op_log_limit = 128` and
@@ -345,18 +357,6 @@ The automated test uses 60-second phase deadlines and 15-second shutdown
 deadlines. It verifies unauthenticated management requests receive 401 and C's
 previous local KV snapshot remains `(original NodeId, 3)` before running the
 reader after restart. Recovery then comes from the CRDT path, not the snapshot.
-
-### Local verification — 2026-09-14
-
-On the working tree based on `1674d5ee` (with the release-preparation changes),
-the explicitly selected three-daemon E2E passed on macOS over the host's real
-LAN interface: `0 -> 3 -> offline writes -> 5 -> restart recovery -> 6`.
-The two-daemon mDNS discovery/removal test and the opt-in script lifecycle test
-also passed. The latter verified a real SDK write and durable restart.
-
-These are **same-host** results. No three-device LAN run or remote CI matrix is
-attested here; publication remains subject to those separate checks. Tokens and
-private node directories are not release evidence and must not be published.
 
 ## Script checks
 

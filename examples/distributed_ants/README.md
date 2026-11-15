@@ -55,10 +55,9 @@ target/wasm32-unknown-unknown/release/distributed_ants.wasm
 
 ## How one tick works
 
-`nx run` invokes a guest's `run()` exactly once per process, then exits —
-there's no in-guest loop or sleep. So "many simulation ticks" means
-re-invoking `nx run` repeatedly against the same `--datastore-path`, while
-`--listen`/`--peer` keeps that node's CRDT state synced with the others.
+Each guest invocation performs one tick; there is no in-guest loop or sleep.
+The demo keeps `nx serve` running and invokes its registered guest through
+authenticated loopback management. Manual `nx run` invocations remain available.
 Each invocation:
 
 1. Reads grid size, hotspot count, seed and nest position from `NUMAX_*`
@@ -109,7 +108,9 @@ base_port = 9000
 
 Guest WASM has no filesystem access (only `db`/`net`/`crdt`/`system`/
 `crypto`/`time` host calls), so this file is parsed **host-side** by
-`demo.sh` and re-exposed to every guest invocation as `NUMAX_*` env vars.
+the shared runner and passed to each guest through local `demo:env/NUMAX_*`
+keys. A small control guest writes these keys through the SDK; the management
+key API remains read-only. Manual invocations fall back to `NUMAX_*` env vars.
 Changing `grid_width`/`grid_height`/`hotspot_count` and re-running
 `demo.sh` changes the simulated world accordingly — nothing is hardcoded
 in the guest.
@@ -122,21 +123,30 @@ of individual copy-pasted commands. From the repo root:
 
 ```bash
 cargo build --release -p nx-cli
+cargo build --manifest-path examples/swarm_control/Cargo.toml
 cd examples/distributed_ants
 cargo build --release --target wasm32-unknown-unknown
 ./demo.sh                      # uses swarm.config.toml
 ./demo.sh my-other-config.toml # or a different config file
 ```
 
-This launches `ants` background nodes, fully meshed as peers, each
-looping `ticks_per_ant` times over its own datastore. On exit it prints
-each node's converged `ant:trips_completed` GCounter (should agree across
-nodes, modulo at most 1 due to the timing of the final snapshot — that's
-normal eventual-consistency skew, not a bug) and points you at the log to
-render.
+Requires Python 3.11+ and permission to open local sockets. The shared runner
+parses TOML with the standard library, starts persistent daemons with ring
+candidate endpoints and invokes ticks with at most four guest executions in
+flight. Network ports start at `base_port`; loopback management ports follow
+the network-port range. Each node has its own datastore and private token.
 
-If you'd rather see a single raw tick by hand, the same underlying
-`nx run` invocation the script loops looks like:
+The runner waits for healthy membership before ticks, then checks per-origin
+receipt coverage and equality of read-only CRDT snapshots before rendering.
+Timeouts and failed or uncertain mutations stop the run; mutations are never
+automatically retried. Signals stop and reap only the owned daemons.
+
+Each run creates a new `runs/<id>` directory and preserves it afterward. Use
+`./demo.sh swarm.config.toml --state /tmp/numax-ants-new-run` to choose another
+new directory. `--timeout` bounds each observation phase, not guest acceptance
+or a production detector setting. Existing data/log directories are untouched.
+
+For a separate single-node tick by hand:
 
 ```bash
 NUMAX_GRID_W=12 NUMAX_GRID_H=12 NUMAX_HOTSPOT_COUNT=3 NUMAX_SEED=1337 \
@@ -157,12 +167,12 @@ persists in `nx_sdk::db` between invocations.
 ## Render the pheromone map + shortest paths
 
 ```bash
-python3 render_paths.py logs/ant-0.log --grid-width 12 --grid-height 12 --out swarm.html
+python3 render_paths.py runs/<id>/node-0/daemon.log --grid-width 12 --grid-height 12 --out swarm.html
 ```
 
 Stdlib-only (no matplotlib/numpy). It parses the structured `PHERO,x,y,v`
-/ `HOTSPOT,x,y` / `NEST,x,y` lines that the last tick of node 0 emits
-(gated behind `NUMAX_RENDER=1`, which `demo.sh` sets automatically), then:
+/ `HOTSPOT,x,y` / `NEST,x,y` lines that node 0's final read-only observation
+emits (the runner sets `NUMAX_OBSERVE=1` and `NUMAX_RENDER=1`), then:
 
 - builds an in-memory copy of the converged pheromone grid,
 - derives an explicit "shortest path" for **every pair** of points of
@@ -180,11 +190,12 @@ Stdlib-only (no matplotlib/numpy). It parses the structured `PHERO,x,y,v`
 
 Open the resulting `swarm.html` in a browser.
 
-## Reset
+## Data and tokens
 
-```bash
-rm -rf examples/distributed_ants/data-* examples/distributed_ants/logs
-```
+Use a new run directory to start again. The runner refuses existing directories;
+it does not reset or migrate old stores. Keep token files private and do not
+publish them with logs or reports. Retain or remove completed run directories
+explicitly after their daemons have stopped.
 
 ## Notes
 
@@ -193,10 +204,11 @@ rm -rf examples/distributed_ants/data-* examples/distributed_ants/logs
 - `--wait-before-run` / `--settle-for` follow the same convention as the
   other examples — see `distributed_counter`'s README for a fuller
   explanation of both.
-- Reusing datastores between `demo.sh` runs of the *same* config is fine;
-  changing grid size or hotspot count mid-simulation isn't (positions from
-  a smaller/differently-seeded world may fall outside the new grid), so
-  `demo.sh` always clears `data-*`/`logs` first.
+- Do not change grid size, seed or hotspot count on an existing manual store:
+  its persisted positions may no longer belong to that world.
+- Run helper tests with `python3 -m unittest discover -s ../ -p test_swarm_demo.py`;
+  opt into real daemon lifecycle tests with `NUMAX_SWARM_E2E=1`. Those tests
+  use the debug `nx` binary and the built swarm WASM modules.
 
 ## Future direction: human-in-the-loop swarming (HILT)
 

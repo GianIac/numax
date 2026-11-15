@@ -33,3 +33,8 @@ docs/nx-site/.pnpm-store/
 # cargo-fuzz runtime output; seed corpora remain tracked
 fuzz/artifacts/
 fuzz/coverage/
+
+# Private swarm demo runs contain management tokens and per-node stores.
+/examples/distributed_ants/runs/
+/examples/distributed_magnets/runs/
+__pycache__/

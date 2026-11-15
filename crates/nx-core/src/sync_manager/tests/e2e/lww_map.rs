@@ -1,6 +1,31 @@
 use super::super::support::*;
 
 #[tokio::test]
+async fn manual_map_recovers_history_and_new_writes() {
+    for format in [
+        nx_net::SerializationFormat::Json,
+        nx_net::SerializationFormat::Bincode,
+    ] {
+        let (mut a, ha, sa, mut b, hb, sb, endpoint) = manual_pair(format).await;
+        local_lww_map_set(&ha, "manual-m", "field", b"before", 100).await;
+        hb.add_peer(endpoint).await.unwrap();
+        wait_for_lww_map(&b, "manual-m", &[("field", b"before")]).await;
+        local_lww_map_remove(&hb, "manual-m", "field", 200).await;
+        wait_for_lww_map(&a, "manual-m", &[]).await;
+        assert_eq!(
+            read_materialized_lww_map(&sa, "manual-m"),
+            read_materialized_lww_map(&sb, "manual-m")
+        );
+        assert_eq!(
+            read_durable_lww_map_state(&sa, "manual-m"),
+            read_durable_lww_map_state(&sb, "manual-m")
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn e2e_two_nodes_lww_map_sets_and_remove_converge() {
     let key = "settings:service-a";
     let addr_a = free_addr();

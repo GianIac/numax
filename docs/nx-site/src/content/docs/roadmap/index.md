@@ -179,52 +179,51 @@ while peer discovery remains deliberately separated from authentication and auth
 
 **Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
 
-**Design doc as a public RFC**:
-- [x] [peer-discovery.md](/numax/design/peer-discovery/) (draft), describing the feature, its current foundations, planned behavior and open decisions
-- [ ] Documented failure scenarios
-- [ ] Detailed test plan
-
 **Replication correctness prerequisites**:
-- [ ] Define and test atomic local persistence of CRDT state, operation identity and replay metadata before acknowledging a local write
-- [ ] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics
-- [ ] Decide how to deduplicate delayed replay safely and identify missing operations; evaluate per-origin sequencing versus idempotent state/delta replication without treating an observed maximum OpId as a causal frontier
-- [ ] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures
-- [ ] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary
-- [ ] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
-- [ ] Decide whether bounded-window recovery is sufficient or a versioned CRDT state-transfer subset must move forward from `0.1.11`; do not promise unrestricted lossless recovery before this decision
+- [x] Atomic local operation persistence: create `OpId` before persistence and commit CRDT state, materialized value, seen-operation metadata and replay record in one batch.
+- [x] Flush-confirmed local acceptance: return success only after a flush covering the batch; define uncertain outcomes, retry semantics and the bounded process-crash model.
+- [x] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics ([current contract](/numax/design/peer-discovery/#acknowledgement-semantics))
+- [x] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
+- [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([compatibility contract](/numax/design/peer-discovery/#compatibility-and-limits))
+- [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#compatibility-and-limits))
+- [x] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
+- [x] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
 
 **Separate control and data responsibilities**:
-- [ ] **Membership**: SWIM / Lifeguard (who is in the cluster)
-- [ ] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
-- [ ] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
-- [ ] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
-- [ ] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
-- [ ] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
+- [x] **Membership**: SWIM / Lifeguard (who is in the cluster)
+- [x] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
+- [x] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
+- [x] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
+- [x] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
+- [x] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
 
 **Adaptive K-fanout gossip**:
-- [ ] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits
-- [ ] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
-- [ ] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect
-- [ ] Adaptive rate based on load/RTT
-- [ ] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
-- [ ] Periodic, byte-bounded and paginated anti-entropy complementing gossip
+- [x] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits ([fanout policy, c = 3](/numax/design/peer-discovery/#fanout))
+- [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
+- [x] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect ([topology contract](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts))
+- [x] Adaptive rate based on load/RTT
+- [x] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
+- [x] Periodic, byte-bounded and paginated anti-entropy complementing gossip
 
 **Runtime peer management**:
-- [ ] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
-- [ ] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
-- [ ] Document whether runtime-added peers persist across node restarts
-- [ ] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
+- [x] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
+- [x] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
+- [x] Document whether runtime-added peers persist across node restarts
+- [x] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
+
+[Runtime-management contract](/numax/guides/management-api/#add-a-persistent-peer-candidate).
+Release-scale loss, partition and detector criteria remain separate below.
 
 **Determinism for tests**:
-- [ ] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
+- [x] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
 
 **Test scenarios**:
-- [ ] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model
-- [ ] Separate simulated message loss from packet loss over the real transport
-- [ ] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
-- [ ] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
-- [ ] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
-- [ ] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use
+- [x] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model: test sync_manager::manager::tests::determinism::split_brain_50_nodes_production_defaults_json
+- [x] Separate simulated message loss from packet loss over the real transport: `packet_loss::partition_50_nodes` (50 real Linux workers, 25+25, 60s veth partition, 10% netem loss, JSON/Bincode; 600 accepted operations recovered on every node within 30s)
+- [x] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
+- [x] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
+- [x] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
+- [x] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use: `detector_50_nodes_one_hour_json` (50 real Linux processes, nominal 1h, zero false declarations; separate crash observation and sampled resource use)
 
 **Closing criterion**:
 > A reproducible 50-node test with a declared 10% loss model converges in < 30s after a 60s partition into two groups of 25, with no loss of accepted operations within the specified recovery contract. The primary recovery test stops new writes at rejoin; a separate test continues writing under recovery load. Validate the real transport under packet loss as well. A defined nominal 1h run records no false failure declarations and reports refuted suspicions separately. Publish workloads, seeds and results; this observation is not a universal zero-failure guarantee.
@@ -365,6 +364,11 @@ time = true
 
 **Storage**:
 - [ ] `KvBackend` abstraction to decouple from sled (preparation for a possible switch to redb/fjall)
+
+**Scalability and performance**:
+- [ ] Diagnose the stalls and performance limits encountered in earlier 100-node experiments, including macOS preflights; distinguish storage, replicated application, networking and scheduling bottlenecks
+- [ ] Implement measured bottleneck fixes while preserving flush-confirmed acceptance, recovery guarantees, bounded queues and detector behavior; a storage-backend change is not an assumed solution
+- [ ] Repeat 100-node preflight and nominal one-hour scenarios on Linux and macOS with declared workloads and comparable baselines, tracking throughput, latency, resource use and false failure declarations
 
 **Closing criterion**:
 > A cluster operating for 7 days with active compaction keeps the op-log within a configured budget. Restore from snapshot in < 60s for a 10GB datastore.

@@ -46,24 +46,38 @@ For now, build from source:
 git clone https://github.com/GianIac/numax
 cd numax
 cargo build --release
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --manifest-path examples/distributed_counter/Cargo.toml
+export NX=./target/release/nx
+export WASM=examples/distributed_counter/target/wasm32-unknown-unknown/release/distributed_counter.wasm
 ```
 
-Run the `distributed_counter` example on two nodes:
+### Manual peers
+
+Run the `distributed_counter` example in two terminals on the **same machine**.
+Set `NX` and `WASM` as above in both terminals, use fresh `data-a`/`data-b`
+directories, and start the commands within a few seconds of each other:
 
 ```bash
 # Node A
-nx run distributed_counter.wasm \
+$NX run $WASM \
     --listen 0.0.0.0:9000 \
+    --peer 127.0.0.1:9001 \
+    --wait-before-run 1500ms --settle-for 5s \
+    --print-gcounter counter:visits \
     --datastore-path ./data-a -v
 
 # Node B
-nx run distributed_counter.wasm \
+$NX run $WASM \
     --listen 0.0.0.0:9001 \
     --peer 127.0.0.1:9000 \
+    --wait-before-run 1500ms --settle-for 5s \
+    --print-gcounter counter:visits \
     --datastore-path ./data-b -v
 ```
 
-The two nodes find each other, sync, and converge. You don't have to do anything else.
+Here the peer addresses are supplied manually. Each guest increments once;
+both commands should print `counter:visits = 2` after settling, then exit.
 
 You can also move the node settings into TOML files and keep the command line
 focused on run-specific options:
@@ -83,10 +97,10 @@ mode = "static"
 ```
 
 ```bash
-nx config validate --config node-a.toml
-nx config show --config node-a.toml --effective
+$NX config validate --config node-a.toml
+$NX config show --config node-a.toml --effective
 
-nx run distributed_counter.wasm \
+$NX run $WASM \
     --config node-a.toml \
     --settle-for 5s \
     --print-gcounter counter:visits
@@ -96,13 +110,51 @@ To start the configured node without executing a WASM module, use the daemon
 command:
 
 ```bash
-nx serve --config node-a.toml
+$NX serve --config node-a.toml
 ```
 
 Runtime precedence is explicit: CLI flags override `NX_*` environment
 variables, environment variables override the TOML file, and the file overrides
 runtime defaults. The distributed examples below include full two-node TOML
 setups.
+
+### Automatic peer discovery
+
+Try **three nodes on the same machine**, discovering each other with **mDNS**.
+Open three terminals in `numax/`. In each, set `NX` and `WASM` as above, then set
+your machine's LAN IPv4 (replace the example address):
+
+```bash
+export LAN_IP=192.168.1.20
+```
+
+Use fresh `auto-a`, `auto-b`, `auto-c` directories and stop other Numax demos.
+Start these within a few seconds of each other, **one per terminal**:
+
+```bash
+# Terminal 1
+$NX run $WASM --listen "$LAN_IP:9001" \
+    --discovery-mode mdns --mdns-instance node-a --datastore-path ./auto-a \
+    --wait-before-run 10s --settle-for 45s --print-gcounter counter:visits
+
+# Terminal 2
+$NX run $WASM --listen "$LAN_IP:9002" \
+    --discovery-mode mdns --mdns-instance node-b --datastore-path ./auto-b \
+    --wait-before-run 10s --settle-for 45s --print-gcounter counter:visits
+
+# Terminal 3
+$NX run $WASM --listen "$LAN_IP:9003" \
+    --discovery-mode mdns --mdns-instance node-c --datastore-path ./auto-c \
+    --wait-before-run 10s --settle-for 45s --print-gcounter counter:visits
+```
+
+After about a minute, all three should print **`counter:visits = 3`** and exit.
+No peer addresses to configure: each node announces itself and finds the others.
+
+Use a trusted LAN with multicast UDP **5353** and TCP **9001–9003** allowed.
+Firewalls, Wi-Fi client isolation, VLANs or VPNs can block discovery; this demo
+uses unencrypted TCP. See the [quickstart](https://gianiac.github.io/numax/getting-started/quickstart-5-min/)
+for the walkthrough and [LAN demo](./examples/discovery_lan) for separate devices.
 
 ---
 

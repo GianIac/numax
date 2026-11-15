@@ -67,6 +67,7 @@ pub(super) struct ProviderTask {
     provider: &'static str,
     _supervisor: Arc<JoinHandle<()>>,
     completion: watch::Receiver<Option<TaskCompletion>>,
+    stopping: watch::Receiver<bool>,
 }
 
 #[derive(Clone)]
@@ -88,6 +89,7 @@ impl ProviderTask {
         C: Future<Output = Result<(), DiscoveryError>> + Send + 'static,
     {
         let (complete, completion) = watch::channel(None);
+        let stopping = shutdown.clone();
         state.activate();
         // Construct guards before spawning, including for runtime teardown.
         let mut final_state = FinalizeState { state, armed: true };
@@ -157,6 +159,7 @@ impl ProviderTask {
             provider,
             _supervisor: Arc::new(supervisor),
             completion,
+            stopping,
         }
     }
 
@@ -184,6 +187,13 @@ impl ProviderTask {
                 return Err(error.clone());
             }
             return Ok(false);
+        }
+        if *self.stopping.borrow() {
+            return Err(DiscoveryError::Provider {
+                provider: provider.into(),
+                message: "previous discovery generation is stopping".into(),
+                retryable: true,
+            });
         }
         if self.completion.has_changed().is_err() {
             return Err(DiscoveryError::Provider {
