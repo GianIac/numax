@@ -22,6 +22,16 @@ macro_rules! mock_mutation {
     };
 }
 
+macro_rules! mock_unexpected_host_call {
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?)) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $name($($arg: $ty),*) -> i32 {
+            $(let _ = $arg;)*
+            panic!("unexpected host call: {}", stringify!($name));
+        }
+    };
+}
+
 mock_mutation!(crdt_gcounter_inc(key_ptr: u32, key_len: u32, delta: u64));
 mock_mutation!(crdt_pncounter_inc(key_ptr: u32, key_len: u32, delta: u64));
 mock_mutation!(crdt_pncounter_dec(key_ptr: u32, key_len: u32, delta: u64));
@@ -40,6 +50,60 @@ mock_mutation!(crdt_lww_map_remove(key_ptr: u32, key_len: u32, field_ptr: u32, f
 mock_mutation!(crdt_orset_add(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32));
 mock_mutation!(crdt_orset_remove(key_ptr: u32, key_len: u32, element_ptr: u32, element_len: u32));
 mock_mutation!(crdt_rga_delete(key_ptr: u32, key_len: u32, id_ptr: u32, id_len: u32));
+
+mock_unexpected_host_call!(host_capabilities(out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(env_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(module_id(out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(net_node_id(out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(net_peers(out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(random_bytes(out_ptr: u32, out_len: u32));
+mock_unexpected_host_call!(db_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(
+    db_keys(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32)
+);
+mock_unexpected_host_call!(
+    db_scan(prefix_ptr: u32, prefix_len: u32, cursor: u64, limit: u32, out_ptr: u32, out_cap: u32)
+);
+mock_unexpected_host_call!(
+    db_keys_after(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        start_after_ptr: u32,
+        start_after_len: u32,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    )
+);
+mock_unexpected_host_call!(
+    db_scan_after(
+        prefix_ptr: u32,
+        prefix_len: u32,
+        start_after_ptr: u32,
+        start_after_len: u32,
+        limit: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    )
+);
+mock_unexpected_host_call!(crdt_lww_get(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32));
+mock_unexpected_host_call!(
+    crdt_lww_map_get(
+        key_ptr: u32,
+        key_len: u32,
+        field_ptr: u32,
+        field_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+    )
+);
+mock_unexpected_host_call!(
+    crdt_lww_map_entries(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32)
+);
+mock_unexpected_host_call!(
+    crdt_orset_elements(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32)
+);
+mock_unexpected_host_call!(crdt_rga_values(key_ptr: u32, key_len: u32, out_ptr: u32, out_cap: u32));
 
 #[unsafe(no_mangle)]
 pub extern "C" fn crdt_rga_insert(

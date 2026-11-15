@@ -19,7 +19,7 @@ use super::types::*;
 #[cfg(test)]
 static REMOTE_REPLAY_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(super) fn set_remote_replay_trace_enabled(enabled: bool) {
     REMOTE_REPLAY_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
 }

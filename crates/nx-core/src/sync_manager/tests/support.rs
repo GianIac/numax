@@ -668,6 +668,7 @@ pub(super) fn isolated_test_output(
     isolated_test_output_with_capture(test_name, marker, value, lifetime, false)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn isolated_test_output_tail(
     test_name: &str,
     marker: &str,

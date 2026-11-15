@@ -40,6 +40,7 @@ pub(super) mod critical_trace {
         *CLOCK.get_or_init(Instant::now)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(in crate::sync_manager) fn enable() {
         clock();
         ENABLED.store(true, Ordering::Release);
