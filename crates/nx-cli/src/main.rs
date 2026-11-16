@@ -1810,6 +1810,28 @@ mod tests {
         }
 
         #[test]
+        fn requested_color_accepts_equals_forms() {
+            for value in ["auto", "always", "never"] {
+                let parsed = parse_requested_color([format!("--color={value}").into()]).unwrap();
+                assert_eq!(parsed.to_string(), value);
+            }
+        }
+
+        #[test]
+        fn requested_color_accepts_space_forms() {
+            for value in ["auto", "always", "never"] {
+                let parsed = parse_requested_color(["--color".into(), value.into()]).unwrap();
+                assert_eq!(parsed.to_string(), value);
+            }
+        }
+
+        #[test]
+        fn requested_color_defaults_to_auto_when_absent() {
+            let parsed = parse_requested_color(["run".into(), "x.wasm".into()]).unwrap();
+            assert_eq!(parsed, ColorWhen::Auto);
+        }
+
+        #[test]
         fn requested_color_rejects_invalid_values() {
             let err = parse_requested_color(["--color=foobar".into()]).unwrap_err();
             assert!(err.to_string().contains("invalid value 'foobar'"));
