@@ -24,7 +24,7 @@ description: Current status and planned versions.
 
 ## Status and goal
 
-- **Latest version**: `v0.1.5` (Peer Discovery - Foundations).
+- **Latest version**: `v0.1.6` (Peer Discovery - SWIM & Gossip K-fanout).
 - **Final goal of the cycle**: stable `v0.2.0`.
 - **Philosophy of intermediate releases**: every `0.1.x` is a **stable and usable** release. Capabilities are added incrementally without sacrificing quality.
 
@@ -43,28 +43,42 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 
 | Version | Theme | Status |
 |---|---|---|
-| `v0.1.0` | First production-ready + Documentation, Distribution & Configuration | released |
-| `v0.1.1` | Architectural Cleanup & Versioning | released |
-| `v0.1.2` | Performance & Profiling | released |
-| `v0.1.3` | Supply Chain & Fuzzing | released |
-| `v0.1.4` | Management API | released |
-| `v0.1.5` | Peer Discovery - Foundations | current |
-| `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
-| `v0.1.7` | Reactive Module Model - Events | planned |
-| `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | planned |
-| `v0.1.9` | Capability-Based Security | planned |
-| `v0.1.10` | Resource Quotas & Multi-tenant | planned |
-| `v0.1.11` | Op-log Compaction & Snapshots | planned |
-| `v0.1.12` | Operability Tools | planned |
-| `v0.1.13` | Built-in Dashboard | planned |
-| `v0.1.14` | TUI & Advanced CRDTs | planned |
-| `v0.1.15` | WIT & Component Model | planned |
-| `v0.2.0-rc.1` | Release Candidate hardening | planned |
-| `v0.2.0` | **Stable - production-ready, any criticality** | final goal |
+| [`v0.1.0`](#roadmap-v010) | First production-ready + Documentation, Distribution & Configuration | released |
+| [`v0.1.1`](#roadmap-v011) | Architectural Cleanup & Versioning | released |
+| [`v0.1.2`](#roadmap-v012) | Performance & Profiling | released |
+| [`v0.1.3`](#roadmap-v013) | Supply Chain & Fuzzing | released |
+| [`v0.1.4`](#roadmap-v014) | Management API | released |
+| [`v0.1.5`](#roadmap-v015) | Peer Discovery - Foundations | released |
+| [`v0.1.6`](#roadmap-v016) | Peer Discovery - SWIM & Gossip K-fanout | current |
+| [`v0.1.7`](#roadmap-v017) | Reactive Module Model - Events | planned |
+| [`v0.1.8`](#roadmap-v018) | Reactive Module Model - HTTP & Hot Reload | planned |
+| [`v0.1.9`](#roadmap-v019) | Capability-Based Security | planned |
+| [`v0.1.10`](#roadmap-v0110) | Resource Quotas & Multi-tenant | planned |
+| [`v0.1.11`](#roadmap-v0111) | Op-log Compaction & Snapshots | planned |
+| [`v0.1.12`](#roadmap-v0112) | Operability Tools | planned |
+| [`v0.1.13`](#roadmap-v0113) | Built-in Dashboard | planned |
+| [`v0.1.14`](#roadmap-v0114) | TUI & Advanced CRDTs | planned |
+| [`v0.1.15`](#roadmap-v0115) | WIT & Component Model | planned |
+| [`v0.2.0-rc.1`](#roadmap-v020-rc1) | Release Candidate hardening | planned |
+| [`v0.2.0`](#roadmap-v020) | **Stable - production-ready, any criticality** | final goal |
 
 > **Legend**: released = previous stable release; current = latest stable release; planned = future work; final goal = end of the cycle.
 
 ---
+
+<span id="roadmap-v010"></span>
+
+## v0.1.0 - First production-ready
+
+`v0.1.0` established the first stable Numax release for non-critical workloads,
+with documentation, distribution and configuration as the starting point for
+the `0.1.x` cycle.
+
+📄 Full details in the [`v0.1.0` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.0).
+
+---
+
+<span id="roadmap-v011"></span>
 
 ## v0.1.1 - Architectural Cleanup & Versioning 🧹
 
@@ -89,6 +103,8 @@ instead of crashing.
 
 ---
 
+<span id="roadmap-v012"></span>
+
 ## v0.1.2 - Performance & Profiling 📊
 
 `v0.1.2` made performance observation automatic and silent regressions
@@ -112,6 +128,8 @@ automatically with the regression details.
 
 ---
 
+<span id="roadmap-v013"></span>
+
 ## v0.1.3 - Supply Chain & Fuzzing
 
 `v0.1.3` hardened the boundaries where Numax meets untrusted input and made
@@ -133,6 +151,8 @@ a partially updated state.
 📄 Full details in the [`v0.1.3` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.3).
 
 ---
+
+<span id="roadmap-v014"></span>
 
 ## v0.1.4 - Management API 🔌
 
@@ -162,6 +182,8 @@ single further CLI command.
 
 ---
 
+<span id="roadmap-v015"></span>
+
 ## v0.1.5 - Peer Discovery: Foundations 🌐
 
 Introduces the foundations for dynamic peer discovery, allowing Numax nodes to discover potential 
@@ -175,60 +197,32 @@ while peer discovery remains deliberately separated from authentication and auth
 
 ---
 
+<span id="roadmap-v016"></span>
+
 ## v0.1.6 - Peer Discovery: SWIM & Gossip K-fanout 🕸
 
-**Goal**: build dynamic membership, failure detection and K-fanout dissemination on the discovery foundations, with explicit recovery guarantees and bounded resource use.
+`v0.1.6` takes discovery beyond finding addresses: Numax now tracks dynamic
+membership and failures through SWIM/Lifeguard, and spreads CRDT operations
+through bounded K-fanout gossip with adaptive pacing and rotating recovery
+contacts.
 
-**Replication correctness prerequisites**:
-- [x] Atomic local operation persistence: create `OpId` before persistence and commit CRDT state, materialized value, seen-operation metadata and replay record in one batch.
-- [x] Flush-confirmed local acceptance: return success only after a flush covering the batch; define uncertain outcomes, retry semantics and the bounded process-crash model.
-- [x] Distinguish batch acceptance, flush-confirmed durability and remote replication; specify any acknowledgement semantics ([current contract](/numax/design/peer-discovery/#acknowledgement-semantics))
-- [x] Implement and test safe delayed-replay deduplication and missing-operation detection using the RFC's per-origin/generation sequencing; an observed maximum OpId is not a causal frontier
-- [x] Specify and test wire/schema evolution and historical-data handling for the chosen approach; preserve historical fixtures ([compatibility contract](/numax/design/peer-discovery/#compatibility-and-limits))
-- [x] Test JSON/Bincode protocol changes and safe rejection against the `v0.1.5` binary ([validation](/numax/design/peer-discovery/#compatibility-and-limits))
-- [x] Define the recoverable retention window and detect unrecoverable gaps, including a new node joining after required history has expired
-- [x] Specify, implement and test the minimal versioned CRDT state-transfer subset brought forward from `0.1.11`; do not promise unrestricted lossless recovery
+The release connects membership to durable replication: atomic local writes
+and flush-confirmed success, per-origin sequencing and replay deduplication,
+and bounded anti-entropy with versioned state transfer when retained history
+is insufficient. Runtime peer registration and separate views of candidates,
+connections, membership and recovery make these boundaries observable.
 
-**Separate control and data responsibilities**:
-- [x] **Membership**: SWIM / Lifeguard (who is in the cluster)
-- [x] **Failure detection**: select and specify the suspicion model; evaluate SWIM-style suspicion with Lifeguard before adding a separate phi-accrual detector
-- [x] **Data dissemination**: K-fanout gossip for CRDT ops (what to propagate)
-- [x] Define identity, restart generations, incarnation ordering, refutation, leave/rejoin and stale-message handling
-- [x] Choose and validate control transport and authentication; isolate probe/control budgets from data backpressure
-- [x] Measure local scheduling delays and detector behavior under CPU-bound WASM execution and slow storage
+Net result: nodes can discover, monitor and reconnect to peers, then repair
+missed state within an explicit recovery contract rather than treating a live
+connection as proof of convergence. Deterministic replay, restart and
+packet-loss scenarios cover the new paths; larger-scale performance work
+remains tracked under `v0.1.11`.
 
-**Adaptive K-fanout gossip**:
-- [x] Configurable fanout (target default `K = ceil(log2(N) + c)`); define local membership estimate `N`, calibrate `c` and clamp to eligible peers and configured limits ([fanout policy, c = 3](/numax/design/peer-discovery/#fanout))
-- [x] Forward newly accepted remote operations after persistence, preserving origin and preventing duplicate forwarding loops
-- [x] Maintain a bounded, rotating neighbor set and recovery contacts so sparse topologies and healed partitions can reconnect ([topology contract](/numax/design/peer-discovery/#bounded-neighbors-and-recovery-contacts))
-- [x] Adaptive rate based on load/RTT
-- [x] Backpressure with bounded queues, byte budgets, jitter and stable adaptation; dropping a send attempt must not discard the only recoverable copy of an accepted operation
-- [x] Periodic, byte-bounded and paginated anti-entropy complementing gossip
-
-**Runtime peer management**:
-- [x] `POST /api/v1/peers` through `RuntimeManagement` - accept a manual candidate for normal validation and admission, without implying that connection or authentication has succeeded
-- [x] Once admitted, peers added through the API participate in failure detection, reconnection and anti-entropy
-- [x] Document whether runtime-added peers persist across node restarts
-- [x] Distinguish candidates, membership, active connections and replication recovery in introspection; expose bounded metrics for probes, queues, retries, fanout and recovery gaps
-
-[Runtime-management contract](/numax/guides/management-api/#add-a-persistent-peer-candidate).
-Release-scale loss, partition and detector criteria remain separate below.
-
-**Determinism for tests**:
-- [x] Shared production/simulation state machine with injected clock, transport and seedable PRNG; deterministic event and candidate ordering
-
-**Test scenarios**:
-- [x] 50 nodes, 10% loss and partition recovery, with versioned seeds, topology, load, payload sizes, latency, retention and loss model: test sync_manager::manager::tests::determinism::split_brain_50_nodes_production_defaults_json
-- [x] Separate simulated message loss from packet loss over the real transport: `packet_loss::partition_50_nodes` (50 real Linux workers, 25+25, 60s veth partition, 10% netem loss, JSON/Bincode; 600 accepted operations recovered on every node within 30s)
-- [x] Cluster split-brain → merge without accepted-op loss within the declared recovery contract; exceed retention separately and verify explicit recovery failure rather than false convergence
-- [x] Sparse-topology convergence for every CRDT family, delayed duplicates, storage failures and interrupted persistence
-- [x] 100% rolling restart, one node at a time with recovery between restarts; test simultaneous full shutdown separately
-- [x] False-positive suspicion and failure-declaration rates measured alongside true-failure detection latency and resource use: `detector_50_nodes_one_hour_json` (50 real Linux processes, nominal 1h, zero false declarations; separate crash observation and sampled resource use)
-
-**Closing criterion**:
-> A reproducible 50-node test with a declared 10% loss model converges in < 30s after a 60s partition into two groups of 25, with no loss of accepted operations within the specified recovery contract. The primary recovery test stops new writes at rejoin; a separate test continues writing under recovery load. Validate the real transport under packet loss as well. A defined nominal 1h run records no false failure declarations and reports refuted suspicions separately. Publish workloads, seeds and results; this observation is not a universal zero-failure guarantee.
+📄 Full details in the [`v0.1.6` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.6).
 
 ---
+
+<span id="roadmap-v017"></span>
 
 ## v0.1.7 - Reactive Module Model: Events ⚡
 
@@ -258,6 +252,8 @@ Release-scale loss, partition and detector criteria remain separate below.
 
 ---
 
+<span id="roadmap-v018"></span>
+
 ## v0.1.8 - Reactive Module Model: HTTP & Hot Reload 🔁
 
 **Goal**: modules can **serve HTTP** and be **reloaded without dropping peer connections**.
@@ -279,6 +275,8 @@ Release-scale loss, partition and detector criteria remain separate below.
 > The "collaborative todo list" demo runs on 3 devices, the user edits a todo, the other devices see it in < 500ms. Hot reload in production with no state loss.
 
 ---
+
+<span id="roadmap-v019"></span>
 
 ## v0.1.9 - Capability-Based Security 🔒
 
@@ -316,6 +314,8 @@ time = true
 
 ---
 
+<span id="roadmap-v0110"></span>
+
 ## v0.1.10 - Resource Quotas & Multi-tenant 📦
 
 **Goal**: numax becomes **multi-tenant safe**: multiple modules on the same node, isolated, with resource quotas.
@@ -341,6 +341,8 @@ time = true
 > 10 modules on the same node, each with different quotas, none can affect the others. "Malicious module" test attempting to exhaust resources → contained correctly.
 
 ---
+
+<span id="roadmap-v0111"></span>
 
 ## v0.1.11 - Op-log Compaction & Snapshots 🗜
 
@@ -375,6 +377,8 @@ time = true
 
 ---
 
+<span id="roadmap-v0112"></span>
+
 ## v0.1.12 - Operability Tools 🛠
 
 **Goal**: when something goes wrong, you need the tools to figure it out.
@@ -399,6 +403,8 @@ time = true
 > A real divergence case (even simulated) is diagnosed in < 15 minutes using only the official tools.
 
 ---
+
+<span id="roadmap-v0113"></span>
 
 ## v0.1.13 - Built-in Dashboard 🎨
 
@@ -431,6 +437,8 @@ time = true
 
 ---
 
+<span id="roadmap-v0114"></span>
+
 ## v0.1.14 - TUI & Advanced CRDTs 🖥
 
 **Goal**: those who live in SSH have their version. Those who need collaborative text editing have it too.
@@ -459,6 +467,8 @@ time = true
 
 ---
 
+<span id="roadmap-v0115"></span>
+
 ## v0.1.15 - WIT & Component Model 🧩
 
 **Goal**: the host API ABI becomes **standard, stable, multi-language** via the WebAssembly Component Model.
@@ -483,6 +493,8 @@ time = true
 
 ---
 
+<span id="roadmap-v020-rc1"></span>
+
 ## v0.2.0-rc.1 - Release Candidate Hardening
 
 **Goal**: everything built in `0.1.0`–`0.1.15` is put under stress, integrated, documented and finished.
@@ -506,6 +518,8 @@ time = true
 - [ ] All tutorials verified end-to-end
 
 ---
+
+<span id="roadmap-v020"></span>
 
 ## v0.2.0 - Stable
 
