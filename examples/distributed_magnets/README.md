@@ -323,7 +323,7 @@ Retain or remove completed directories explicitly after their daemons stop.
   tick loop; every other particle only ever *reads* live anchor weights,
   never writes them. Do not retry an uncertain tick: it may already have
   applied its boost.
-- Run helper tests with `python3 -m unittest discover -s ../ -p test_swarm_demo.py`;
+- Run helper tests with `python3 -m unittest discover -s ../swarm_control -p test_swarm_demo.py`;
   use `NUMAX_SWARM_E2E=1` for real lifecycle tests with the debug `nx` binary
   and both built swarm WASM modules.
 
