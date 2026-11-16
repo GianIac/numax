@@ -235,17 +235,6 @@ cosign verify-blob \
 grep " ${ARCHIVE}$" SHA256SUMS | sha256sum -c -
 ```
 
-For assets republished through the documented manual recovery workflow on
-`main`, use the exact identity below instead of the tag-based `IDENTITY` above,
-then run the same `cosign verify-blob` and checksum checks:
-
-```bash
-IDENTITY="https://github.com/GianIac/numax/.github/workflows/release.yml@refs/heads/main"
-```
-
-The recovery workflow still builds the existing release tag; the identity
-identifies the workflow revision that performed the build and signing.
-
 ---
 
 ## Related
