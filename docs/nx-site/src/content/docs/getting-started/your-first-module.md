@@ -321,7 +321,7 @@ GOARCH=wasm GOOS=wasip1 go build -o guest.wasm main.go
 $NX run ./guest.wasm
 ```
 
-> Full Go example coming soon.
+Full example: [`guest_tinygo`](https://github.com/GianIac/numax/tree/main/examples/guest_tinygo)
 
 ---
 
@@ -332,13 +332,13 @@ Python can target WASM via [Extism](https://extism.org/) PDK or by compiling wit
 is the same: one exported `run` function, host imports from the `nx` namespace.
 
 ```python
-# Conceptual - full example coming soon
+# Conceptual
 
 def run():
     log("Hello from Python guest!")
 ```
 
-> Full Python example coming soon.
+Full example: [`guest_python`](https://github.com/GianIac/numax/tree/main/examples/guest_python)
 
 ---
 
