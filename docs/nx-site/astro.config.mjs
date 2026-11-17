@@ -82,6 +82,7 @@ export default defineConfig({
               label: 'Crates',
               items: [
                 { label: 'Overview', slug: 'reference/crates' },
+                { label: 'nx-api', slug: 'reference/crates/nx-api' },
                 { label: 'nx-cli', slug: 'reference/crates/nx-cli' },
                 { label: 'nx-core', slug: 'reference/crates/nx-core' },
                 { label: 'nx-net', slug: 'reference/crates/nx-net' },
