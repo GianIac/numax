@@ -32,5 +32,19 @@ impl fmt::Display for NxError {
     }
 }
 
-// #[cfg(feature = "std")]
-// impl std::error::Error for NxError {}
+#[cfg(feature = "std")]
+impl std::error::Error for NxError {}
+
+#[cfg(all(test, feature = "std"))]
+mod std_error_tests {
+    use super::NxError;
+
+    #[test]
+    fn nx_error_implements_std_error() {
+        fn assert_std_error(error: &dyn std::error::Error) {
+            let _ = error;
+        }
+
+        assert_std_error(&NxError::NotFound);
+    }
+}
