@@ -207,7 +207,7 @@ jobs:
         # Real multicast is explicitly opted into in the macOS test job above.
         run: >-
           cargo test -p nx-cli --test multiprocess_smoke
-          -- --ignored --skip discovery_lan::
+          -- --include-ignored --skip discovery_lan::
 
   benchmark-tools:
     name: Benchmark Comparator Tests
