@@ -209,6 +209,36 @@ jobs:
           cargo test -p nx-cli --test multiprocess_smoke
           -- --include-ignored --skip discovery_lan::
 
+  observability-smoke:
+    name: Observability Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: Build nx CLI
+        run: cargo build --release -p nx-cli
+      - name: Check observability endpoints
+        run: |
+          set -euo pipefail
+          datastore_path="$(mktemp -d)"
+          trap '[[ -n "${nx_pid:-}" ]] && kill "${nx_pid}" 2>/dev/null || true; rm -rf "${datastore_path}"' EXIT
+          target/release/nx serve \
+            --datastore-path "${datastore_path}" \
+            --observability-listen 127.0.0.1:9100 \
+            >/tmp/nx-serve.log 2>&1 &
+          nx_pid=$!
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:9100/health >/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl --fail --silent http://127.0.0.1:9100/health
+          docs/scripts/check-observability.sh http://127.0.0.1:9100
+
   benchmark-tools:
     name: Benchmark Comparator Tests
     runs-on: ubuntu-24.04
@@ -338,6 +368,7 @@ jobs:
       - discovery-demo-tests
       - build-wasm
       - cli-smoke
+      - observability-smoke
       - benchmark-tools
       - benchmark-regression
       - profiling-artifacts
@@ -354,6 +385,7 @@ jobs:
              [[ "${{ needs.discovery-demo-tests.result }}" != "success" ]] || \
              [[ "${{ needs.build-wasm.result }}" != "success" ]] || \
              [[ "${{ needs.cli-smoke.result }}" != "success" ]] || \
+             [[ "${{ needs.observability-smoke.result }}" != "success" ]] || \
              [[ "${{ needs.benchmark-tools.result }}" != "success" ]] || \
              [[ "${{ needs.benchmark-regression.result }}" != "success" ]] || \
              [[ "${{ needs.profiling-artifacts.result }}" != "success" ]]; then
