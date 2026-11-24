@@ -755,6 +755,7 @@ mod tests {
         modules: Mutex<BTreeMap<String, ModuleInfo>>,
         ready: AtomicBool,
         peers: Option<Vec<PeerInfo>>,
+        keys: Option<Vec<Vec<u8>>>,
     }
 
     impl TestControl {
@@ -846,7 +847,10 @@ mod tests {
             cursor: Option<Vec<u8>>,
             limit: usize,
         ) -> Result<ControlPage<Vec<u8>>, ControlError> {
-            let mut items = [b"app:a".to_vec(), b"app:b".to_vec(), vec![0, 255, b'k']]
+            let mut items = self
+                .keys
+                .clone()
+                .unwrap_or_else(|| vec![b"app:a".to_vec(), b"app:b".to_vec(), vec![0, 255, b'k']])
                 .into_iter()
                 .filter(|key| key.starts_with(&prefix))
                 .filter(|key| cursor.as_ref().is_none_or(|cursor| key > cursor))
@@ -1439,12 +1443,15 @@ mod tests {
             assert_eq!(page["items"].as_array().unwrap().len(), 1);
             assert_eq!(page["items"][0]["address"], format!("127.0.0.1:900{index}"));
             if index < 3 {
-                uri = format!(
-                    "/api/v1/peers?limit=3&cursor={}",
-                    page["next_cursor"].as_str().unwrap()
+                // A truncated page must resume right after its last peer.
+                let cursor = page["next_cursor"].as_str().unwrap();
+                assert_eq!(
+                    cursor,
+                    URL_SAFE_NO_PAD.encode(format!("127.0.0.1:900{index}"))
                 );
+                uri = format!("/api/v1/peers?limit=3&cursor={cursor}");
             } else {
-                assert!(page["next_cursor"].is_null());
+                assert_eq!(page.get("next_cursor"), Some(&Value::Null));
             }
         }
 
@@ -1483,5 +1490,92 @@ mod tests {
         assert!(!items.is_empty());
         assert!(items.len() < 100);
         assert_eq!(page["next_cursor"], *items.last().unwrap());
+    }
+
+    #[tokio::test]
+    async fn key_pages_over_http_stay_bounded_and_walk_every_key_once() {
+        // 100 keys of 8 KiB each encode to ~1.1 MB of base64, so the first page
+        // has to be trimmed even though `limit=100` is accepted.
+        let keys = (0..100u8)
+            .map(|index| vec![index; MAX_KEY_SIZE])
+            .collect::<Vec<_>>();
+        let control = Arc::new(TestControl {
+            keys: Some(keys.clone()),
+            ..TestControl::default()
+        });
+
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        let mut uri = "/api/v1/keys?limit=100".to_string();
+        loop {
+            let response = call(app(control.clone()), Method::GET, &uri, None, Body::empty()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.len() <= MAX_RESPONSE_BODY_SIZE);
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            let items = page["items"].as_array().unwrap();
+            assert!(!items.is_empty());
+            seen.extend(items.iter().map(|item| item.as_str().unwrap().to_string()));
+            pages += 1;
+
+            match page.get("next_cursor") {
+                Some(Value::String(cursor)) => {
+                    // A truncated page must resume right after its last item.
+                    assert_eq!(cursor, items.last().unwrap().as_str().unwrap());
+                    uri = format!("/api/v1/keys?limit=100&cursor={cursor}");
+                }
+                // The final page must carry an explicit `null`, not a missing
+                // field or a value of the wrong type.
+                other => {
+                    assert_eq!(other, Some(&Value::Null));
+                    break;
+                }
+            }
+        }
+
+        assert!(pages > 1, "the keys should not fit into a single page");
+        let expected = keys
+            .iter()
+            .map(|key| URL_SAFE_NO_PAD.encode(key))
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+    }
+
+    #[tokio::test]
+    async fn bounded_page_accepts_a_body_of_exactly_the_limit() {
+        fn page(first: usize, second: usize) -> Response {
+            bounded_page(
+                vec!["x".repeat(first), "y".repeat(second)],
+                None,
+                String::clone,
+            )
+        }
+
+        // Size of the JSON envelope around two empty strings.
+        let envelope = serde_json::to_vec(&PageResponse {
+            items: vec![String::new(), String::new()],
+            next_cursor: None,
+        })
+        .unwrap()
+        .len();
+        let payload = MAX_RESPONSE_BODY_SIZE - envelope;
+
+        let exact = page(payload / 2, payload - payload / 2);
+        assert_eq!(exact.status(), StatusCode::OK);
+        let bytes = exact.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), MAX_RESPONSE_BODY_SIZE);
+        let exact: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(exact["items"].as_array().unwrap().len(), 2);
+        assert_eq!(exact.get("next_cursor"), Some(&Value::Null));
+
+        // One byte more no longer fits: the last item is dropped and the cursor
+        // points at the item that is still returned.
+        let over = page(payload / 2, payload - payload / 2 + 1);
+        assert_eq!(over.status(), StatusCode::OK);
+        let bytes = over.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.len() <= MAX_RESPONSE_BODY_SIZE);
+        let over: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(over["items"].as_array().unwrap().len(), 1);
+        assert_eq!(over["next_cursor"], over["items"][0]);
     }
 }
