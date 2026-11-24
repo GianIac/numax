@@ -1443,12 +1443,15 @@ mod tests {
             assert_eq!(page["items"].as_array().unwrap().len(), 1);
             assert_eq!(page["items"][0]["address"], format!("127.0.0.1:900{index}"));
             if index < 3 {
-                uri = format!(
-                    "/api/v1/peers?limit=3&cursor={}",
-                    page["next_cursor"].as_str().unwrap()
+                // A truncated page must resume right after its last peer.
+                let cursor = page["next_cursor"].as_str().unwrap();
+                assert_eq!(
+                    cursor,
+                    URL_SAFE_NO_PAD.encode(format!("127.0.0.1:900{index}"))
                 );
+                uri = format!("/api/v1/peers?limit=3&cursor={cursor}");
             } else {
-                assert!(page["next_cursor"].is_null());
+                assert_eq!(page.get("next_cursor"), Some(&Value::Null));
             }
         }
 
@@ -1515,13 +1518,18 @@ mod tests {
             seen.extend(items.iter().map(|item| item.as_str().unwrap().to_string()));
             pages += 1;
 
-            match page["next_cursor"].as_str() {
-                Some(cursor) => {
+            match page.get("next_cursor") {
+                Some(Value::String(cursor)) => {
                     // A truncated page must resume right after its last item.
                     assert_eq!(cursor, items.last().unwrap().as_str().unwrap());
                     uri = format!("/api/v1/keys?limit=100&cursor={cursor}");
                 }
-                None => break,
+                // The final page must carry an explicit `null`, not a missing
+                // field or a value of the wrong type.
+                other => {
+                    assert_eq!(other, Some(&Value::Null));
+                    break;
+                }
             }
         }
 
@@ -1558,7 +1566,7 @@ mod tests {
         assert_eq!(bytes.len(), MAX_RESPONSE_BODY_SIZE);
         let exact: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(exact["items"].as_array().unwrap().len(), 2);
-        assert!(exact["next_cursor"].is_null());
+        assert_eq!(exact.get("next_cursor"), Some(&Value::Null));
 
         // One byte more no longer fits: the last item is dropped and the cursor
         // points at the item that is still returned.
