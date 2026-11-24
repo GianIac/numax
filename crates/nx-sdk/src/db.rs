@@ -366,3 +366,170 @@ pub fn get(key: &str) -> Result<Option<Vec<u8>>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u32_le(n: u32) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+
+    /// Builds a scan payload: `count`, then for each row `key_len`, `value_len`, key, value.
+    fn scan_payload(rows: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = u32_le(rows.len() as u32);
+        for (key, value) in rows {
+            buf.extend(u32_le(key.len() as u32));
+            buf.extend(u32_le(value.len() as u32));
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(value);
+        }
+        buf
+    }
+
+    /// Builds a keys payload: `count`, then for each key `key_len`, key.
+    fn keys_payload(keys: &[&[u8]]) -> Vec<u8> {
+        let mut buf = u32_le(keys.len() as u32);
+        for key in keys {
+            buf.extend(u32_le(key.len() as u32));
+            buf.extend_from_slice(key);
+        }
+        buf
+    }
+
+    #[test]
+    fn read_u32_le_reads_and_advances_offset() {
+        let buf = [1, 0, 0, 0, 2, 1, 0, 0];
+        let mut offset = 0;
+        assert_eq!(read_u32_le(&buf, &mut offset), Ok(1));
+        assert_eq!(offset, 4);
+        assert_eq!(read_u32_le(&buf, &mut offset), Ok(258));
+        assert_eq!(offset, 8);
+    }
+
+    #[test]
+    fn read_u32_le_rejects_short_buffer() {
+        let mut offset = 2;
+        assert_eq!(
+            read_u32_le(&[0, 0, 0, 0], &mut offset),
+            Err(NxError::Internal)
+        );
+        assert_eq!(offset, 2);
+    }
+
+    #[test]
+    fn parse_scan_rows_decodes_rows() {
+        let buf = scan_payload(&[(b"a", b"1"), (b"bb", b""), (b"", b"xyz")]);
+        let rows = parse_scan_rows(&buf).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"bb".to_vec(), Vec::new()),
+                (Vec::new(), b"xyz".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_scan_rows_accepts_empty_payload() {
+        assert_eq!(parse_scan_rows(&u32_le(0)), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn parse_scan_rows_rejects_missing_count() {
+        assert_eq!(parse_scan_rows(&[]), Err(NxError::Internal));
+        assert_eq!(parse_scan_rows(&[1, 0]), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_scan_rows_rejects_truncated_payload() {
+        let buf = scan_payload(&[(b"key", b"value")]);
+        // Cut inside the value, inside the key, and inside the length header.
+        for cut in [buf.len() - 1, buf.len() - 6, 10] {
+            assert_eq!(
+                parse_scan_rows(&buf[..cut]),
+                Err(NxError::Internal),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_scan_rows_rejects_count_larger_than_rows() {
+        let mut buf = scan_payload(&[(b"k", b"v")]);
+        buf[..4].copy_from_slice(&u32_le(2));
+        assert_eq!(parse_scan_rows(&buf), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_scan_rows_rejects_oversized_lengths() {
+        let mut buf = u32_le(1);
+        buf.extend(u32_le(u32::MAX));
+        buf.extend(u32_le(u32::MAX));
+        buf.extend_from_slice(b"kv");
+        assert_eq!(parse_scan_rows(&buf), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_scan_rows_rejects_trailing_bytes() {
+        let mut buf = scan_payload(&[(b"k", b"v")]);
+        buf.push(0);
+        assert_eq!(parse_scan_rows(&buf), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_keys_decodes_keys() {
+        let buf = keys_payload(&[b"a", b"", b"ccc"]);
+        assert_eq!(
+            parse_keys(&buf),
+            Ok(vec![b"a".to_vec(), Vec::new(), b"ccc".to_vec()])
+        );
+    }
+
+    #[test]
+    fn parse_keys_accepts_empty_payload() {
+        assert_eq!(parse_keys(&u32_le(0)), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn parse_keys_rejects_missing_count() {
+        assert_eq!(parse_keys(&[]), Err(NxError::Internal));
+        assert_eq!(parse_keys(&[1, 0, 0]), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_keys_rejects_truncated_payload() {
+        let buf = keys_payload(&[b"key"]);
+        // Cut inside the key and inside the length header.
+        for cut in [buf.len() - 1, 6] {
+            assert_eq!(
+                parse_keys(&buf[..cut]),
+                Err(NxError::Internal),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_keys_rejects_count_larger_than_keys() {
+        let mut buf = keys_payload(&[b"k"]);
+        buf[..4].copy_from_slice(&u32_le(2));
+        assert_eq!(parse_keys(&buf), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_keys_rejects_oversized_length() {
+        let mut buf = u32_le(1);
+        buf.extend(u32_le(u32::MAX));
+        buf.extend_from_slice(b"k");
+        assert_eq!(parse_keys(&buf), Err(NxError::Internal));
+    }
+
+    #[test]
+    fn parse_keys_rejects_trailing_bytes() {
+        let mut buf = keys_payload(&[b"k"]);
+        buf.push(0);
+        assert_eq!(parse_keys(&buf), Err(NxError::Internal));
+    }
+}
